@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  repo-integrity:
+    name: repo-integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Baseline verification
+        run: uv run python scripts/verify_baseline.py
+      - name: Build metadata (records baseline hash and versions)
+        run: uv run python scripts/build_metadata.py --output artifacts/generated/build_metadata.json
+      - name: Architecture guardrails
+        run: uv run python scripts/check_architecture.py
+      - name: Whitespace check
+        run: git diff --check
+      - name: Generators must not modify tracked files
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            echo "tracked files changed or untracked files created by generators"
+            exit 1
+          fi
+
+  python-quality:
+    name: python-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Ruff lint
+        run: uv run ruff check .
+      - name: Mypy strict typecheck
+        run: uv run mypy
+      - name: Pytest
+        run: uv run pytest -q
+
+  node-quality:
+    name: node-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable Corepack (pinned pnpm via packageManager)
+        run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Re-enable Corepack for selected Node
+        run: corepack enable
+      - name: Install frozen dependencies
+        run: corepack pnpm install --frozen-lockfile
+      - name: ESLint
+        run: corepack pnpm lint
+      - name: TypeScript typecheck
+        run: corepack pnpm typecheck
+      - name: Vitest
+        run: corepack pnpm test
+
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks (full history, redacted output)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  arm64-emulated:
+    name: arm64-emulated
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Install deps and run test suite under linux/arm64 (QEMU)
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD:/repo" -w /repo \
+            -e UV_LINK_MODE=copy \
+            -e UV_PROJECT_ENVIRONMENT=/tmp/venv \
+            ghcr.io/astral-sh/uv:python3.13-bookworm-slim \
+            sh -ec '
+              echo "machine: $(uname -m)"
+              test "$(uname -m)" = "aarch64"
+              uv sync --locked
+              uv run python scripts/verify_baseline.py
+              uv run python scripts/check_architecture.py
+              uv run pytest -q
+            '

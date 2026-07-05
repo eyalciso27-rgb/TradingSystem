@@ -1,8 +1,11 @@
 """Tests for the build metadata record (IMP-0003)."""
 
 import re
+import shutil
 from pathlib import Path
 from types import ModuleType
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -21,6 +24,7 @@ def test_build_record_ties_versions_and_hashes(
     assert record["baseline_problems"] == []
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="git binary not available")
 def test_git_commit_sha_in_real_repository(build_metadata: ModuleType) -> None:
     sha = build_metadata.git_commit_sha(REPO_ROOT)
     assert re.fullmatch(r"[0-9a-f]{40}", sha)
