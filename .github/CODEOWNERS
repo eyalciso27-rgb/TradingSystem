@@ -1,0 +1,41 @@
+# CODEOWNERS — IMP-0002 architecture guardrails.
+# Owner verified against the git remote: github.com/eyalciso27-rgb/TradingSystem.
+# Later-matching rules take precedence; the fallback rule covers everything.
+
+# Default owner for the entire repository.
+* @eyalciso27-rgb
+
+# Broker adapter — the only package allowed to contain IBKR-specific code.
+/packages/py/broker-ibkr/ @eyalciso27-rgb
+
+# Broker port and conformance interfaces.
+/packages/py/broker-core/ @eyalciso27-rgb
+
+# Risk and policy configuration.
+/config/policies/ @eyalciso27-rgb
+/config/strategies/ @eyalciso27-rgb
+/config/brokers/ @eyalciso27-rgb
+
+# Security-sensitive files.
+/.github/ @eyalciso27-rgb
+/.gitignore @eyalciso27-rgb
+/scripts/ @eyalciso27-rgb
+/packages/py/config/ @eyalciso27-rgb
+
+# Deployment files.
+/deploy/ @eyalciso27-rgb
+
+# Authoritative specification baseline — changes require explicit approval.
+/docs/baseline-v0.5/ @eyalciso27-rgb
+/docs/adr/ @eyalciso27-rgb
+/CLAUDE.md @eyalciso27-rgb
+
+# Contracts (canonical and generated).
+/packages/py/contracts/ @eyalciso27-rgb
+/packages/ts/contracts-generated/ @eyalciso27-rgb
+
+# Database migrations and seeds.
+/database/ @eyalciso27-rgb
+
+# Architecture guardrail tests.
+/tests/architecture/ @eyalciso27-rgb

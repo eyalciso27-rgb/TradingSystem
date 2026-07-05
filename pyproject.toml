@@ -65,7 +65,7 @@ select = ["E", "W", "F", "I", "B", "UP"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
-files = ["apps", "packages/py", "tests"]
+files = ["apps", "packages/py", "scripts", "tests"]
 exclude = ["node_modules", "\\.venv"]
 
 [tool.pytest.ini_options]

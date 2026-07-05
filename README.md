@@ -62,6 +62,31 @@ corepack pnpm typecheck
 corepack pnpm test
 ```
 
+## Architecture guardrails
+
+Machine-enforced rules from the baseline (IMP-0002):
+
+- `ibapi` is allowed only inside `packages/py/broker-ibkr`; provider SDKs
+  (FastAPI, SQLAlchemy, NATS, Playwright) only inside their adapter/app.
+- `contracts` imports no internal packages; `domain` imports only `contracts`;
+  the broker adapter is imported only by itself and `apps/execution-agent`.
+- Canonical environments (`RESEARCH`/`PAPER`/`LIVE`) and operating modes are
+  defined in `packages/py/config/src/trading_config/environments.py`. Unknown
+  values fail explicitly; LIVE and PAPER_AUTO are prohibited by baseline;
+  Paper and Live never share queue names or account allowlists.
+- Forbidden patterns: hardcoded account ids, LIVE defaults, queue names mixing
+  paper and live, embedded secrets, hardcoded Windows paths.
+
+Run the guardrails:
+
+```sh
+uv run python scripts/check_architecture.py   # standalone checker
+uv run pytest tests/architecture              # positive + negative tests
+```
+
+Architecture changes require an ADR (`docs/adr/ADR-0000-template.md`) and
+user approval. Code ownership is defined in `.github/CODEOWNERS`.
+
 ## Hebrew setup notes
 
 See `README_SETUP_HE.md` for the original Hebrew setup instructions.
