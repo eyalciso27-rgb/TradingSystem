@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/social_access_mode/v1",
+  "title": "SocialAccessMode",
+  "description": "Cross-provider access mode of a social connection profile.",
+  "type": "string",
+  "enum": [
+    "WHATSAPP_USER",
+    "DISCORD_USER",
+    "TELEGRAM_USER_TDLIB",
+    "TELEGRAM_BOT"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

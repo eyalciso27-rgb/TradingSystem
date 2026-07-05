@@ -11,29 +11,28 @@ Sources of truth:
   (live_enabled=false, paper_auto_enabled=false).
 
 This module is deliberately constants + deterministic validation only.
-The versioned configuration loader arrives with IMP-0105; canonical enums
-with JSON schemas arrive with IMP-0101.
+The versioned configuration loader arrives with IMP-0105. Since IMP-0101 the
+canonical value sets are consumed from trading_contracts.enums (the single
+source of truth); this module adds the enablement policy on top.
 """
 
 import re
 from collections.abc import Iterable
 from typing import Final
 
-CANONICAL_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"RESEARCH", "PAPER", "LIVE"})
+from trading_contracts.enums import Environment, OperatingMode
 
-CANONICAL_OPERATING_MODES: Final[frozenset[str]] = frozenset(
-    {
-        "RESEARCH",
-        "REPLAY",
-        "SHADOW",
-        "PAPER_MANUAL",
-        "PAPER_AUTO",
-        "LIVE_MANUAL",
-        "LIVE_LIMITED_AUTO",
-    }
+CANONICAL_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
+    member.value for member in Environment
 )
 
-LIVE_OPERATING_MODES: Final[frozenset[str]] = frozenset({"LIVE_MANUAL", "LIVE_LIMITED_AUTO"})
+CANONICAL_OPERATING_MODES: Final[frozenset[str]] = frozenset(
+    member.value for member in OperatingMode
+)
+
+LIVE_OPERATING_MODES: Final[frozenset[str]] = frozenset(
+    {OperatingMode.LIVE_MANUAL.value, OperatingMode.LIVE_LIMITED_AUTO.value}
+)
 
 # Mirrors BASELINE_MANIFEST.json. Flipping these requires an approved ADR
 # and an updated baseline; there is intentionally no runtime override.

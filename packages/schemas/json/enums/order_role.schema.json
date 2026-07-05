@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/order_role/v1",
+  "title": "OrderRole",
+  "description": "Role of an order within a trade plan.",
+  "type": "string",
+  "enum": [
+    "ENTRY",
+    "PROTECTIVE_STOP",
+    "TAKE_PROFIT",
+    "REDUCE",
+    "EXIT"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

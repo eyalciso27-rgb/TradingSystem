@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/source_type/v1",
+  "title": "SourceType",
+  "description": "Canonical source/evidence origin classification.",
+  "type": "string",
+  "enum": [
+    "WHATSAPP",
+    "DISCORD",
+    "TELEGRAM",
+    "INVESTINGPRO",
+    "NEWS",
+    "FILING",
+    "MARKET"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

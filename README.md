@@ -87,6 +87,26 @@ uv run pytest tests/architecture              # positive + negative tests
 Architecture changes require an ADR (`docs/adr/ADR-0000-template.md`) and
 user approval. Code ownership is defined in `.github/CODEOWNERS`.
 
+## Canonical contracts (enums)
+
+The single source of truth for canonical enums is
+`packages/py/contracts/src/trading_contracts/enums.py` (IMP-0101); every value
+is taken verbatim from the baseline documents. JSON Schemas
+(`packages/schemas/json/enums/`) and TypeScript types
+(`packages/ts/contracts-generated/src/enums.ts`) are **generated — never edit
+them by hand**.
+
+```sh
+uv run python scripts/generate_contracts.py          # regenerate (idempotent)
+uv run python scripts/generate_contracts.py --check  # drift check (runs in CI)
+uv run pytest tests/contracts                        # value + parity tests
+```
+
+Adding an enum: define it in `enums.py` with its authority reference, append
+it to `CANONICAL_ENUMS`, regenerate, and add its expected values to
+`tests/contracts/test_enums.py`. Changing an existing enum requires a schema
+version bump and a migration plan per the Data Model specification.
+
 ## Baseline verification
 
 The specification baseline in `docs/baseline-v0.5/` is hash-locked (IMP-0003):

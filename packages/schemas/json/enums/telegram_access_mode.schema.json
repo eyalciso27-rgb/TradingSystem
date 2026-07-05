@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/telegram_access_mode/v1",
+  "title": "TelegramAccessMode",
+  "description": "Telegram-specific access mode recorded on profiles and events.",
+  "type": "string",
+  "enum": [
+    "BOT_API",
+    "USER_ACCOUNT_TDLIB"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

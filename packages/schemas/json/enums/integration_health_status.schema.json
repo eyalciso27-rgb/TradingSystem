@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/integration_health_status/v1",
+  "title": "IntegrationHealthStatus",
+  "description": "Health states of an integration/connector.",
+  "type": "string",
+  "enum": [
+    "INITIALIZING",
+    "HEALTHY",
+    "DEGRADED",
+    "AUTH_REQUIRED",
+    "RATE_LIMITED",
+    "CIRCUIT_OPEN",
+    "PAUSED",
+    "DOWN"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/evidence_role/v1",
+  "title": "EvidenceRole",
+  "description": "Role of evidence in a fusion run.",
+  "type": "string",
+  "enum": [
+    "REQUIRED",
+    "OPTIONAL",
+    "VETO",
+    "CONTEXT"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/operating_mode/v1",
+  "title": "OperatingMode",
+  "description": "Canonical operating modes.",
+  "type": "string",
+  "enum": [
+    "RESEARCH",
+    "REPLAY",
+    "SHADOW",
+    "PAPER_MANUAL",
+    "PAPER_AUTO",
+    "LIVE_MANUAL",
+    "LIVE_LIMITED_AUTO"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

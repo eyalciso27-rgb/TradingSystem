@@ -219,6 +219,12 @@ source = { editable = "packages/py/broker-ibkr" }
 name = "trading-config"
 version = "0.1.0"
 source = { editable = "packages/py/config" }
+dependencies = [
+    { name = "trading-contracts" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "trading-contracts", editable = "packages/py/contracts" }]
 
 [[package]]
 name = "trading-contracts"

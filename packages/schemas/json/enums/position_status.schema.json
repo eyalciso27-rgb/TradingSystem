@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/position_status/v1",
+  "title": "PositionStatus",
+  "description": "Canonical position status.",
+  "type": "string",
+  "enum": [
+    "OPENING",
+    "OPEN",
+    "REDUCING",
+    "CLOSING",
+    "CLOSED",
+    "RECONCILIATION_REQUIRED"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

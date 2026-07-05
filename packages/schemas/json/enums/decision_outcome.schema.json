@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/decision_outcome/v1",
+  "title": "DecisionOutcome",
+  "description": "Terminal outcome of a decision run.",
+  "type": "string",
+  "enum": [
+    "REJECT",
+    "WATCH",
+    "SHADOW",
+    "APPROVE",
+    "NEEDS_REVIEW",
+    "EXPIRE",
+    "INVALID"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

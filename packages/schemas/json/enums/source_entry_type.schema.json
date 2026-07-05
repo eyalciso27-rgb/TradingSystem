@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/source_entry_type/v1",
+  "title": "SourceEntryType",
+  "description": "Entry semantics extracted from a source instruction.",
+  "type": "string",
+  "enum": [
+    "BUY_LIMIT_MAX",
+    "BUY_STOP_TRIGGER",
+    "BUY_ZONE",
+    "ENTER_IMMEDIATELY",
+    "BUY_PULLBACK",
+    "CONDITIONAL_ENTRY",
+    "UNKNOWN"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

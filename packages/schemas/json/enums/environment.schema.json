@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/environment/v1",
+  "title": "Environment",
+  "description": "Environment axis, separate from operating mode.",
+  "type": "string",
+  "enum": [
+    "RESEARCH",
+    "PAPER",
+    "LIVE"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

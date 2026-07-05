@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/order_type/v1",
+  "title": "OrderType",
+  "description": "Canonical order types.",
+  "type": "string",
+  "enum": [
+    "LIMIT",
+    "STOP",
+    "STOP_LIMIT",
+    "MARKET"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

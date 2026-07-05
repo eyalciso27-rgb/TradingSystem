@@ -35,6 +35,8 @@ jobs:
         run: uv run python scripts/build_metadata.py --output artifacts/generated/build_metadata.json
       - name: Architecture guardrails
         run: uv run python scripts/check_architecture.py
+      - name: Contract generation drift check
+        run: uv run python scripts/generate_contracts.py --check
       - name: Whitespace check
         run: git diff --check
       - name: Generators must not modify tracked files

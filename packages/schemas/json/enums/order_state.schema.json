@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/order_state/v1",
+  "title": "OrderState",
+  "description": "Canonical order state machine states.",
+  "type": "string",
+  "enum": [
+    "CREATED",
+    "VALIDATED",
+    "QUEUED",
+    "SUBMITTING",
+    "ACKNOWLEDGED",
+    "PARTIALLY_FILLED",
+    "FILLED",
+    "CANCEL_PENDING",
+    "CANCELLED",
+    "CANCELLED_BY_POLICY",
+    "REJECTED",
+    "EXPIRED",
+    "UNKNOWN"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

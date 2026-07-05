@@ -3,7 +3,10 @@ name = "trading-config"
 version = "0.1.0"
 description = "Versioned configuration loading and validation"
 requires-python = ">=3.13,<3.14"
-dependencies = []
+dependencies = ["trading-contracts"]
+
+[tool.uv.sources]
+trading-contracts = { workspace = true }
 
 [build-system]
 requires = ["uv_build>=0.9,<0.10"]
