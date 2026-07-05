@@ -1,0 +1,1252 @@
+version: '0.1'
+baseline: v0.5
+tasks:
+- task_id: IMP-0001
+  phase: PHASE-0
+  phase_name: Repository and Governance
+  title: Create monorepo skeleton
+  dependencies: &id001 []
+  scope: apps, packages, infra, docs, tests; no business logic.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Repository builds on ARM64; lint/typecheck/test commands exist.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0002
+  phase: PHASE-0
+  phase_name: Repository and Governance
+  title: Add architecture guardrails
+  dependencies: *id001
+  scope: ADR template, CODEOWNERS, forbidden import rules, environment naming.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: CI rejects ibapi outside broker-ibkr and provider SDK leakage outside
+    adapters.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0003
+  phase: PHASE-0
+  phase_name: Repository and Governance
+  title: Add baseline documents
+  dependencies: *id001
+  scope: Store version manifest and contract authority map.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Build records baseline hash and versions.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0004
+  phase: PHASE-0
+  phase_name: Repository and Governance
+  title: Configure CI
+  dependencies: *id001
+  scope: Python/Node lint, tests, schema validation, container build, secret scan.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Clean clone passes all CI on PR.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0101
+  phase: PHASE-1
+  phase_name: Canonical Contracts and Configuration
+  title: Define canonical enums
+  dependencies: &id002
+  - PHASE-0
+  scope: Entry, outcome, order, position, health, evidence, access modes.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: JSON schemas and Python/TS generated types match.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0102
+  phase: PHASE-1
+  phase_name: Canonical Contracts and Configuration
+  title: Define event envelope
+  dependencies: *id002
+  scope: event_id, type, version, occurred/observed/available/ingested, correlation,
+    causation.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Contract tests reject missing point-in-time fields.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0103
+  phase: PHASE-1
+  phase_name: Canonical Contracts and Configuration
+  title: Define source and social contracts
+  dependencies: *id002
+  scope: Canonical social message + observations; user/bot modes.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Cross-mode examples validate and dedup key is explicit.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0104
+  phase: PHASE-1
+  phase_name: Canonical Contracts and Configuration
+  title: Define decision/risk/order contracts
+  dependencies: *id002
+  scope: Candidate, assessments, trade plan, order intent, normalized broker event.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: No broker-specific field in domain schemas.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0105
+  phase: PHASE-1
+  phase_name: Canonical Contracts and Configuration
+  title: Implement versioned config loader
+  dependencies: *id002
+  scope: Policy/strategy/provider/source active pointers and validation.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Invalid config fails startup; rollback changes pointer without build.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0201
+  phase: PHASE-2
+  phase_name: Platform Data and Messaging
+  title: Create PostgreSQL schema core
+  dependencies: &id003
+  - PHASE-1
+  scope: Instrument, evidence, candidates, decisions, orders, fills, positions, versions.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Alembic migration applies/rolls back on empty DB.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0202
+  phase: PHASE-2
+  phase_name: Platform Data and Messaging
+  title: Implement point-in-time storage
+  dependencies: *id003
+  scope: observed/effective/available/ingested/superseded fields and as-of queries.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Replay test proves no future record is visible.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0203
+  phase: PHASE-2
+  phase_name: Platform Data and Messaging
+  title: Implement transactional outbox
+  dependencies: *id003
+  scope: Write domain state and outbox atomically.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Crash after commit produces exactly one logical event.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0204
+  phase: PHASE-2
+  phase_name: Platform Data and Messaging
+  title: Implement consumer inbox
+  dependencies: *id003
+  scope: Idempotent processing at every service boundary.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Duplicate deliveries do not duplicate state/orders.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0205
+  phase: PHASE-2
+  phase_name: Platform Data and Messaging
+  title: Implement object storage port
+  dependencies: *id003
+  scope: Content-addressed raw evidence/attachments/artifacts.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Hash verification and retention tests pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0301
+  phase: PHASE-3
+  phase_name: Security, Identity, Audit and Sessions
+  title: Implement authentication and RBAC
+  dependencies: &id004
+  - PHASE-2
+  scope: OWNER/OPERATOR/VIEWER/SERVICE roles with MFA hooks.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Unauthorized approval/policy/emergency actions are denied and audited.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0302
+  phase: PHASE-3
+  phase_name: Security, Identity, Audit and Sessions
+  title: Implement static secret loading
+  dependencies: *id004
+  scope: SOPS/age runtime file secrets; no secrets in images/env dumps.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Secret scan and log tests pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0303
+  phase: PHASE-3
+  phase_name: Security, Identity, Audit and Sessions
+  title: Implement runtime session store
+  dependencies: *id004
+  scope: Per-connector encrypted session blobs, rotate/revoke/re-auth.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: One connector session can be revoked without affecting others.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0304
+  phase: PHASE-3
+  phase_name: Security, Identity, Audit and Sessions
+  title: Implement tamper-evident audit
+  dependencies: *id004
+  scope: Append-only events, hash chain, offsite checkpoints.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Mutation breaks verification; checkpoint restore verifies chain.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0305
+  phase: PHASE-3
+  phase_name: Security, Identity, Audit and Sessions
+  title: Implement trust/quarantine service
+  dependencies: *id004
+  scope: Untrusted content, attachments, prompt injection markers, content clusters.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Malicious fixture cannot call tools or reach execution.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0401
+  phase: PHASE-4
+  phase_name: Infrastructure, Docker and Operations Core
+  title: Create Docker Compose stacks
+  dependencies: &id005
+  - PHASE-3
+  scope: dev, test, paper with isolated networks and volumes.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Only approved endpoints exposed; all services healthchecked.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0402
+  phase: PHASE-4
+  phase_name: Infrastructure, Docker and Operations Core
+  title: Implement observability
+  dependencies: *id005
+  scope: OTel, Prometheus, Grafana, Loki/Alloy, alerts.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Source-to-decision trace and secret redaction tests pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0403
+  phase: PHASE-4
+  phase_name: Infrastructure, Docker and Operations Core
+  title: Implement backup and restore
+  dependencies: *id005
+  scope: Postgres, NATS, object/session storage encrypted offsite.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Restore drill meets documented RPO/RTO.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0404
+  phase: PHASE-4
+  phase_name: Infrastructure, Docker and Operations Core
+  title: Implement emergency control service
+  dependencies: *id005
+  scope: Global/account/strategy/source halts; persistent state.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Halt blocks queued and pre-submit entries, preserves protective exits.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0405
+  phase: PHASE-4
+  phase_name: Infrastructure, Docker and Operations Core
+  title: Implement notification service
+  dependencies: *id005
+  scope: UI + Telegram private alerts, dedup/escalation/ack.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Critical test alert delivered and correlated without remote commands.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0501
+  phase: PHASE-5
+  phase_name: Proof-of-Integration Execution
+  title: Execute all P0 PoIs
+  dependencies: &id006
+  - PHASE-4
+  scope: Run backlog, capture evidence, issue ADRs.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Every P0 item PASS/approved alternate ADR.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0502
+  phase: PHASE-5
+  phase_name: Proof-of-Integration Execution
+  title: Execute P1 PoIs
+  dependencies: *id006
+  scope: Telegram Bot, TradingView, observability refinements.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Each item has decision and fixtures.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0503
+  phase: PHASE-5
+  phase_name: Proof-of-Integration Execution
+  title: Freeze provider/runtime choices
+  dependencies: *id006
+  scope: Update config catalogs and capability matrices.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: No unresolved provider assumption remains in implementation tasks.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0601
+  phase: PHASE-6
+  phase_name: Production Source Adapters
+  title: Build WhatsApp user adapter
+  dependencies: &id007
+  - PHASE-5
+  scope: Required user session, allowlist, events, health, re-auth.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Contract/integration tests from PoI pass in production adapter.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0602
+  phase: PHASE-6
+  phase_name: Production Source Adapters
+  title: Build Discord user adapter
+  dependencies: *id007
+  scope: Required user session, channels/threads, edits, attachments, resume.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Contract/integration tests pass; no bot-only substitution.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0603
+  phase: PHASE-6
+  phase_name: Production Source Adapters
+  title: Build Telegram user adapter
+  dependencies: *id007
+  scope: Required-primary TDLib user connector.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Login/QR/2FA, restart, allowlist, events and encrypted session pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0604
+  phase: PHASE-6
+  phase_name: Production Source Adapters
+  title: Build Telegram bot adapter
+  dependencies: *id007
+  scope: Supplemental Bot API ingestion and private notifications.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Works alongside user adapter and cannot satisfy user gate.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0605
+  phase: PHASE-6
+  phase_name: Production Source Adapters
+  title: Implement cross-adapter social normalization
+  dependencies: *id007
+  scope: Canonical messages, observations, revisions, clusters.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Same Telegram post via user/bot creates one candidate.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0606
+  phase: PHASE-6
+  phase_name: Production Source Adapters
+  title: Build InvestingPro adapter
+  dependencies: *id007
+  scope: Parser canary, field catalog, raw snapshots, circuit breaker.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Schema drift causes alert/circuit, never silent defaults.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0607
+  phase: PHASE-6
+  phase_name: Production Source Adapters
+  title: Build news/filings adapters
+  dependencies: *id007
+  scope: Official source, news provider, corrections, clustering.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Point-in-time and independent-source tests pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0608
+  phase: PHASE-6
+  phase_name: Production Source Adapters
+  title: Build TradingView adapter
+  dependencies: *id007
+  scope: Authenticated webhook external signal only.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: No direct order path; replay/idempotency pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0701
+  phase: PHASE-7
+  phase_name: Instrument, Market Data and Trading Calendar
+  title: Implement instrument master
+  dependencies: &id008
+  - PHASE-6
+  scope: Internal IDs and provider/broker mappings.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Ambiguous symbol requires review; mappings versioned.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0702
+  phase: PHASE-7
+  phase_name: Instrument, Market Data and Trading Calendar
+  title: Implement market data provider port
+  dependencies: *id008
+  scope: Quotes, bars, fundamentals metadata and health.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Primary/fallback and freshness policies enforced.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0703
+  phase: PHASE-7
+  phase_name: Instrument, Market Data and Trading Calendar
+  title: Implement feature data snapshots
+  dependencies: *id008
+  scope: ATR, ADV, spread, relative volume and point-in-time snapshots.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Feature replay deterministic.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0704
+  phase: PHASE-7
+  phase_name: Instrument, Market Data and Trading Calendar
+  title: Implement trading calendar
+  dependencies: *id008
+  scope: America/New_York, DST, holidays, half days, RTH windows.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Known calendar fixtures pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0705
+  phase: PHASE-7
+  phase_name: Instrument, Market Data and Trading Calendar
+  title: Implement corporate action workflow
+  dependencies: *id008
+  scope: Splits, symbol changes, mergers, delisting and halts.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Unresolved action blocks affected instrument only.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0801
+  phase: PHASE-8
+  phase_name: Research and Signal Engines
+  title: Technical engine v1
+  dependencies: &id009
+  - PHASE-7
+  scope: Breakout, volume, trend, ATR, support/resistance features.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Golden market fixtures produce expected assessments.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0802
+  phase: PHASE-8
+  phase_name: Research and Signal Engines
+  title: Fundamental engine v1
+  dependencies: *id009
+  scope: Quality, growth, valuation and financial risk scores.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Field lineage and missing-data behavior pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0803
+  phase: PHASE-8
+  phase_name: Research and Signal Engines
+  title: News/NLP engine v1
+  dependencies: *id009
+  scope: Entity, catalyst, materiality, source class, sentiment and revisions.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Structured output and adversarial tests pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0804
+  phase: PHASE-8
+  phase_name: Research and Signal Engines
+  title: AI extraction tasks
+  dependencies: *id009
+  scope: Entity/instruction/context/critic with schema validation.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Golden-set thresholds and fallback behavior pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0805
+  phase: PHASE-8
+  phase_name: Research and Signal Engines
+  title: Market regime engine v1
+  dependencies: *id009
+  scope: Trend/range/volatility/risk-on/off/unknown.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Unknown handled explicitly; no look-ahead.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0806
+  phase: PHASE-8
+  phase_name: Research and Signal Engines
+  title: Quant/ML registry scaffolding
+  dependencies: *id009
+  scope: Shadow-only models, artifacts, calibration status and drift.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: No unapproved model can become active.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0901
+  phase: PHASE-9
+  phase_name: Fusion, Decision, Risk and Portfolio
+  title: Implement strategy manifest evaluator
+  dependencies: &id010
+  - PHASE-8
+  scope: REQUIRED/VETO/SOFT/BONUS/CONTEXT per strategy.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: No global all-model agreement gate.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0902
+  phase: PHASE-9
+  phase_name: Fusion, Decision, Risk and Portfolio
+  title: Implement signal fusion
+  dependencies: *id010
+  scope: Assessments, provenance, conflicts, score/action tier.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Duplicate source observations do not double count.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0903
+  phase: PHASE-9
+  phase_name: Fusion, Decision, Risk and Portfolio
+  title: Implement deterministic decision engine
+  dependencies: *id010
+  scope: Outcomes and action tiers with explanation.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Same snapshot/version produces same decision.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0904
+  phase: PHASE-9
+  phase_name: Fusion, Decision, Risk and Portfolio
+  title: Implement risk engine
+  dependencies: *id010
+  scope: Canonical risk formula, loss/exposure limits, veto and quantity reduction.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Boundary/property tests pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0905
+  phase: PHASE-9
+  phase_name: Fusion, Decision, Risk and Portfolio
+  title: Implement portfolio allocator
+  dependencies: *id010
+  scope: Aggregate risk, sector/theme/correlation/source/strategy caps.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Concurrent candidate tests produce deterministic allocation.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-0906
+  phase: PHASE-9
+  phase_name: Fusion, Decision, Risk and Portfolio
+  title: Implement final pre-submit check
+  dependencies: *id010
+  scope: Refresh market/account/approval/kill/risk immediately before submit.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Price/risk/kill changes invalidate or resize safely.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1001
+  phase: PHASE-10
+  phase_name: Broker Execution and Position Management
+  title: Implement broker core port and conformance suite
+  dependencies: &id011
+  - PHASE-9
+  scope: Capabilities, order mapping, normalized events.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Mock adapter passes suite; no IBKR leakage.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1002
+  phase: PHASE-10
+  phase_name: Broker Execution and Position Management
+  title: Implement IBKR Paper adapter
+  dependencies: *id011
+  scope: Connection, accounts, orders, events and reconciliation.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: PoI fixtures and conformance suite pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1003
+  phase: PHASE-10
+  phase_name: Broker Execution and Position Management
+  title: Implement execution agent
+  dependencies: *id011
+  scope: Queue consume, idempotency, kill check, submit/cancel/modify.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: No blind retry on unknown state.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1004
+  phase: PHASE-10
+  phase_name: Broker Execution and Position Management
+  title: Implement position coordinator
+  dependencies: *id011
+  scope: Single writer for stops, targets, reductions and exits.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Concurrent exit triggers produce one coherent action plan.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1005
+  phase: PHASE-10
+  phase_name: Broker Execution and Position Management
+  title: Implement broker-side protection
+  dependencies: *id011
+  scope: Protect every fill, adjust on partial fills, OCA/bracket by capability.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: No required position remains unprotected.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1006
+  phase: PHASE-10
+  phase_name: Broker Execution and Position Management
+  title: Implement reconciliation
+  dependencies: *id011
+  scope: Startup/periodic/event-driven account-order-position reconciliation.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Mismatch creates controlled state and blocks new entries if required.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1101
+  phase: PHASE-11
+  phase_name: Operations Console
+  title: Build dashboard shell
+  dependencies: &id012
+  - PHASE-10
+  scope: Mode, health, P&L, risk, positions, alerts, halt banner.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Responsive authenticated UI with live SSE updates.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1102
+  phase: PHASE-11
+  phase_name: Operations Console
+  title: Build source connections screens
+  dependencies: *id012
+  scope: WhatsApp/Discord/Telegram user, Telegram bot, InvestingPro, news, market
+    data.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Capability/runtime status separated; re-auth flows available.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1103
+  phase: PHASE-11
+  phase_name: Operations Console
+  title: Build candidate workspace
+  dependencies: *id012
+  scope: Evidence, model cards, fusion, vetoes, plan and freshness.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Every decision is explainable from UI.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1104
+  phase: PHASE-11
+  phase_name: Operations Console
+  title: Build approval queue
+  dependencies: *id012
+  scope: Approve/reject/watch/reanalyse/reduce quantity with expiry.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Expired/materially changed plan requires refresh.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1105
+  phase: PHASE-11
+  phase_name: Operations Console
+  title: Build positions/orders/reconciliation
+  dependencies: *id012
+  scope: Stops, targets, fills, order states and mismatches.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: UI mirrors canonical state, not broker raw status.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1106
+  phase: PHASE-11
+  phase_name: Operations Console
+  title: Build emergency controls
+  dependencies: *id012
+  scope: Global halt and separate flatten preview/reauth.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Halt drill passes; flatten remains disabled in initial release unless
+    explicitly enabled.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1107
+  phase: PHASE-11
+  phase_name: Operations Console
+  title: Build research/calibration screens
+  dependencies: *id012
+  scope: Funnel, starvation, challengers, backtests, models.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: No UI action auto-promotes policy/model.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1201
+  phase: PHASE-12
+  phase_name: Replay, Backtesting and Calibration
+  title: Implement replay runner
+  dependencies: &id013
+  - PHASE-11
+  scope: As-of snapshots, exact versions and deterministic event ordering.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Repeated replay yields identical results.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1202
+  phase: PHASE-12
+  phase_name: Replay, Backtesting and Calibration
+  title: Implement backtest engine
+  dependencies: *id013
+  scope: Costs, spread, slippage, fill assumptions and walk-forward splits.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Look-ahead and leakage tests pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1203
+  phase: PHASE-12
+  phase_name: Replay, Backtesting and Calibration
+  title: Implement opportunity funnel
+  dependencies: *id013
+  scope: Stage counts and rejection reason attribution.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Every candidate has terminal/stage history.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1204
+  phase: PHASE-12
+  phase_name: Replay, Backtesting and Calibration
+  title: Implement counterfactual shadow
+  dependencies: *id013
+  scope: Track rejected/watch/manual candidates with virtual outcomes.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: No counterfactual event affects live/paper state.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1205
+  phase: PHASE-12
+  phase_name: Replay, Backtesting and Calibration
+  title: Implement champion/challenger
+  dependencies: *id013
+  scope: Same events, isolated state, comparison report.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Challenger cannot execute or change active pointer.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1206
+  phase: PHASE-12
+  phase_name: Replay, Backtesting and Calibration
+  title: Implement policy change workflow
+  dependencies: *id013
+  scope: Proposal, replay, shadow, approval and rollback.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: No direct edit of active immutable version.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1301
+  phase: PHASE-13
+  phase_name: End-to-End Shadow and Paper Manual
+  title: Run E2E shadow scenarios
+  dependencies: &id014
+  - PHASE-12
+  scope: All source types, independent discovery, failures and recovery.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Traceability acceptance suite passes.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1302
+  phase: PHASE-13
+  phase_name: End-to-End Shadow and Paper Manual
+  title: Run Paper Manual
+  dependencies: *id014
+  scope: User approves complete plans; execution/protection/reconciliation.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Zero duplicate orders and zero required unprotected positions.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1303
+  phase: PHASE-13
+  phase_name: End-to-End Shadow and Paper Manual
+  title: Run chaos and recovery drills
+  dependencies: *id014
+  scope: Broker/data/source/db/NATS/UI outages and restarts.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Documented safe behavior and runbooks pass.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1304
+  phase: PHASE-13
+  phase_name: End-to-End Shadow and Paper Manual
+  title: Close operational defects
+  dependencies: *id014
+  scope: Resolve P0/P1 defects and rerun regression.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: No open critical/high safety defect.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1401
+  phase: PHASE-14
+  phase_name: Restricted Paper Auto
+  title: Select one eligible strategy
+  dependencies: &id015
+  - PHASE-13
+  scope: Meets promotion criteria and has approved policy.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Explicit owner approval recorded.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1402
+  phase: PHASE-14
+  phase_name: Restricted Paper Auto
+  title: Enable restricted auto scope
+  dependencies: *id015
+  scope: Allowlist, lower risk, max positions, probation period.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Config cannot exceed approved envelope.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1403
+  phase: PHASE-14
+  phase_name: Restricted Paper Auto
+  title: Monitor and auto-demote
+  dependencies: *id015
+  scope: Safety incidents, drawdown, data/broker errors and drift.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Any demotion condition halts new auto entries.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1404
+  phase: PHASE-14
+  phase_name: Restricted Paper Auto
+  title: Complete probation review
+  dependencies: *id015
+  scope: Compare decisions, execution and operational reliability.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Continue, modify or demote decision documented.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1501
+  phase: PHASE-15
+  phase_name: Six-Month Paper Validation
+  title: Operate for minimum six months
+  dependencies: &id016
+  - PHASE-14
+  scope: Daily/weekly/monthly reviews and immutable records.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Six-month evidence window complete.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1502
+  phase: PHASE-15
+  phase_name: Six-Month Paper Validation
+  title: Evaluate strategy and operations
+  dependencies: *id016
+  scope: Expectancy, drawdown, regimes, execution, safety, calibration.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Report separates decision quality from luck/data/execution.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs
+- task_id: IMP-1503
+  phase: PHASE-15
+  phase_name: Six-Month Paper Validation
+  title: Produce future Live readiness recommendation
+  dependencies: *id016
+  scope: No automatic activation; separate policy and legal/broker review.
+  deliverables:
+  - code
+  - tests
+  - documentation
+  done_criteria: Owner receives GO/NO-GO/RESEARCH recommendation; Live remains disabled.
+  forbidden:
+  - live trading
+  - unapproved architecture changes
+  - secrets in code or logs

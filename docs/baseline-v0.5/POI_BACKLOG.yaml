@@ -1,0 +1,330 @@
+version: '0.1'
+items:
+- id: POI-PLAT-ARM-001
+  priority: P0
+  area: Platform
+  title: ARM64 Docker stack
+  depends: []
+  timebox: 2 days
+  objective: להוכיח שכל רכיבי הבסיס נבנים ורצים ב-Oracle ARM.
+  steps:
+  - Build Python API/worker image
+  - Build Node connector/UI image
+  - Start PostgreSQL, NATS, observability
+  - Run health and restart tests
+  pass: כל images נבנים arm64; services healthy; restart preserves volumes; no privileged
+    containers.
+  fail: רכיב ליבה חסר image או דורש emulation בלתי יציבה.
+  outputs:
+  - compose-poi.yaml
+  - image matrix
+  - resource report
+  - decision record
+- id: POI-SEC-SESS-002
+  priority: P0
+  area: Security
+  title: Encrypted Runtime Session Store
+  depends:
+  - POI-PLAT-ARM-001
+  timebox: 3 days
+  objective: להוכיח אחסון והחזרת sessions דינמיים ללא חשיפה.
+  steps:
+  - Encrypt session at rest
+  - Restart adapter
+  - Rotate wrapping key
+  - Revoke one session
+  - Verify logs redaction
+  pass: Session survives restart; secrets absent from logs/DB/domain tables; single-session
+    revoke works.
+  fail: session plaintext, shared secret scope, or unrecoverable restart.
+  outputs:
+  - session-store spike
+  - threat notes
+  - key rotation test
+- id: POI-SOC-WA-USER
+  priority: P0
+  area: Social
+  title: WhatsApp User Adapter
+  depends:
+  - POI-SEC-SESS-002
+  timebox: 5 days
+  objective: להוכיח קליטה באמצעות חשבון המשתמש כפי שסוכם.
+  steps:
+  - Pair user session
+  - Allowlist groups
+  - Capture message/reply/attachment
+  - Restart/reconnect
+  - Simulate auth expiry
+  - Measure gaps and IDs
+  pass: user session works; stable IDs/dedup; allowlist; reconnect; auth-required
+    state; no broker access.
+  fail: Bot-only solution, unstable IDs, uncontrolled gaps, or session not securable.
+  outputs:
+  - adapter recommendation
+  - golden fixtures
+  - PoI report
+  - go/no-go
+- id: POI-SOC-DC-USER
+  priority: P0
+  area: Social
+  title: Discord User Adapter
+  depends:
+  - POI-SEC-SESS-002
+  timebox: 5 days
+  objective: להוכיח קריאת שרתים/ערוצים/Threads דרך חשבון המשתמש.
+  steps:
+  - Authorize user session
+  - Allowlist servers/channels
+  - Capture edits/deletes/threads/attachments
+  - Restart/resume
+  - Auth expiry test
+  pass: user-mode requirements pass; events normalized; resume/dedup reliable; no
+    broker access.
+  fail: Bot-only substitution or inability to secure/operate required user mode.
+  outputs:
+  - adapter recommendation
+  - event fixtures
+  - PoI report
+- id: POI-SOC-TG-USER
+  priority: P0
+  area: Social
+  title: Telegram User Adapter via TDLib
+  depends:
+  - POI-SEC-SESS-002
+  - POI-PLAT-ARM-001
+  timebox: 5 days
+  objective: להוכיח את נתיב החובה והעיקרי דרך חשבון Telegram של המשתמש.
+  steps:
+  - Obtain api_id/api_hash
+  - Login by phone/QR/2FA
+  - List and allowlist chats/channels/topics
+  - Capture messages/posts/edits/deletes/replies/forwards
+  - Restart with encrypted TDLib DB
+  - Re-auth and revoke
+  - Build/run arm64 or document x86 host fallback
+  pass: TDLib user flow passes all events, restart, encrypted session, allowlist and
+    health; Bot is not used as substitute.
+  fail: only Bot API works, session insecure, or no viable isolated host.
+  outputs:
+  - TDLib adapter spike
+  - host decision
+  - fixtures
+  - PoI report
+  - go/no-go
+- id: POI-SOC-TG-BOT
+  priority: P1
+  area: Social
+  title: Telegram Bot API supplemental mode
+  depends:
+  - POI-PLAT-ARM-001
+  timebox: 3 days
+  objective: להוכיח Bot API כמסלול נוסף לקליטה/התראות.
+  steps:
+  - Create dedicated bot
+  - Test privacy/permissions
+  - Webhook secret or long polling
+  - Capture channel/group updates
+  - Send private test alert
+  pass: Bot mode works where authorized; token isolated; no claim of replacing user
+    mode.
+  fail: token leakage, duplicate uncontrolled updates, or coupling to user requirement.
+  outputs:
+  - bot adapter spike
+  - permission matrix
+  - notification test
+- id: POI-SOC-TG-COEX
+  priority: P0
+  area: Social/Data
+  title: Telegram User/Bot coexistence and dedup
+  depends:
+  - POI-SOC-TG-USER
+  - POI-SOC-TG-BOT
+  timebox: 2 days
+  objective: להוכיח קליטה מקבילה ללא Candidate כפול.
+  steps:
+  - Ingest same post via both modes
+  - Edit/delete from one/both modes
+  - Verify canonical message and observations
+  - Run content cluster test
+  pass: one canonical evidence/candidate; both observations retained; revisions deterministic.
+  fail: double scoring, double candidate or lost provenance.
+  outputs:
+  - dedup algorithm decision
+  - test fixtures
+  - contract examples
+- id: POI-MD-001
+  priority: P0
+  area: Market Data
+  title: Market data provider benchmark
+  depends:
+  - POI-PLAT-ARM-001
+  timebox: 5 days
+  objective: לבחור primary/fallback ל-quotes, bars, corporate actions and calendar.
+  steps:
+  - Benchmark IBKR and external provider
+  - Measure freshness/completeness
+  - Validate symbols and timestamps
+  - Test outage/fallback
+  - Cost/limits review
+  pass: field ownership matrix and provider decision satisfy FAST/STANDARD freshness
+    and point-in-time needs.
+  fail: missing required fields or no reliable timestamp/fallback.
+  outputs:
+  - benchmark report
+  - field ownership matrix
+  - provider ADR
+- id: POI-IBKR-001
+  priority: P0
+  area: Broker
+  title: IBKR Paper execution
+  depends:
+  - POI-PLAT-ARM-001
+  - POI-MD-001
+  timebox: 7 days
+  objective: להוכיח account, orders, protection, fills and reconciliation in Paper.
+  steps:
+  - Connect TWS/IB Gateway
+  - Account snapshot
+  - Instrument mapping
+  - Limit/stop/bracket
+  - Partial fill/cancel
+  - Disconnect/reconnect
+  - Unknown-state reconciliation
+  pass: no duplicate orders; protection follows fills; normalized events; recovery
+    deterministic; host decision documented.
+  fail: blind retry, unprotected fill, unstable gateway or domain leakage of IBKR
+    fields.
+  outputs:
+  - broker adapter spike
+  - capability matrix
+  - host ADR
+  - reconciliation fixtures
+- id: POI-INVPRO-001
+  priority: P0
+  area: Source
+  title: InvestingPro parser and drift canary
+  depends:
+  - POI-PLAT-ARM-001
+  - POI-SEC-SESS-002
+  timebox: 5 days
+  objective: להוכיח login, field extraction, raw snapshot and drift detection.
+  steps:
+  - Login/session
+  - Parse 3-5 page types
+  - Define field catalog/units
+  - Golden fixtures
+  - Break selector to test canary
+  - Restart session
+  pass: no silent defaults; schema drift opens circuit; raw snapshots retained; field
+    catalog approved.
+  fail: fragile parsing without canary or unverifiable fields.
+  outputs:
+  - parser spike
+  - field catalog
+  - fixtures
+  - drift report
+- id: POI-NEWS-001
+  priority: P0
+  area: News/Filings
+  title: Official filings and news ingestion
+  depends:
+  - POI-PLAT-ARM-001
+  timebox: 5 days
+  objective: להוכיח primary-source timestamps, dedup and clustering.
+  steps:
+  - SEC/IR retrieval
+  - News provider sample
+  - Published/observed/available timestamps
+  - Cluster duplicates
+  - Correction/revision test
+  pass: official source path works; point-in-time fields reliable; duplicate headlines
+    cluster.
+  fail: timestamp ambiguity or no primary-source verification.
+  outputs:
+  - provider decision
+  - fixtures
+  - timestamp rules
+- id: POI-TV-001
+  priority: P1
+  area: External Signals
+  title: TradingView webhook
+  depends:
+  - POI-PLAT-ARM-001
+  timebox: 2 days
+  objective: להוכיח authenticated external signal ingestion without direct trading.
+  steps:
+  - TLS endpoint
+  - Secret/idempotency
+  - Replay/duplicate test
+  - Payload schema
+  - Market-data revalidation
+  pass: alert creates external signal only; duplicates ignored; no broker path.
+  fail: direct-to-order or unauthenticated/replayable endpoint.
+  outputs:
+  - webhook contract
+  - security test
+  - fixtures
+- id: POI-AI-001
+  priority: P0
+  area: AI
+  title: Structured extraction benchmark
+  depends: []
+  timebox: 5 days
+  objective: לבחור model/provider per task and quantify quality/latency/cost.
+  steps:
+  - Build golden set
+  - Test entity/instruction/catalyst/critic
+  - Schema validation
+  - Adversarial prompts
+  - Latency/cost comparison
+  - Calibration assessment
+  pass: selected providers meet task thresholds or are restricted to manual/shadow;
+    no self-reported confidence gate.
+  fail: unreliable structured output or unbounded prompt/tool behavior.
+  outputs:
+  - benchmark report
+  - provider matrix
+  - prompt/model versions
+  - golden set
+- id: POI-EMERG-001
+  priority: P0
+  area: Operations
+  title: Emergency halt path
+  depends:
+  - POI-PLAT-ARM-001
+  timebox: 3 days
+  objective: להוכיח GLOBAL_ENTRY_HALT עצמאי מה-UI וה-AI.
+  steps:
+  - Set halt via UI
+  - Set halt via emergency endpoint/CLI
+  - Queue order then halt
+  - Verify pre-submit check
+  - Restart services
+  - Resume with MFA/reconcile
+  pass: queued/new entries blocked; protective exits remain; state survives restart;
+    full audit.
+  fail: order submits after halt or protection is cancelled.
+  outputs:
+  - runbook
+  - drill evidence
+  - test automation
+- id: POI-OBS-001
+  priority: P1
+  area: Observability
+  title: End-to-end telemetry and alerting
+  depends:
+  - POI-PLAT-ARM-001
+  timebox: 3 days
+  objective: להוכיח tracing, metrics, logs and notification routing.
+  steps:
+  - Trace source-to-decision
+  - Redact secrets
+  - Create critical alerts
+  - Send Telegram private alert
+  - Simulate adapter down/data stale
+  pass: correlation ID end-to-end; no secrets; alerts dedup/escalate; health visible.
+  fail: missing trace across boundary or secret exposure.
+  outputs:
+  - dashboards
+  - alert rules
+  - redaction tests

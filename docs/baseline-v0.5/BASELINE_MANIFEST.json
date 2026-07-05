@@ -1,0 +1,34 @@
+{
+  "pack_version": "0.5",
+  "date": "2026-07-05",
+  "status": "CONSISTENT_FOR_IMPLEMENTATION",
+  "social_connectors": {
+    "whatsapp_user": {
+      "required_capability": true,
+      "replacement_by_bot": false
+    },
+    "discord_user": {
+      "required_capability": true,
+      "replacement_by_bot": false
+    },
+    "telegram_user_tdlib": {
+      "required_capability": true,
+      "primary": true,
+      "replacement_by_bot": false
+    },
+    "telegram_bot_api": {
+      "required_feature": true,
+      "supplemental": true,
+      "can_satisfy_user_requirement": false
+    }
+  },
+  "deliverables": [
+    "Baseline Consistency Review",
+    "Proof-of-Integration Backlog",
+    "Claude Code Implementation Plan",
+    "POI_BACKLOG.yaml",
+    "CLAUDE_CODE_TASKS.yaml"
+  ],
+  "live_enabled": false,
+  "paper_auto_enabled": false
+}
