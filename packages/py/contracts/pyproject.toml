@@ -1,0 +1,10 @@
+[project]
+name = "trading-contracts"
+version = "0.1.0"
+description = "Canonical contracts and schemas (Pydantic is source of truth in later tasks)"
+requires-python = ">=3.13,<3.14"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.9,<0.10"]
+build-backend = "uv_build"

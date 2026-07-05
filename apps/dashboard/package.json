@@ -1,0 +1,11 @@
+{
+  "name": "@trading-system/dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Operations Console placeholder; Next.js app arrives with the Operations Console phase",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  }
+}

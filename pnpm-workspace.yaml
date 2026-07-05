@@ -1,0 +1,4 @@
+packages:
+  - "apps/connectors"
+  - "apps/dashboard"
+  - "packages/ts/*"

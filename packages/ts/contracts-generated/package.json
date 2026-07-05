@@ -1,0 +1,11 @@
+{
+  "name": "@trading-system/contracts-generated",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Generated TypeScript contract types; generation pipeline arrives in its own task",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  }
+}

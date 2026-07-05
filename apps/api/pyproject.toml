@@ -1,0 +1,10 @@
+[project]
+name = "trading-api"
+version = "0.1.0"
+description = "Core API service (FastAPI arrives in its own task)"
+requires-python = ">=3.13,<3.14"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.9,<0.10"]
+build-backend = "uv_build"

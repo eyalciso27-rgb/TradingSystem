@@ -1,0 +1,11 @@
+{
+  "name": "@trading-system/connectors",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Connector runtime placeholder; WhatsApp/Discord/Telegram adapters arrive in their own tasks",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  }
+}
