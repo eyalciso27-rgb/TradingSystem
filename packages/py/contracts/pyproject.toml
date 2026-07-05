@@ -1,9 +1,9 @@
 [project]
 name = "trading-contracts"
 version = "0.1.0"
-description = "Canonical contracts and schemas (Pydantic is source of truth in later tasks)"
+description = "Canonical contracts and schemas (Pydantic models are the source of truth)"
 requires-python = ">=3.13,<3.14"
-dependencies = []
+dependencies = ["pydantic>=2.9,<3"]
 
 [build-system]
 requires = ["uv_build>=0.9,<0.10"]
