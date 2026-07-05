@@ -1,0 +1,189 @@
+{
+  "pack_version": "0.5",
+  "manifest": "BASELINE_MANIFEST.json",
+  "algorithm": "sha256",
+  "normalization": "crlf-to-lf",
+  "tree_hash": "f54da17cb8afdca059bc57cd10cd738c851c2e6ccb57a5a8e61d6cb5cda1f73c",
+  "files": [
+    {
+      "path": "Baseline_Consistency_Review_v0.1_HE.docx",
+      "sha256": "0d9acbe3952d701c9c2b9def437c6897100477919bddd70a8dd0676ad4fd0f3b"
+    },
+    {
+      "path": "Baseline_Consistency_Review_v0.1_HE.md",
+      "sha256": "333ad1fc3a2f09a3771e7146db05095631eb7c4a1d76ff2e6dac5435c909e13a"
+    },
+    {
+      "path": "BASELINE_MANIFEST.json",
+      "sha256": "3c55f600b0ffb36012659e9242f9d8a8f818e5d9753655cd7de625bd708b5420"
+    },
+    {
+      "path": "Claude_Code_Implementation_Plan_v0.1_HE.docx",
+      "sha256": "0e98d7c39ea89528fe1177f356b103c5b719df95f8f8caaeae695606cc552c4c"
+    },
+    {
+      "path": "Claude_Code_Implementation_Plan_v0.1_HE.md",
+      "sha256": "b73201f728612653a87666cbad0a8e66334e1fe454c47aaed9c066206c9b21f2"
+    },
+    {
+      "path": "CLAUDE_CODE_TASKS.yaml",
+      "sha256": "1dabe890e4cb438f059ce2226731ae3f6858d57f51f2642d9eae373dc38ab881"
+    },
+    {
+      "path": "CONTRACT_AUTHORITY_MAP.json",
+      "sha256": "f23c241c203b15473bf0815fdade7ef0a65752e58ddc5e6efa66a19a8eec6abb"
+    },
+    {
+      "path": "Data_Model_and_Retention_Specification_v0.6_HE.docx",
+      "sha256": "f80a44d4854e788d6dce0e81a0bffd21101cbeb246c33e5a7760e90167ec7fcc"
+    },
+    {
+      "path": "Data_Model_and_Retention_Specification_v0.6_HE.md",
+      "sha256": "39fb63bd5f3ff35b8baca4f71237b7a268d02547ab58c34e1fd77ba9d3b5e184"
+    },
+    {
+      "path": "Decision_Contract_v0.8_Trading_System_HE.docx",
+      "sha256": "6c195097febe0a987c417f7205bd086cdf8ae5c474d8849adcd86f1a7278e35f"
+    },
+    {
+      "path": "Decision_Contract_v0.8_Trading_System_HE.md",
+      "sha256": "67a1f0b041c2bf73024058f9188e88145d255956bc5a1e447f9e2c5ca5184508"
+    },
+    {
+      "path": "Integration_Specification_v0.6_Trading_System_HE.docx",
+      "sha256": "34272460812652f9341501ea99fad4e6ae0b42baa238cd90b05691e61703bac3"
+    },
+    {
+      "path": "Integration_Specification_v0.6_Trading_System_HE.md",
+      "sha256": "dd4b13ca5dc902152078e166aafec924b1ecd9a745fe7854dd1abe259e52ee4e"
+    },
+    {
+      "path": "Master_Architecture_Baseline_v0.3_HE.docx",
+      "sha256": "3863ce048845d51082bcf9ec9c8d489836f0b6c23584092b81c1a40624bd5fb2"
+    },
+    {
+      "path": "Master_Architecture_Baseline_v0.3_HE.md",
+      "sha256": "01cec1afab5dfc37ea6b6e19c37ebe3b6c25e1c81ce5bf5c72972054bf1afc63"
+    },
+    {
+      "path": "Multi_Model_Research_Signals_and_Fusion_Specification_v0.4_HE.docx",
+      "sha256": "271874129b64d445dd5606093aea86c8cb87201559b1a0b2f7a9229cc1599352"
+    },
+    {
+      "path": "Multi_Model_Research_Signals_and_Fusion_Specification_v0.4_HE.md",
+      "sha256": "315851bcdfc86be4c886d8d8638044c3b065f345097f4f3afa24e2ffcd0b4be7"
+    },
+    {
+      "path": "MVP_Scope_v0.6_Trading_System_HE.docx",
+      "sha256": "5c6b780c69bf0ee41c2ceaaee488c4a0f369c32d1245e0e33097af090702eada"
+    },
+    {
+      "path": "MVP_Scope_v0.6_Trading_System_HE.md",
+      "sha256": "d0272ca135e8a5a71b609b4320387a740d2ec15f446cf26a3035ffff8a24ec34"
+    },
+    {
+      "path": "Operations_Console_and_UX_Specification_v0.4_HE.docx",
+      "sha256": "4efe503d55ee07e5098b0a1aebea01ca738eae7b222af9a33063551291af37d3"
+    },
+    {
+      "path": "Operations_Console_and_UX_Specification_v0.4_HE.md",
+      "sha256": "2dfcb21256091a677d86888aef60bd096ff3de9fb4d9797adf4ed101492cedea"
+    },
+    {
+      "path": "Opportunity_Calibration_Backtesting_and_Model_Governance_v0.1_HE.docx",
+      "sha256": "c30c358a27f0e59977eb8678c916db08bdd133a86cb3c41ec14a2adb3c99d418"
+    },
+    {
+      "path": "Opportunity_Calibration_Backtesting_and_Model_Governance_v0.1_HE.md",
+      "sha256": "af30d86f9691f9b2ff65ac3558784c97891099551ad42a511164507113548a71"
+    },
+    {
+      "path": "POI_BACKLOG.yaml",
+      "sha256": "bc78ac1f5fff99b03f351289fbe8730df7df7ac712b8e5f851beceeb76533ca1"
+    },
+    {
+      "path": "Policy_Parameters_and_Initial_Assumptions_v0.5_HE.docx",
+      "sha256": "9a0c2e7a1d0789d4b28d8420472d80e035827f2612fa2b4dd04fe5a1e7ddeff3"
+    },
+    {
+      "path": "Policy_Parameters_and_Initial_Assumptions_v0.5_HE.md",
+      "sha256": "0ccfe3e6815b13af71e8399e6bb09492cdf6b06ea85bbac6d74ee5f235707955"
+    },
+    {
+      "path": "Portfolio_Capital_Allocation_and_Market_Regime_v0.1_HE.docx",
+      "sha256": "de927f4b69cc56400fb91b26420ac0afd3afe0b66c42f7ffb950425fe7ed185d"
+    },
+    {
+      "path": "Portfolio_Capital_Allocation_and_Market_Regime_v0.1_HE.md",
+      "sha256": "aad7878dfa4ea83788e843faeea53ebe248d290a921de09d871e5272035c8e45"
+    },
+    {
+      "path": "Proof_of_Integration_Backlog_v0.1_HE.docx",
+      "sha256": "20b7064763b1ab8d8154baea5a4d5231f56e2b024ea4812375fcab8d58af47f4"
+    },
+    {
+      "path": "Proof_of_Integration_Backlog_v0.1_HE.md",
+      "sha256": "6e513c9662abc3dde12759d990d98672444bda8ea23c8cbdf0dfea16a416bc29"
+    },
+    {
+      "path": "README_HE.md",
+      "sha256": "abdb5fbbc758f0cdcff041074893316dd92ddc59b0db2dcf8c1b68116ed779c0"
+    },
+    {
+      "path": "Security_and_Operations_Specification_v0.6_Trading_System_HE.docx",
+      "sha256": "c681aaa8eb04670567ad734837ca7efdec8120b567e420a969025d731c1b59db"
+    },
+    {
+      "path": "Security_and_Operations_Specification_v0.6_Trading_System_HE.md",
+      "sha256": "7cf7371440f892f58758ab124615345694f848b15d4222f2337b9c6c31864320"
+    },
+    {
+      "path": "Specification_Pack_Index_v0.5_HE.docx",
+      "sha256": "6f2c27093c6e961abe657947f84751cc00ae9197ca0623a555622a6e9e89a56d"
+    },
+    {
+      "path": "Specification_Pack_Index_v0.5_HE.md",
+      "sha256": "19bc7ebec28177ddc1815cf556da6143d4af3641fd7b48188bd9d20282739075"
+    },
+    {
+      "path": "Strategy_and_Decision_Framework_v0.5_Trading_System_HE.docx",
+      "sha256": "3a3d3fab2935c51b233e715aa6ed3e0d1e6716ab7115b53133f2f349c0705502"
+    },
+    {
+      "path": "Strategy_and_Decision_Framework_v0.5_Trading_System_HE.md",
+      "sha256": "bb54cb3151fdfa5b571b582cae863e7cc73a4f99283202c0b4eb3a7d70945864"
+    },
+    {
+      "path": "System_Functional_Specification_v0.7_Trading_System_HE.docx",
+      "sha256": "ccb1e9b8ae82049a3e5d32cb9d9a7c29b36b5a5080e67e0a41b4718b28115059"
+    },
+    {
+      "path": "System_Functional_Specification_v0.7_Trading_System_HE.md",
+      "sha256": "cee455003c19c92fcf140c5efbdb2afdf5fdcfa3f26735540b400a24a650f4f2"
+    },
+    {
+      "path": "Technology_and_Deployment_Decisions_v0.6_Trading_System_HE.docx",
+      "sha256": "a3e1fa0ade7dc704debf61383178b1625e701f3dfea4506b82704e6fb7dd3f79"
+    },
+    {
+      "path": "Technology_and_Deployment_Decisions_v0.6_Trading_System_HE.md",
+      "sha256": "8a0b88e37c544844e08374c8adb7476ba4fcdb75142433cf8fffa7db534af45c"
+    },
+    {
+      "path": "Traceability_Matrix_v0.3_HE.docx",
+      "sha256": "801b6debedbf4f7783bf25a9b4b9adc3ce29964de1852d5087a379482c3f749e"
+    },
+    {
+      "path": "Traceability_Matrix_v0.3_HE.md",
+      "sha256": "7b11675e7261abe388d7acc29179ec07c99b8b5e1e6ad56940b807da780fa805"
+    },
+    {
+      "path": "Trust_Adversarial_Input_and_Market_Manipulation_Controls_v0.3_HE.docx",
+      "sha256": "1333910346428eaad6dc1425e8c021a2e479d56dd5ba6881fa35772dff12923e"
+    },
+    {
+      "path": "Trust_Adversarial_Input_and_Market_Manipulation_Controls_v0.3_HE.md",
+      "sha256": "66c81340b5b7674c3d974a3fb5bcc8f66ba58b45a3b52ea68ddb0e396eaa3c63"
+    }
+  ]
+}

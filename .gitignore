@@ -13,6 +13,7 @@ auth/
 data/
 volumes/
 artifacts/poi/private/
+artifacts/generated/
 *.log
 __pycache__/
 .pytest_cache/
@@ -32,4 +33,4 @@ TradingSystem/
 *.zip
 
 # Local conversation export
-асишивййъ беи осзш.txt
+пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ пїЅпїЅпїЅпїЅ.txt

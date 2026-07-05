@@ -87,6 +87,23 @@ uv run pytest tests/architecture              # positive + negative tests
 Architecture changes require an ADR (`docs/adr/ADR-0000-template.md`) and
 user approval. Code ownership is defined in `.github/CODEOWNERS`.
 
+## Baseline verification
+
+The specification baseline in `docs/baseline-v0.5/` is hash-locked (IMP-0003):
+`BASELINE_LOCK.json` pins the SHA-256 of every baseline file (CRLF normalized
+to LF so hashes match across Windows and Linux), and
+`CONTRACT_AUTHORITY_MAP.json` records which document is authoritative for
+which contract area. Changing a baseline document without an explicit lock
+update fails verification.
+
+```sh
+uv run python scripts/verify_baseline.py    # verify manifest, hashes, lock
+uv run python scripts/build_metadata.py     # build record: versions + hashes
+uv run pytest tests/baseline                # positive + negative tests
+```
+
+Regenerating the lock (`--update`) is an explicit, reviewed action.
+
 ## Hebrew setup notes
 
 See `README_SETUP_HE.md` for the original Hebrew setup instructions.

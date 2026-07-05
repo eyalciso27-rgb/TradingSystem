@@ -1,0 +1,119 @@
+{
+  "pack_version": "0.5",
+  "source": "Specification_Pack_Index_v0.5_HE.md (section 1)",
+  "precedence": "Master_Architecture_Baseline_v0.3_HE.md",
+  "documents": [
+    {
+      "index": 1,
+      "title": "Master Architecture Baseline",
+      "version": "0.3",
+      "file": "Master_Architecture_Baseline_v0.3_HE.md",
+      "authority": "הגדרה, קדימות ו-Invariants."
+    },
+    {
+      "index": 2,
+      "title": "Decision Contract",
+      "version": "0.8",
+      "file": "Decision_Contract_v0.8_Trading_System_HE.md",
+      "authority": "חוזי החלטה, Gates, Action tiers וחירום."
+    },
+    {
+      "index": 3,
+      "title": "System Functional Specification",
+      "version": "0.7",
+      "file": "System_Functional_Specification_v0.7_Trading_System_HE.md",
+      "authority": "יכולות ותהליכים מקצה לקצה."
+    },
+    {
+      "index": 4,
+      "title": "Data Model and Retention",
+      "version": "0.6",
+      "file": "Data_Model_and_Retention_Specification_v0.6_HE.md",
+      "authority": "ישויות, Point-in-Time, Governance ו-Audit."
+    },
+    {
+      "index": 5,
+      "title": "Integration Specification",
+      "version": "0.6",
+      "file": "Integration_Specification_v0.6_Trading_System_HE.md",
+      "authority": "Adapters, Sources, Providers ו-Degraded modes."
+    },
+    {
+      "index": 6,
+      "title": "Security and Operations",
+      "version": "0.6",
+      "file": "Security_and_Operations_Specification_v0.6_Trading_System_HE.md",
+      "authority": "אבטחה, Trust, Sessions, DR ו-Kill Switch."
+    },
+    {
+      "index": 7,
+      "title": "Strategy and Decision Framework",
+      "version": "0.5",
+      "file": "Strategy_and_Decision_Framework_v0.5_Trading_System_HE.md",
+      "authority": "אסטרטגיות, Fusion roles, Risk ו-Exit."
+    },
+    {
+      "index": 8,
+      "title": "MVP Scope",
+      "version": "0.6",
+      "file": "MVP_Scope_v0.6_Trading_System_HE.md",
+      "authority": "גבולות ו-Phases."
+    },
+    {
+      "index": 9,
+      "title": "Technology and Deployment",
+      "version": "0.6",
+      "file": "Technology_and_Deployment_Decisions_v0.6_Trading_System_HE.md",
+      "authority": "Stack, modules ו-deployment."
+    },
+    {
+      "index": 10,
+      "title": "Policy Parameters",
+      "version": "0.5",
+      "file": "Policy_Parameters_and_Initial_Assumptions_v0.5_HE.md",
+      "authority": "ספים, risk, starvation ו-regime."
+    },
+    {
+      "index": 11,
+      "title": "Multi-Model Research, Signals and Fusion",
+      "version": "0.4",
+      "file": "Multi_Model_Research_Signals_and_Fusion_Specification_v0.4_HE.md",
+      "authority": "ששת מנועי הניתוח ושילוב אותות."
+    },
+    {
+      "index": 12,
+      "title": "Operations Console and UX",
+      "version": "0.4",
+      "file": "Operations_Console_and_UX_Specification_v0.4_HE.md",
+      "authority": "Dashboard, research, portfolio וחירום."
+    },
+    {
+      "index": 13,
+      "title": "Opportunity, Calibration, Backtesting and Model Governance",
+      "version": "0.1",
+      "file": "Opportunity_Calibration_Backtesting_and_Model_Governance_v0.1_HE.md",
+      "authority": "מחקר, קיפאון, Counterfactual ומודלים."
+    },
+    {
+      "index": 14,
+      "title": "Portfolio, Capital Allocation and Market Regime",
+      "version": "0.1",
+      "file": "Portfolio_Capital_Allocation_and_Market_Regime_v0.1_HE.md",
+      "authority": "הקצאת הון ותנאי שוק."
+    },
+    {
+      "index": 15,
+      "title": "Trust, Adversarial Input and Market Manipulation Controls",
+      "version": "0.3",
+      "file": "Trust_Adversarial_Input_and_Market_Manipulation_Controls_v0.3_HE.md",
+      "authority": "שרשרת אמון וקלט עוין."
+    },
+    {
+      "index": 16,
+      "title": "Traceability Matrix",
+      "version": "0.3",
+      "file": "Traceability_Matrix_v0.3_HE.md",
+      "authority": "Requirement -> Component -> Data -> Test."
+    }
+  ]
+}
