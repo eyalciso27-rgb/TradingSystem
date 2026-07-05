@@ -30,3 +30,6 @@ _archive/
 # Local duplicate repository and archives
 TradingSystem/
 *.zip
+
+# Local conversation export
+אסטרטגיית בוט מסחר.txt
