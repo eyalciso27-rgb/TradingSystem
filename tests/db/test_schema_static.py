@@ -44,6 +44,7 @@ EXPECTED_TABLES = {
     "positions",
     "config_versions",
     "active_version_pointers",
+    "outbox_messages",
 }
 
 FORBIDDEN_BROKER_TOKENS = [
@@ -150,7 +151,15 @@ def test_migration_is_initial_and_frozen() -> None:
     assert "down_revision: str | None = None" in text
     assert "create_all" not in text
     assert "trading_persistence.models" not in text
-    assert text.count("CREATE TABLE") == len(EXPECTED_TABLES)
+    assert text.count("CREATE TABLE") == 22  # the frozen 0001-era tables
+
+
+def test_outbox_migration_exists_and_is_frozen() -> None:
+    outbox = MIGRATION.parent / "0003_transactional_outbox.py"
+    text = outbox.read_text(encoding="utf-8")
+    assert 'down_revision: str | None = "0002_point_in_time_storage"' in text
+    assert "outbox_messages" in text
+    assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
 
 
 def test_point_in_time_migration_exists() -> None:

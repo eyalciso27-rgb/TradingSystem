@@ -571,6 +571,37 @@ class Position(Base):
     )
 
 
+class OutboxMessage(Base):
+    """Transactional outbox row (IMP-0203, Data_Model v0.6 section 24.3).
+
+    Written in the same transaction as the domain state; a separate publisher
+    later publishes to the event bus using ``id`` as the message id and marks
+    the row PUBLISHED. Crash after commit therefore yields exactly one
+    logical event.
+    """
+
+    __tablename__ = "outbox_messages"
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    aggregate_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="PENDING")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = _ts(nullable=False)
+    published_at: Mapped[datetime | None] = _ts()
+
+    __table_args__ = (
+        values_check("status", ("PENDING", "PUBLISHED"), "outbox_messages_status"),
+        raw_check("attempts >= 0", "outbox_messages_attempts_nonneg"),
+        raw_check(
+            "(status = 'PUBLISHED') = (published_at IS NOT NULL)",
+            "outbox_messages_published_consistency",
+        ),
+        Index("ix_outbox_messages_status_created_at", "status", "created_at"),
+    )
+
+
 class ConfigVersion(Base):
     __tablename__ = "config_versions"
 
