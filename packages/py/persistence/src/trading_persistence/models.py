@@ -624,6 +624,40 @@ class ConsumerInboxRecord(Base):
     __table_args__ = (UniqueConstraint("consumer_id", "message_id"),)
 
 
+class AuditEvent(Base):
+    """Tamper-evident audit record (IMP-0304, Data_Model section 6.8).
+
+    Append-only hash chain: every record carries the previous record's hash
+    and its own hash over the canonical field serialization, so mutation,
+    deletion, reordering or forged insertion breaks verification. Sensitive
+    payloads are never stored inline — only a redacted detail or an opaque
+    payload_ref.
+    """
+
+    __tablename__ = "audit_events"
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    sequence_no: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    actor_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    target_ref: Mapped[str | None] = mapped_column(Text)
+    environment: Mapped[str] = mapped_column(Text, nullable=False)
+    detail: Mapped[str | None] = mapped_column(Text)
+    payload_ref: Mapped[str | None] = mapped_column(Text)
+    correlation_id: Mapped[PyUUID | None] = mapped_column(UUID(as_uuid=True))
+    occurred_at: Mapped[datetime] = _ts(nullable=False)
+    previous_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    current_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = _ts(nullable=False)
+
+    __table_args__ = (
+        enum_check("environment", Environment, "audit_events_environment"),
+        UniqueConstraint("sequence_no"),
+        UniqueConstraint("current_hash"),
+        Index("ix_audit_events_occurred_at", "occurred_at"),
+    )
+
+
 class ConfigVersion(Base):
     __tablename__ = "config_versions"
 
