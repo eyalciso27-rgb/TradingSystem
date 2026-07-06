@@ -270,11 +270,15 @@ name = "trading-config"
 version = "0.1.0"
 source = { editable = "packages/py/config" }
 dependencies = [
+    { name = "pydantic" },
     { name = "trading-contracts" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "trading-contracts", editable = "packages/py/contracts" }]
+requires-dist = [
+    { name = "pydantic", specifier = ">=2.9,<3" },
+    { name = "trading-contracts", editable = "packages/py/contracts" },
+]
 
 [[package]]
 name = "trading-contracts"

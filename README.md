@@ -236,6 +236,50 @@ rather than a closed enum. The Data Model's `order_intents.intent_type`
 domain order contracts, so `OrderIntent.order_role` uses the canonical
 `OrderRole`.
 
+## Versioned configuration
+
+The config loader (IMP-0105) lives in `packages/py/config`
+(`trading_config.models` / `trading_config.loader`). Behavioural values are
+loaded at runtime — never hard-coded — from an immutable versioned tree, with
+a small mutable pointer per environment selecting the active version.
+
+```
+config/
+  policies/<config_id>/<version>.json      # immutable versioned configs
+  strategies/<config_id>/<version>.json
+  providers/<config_id>/<version>.json
+  sources/<config_id>/<version>.json
+  active/<ENVIRONMENT>/<TYPE>/<config_id>.json   # active pointers (mutable)
+```
+
+- **Versioned config vs active pointer:** a versioned file is immutable and
+  fully self-describing (`config_type`, `config_id`, `version`,
+  `schema_version`, `environments`, `owner`, `status`, `valid_from`, …); an
+  active pointer carries no config content, only which `version` is active for
+  an environment plus audit fields (`activated_at`/`activated_by`/`reason`).
+- **Version format** is SemVer (`MAJOR.MINOR.PATCH`); `schema_version`,
+  content version, strategy/policy version, baseline version and app build
+  version are kept distinct.
+- **Startup validation:** `uv run python -m trading_config.validate_active
+  --root config` loads and validates every active config; **any** problem
+  (missing pointer, missing target version, bad schema, unknown field,
+  environment mismatch, hash mismatch, path traversal, inline secret) exits
+  non-zero. There is **no silent fallback** to a previous version or default.
+- **Rollback** repoints the active pointer to an existing earlier version via
+  an atomic write (`write_active_pointer`, temp + `os.replace`) — no build,
+  code change or regeneration. Proven in `tests/config`.
+- **Paper/Live isolation:** pointers live in separate environment namespaces;
+  a pointer's environment must be permitted by the target config's operating
+  modes (`OPERATING_MODE_TO_ENVIRONMENT`), so a PAPER pointer can never
+  activate a LIVE-only config or vice versa.
+- **No secrets in config:** only opaque `secret_ref` references are allowed;
+  inline secret values and credential-shaped fields are rejected.
+
+These are Python backend loader contracts, so — unlike the enums/envelope/
+social/decision contracts — they are intentionally **not** part of
+`scripts/generate_contracts.py` (no JSON-Schema/TypeScript generation). A
+minimal valid example is exercised by the test fixtures in `tests/config`.
+
 ## Baseline verification
 
 The specification baseline in `docs/baseline-v0.5/` is hash-locked (IMP-0003):
