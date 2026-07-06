@@ -195,3 +195,99 @@ export const ENVIRONMENT_VALUES: readonly Environment[] = Object.freeze(Object.v
 export function isEnvironment(value: string): value is Environment {
   return (ENVIRONMENT_VALUES as readonly string[]).includes(value);
 }
+
+/** Family of a signal assessment. */
+export const SignalFamily = {
+  TECHNICAL: "TECHNICAL",
+  FUNDAMENTAL: "FUNDAMENTAL",
+  NEWS: "NEWS",
+  QUANT_ML: "QUANT_ML",
+  EXTERNAL: "EXTERNAL",
+  SOCIAL: "SOCIAL",
+} as const;
+export type SignalFamily = (typeof SignalFamily)[keyof typeof SignalFamily];
+export const SIGNAL_FAMILY_VALUES: readonly SignalFamily[] = Object.freeze(Object.values(SignalFamily));
+export function isSignalFamily(value: string): value is SignalFamily {
+  return (SIGNAL_FAMILY_VALUES as readonly string[]).includes(value);
+}
+
+/** Directional bias of an assessment, candidate or plan. */
+export const SignalDirection = {
+  LONG: "LONG",
+  NEUTRAL: "NEUTRAL",
+  NEGATIVE: "NEGATIVE",
+} as const;
+export type SignalDirection = (typeof SignalDirection)[keyof typeof SignalDirection];
+export const SIGNAL_DIRECTION_VALUES: readonly SignalDirection[] = Object.freeze(Object.values(SignalDirection));
+export function isSignalDirection(value: string): value is SignalDirection {
+  return (SIGNAL_DIRECTION_VALUES as readonly string[]).includes(value);
+}
+
+/** Status of a signal assessment. */
+export const AssessmentStatus = {
+  TRIGGERED: "TRIGGERED",
+  ELIGIBLE: "ELIGIBLE",
+  BLOCKED: "BLOCKED",
+  INCONCLUSIVE: "INCONCLUSIVE",
+  EXPIRED: "EXPIRED",
+} as const;
+export type AssessmentStatus = (typeof AssessmentStatus)[keyof typeof AssessmentStatus];
+export const ASSESSMENT_STATUS_VALUES: readonly AssessmentStatus[] = Object.freeze(Object.values(AssessmentStatus));
+export function isAssessmentStatus(value: string): value is AssessmentStatus {
+  return (ASSESSMENT_STATUS_VALUES as readonly string[]).includes(value);
+}
+
+/** Calibration status of a model-produced probability. */
+export const CalibrationStatus = {
+  UNVERIFIED: "UNVERIFIED",
+  HEURISTIC: "HEURISTIC",
+  CALIBRATED: "CALIBRATED",
+} as const;
+export type CalibrationStatus = (typeof CalibrationStatus)[keyof typeof CalibrationStatus];
+export const CALIBRATION_STATUS_VALUES: readonly CalibrationStatus[] = Object.freeze(Object.values(CalibrationStatus));
+export function isCalibrationStatus(value: string): value is CalibrationStatus {
+  return (CALIBRATION_STATUS_VALUES as readonly string[]).includes(value);
+}
+
+/** Action tier of a decision. */
+export const ActionTier = {
+  AUTO_FULL: "AUTO_FULL",
+  AUTO_REDUCED: "AUTO_REDUCED",
+  MANUAL: "MANUAL",
+  SHADOW: "SHADOW",
+  WATCH: "WATCH",
+  REJECT: "REJECT",
+  HALT: "HALT",
+} as const;
+export type ActionTier = (typeof ActionTier)[keyof typeof ActionTier];
+export const ACTION_TIER_VALUES: readonly ActionTier[] = Object.freeze(Object.values(ActionTier));
+export function isActionTier(value: string): value is ActionTier {
+  return (ACTION_TIER_VALUES as readonly string[]).includes(value);
+}
+
+/** Outcome of a risk evaluation; the Risk Engine holds absolute veto. */
+export const RiskDecisionOutcome = {
+  APPROVE: "APPROVE",
+  REDUCE: "REDUCE",
+  VETO: "VETO",
+} as const;
+export type RiskDecisionOutcome = (typeof RiskDecisionOutcome)[keyof typeof RiskDecisionOutcome];
+export const RISK_DECISION_OUTCOME_VALUES: readonly RiskDecisionOutcome[] = Object.freeze(Object.values(RiskDecisionOutcome));
+export function isRiskDecisionOutcome(value: string): value is RiskDecisionOutcome {
+  return (RISK_DECISION_OUTCOME_VALUES as readonly string[]).includes(value);
+}
+
+/** Lifecycle status of a system trade plan. */
+export const TradePlanStatus = {
+  DRAFT: "DRAFT",
+  APPROVED: "APPROVED",
+  ACTIVE: "ACTIVE",
+  COMPLETED: "COMPLETED",
+  CANCELLED: "CANCELLED",
+  EXPIRED: "EXPIRED",
+} as const;
+export type TradePlanStatus = (typeof TradePlanStatus)[keyof typeof TradePlanStatus];
+export const TRADE_PLAN_STATUS_VALUES: readonly TradePlanStatus[] = Object.freeze(Object.values(TradePlanStatus));
+export function isTradePlanStatus(value: string): value is TradePlanStatus {
+  return (TRADE_PLAN_STATUS_VALUES as readonly string[]).includes(value);
+}

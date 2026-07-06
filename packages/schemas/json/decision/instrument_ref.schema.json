@@ -1,0 +1,57 @@
+{
+  "$id": "trading-system/decision/instrument_ref/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Broker-neutral instrument identity.\n\ninstrument_id is the resolved canonical id; provider and broker-native\ncontract identifiers and exchange routing live in the adapter layer, never\non the domain instrument.",
+  "properties": {
+    "asset_class": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Asset Class"
+    },
+    "currency": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Z]{3}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Currency"
+    },
+    "instrument_id": {
+      "format": "uuid",
+      "title": "Instrument Id",
+      "type": "string"
+    },
+    "symbol": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Symbol"
+    }
+  },
+  "required": [
+    "instrument_id"
+  ],
+  "title": "InstrumentRef",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

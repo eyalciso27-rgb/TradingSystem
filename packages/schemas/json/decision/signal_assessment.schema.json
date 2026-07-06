@@ -1,0 +1,180 @@
+{
+  "$defs": {
+    "AssessmentStatus": {
+      "description": "Status of a signal assessment.\n\nAuthority: Decision_Contract_v0.8 section 13.2 (SignalAssessment status).",
+      "enum": [
+        "TRIGGERED",
+        "ELIGIBLE",
+        "BLOCKED",
+        "INCONCLUSIVE",
+        "EXPIRED"
+      ],
+      "title": "AssessmentStatus",
+      "type": "string"
+    },
+    "CalibrationStatus": {
+      "description": "Calibration status of a model-produced probability.\n\nAuthority: Decision_Contract_v0.8 section 12.2. PAPER_AUTO requires\nCALIBRATED for any AI task used as a gate.",
+      "enum": [
+        "UNVERIFIED",
+        "HEURISTIC",
+        "CALIBRATED"
+      ],
+      "title": "CalibrationStatus",
+      "type": "string"
+    },
+    "SignalDirection": {
+      "description": "Directional bias of an assessment, candidate or plan.\n\nAuthority: Decision_Contract_v0.8 section 13.2 (SignalAssessment\ndirection).",
+      "enum": [
+        "LONG",
+        "NEUTRAL",
+        "NEGATIVE"
+      ],
+      "title": "SignalDirection",
+      "type": "string"
+    },
+    "SignalFamily": {
+      "description": "Family of a signal assessment.\n\nAuthority: Decision_Contract_v0.8 section 13.2 (SignalAssessment\nsignal_family).",
+      "enum": [
+        "TECHNICAL",
+        "FUNDAMENTAL",
+        "NEWS",
+        "QUANT_ML",
+        "EXTERNAL",
+        "SOCIAL"
+      ],
+      "title": "SignalFamily",
+      "type": "string"
+    }
+  },
+  "$id": "trading-system/decision/signal_assessment/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Structured output of one analysis engine (Decision_Contract 13.2).",
+  "properties": {
+    "available_at": {
+      "format": "date-time",
+      "title": "Available At",
+      "type": "string"
+    },
+    "calibrated_probability": {
+      "anyOf": [
+        {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Calibrated Probability"
+    },
+    "calibration_status": {
+      "$ref": "#/$defs/CalibrationStatus"
+    },
+    "direction": {
+      "$ref": "#/$defs/SignalDirection"
+    },
+    "evidence_refs": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Evidence Refs",
+      "type": "array"
+    },
+    "instrument_id": {
+      "format": "uuid",
+      "title": "Instrument Id",
+      "type": "string"
+    },
+    "invalidation_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Invalidation Ref"
+    },
+    "model_id": {
+      "minLength": 1,
+      "title": "Model Id",
+      "type": "string"
+    },
+    "model_version": {
+      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$",
+      "title": "Model Version",
+      "type": "string"
+    },
+    "observed_at": {
+      "format": "date-time",
+      "title": "Observed At",
+      "type": "string"
+    },
+    "risk_flags": {
+      "default": [],
+      "items": {
+        "pattern": "^[A-Z][A-Z0-9_]*$",
+        "type": "string"
+      },
+      "title": "Risk Flags",
+      "type": "array"
+    },
+    "score": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        }
+      ],
+      "title": "Score"
+    },
+    "signal_family": {
+      "$ref": "#/$defs/SignalFamily"
+    },
+    "status": {
+      "$ref": "#/$defs/AssessmentStatus"
+    },
+    "valid_until": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Valid Until"
+    }
+  },
+  "required": [
+    "instrument_id",
+    "signal_family",
+    "model_id",
+    "model_version",
+    "direction",
+    "status",
+    "score",
+    "calibration_status",
+    "observed_at",
+    "available_at"
+  ],
+  "title": "SignalAssessment",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

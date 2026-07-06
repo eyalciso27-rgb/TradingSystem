@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/calibration_status/v1",
+  "title": "CalibrationStatus",
+  "description": "Calibration status of a model-produced probability.",
+  "type": "string",
+  "enum": [
+    "UNVERIFIED",
+    "HEURISTIC",
+    "CALIBRATED"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

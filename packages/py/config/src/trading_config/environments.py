@@ -20,7 +20,11 @@ import re
 from collections.abc import Iterable
 from typing import Final
 
-from trading_contracts.enums import Environment, OperatingMode
+from trading_contracts.enums import (
+    OPERATING_MODE_TO_ENVIRONMENT,
+    Environment,
+    OperatingMode,
+)
 
 CANONICAL_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
     member.value for member in Environment
@@ -39,14 +43,11 @@ LIVE_OPERATING_MODES: Final[frozenset[str]] = frozenset(
 LIVE_ENABLED: Final[bool] = False
 PAPER_AUTO_ENABLED: Final[bool] = False
 
+# Derived from the canonical mapping in trading_contracts.enums (single
+# source of truth); this module adds the enablement policy on top.
 _MODE_TO_ENVIRONMENT: Final[dict[str, str]] = {
-    "RESEARCH": "RESEARCH",
-    "REPLAY": "RESEARCH",
-    "SHADOW": "RESEARCH",
-    "PAPER_MANUAL": "PAPER",
-    "PAPER_AUTO": "PAPER",
-    "LIVE_MANUAL": "LIVE",
-    "LIVE_LIMITED_AUTO": "LIVE",
+    mode.value: environment.value
+    for mode, environment in OPERATING_MODE_TO_ENVIRONMENT.items()
 }
 
 _ENVIRONMENT_TOKENS: Final[dict[str, str]] = {"PAPER": "paper", "LIVE": "live"}

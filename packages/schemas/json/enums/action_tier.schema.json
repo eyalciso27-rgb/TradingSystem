@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/action_tier/v1",
+  "title": "ActionTier",
+  "description": "Action tier of a decision.",
+  "type": "string",
+  "enum": [
+    "AUTO_FULL",
+    "AUTO_REDUCED",
+    "MANUAL",
+    "SHADOW",
+    "WATCH",
+    "REJECT",
+    "HALT"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

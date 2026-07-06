@@ -30,7 +30,12 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
-from trading_contracts.enums import CANONICAL_ENUMS, SCHEMA_VERSION
+from trading_contracts.decision import DECISION_MODELS
+from trading_contracts.enums import (
+    CANONICAL_ENUMS,
+    OPERATING_MODE_TO_ENVIRONMENT,
+    SCHEMA_VERSION,
+)
 from trading_contracts.envelope import ENVELOPE_SCHEMA_ID, EventEnvelope
 from trading_contracts.social import (
     SOCIAL_MODELS,
@@ -42,11 +47,14 @@ TS_SRC = REPO_ROOT / "packages" / "ts" / "contracts-generated" / "src"
 SCHEMA_DIR = REPO_ROOT / "packages" / "schemas" / "json" / "enums"
 EVENTS_SCHEMA_DIR = REPO_ROOT / "packages" / "schemas" / "json" / "events"
 SOCIAL_SCHEMA_DIR = REPO_ROOT / "packages" / "schemas" / "json" / "social"
+DECISION_SCHEMA_DIR = REPO_ROOT / "packages" / "schemas" / "json" / "decision"
 TS_FILE = TS_SRC / "enums.ts"
 ENVELOPE_TS_FILE = TS_SRC / "event-envelope.ts"
 SOCIAL_TS_FILE = TS_SRC / "social.ts"
+DECISION_TS_FILE = TS_SRC / "decision.ts"
 
 GENERATED_HEADER = "GENERATED FILE — DO NOT EDIT"
+DECIMAL_TS_PATTERN = "^-?\\d+(?:\\.\\d+)?$"
 
 # Enum classes indexed by name, to resolve $ref enum fields when rendering
 # social models (single source of truth — values come from the enum classes).
@@ -450,6 +458,252 @@ def render_social_typescript() -> str:
     return "\n".join(lines)
 
 
+def decision_json_schema(model: type[BaseModel]) -> dict[str, Any]:
+    schema: dict[str, Any] = model.model_json_schema()
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["$id"] = f"trading-system/decision/{_snake(model.__name__)}/v1"
+    schema["x-generated-by"] = "scripts/generate_contracts.py"
+    schema["x-generated-note"] = GENERATED_HEADER
+    return schema
+
+
+def render_decision_schema(model: type[BaseModel]) -> str:
+    payload = json.dumps(decision_json_schema(model), ensure_ascii=False, indent=2, sort_keys=True)
+    return payload + "\n"
+
+
+_DECISION_MODEL_NAMES = {model.__name__ for model in DECISION_MODELS}
+
+
+def _decision_field_rule(model: type[BaseModel], name: str, prop: dict[str, Any]) -> dict[str, Any]:
+    """Classify a decision-model field into a TS type + validation rule."""
+    required = name in model.model_json_schema().get("required", [])
+    variants = prop.get("anyOf", [prop])
+    nullable = any(v.get("type") == "null" for v in variants)
+    non_null = [v for v in variants if v.get("type") != "null"]
+    base: dict[str, Any] = {"required": required, "nullable": nullable}
+
+    if any(v.get("type") == "number" for v in non_null):
+        return {**base, "kind": "decimal", "ts_type": "string", "pattern": DECIMAL_TS_PATTERN}
+
+    core = non_null[0] if non_null else prop
+    ref = core.get("$ref")
+    if ref is not None:
+        target = ref.split("/")[-1]
+        if target in _ENUM_BY_NAME:
+            values = [member.value for member in _ENUM_BY_NAME[target]]
+            return {**base, "kind": "enum", "ts_type": target, "values": values}
+        if target in _DECISION_MODEL_NAMES:
+            return {**base, "kind": "model", "ts_type": target}
+    if core.get("type") == "array":
+        items = core.get("items", {})
+        item_ref = items.get("$ref")
+        if item_ref is not None and item_ref.split("/")[-1] in _DECISION_MODEL_NAMES:
+            target = item_ref.split("/")[-1]
+            return {**base, "kind": "model_array", "ts_type": f"{target}[]", "item_model": target}
+        return {
+            **base,
+            "kind": "string_array",
+            "ts_type": "string[]",
+            "item_pattern": items.get("pattern"),
+        }
+    if core.get("format") == "uuid":
+        return {**base, "kind": "pattern", "ts_type": "string", "pattern": UUID_TS_PATTERN}
+    if core.get("format") == "date-time":
+        return {
+            **base,
+            "kind": "pattern",
+            "ts_type": "string",
+            "pattern": AWARE_DATETIME_TS_PATTERN,
+        }
+    if core.get("type") == "integer":
+        return {**base, "kind": "integer", "ts_type": "number", "min": core.get("minimum", 0)}
+    if core.get("type") == "boolean":
+        return {**base, "kind": "boolean", "ts_type": "boolean"}
+    if "pattern" in core:
+        return {**base, "kind": "pattern", "ts_type": "string", "pattern": core["pattern"]}
+    return {**base, "kind": "string", "ts_type": "string"}
+
+
+def _decision_model_rules(model: type[BaseModel]) -> dict[str, dict[str, Any]]:
+    schema = model.model_json_schema()
+    return {n: _decision_field_rule(model, n, p) for n, p in schema["properties"].items()}
+
+
+# Cross-field guard clauses (baseline rules a per-field schema cannot express).
+_DECISION_EXTRA_GUARDS: dict[str, list[str]] = {
+    "OrderIntent": [
+        "OPERATING_MODE_TO_ENVIRONMENT[record.operating_mode as OperatingMode]"
+        " === record.environment",
+    ],
+    "RiskDecision": [
+        '(record.outcome === "VETO"'
+        " ? record.approved_quantity === undefined"
+        "   && Array.isArray(record.veto_reason_codes)"
+        "   && record.veto_reason_codes.length > 0"
+        " : record.approved_quantity !== undefined"
+        "   && (record.veto_reason_codes === undefined"
+        "     || (record.veto_reason_codes as unknown[]).length === 0))",
+    ],
+}
+
+
+def _decision_ts_rules_literal(rules: dict[str, dict[str, Any]]) -> list[str]:
+    lines = ["{"]
+    for name, rule in rules.items():
+        parts = [f'kind: "{rule["kind"]}"']
+        parts.append(f"required: {str(rule['required']).lower()}")
+        parts.append(f"nullable: {str(rule['nullable']).lower()}")
+        if "pattern" in rule:
+            parts.append(f"pattern: /{rule['pattern'].replace('/', '\\/')}/")
+        if rule["kind"] == "enum":
+            parts.append("values: [" + ", ".join(f'"{v}"' for v in rule["values"]) + "]")
+        if rule["kind"] == "integer":
+            parts.append(f"min: {rule['min']}")
+        if rule["kind"] == "model":
+            parts.append(f'model: "{rule["ts_type"]}"')
+        if rule["kind"] == "model_array":
+            parts.append(f'model: "{rule["item_model"]}"')
+        if rule["kind"] == "string_array" and rule.get("item_pattern"):
+            parts.append(f"pattern: /{rule['item_pattern'].replace('/', '\\/')}/")
+        lines.append(f"    {name}: {{ {', '.join(parts)} }},")
+    lines.append("  }")
+    return lines
+
+
+def render_decision_typescript() -> str:
+    all_rules = {model.__name__: _decision_model_rules(model) for model in DECISION_MODELS}
+    used_enums = sorted(
+        {
+            rule["ts_type"]
+            for rules in all_rules.values()
+            for rule in rules.values()
+            if rule["kind"] == "enum"
+        }
+    )
+    mapping_entries = ", ".join(
+        f'{mode.value}: "{environment.value}"'
+        for mode, environment in OPERATING_MODE_TO_ENVIRONMENT.items()
+    )
+    lines: list[str] = [
+        f"// {GENERATED_HEADER}.",
+        "// Generated by scripts/generate_contracts.py from trading_contracts.decision",
+        "// (single source of truth). Broker-neutral: no broker identifier, native",
+        "// status or raw payload. Money/quantity values are decimal strings.",
+        "",
+        f"import {{ {', '.join(used_enums)} }} from \"./enums\";",
+        "",
+        "export const OPERATING_MODE_TO_ENVIRONMENT: Readonly<",
+        "  Record<OperatingMode, Environment>",
+        f"> = {{ {mapping_entries} }} as const;",
+        "",
+        "type FieldKind =",
+        '  | "string"',
+        '  | "pattern"',
+        '  | "enum"',
+        '  | "decimal"',
+        '  | "integer"',
+        '  | "boolean"',
+        '  | "model"',
+        '  | "model_array"',
+        '  | "string_array";',
+        "interface FieldRule {",
+        "  readonly kind: FieldKind;",
+        "  readonly required: boolean;",
+        "  readonly nullable: boolean;",
+        "  readonly pattern?: RegExp;",
+        "  readonly values?: readonly string[];",
+        "  readonly min?: number;",
+        "  readonly model?: string;",
+        "}",
+        "",
+        "const GUARDS: Record<string, (value: unknown) => boolean> = {};",
+        "",
+        "function checkField(rule: FieldRule, value: unknown): boolean {",
+        "  if (value === undefined) return !rule.required;",
+        "  if (value === null) return rule.nullable;",
+        "  switch (rule.kind) {",
+        '    case "string":',
+        '      return typeof value === "string";',
+        '    case "pattern":',
+        '    case "decimal":',
+        '      return typeof value === "string" && rule.pattern!.test(value);',
+        '    case "enum":',
+        '      return typeof value === "string" && rule.values!.includes(value);',
+        '    case "integer":',
+        '      return typeof value === "number" && Number.isInteger(value)'
+        " && value >= (rule.min ?? 0);",
+        '    case "boolean":',
+        '      return typeof value === "boolean";',
+        '    case "model": {',
+        "      const guard = GUARDS[rule.model!];",
+        "      return guard !== undefined && guard(value);",
+        "    }",
+        '    case "model_array": {',
+        "      const guard = GUARDS[rule.model!];",
+        "      return (",
+        "        guard !== undefined &&",
+        "        Array.isArray(value) &&",
+        "        value.every((item) => guard(item))",
+        "      );",
+        "    }",
+        '    case "string_array":',
+        "      return (",
+        "        Array.isArray(value) &&",
+        '        value.every((item) => typeof item === "string"'
+        " && (!rule.pattern || rule.pattern.test(item)))",
+        "      );",
+        "  }",
+        "}",
+        "",
+        "function checkObject(",
+        "  rules: Readonly<Record<string, FieldRule>>,",
+        "  value: unknown,",
+        "): boolean {",
+        '  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;',
+        "  const record = value as Record<string, unknown>;",
+        "  for (const key of Object.keys(record)) {",
+        "    if (!(key in rules)) return false;",
+        "  }",
+        "  for (const [key, rule] of Object.entries(rules)) {",
+        "    if (!checkField(rule, record[key])) return false;",
+        "  }",
+        "  return true;",
+        "}",
+        "",
+    ]
+    for model in DECISION_MODELS:
+        rules = all_rules[model.__name__]
+        lines.append(f"export interface {model.__name__} {{")
+        for field_name, rule in rules.items():
+            ts_type = f"{rule['ts_type']} | null" if rule["nullable"] else rule["ts_type"]
+            optional = "" if rule["required"] else "?"
+            lines.append(f"  {field_name}{optional}: {ts_type};")
+        lines.append("}")
+        lines.append("")
+    for model in DECISION_MODELS:
+        name = model.__name__
+        rules = all_rules[name]
+        rules_const = f"{_snake(name).upper()}_RULES"
+        lines.append(
+            f"const {rules_const}: Readonly<Record<string, FieldRule>> = "
+            + "\n".join(_decision_ts_rules_literal(rules))
+            + ";"
+        )
+        lines.append(f"export function is{name}(value: unknown): value is {name} {{")
+        lines.append(f"  if (!checkObject({rules_const}, value)) return false;")
+        extra = _DECISION_EXTRA_GUARDS.get(name)
+        if extra:
+            lines.append("  const record = value as Record<string, unknown>;")
+            for clause in extra:
+                lines.append(f"  if (!({clause})) return false;")
+        lines.append("  return true;")
+        lines.append("}")
+        lines.append(f"GUARDS.{name} = is{name} as (value: unknown) => boolean;")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def expected_files() -> dict[Path, str]:
     files: dict[Path, str] = {
         SCHEMA_DIR / f"{snake_name(enum_class)}.schema.json": render_schema(enum_class)
@@ -463,6 +717,10 @@ def expected_files() -> dict[Path, str]:
             model
         )
     files[SOCIAL_TS_FILE] = render_social_typescript()
+    for model in DECISION_MODELS:
+        rel = DECISION_SCHEMA_DIR / f"{_snake(model.__name__)}.schema.json"
+        files[rel] = render_decision_schema(model)
+    files[DECISION_TS_FILE] = render_decision_typescript()
     return files
 
 
@@ -487,7 +745,7 @@ def check_files() -> list[str]:
         elif path.read_text(encoding="utf-8") != content:
             problems.append(f"drift: {rel} differs from the canonical source")
     expected_schemas = {path for path in expected if path.suffix == ".json"}
-    for schema_dir in (SCHEMA_DIR, EVENTS_SCHEMA_DIR, SOCIAL_SCHEMA_DIR):
+    for schema_dir in (SCHEMA_DIR, EVENTS_SCHEMA_DIR, SOCIAL_SCHEMA_DIR, DECISION_SCHEMA_DIR):
         if not schema_dir.is_dir():
             continue
         for stray in sorted(schema_dir.glob("*.schema.json")):

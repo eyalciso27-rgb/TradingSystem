@@ -112,6 +112,18 @@ EXPECTED_VALUES: dict[str, list[str]] = {
     ],
     # Data_Model_and_Retention_Specification_v0.6 section 4
     "Environment": ["RESEARCH", "PAPER", "LIVE"],
+    # Decision_Contract_v0.8 section 13.2
+    "SignalFamily": ["TECHNICAL", "FUNDAMENTAL", "NEWS", "QUANT_ML", "EXTERNAL", "SOCIAL"],
+    "SignalDirection": ["LONG", "NEUTRAL", "NEGATIVE"],
+    "AssessmentStatus": ["TRIGGERED", "ELIGIBLE", "BLOCKED", "INCONCLUSIVE", "EXPIRED"],
+    # Decision_Contract_v0.8 section 12.2
+    "CalibrationStatus": ["UNVERIFIED", "HEURISTIC", "CALIBRATED"],
+    # Master_Architecture_Baseline_v0.3 section 5
+    "ActionTier": ["AUTO_FULL", "AUTO_REDUCED", "MANUAL", "SHADOW", "WATCH", "REJECT", "HALT"],
+    # Decision_Contract_v0.8 section 12.3 / risk_evaluations
+    "RiskDecisionOutcome": ["APPROVE", "REDUCE", "VETO"],
+    # Data_Model_and_Retention_Specification_v0.6 section 7.6
+    "TradePlanStatus": ["DRAFT", "APPROVED", "ACTIVE", "COMPLETED", "CANCELLED", "EXPIRED"],
 }
 
 

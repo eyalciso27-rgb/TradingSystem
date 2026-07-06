@@ -1,0 +1,100 @@
+{
+  "$defs": {
+    "OrderType": {
+      "description": "Canonical order types.\n\nAuthority: Decision_Contract_v0.8 section 12.1 (OrderType).",
+      "enum": [
+        "LIMIT",
+        "STOP",
+        "STOP_LIMIT",
+        "MARKET"
+      ],
+      "title": "OrderType",
+      "type": "string"
+    },
+    "SourceEntryType": {
+      "description": "Entry semantics extracted from a source instruction.\n\nAuthority: Decision_Contract_v0.8 section 12.1 (SourceEntryType).\nENTER_IMMEDIATELY is source intent only and never authorizes an\nautomatic market order.",
+      "enum": [
+        "BUY_LIMIT_MAX",
+        "BUY_STOP_TRIGGER",
+        "BUY_ZONE",
+        "ENTER_IMMEDIATELY",
+        "BUY_PULLBACK",
+        "CONDITIONAL_ENTRY",
+        "UNKNOWN"
+      ],
+      "title": "SourceEntryType",
+      "type": "string"
+    }
+  },
+  "$id": "trading-system/decision/entry_spec/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Entry idea — not an executable order and with no final quantity.",
+  "properties": {
+    "entry_type": {
+      "$ref": "#/$defs/SourceEntryType"
+    },
+    "limit_price": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Limit Price"
+    },
+    "max_chase_price": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Max Chase Price"
+    },
+    "order_type": {
+      "$ref": "#/$defs/OrderType"
+    },
+    "stop_trigger_price": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stop Trigger Price"
+    }
+  },
+  "required": [
+    "entry_type",
+    "order_type"
+  ],
+  "title": "EntrySpec",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

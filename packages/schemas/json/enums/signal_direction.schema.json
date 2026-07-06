@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/signal_direction/v1",
+  "title": "SignalDirection",
+  "description": "Directional bias of an assessment, candidate or plan.",
+  "type": "string",
+  "enum": [
+    "LONG",
+    "NEUTRAL",
+    "NEGATIVE"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

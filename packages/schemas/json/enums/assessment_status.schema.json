@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/assessment_status/v1",
+  "title": "AssessmentStatus",
+  "description": "Status of a signal assessment.",
+  "type": "string",
+  "enum": [
+    "TRIGGERED",
+    "ELIGIBLE",
+    "BLOCKED",
+    "INCONCLUSIVE",
+    "EXPIRED"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

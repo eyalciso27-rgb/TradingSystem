@@ -1,0 +1,269 @@
+{
+  "$defs": {
+    "Environment": {
+      "description": "Environment axis, separate from operating mode.\n\nAuthority: Data_Model_and_Retention_Specification_v0.6 section 4\n(environment text: RESEARCH/PAPER/LIVE per Contract). There is no\ndefault environment and no fallback.",
+      "enum": [
+        "RESEARCH",
+        "PAPER",
+        "LIVE"
+      ],
+      "title": "Environment",
+      "type": "string"
+    },
+    "InstrumentRef": {
+      "additionalProperties": false,
+      "description": "Broker-neutral instrument identity.\n\ninstrument_id is the resolved canonical id; provider and broker-native\ncontract identifiers and exchange routing live in the adapter layer, never\non the domain instrument.",
+      "properties": {
+        "asset_class": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Asset Class"
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "instrument_id": {
+          "format": "uuid",
+          "title": "Instrument Id",
+          "type": "string"
+        },
+        "symbol": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Symbol"
+        }
+      },
+      "required": [
+        "instrument_id"
+      ],
+      "title": "InstrumentRef",
+      "type": "object"
+    },
+    "OperatingMode": {
+      "description": "Canonical operating modes.\n\nAuthority: MVP_Scope_v0.6 section 4. LIVE modes are prohibited by\nbaseline policy (BASELINE_MANIFEST.json live_enabled=false); PAPER_AUTO\nrequires explicit enablement. There is no LIVE_AUTO mode.",
+      "enum": [
+        "RESEARCH",
+        "REPLAY",
+        "SHADOW",
+        "PAPER_MANUAL",
+        "PAPER_AUTO",
+        "LIVE_MANUAL",
+        "LIVE_LIMITED_AUTO"
+      ],
+      "title": "OperatingMode",
+      "type": "string"
+    },
+    "OrderRole": {
+      "description": "Role of an order within a trade plan.\n\nAuthority: Decision_Contract_v0.8 section 12.1 (OrderRole).",
+      "enum": [
+        "ENTRY",
+        "PROTECTIVE_STOP",
+        "TAKE_PROFIT",
+        "REDUCE",
+        "EXIT"
+      ],
+      "title": "OrderRole",
+      "type": "string"
+    },
+    "OrderType": {
+      "description": "Canonical order types.\n\nAuthority: Decision_Contract_v0.8 section 12.1 (OrderType).",
+      "enum": [
+        "LIMIT",
+        "STOP",
+        "STOP_LIMIT",
+        "MARKET"
+      ],
+      "title": "OrderType",
+      "type": "string"
+    }
+  },
+  "$id": "trading-system/decision/order_intent/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Broker-neutral intent to place/modify/cancel an order (order_intents).\n\nNot a broker order: no broker order id, native status, contract id or\ncredentials. account_ref is an opaque account reference, never a\ncredential. environment and operating_mode must be consistent.",
+  "properties": {
+    "account_ref": {
+      "minLength": 1,
+      "title": "Account Ref",
+      "type": "string"
+    },
+    "decision_id": {
+      "format": "uuid",
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "environment": {
+      "$ref": "#/$defs/Environment"
+    },
+    "idempotency_key": {
+      "minLength": 1,
+      "title": "Idempotency Key",
+      "type": "string"
+    },
+    "instrument": {
+      "$ref": "#/$defs/InstrumentRef"
+    },
+    "intent_id": {
+      "format": "uuid",
+      "title": "Intent Id",
+      "type": "string"
+    },
+    "limit_price": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Limit Price"
+    },
+    "operating_mode": {
+      "$ref": "#/$defs/OperatingMode"
+    },
+    "order_role": {
+      "$ref": "#/$defs/OrderRole"
+    },
+    "order_type": {
+      "$ref": "#/$defs/OrderType"
+    },
+    "outside_rth": {
+      "default": false,
+      "title": "Outside Rth",
+      "type": "boolean"
+    },
+    "parent_intent_id": {
+      "anyOf": [
+        {
+          "format": "uuid",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parent Intent Id"
+    },
+    "quantity": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        }
+      ],
+      "title": "Quantity"
+    },
+    "risk_decision_id": {
+      "format": "uuid",
+      "title": "Risk Decision Id",
+      "type": "string"
+    },
+    "side": {
+      "pattern": "^[A-Z][A-Z0-9_]*$",
+      "title": "Side",
+      "type": "string"
+    },
+    "stop_price": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stop Price"
+    },
+    "strategy_version": {
+      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$",
+      "title": "Strategy Version",
+      "type": "string"
+    },
+    "time_in_force": {
+      "pattern": "^[A-Z][A-Z0-9_]*$",
+      "title": "Time In Force",
+      "type": "string"
+    },
+    "trade_plan_id": {
+      "format": "uuid",
+      "title": "Trade Plan Id",
+      "type": "string"
+    },
+    "valid_until": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Valid Until"
+    }
+  },
+  "required": [
+    "intent_id",
+    "decision_id",
+    "trade_plan_id",
+    "risk_decision_id",
+    "strategy_version",
+    "instrument",
+    "order_role",
+    "side",
+    "order_type",
+    "quantity",
+    "time_in_force",
+    "environment",
+    "operating_mode",
+    "account_ref",
+    "idempotency_key"
+  ],
+  "title": "OrderIntent",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

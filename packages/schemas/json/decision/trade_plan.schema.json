@@ -1,0 +1,396 @@
+{
+  "$defs": {
+    "EntrySpec": {
+      "additionalProperties": false,
+      "description": "Entry idea — not an executable order and with no final quantity.",
+      "properties": {
+        "entry_type": {
+          "$ref": "#/$defs/SourceEntryType"
+        },
+        "limit_price": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Limit Price"
+        },
+        "max_chase_price": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Chase Price"
+        },
+        "order_type": {
+          "$ref": "#/$defs/OrderType"
+        },
+        "stop_trigger_price": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stop Trigger Price"
+        }
+      },
+      "required": [
+        "entry_type",
+        "order_type"
+      ],
+      "title": "EntrySpec",
+      "type": "object"
+    },
+    "Environment": {
+      "description": "Environment axis, separate from operating mode.\n\nAuthority: Data_Model_and_Retention_Specification_v0.6 section 4\n(environment text: RESEARCH/PAPER/LIVE per Contract). There is no\ndefault environment and no fallback.",
+      "enum": [
+        "RESEARCH",
+        "PAPER",
+        "LIVE"
+      ],
+      "title": "Environment",
+      "type": "string"
+    },
+    "InstrumentRef": {
+      "additionalProperties": false,
+      "description": "Broker-neutral instrument identity.\n\ninstrument_id is the resolved canonical id; provider and broker-native\ncontract identifiers and exchange routing live in the adapter layer, never\non the domain instrument.",
+      "properties": {
+        "asset_class": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Asset Class"
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "instrument_id": {
+          "format": "uuid",
+          "title": "Instrument Id",
+          "type": "string"
+        },
+        "symbol": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Symbol"
+        }
+      },
+      "required": [
+        "instrument_id"
+      ],
+      "title": "InstrumentRef",
+      "type": "object"
+    },
+    "OrderType": {
+      "description": "Canonical order types.\n\nAuthority: Decision_Contract_v0.8 section 12.1 (OrderType).",
+      "enum": [
+        "LIMIT",
+        "STOP",
+        "STOP_LIMIT",
+        "MARKET"
+      ],
+      "title": "OrderType",
+      "type": "string"
+    },
+    "ProfitTarget": {
+      "additionalProperties": false,
+      "description": "A profit target and the fraction of the position it closes.",
+      "properties": {
+        "price": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "title": "Price"
+        },
+        "quantity_fraction": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "maximum": 1.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "title": "Quantity Fraction"
+        }
+      },
+      "required": [
+        "price",
+        "quantity_fraction"
+      ],
+      "title": "ProfitTarget",
+      "type": "object"
+    },
+    "SignalDirection": {
+      "description": "Directional bias of an assessment, candidate or plan.\n\nAuthority: Decision_Contract_v0.8 section 13.2 (SignalAssessment\ndirection).",
+      "enum": [
+        "LONG",
+        "NEUTRAL",
+        "NEGATIVE"
+      ],
+      "title": "SignalDirection",
+      "type": "string"
+    },
+    "SourceEntryType": {
+      "description": "Entry semantics extracted from a source instruction.\n\nAuthority: Decision_Contract_v0.8 section 12.1 (SourceEntryType).\nENTER_IMMEDIATELY is source intent only and never authorizes an\nautomatic market order.",
+      "enum": [
+        "BUY_LIMIT_MAX",
+        "BUY_STOP_TRIGGER",
+        "BUY_ZONE",
+        "ENTER_IMMEDIATELY",
+        "BUY_PULLBACK",
+        "CONDITIONAL_ENTRY",
+        "UNKNOWN"
+      ],
+      "title": "SourceEntryType",
+      "type": "string"
+    },
+    "StopSpec": {
+      "additionalProperties": false,
+      "description": "Protective stop specification (price- or percent-anchored).",
+      "properties": {
+        "anchor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Anchor"
+        },
+        "stop_percent": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stop Percent"
+        },
+        "stop_price": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stop Price"
+        }
+      },
+      "title": "StopSpec",
+      "type": "object"
+    },
+    "TradePlanStatus": {
+      "description": "Lifecycle status of a system trade plan.\n\nAuthority: Data_Model_and_Retention_Specification_v0.6 section 7.6\n(system_trade_plans.status).",
+      "enum": [
+        "DRAFT",
+        "APPROVED",
+        "ACTIVE",
+        "COMPLETED",
+        "CANCELLED",
+        "EXPIRED"
+      ],
+      "title": "TradePlanStatus",
+      "type": "string"
+    }
+  },
+  "$id": "trading-system/decision/trade_plan/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Broker-neutral trade plan (Decision_Contract 11.2, Data_Model 7.6).\n\nCarries the entry idea, protection and targets — never the final position\nsize, which only the Risk Engine determines (see RiskDecision).",
+  "properties": {
+    "currency": {
+      "pattern": "^[A-Z]{3}$",
+      "title": "Currency",
+      "type": "string"
+    },
+    "decision_id": {
+      "format": "uuid",
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "direction": {
+      "$ref": "#/$defs/SignalDirection"
+    },
+    "entry": {
+      "$ref": "#/$defs/EntrySpec"
+    },
+    "environment": {
+      "$ref": "#/$defs/Environment"
+    },
+    "instrument": {
+      "$ref": "#/$defs/InstrumentRef"
+    },
+    "invalidation_summary": {
+      "minLength": 1,
+      "title": "Invalidation Summary",
+      "type": "string"
+    },
+    "max_loss_amount": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        }
+      ],
+      "title": "Max Loss Amount"
+    },
+    "profit_targets": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ProfitTarget"
+      },
+      "title": "Profit Targets",
+      "type": "array"
+    },
+    "protective_stop": {
+      "$ref": "#/$defs/StopSpec"
+    },
+    "risk_policy_version": {
+      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$",
+      "title": "Risk Policy Version",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/TradePlanStatus"
+    },
+    "strategy_version": {
+      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$",
+      "title": "Strategy Version",
+      "type": "string"
+    },
+    "thesis": {
+      "minLength": 1,
+      "title": "Thesis",
+      "type": "string"
+    },
+    "trade_plan_id": {
+      "format": "uuid",
+      "title": "Trade Plan Id",
+      "type": "string"
+    },
+    "valid_from": {
+      "format": "date-time",
+      "title": "Valid From",
+      "type": "string"
+    },
+    "valid_until": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Valid Until"
+    }
+  },
+  "required": [
+    "trade_plan_id",
+    "decision_id",
+    "instrument",
+    "direction",
+    "strategy_version",
+    "risk_policy_version",
+    "status",
+    "environment",
+    "thesis",
+    "invalidation_summary",
+    "entry",
+    "protective_stop",
+    "max_loss_amount",
+    "currency",
+    "valid_from"
+  ],
+  "title": "TradePlan",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

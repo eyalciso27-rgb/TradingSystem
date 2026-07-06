@@ -218,6 +218,101 @@ class Environment(StrEnum):
     LIVE = "LIVE"
 
 
+class SignalFamily(StrEnum):
+    """Family of a signal assessment.
+
+    Authority: Decision_Contract_v0.8 section 13.2 (SignalAssessment
+    signal_family).
+    """
+
+    TECHNICAL = "TECHNICAL"
+    FUNDAMENTAL = "FUNDAMENTAL"
+    NEWS = "NEWS"
+    QUANT_ML = "QUANT_ML"
+    EXTERNAL = "EXTERNAL"
+    SOCIAL = "SOCIAL"
+
+
+class SignalDirection(StrEnum):
+    """Directional bias of an assessment, candidate or plan.
+
+    Authority: Decision_Contract_v0.8 section 13.2 (SignalAssessment
+    direction).
+    """
+
+    LONG = "LONG"
+    NEUTRAL = "NEUTRAL"
+    NEGATIVE = "NEGATIVE"
+
+
+class AssessmentStatus(StrEnum):
+    """Status of a signal assessment.
+
+    Authority: Decision_Contract_v0.8 section 13.2 (SignalAssessment status).
+    """
+
+    TRIGGERED = "TRIGGERED"
+    ELIGIBLE = "ELIGIBLE"
+    BLOCKED = "BLOCKED"
+    INCONCLUSIVE = "INCONCLUSIVE"
+    EXPIRED = "EXPIRED"
+
+
+class CalibrationStatus(StrEnum):
+    """Calibration status of a model-produced probability.
+
+    Authority: Decision_Contract_v0.8 section 12.2. PAPER_AUTO requires
+    CALIBRATED for any AI task used as a gate.
+    """
+
+    UNVERIFIED = "UNVERIFIED"
+    HEURISTIC = "HEURISTIC"
+    CALIBRATED = "CALIBRATED"
+
+
+class ActionTier(StrEnum):
+    """Action tier of a decision.
+
+    Authority: Master_Architecture_Baseline_v0.3 section 5 (Action Model).
+    """
+
+    AUTO_FULL = "AUTO_FULL"
+    AUTO_REDUCED = "AUTO_REDUCED"
+    MANUAL = "MANUAL"
+    SHADOW = "SHADOW"
+    WATCH = "WATCH"
+    REJECT = "REJECT"
+    HALT = "HALT"
+
+
+class RiskDecisionOutcome(StrEnum):
+    """Outcome of a risk evaluation; the Risk Engine holds absolute veto.
+
+    Authority: Decision_Contract_v0.8 section 12.3 and
+    Data_Model_and_Retention_Specification_v0.6 (risk_evaluations:
+    APPROVE/REDUCE/VETO).
+    """
+
+    APPROVE = "APPROVE"
+    REDUCE = "REDUCE"
+    VETO = "VETO"
+
+
+class TradePlanStatus(StrEnum):
+    """Lifecycle status of a system trade plan.
+
+    Authority: Data_Model_and_Retention_Specification_v0.6 section 7.6
+    (system_trade_plans.status).
+    """
+
+    DRAFT = "DRAFT"
+    APPROVED = "APPROVED"
+    ACTIVE = "ACTIVE"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+
+
 CANONICAL_ENUMS: Final[tuple[type[StrEnum], ...]] = (
     SourceEntryType,
     DecisionOutcome,
@@ -232,6 +327,26 @@ CANONICAL_ENUMS: Final[tuple[type[StrEnum], ...]] = (
     SocialAccessMode,
     OperatingMode,
     Environment,
+    SignalFamily,
+    SignalDirection,
+    AssessmentStatus,
+    CalibrationStatus,
+    ActionTier,
+    RiskDecisionOutcome,
+    TradePlanStatus,
 )
+
+# Canonical mapping from operating mode to its environment axis value
+# (MVP_Scope_v0.6 section 4). Single source of truth — trading_config imports
+# this rather than restating it.
+OPERATING_MODE_TO_ENVIRONMENT: Final[dict[OperatingMode, Environment]] = {
+    OperatingMode.RESEARCH: Environment.RESEARCH,
+    OperatingMode.REPLAY: Environment.RESEARCH,
+    OperatingMode.SHADOW: Environment.RESEARCH,
+    OperatingMode.PAPER_MANUAL: Environment.PAPER,
+    OperatingMode.PAPER_AUTO: Environment.PAPER,
+    OperatingMode.LIVE_MANUAL: Environment.LIVE,
+    OperatingMode.LIVE_LIMITED_AUTO: Environment.LIVE,
+}
 
 SCHEMA_VERSION: Final[str] = "v1"

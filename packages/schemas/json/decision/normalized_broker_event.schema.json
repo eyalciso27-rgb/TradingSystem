@@ -1,0 +1,203 @@
+{
+  "$defs": {
+    "OrderState": {
+      "description": "Canonical order state machine states.\n\nAuthority: Decision_Contract_v0.8 section 12.5\n(Canonical Order State Machine). UNKNOWN may only be resolved by\nreconciliation.",
+      "enum": [
+        "CREATED",
+        "VALIDATED",
+        "QUEUED",
+        "SUBMITTING",
+        "ACKNOWLEDGED",
+        "PARTIALLY_FILLED",
+        "FILLED",
+        "CANCEL_PENDING",
+        "CANCELLED",
+        "CANCELLED_BY_POLICY",
+        "REJECTED",
+        "EXPIRED",
+        "UNKNOWN"
+      ],
+      "title": "OrderState",
+      "type": "string"
+    }
+  },
+  "$id": "trading-system/decision/normalized_broker_event/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Broker-neutral, normalized view of a broker callback.\n\nPublished inside an EventEnvelope (IMP-0102), which carries occurred/\nobserved/available/ingested — so this payload holds no timestamps. Native\nbroker status is converted to OrderState inside the adapter, not here; any\nraw payload is referenced opaquely, never inlined.",
+  "properties": {
+    "average_fill_price": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Average Fill Price"
+    },
+    "commission": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Commission"
+    },
+    "currency": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Z]{3}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Currency"
+    },
+    "external_execution_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "External Execution Ref"
+    },
+    "external_order_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "External Order Ref"
+    },
+    "filled_quantity": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        }
+      ],
+      "default": "0",
+      "title": "Filled Quantity"
+    },
+    "intent_id": {
+      "format": "uuid",
+      "title": "Intent Id",
+      "type": "string"
+    },
+    "last_fill_price": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Last Fill Price"
+    },
+    "last_fill_quantity": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Last Fill Quantity"
+    },
+    "order_state": {
+      "$ref": "#/$defs/OrderState"
+    },
+    "raw_payload_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Raw Payload Ref"
+    },
+    "rejection_reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Rejection Reason"
+    },
+    "remaining_quantity": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        }
+      ],
+      "default": "0",
+      "title": "Remaining Quantity"
+    }
+  },
+  "required": [
+    "intent_id",
+    "order_state"
+  ],
+  "title": "NormalizedBrokerEvent",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

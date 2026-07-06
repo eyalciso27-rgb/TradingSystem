@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/risk_decision_outcome/v1",
+  "title": "RiskDecisionOutcome",
+  "description": "Outcome of a risk evaluation; the Risk Engine holds absolute veto.",
+  "type": "string",
+  "enum": [
+    "APPROVE",
+    "REDUCE",
+    "VETO"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

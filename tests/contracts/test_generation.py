@@ -21,6 +21,9 @@ def test_rendering_is_deterministic(generator: ModuleType) -> None:
     assert generator.render_social_typescript() == generator.render_social_typescript()
     for model in generator.SOCIAL_MODELS:
         assert generator.render_social_schema(model) == generator.render_social_schema(model)
+    assert generator.render_decision_typescript() == generator.render_decision_typescript()
+    for model in generator.DECISION_MODELS:
+        assert generator.render_decision_schema(model) == generator.render_decision_schema(model)
 
 
 def test_no_timestamps_in_generated_output(generator: ModuleType) -> None:
@@ -41,9 +44,11 @@ def _redirect_to_tmp(
     monkeypatch.setattr(generator, "SCHEMA_DIR", tmp_path / "schemas" / "enums")
     monkeypatch.setattr(generator, "EVENTS_SCHEMA_DIR", tmp_path / "schemas" / "events")
     monkeypatch.setattr(generator, "SOCIAL_SCHEMA_DIR", tmp_path / "schemas" / "social")
+    monkeypatch.setattr(generator, "DECISION_SCHEMA_DIR", tmp_path / "schemas" / "decision")
     monkeypatch.setattr(generator, "TS_FILE", tmp_path / "ts" / "enums.ts")
     monkeypatch.setattr(generator, "ENVELOPE_TS_FILE", tmp_path / "ts" / "event-envelope.ts")
     monkeypatch.setattr(generator, "SOCIAL_TS_FILE", tmp_path / "ts" / "social.ts")
+    monkeypatch.setattr(generator, "DECISION_TS_FILE", tmp_path / "ts" / "decision.ts")
 
 
 def test_missing_generated_file_is_detected(
@@ -161,6 +166,41 @@ def test_missing_social_schema_is_detected(
     _redirect_to_tmp(generator, monkeypatch, tmp_path)
     generator.write_files()
     (tmp_path / "schemas" / "social" / "canonical_social_message.schema.json").unlink()
+    problems = generator.check_files()
+    assert any(problem.startswith("missing-generated:") for problem in problems)
+
+
+def test_decision_ts_drift_is_detected(
+    generator: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _redirect_to_tmp(generator, monkeypatch, tmp_path)
+    generator.write_files()
+    decision_ts = tmp_path / "ts" / "decision.ts"
+    decision_ts.write_text(
+        decision_ts.read_text(encoding="utf-8").replace("idempotency_key", "renamed_field"),
+        encoding="utf-8",
+    )
+    problems = generator.check_files()
+    assert any(problem.startswith("drift:") for problem in problems)
+
+
+def test_stray_decision_schema_is_detected(
+    generator: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _redirect_to_tmp(generator, monkeypatch, tmp_path)
+    generator.write_files()
+    stray = tmp_path / "schemas" / "decision" / "invented_model.schema.json"
+    stray.write_text("{}", encoding="utf-8")
+    problems = generator.check_files()
+    assert any(problem.startswith("stray-generated:") for problem in problems)
+
+
+def test_missing_decision_schema_is_detected(
+    generator: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _redirect_to_tmp(generator, monkeypatch, tmp_path)
+    generator.write_files()
+    (tmp_path / "schemas" / "decision" / "order_intent.schema.json").unlink()
     problems = generator.check_files()
     assert any(problem.startswith("missing-generated:") for problem in problems)
 

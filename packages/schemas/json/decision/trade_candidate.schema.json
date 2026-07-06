@@ -1,0 +1,132 @@
+{
+  "$defs": {
+    "InstrumentRef": {
+      "additionalProperties": false,
+      "description": "Broker-neutral instrument identity.\n\ninstrument_id is the resolved canonical id; provider and broker-native\ncontract identifiers and exchange routing live in the adapter layer, never\non the domain instrument.",
+      "properties": {
+        "asset_class": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Asset Class"
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "instrument_id": {
+          "format": "uuid",
+          "title": "Instrument Id",
+          "type": "string"
+        },
+        "symbol": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Symbol"
+        }
+      },
+      "required": [
+        "instrument_id"
+      ],
+      "title": "InstrumentRef",
+      "type": "object"
+    },
+    "SignalDirection": {
+      "description": "Directional bias of an assessment, candidate or plan.\n\nAuthority: Decision_Contract_v0.8 section 13.2 (SignalAssessment\ndirection).",
+      "enum": [
+        "LONG",
+        "NEUTRAL",
+        "NEGATIVE"
+      ],
+      "title": "SignalDirection",
+      "type": "string"
+    }
+  },
+  "$id": "trading-system/decision/trade_candidate/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A trade idea routed to the decision engine (Decision_Contract 12).",
+  "properties": {
+    "candidate_id": {
+      "format": "uuid",
+      "title": "Candidate Id",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "direction": {
+      "$ref": "#/$defs/SignalDirection"
+    },
+    "instrument": {
+      "$ref": "#/$defs/InstrumentRef"
+    },
+    "source_event_refs": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Source Event Refs",
+      "type": "array"
+    },
+    "strategy_id": {
+      "minLength": 1,
+      "title": "Strategy Id",
+      "type": "string"
+    },
+    "strategy_version": {
+      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$",
+      "title": "Strategy Version",
+      "type": "string"
+    },
+    "valid_until": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Valid Until"
+    }
+  },
+  "required": [
+    "candidate_id",
+    "instrument",
+    "strategy_id",
+    "strategy_version",
+    "direction",
+    "created_at"
+  ],
+  "title": "TradeCandidate",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

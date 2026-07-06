@@ -1,0 +1,105 @@
+{
+  "$defs": {
+    "ActionTier": {
+      "description": "Action tier of a decision.\n\nAuthority: Master_Architecture_Baseline_v0.3 section 5 (Action Model).",
+      "enum": [
+        "AUTO_FULL",
+        "AUTO_REDUCED",
+        "MANUAL",
+        "SHADOW",
+        "WATCH",
+        "REJECT",
+        "HALT"
+      ],
+      "title": "ActionTier",
+      "type": "string"
+    },
+    "DecisionOutcome": {
+      "description": "Terminal outcome of a decision run.\n\nAuthority: Decision_Contract_v0.8 section 12.1 (DecisionOutcome).",
+      "enum": [
+        "REJECT",
+        "WATCH",
+        "SHADOW",
+        "APPROVE",
+        "NEEDS_REVIEW",
+        "EXPIRE",
+        "INVALID"
+      ],
+      "title": "DecisionOutcome",
+      "type": "string"
+    }
+  },
+  "$id": "trading-system/decision/decision_result/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Deterministic system decision for a candidate (decision_runs 7.5).\n\nLLMs never determine outcome, quantity or submission; this is the output\nof the deterministic decision engine.",
+  "properties": {
+    "action_tier": {
+      "$ref": "#/$defs/ActionTier"
+    },
+    "candidate_id": {
+      "format": "uuid",
+      "title": "Candidate Id",
+      "type": "string"
+    },
+    "decided_at": {
+      "format": "date-time",
+      "title": "Decided At",
+      "type": "string"
+    },
+    "decision_hash": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Decision Hash",
+      "type": "string"
+    },
+    "decision_id": {
+      "format": "uuid",
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "decision_policy_version": {
+      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$",
+      "title": "Decision Policy Version",
+      "type": "string"
+    },
+    "outcome": {
+      "$ref": "#/$defs/DecisionOutcome"
+    },
+    "strategy_version": {
+      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$",
+      "title": "Strategy Version",
+      "type": "string"
+    },
+    "supporting_assessment_refs": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Supporting Assessment Refs",
+      "type": "array"
+    },
+    "veto_reason_codes": {
+      "default": [],
+      "items": {
+        "pattern": "^[A-Z][A-Z0-9_]*$",
+        "type": "string"
+      },
+      "title": "Veto Reason Codes",
+      "type": "array"
+    }
+  },
+  "required": [
+    "decision_id",
+    "candidate_id",
+    "outcome",
+    "action_tier",
+    "strategy_version",
+    "decision_policy_version",
+    "decided_at",
+    "decision_hash"
+  ],
+  "title": "DecisionResult",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

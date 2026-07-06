@@ -1,0 +1,133 @@
+{
+  "$defs": {
+    "RiskDecisionOutcome": {
+      "description": "Outcome of a risk evaluation; the Risk Engine holds absolute veto.\n\nAuthority: Decision_Contract_v0.8 section 12.3 and\nData_Model_and_Retention_Specification_v0.6 (risk_evaluations:\nAPPROVE/REDUCE/VETO).",
+      "enum": [
+        "APPROVE",
+        "REDUCE",
+        "VETO"
+      ],
+      "title": "RiskDecisionOutcome",
+      "type": "string"
+    }
+  },
+  "$id": "trading-system/decision/risk_decision/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Deterministic risk evaluation with absolute veto (risk_evaluations).\n\nThe Risk Engine can veto a trade even when the DecisionOutcome is APPROVE.\nAn approved quantity exists only on APPROVE/REDUCE; a VETO carries reason\ncodes and no approved quantity.",
+  "properties": {
+    "approved_quantity": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Approved Quantity"
+    },
+    "approved_risk_amount": {
+      "anyOf": [
+        {
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Approved Risk Amount"
+    },
+    "currency": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Z]{3}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Currency"
+    },
+    "decision_id": {
+      "format": "uuid",
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "evaluated_at": {
+      "format": "date-time",
+      "title": "Evaluated At",
+      "type": "string"
+    },
+    "outcome": {
+      "$ref": "#/$defs/RiskDecisionOutcome"
+    },
+    "risk_decision_id": {
+      "format": "uuid",
+      "title": "Risk Decision Id",
+      "type": "string"
+    },
+    "risk_policy_version": {
+      "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$",
+      "title": "Risk Policy Version",
+      "type": "string"
+    },
+    "stop_distance": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0.0,
+          "type": "number"
+        },
+        {
+          "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stop Distance"
+    },
+    "trade_plan_id": {
+      "format": "uuid",
+      "title": "Trade Plan Id",
+      "type": "string"
+    },
+    "veto_reason_codes": {
+      "default": [],
+      "items": {
+        "pattern": "^[A-Z][A-Z0-9_]*$",
+        "type": "string"
+      },
+      "title": "Veto Reason Codes",
+      "type": "array"
+    }
+  },
+  "required": [
+    "risk_decision_id",
+    "decision_id",
+    "trade_plan_id",
+    "outcome",
+    "risk_policy_version",
+    "evaluated_at"
+  ],
+  "title": "RiskDecision",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}
