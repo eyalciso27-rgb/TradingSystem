@@ -381,6 +381,12 @@ source = { editable = "apps/api" }
 name = "trading-application"
 version = "0.1.0"
 source = { editable = "packages/py/application" }
+dependencies = [
+    { name = "trading-config" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "trading-config", editable = "packages/py/config" }]
 
 [[package]]
 name = "trading-broker-core"
