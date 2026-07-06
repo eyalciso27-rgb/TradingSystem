@@ -65,6 +65,7 @@ def _full_chain(conn: Connection) -> dict[str, Any]:
         event_type="MESSAGE_CREATED",
         observed_at=NOW,
         ingested_at=NOW,
+        available_at=NOW,
         content_hash=HASH,
         raw_object_id=ids["raw_object"],
         created_at=NOW,
@@ -108,6 +109,7 @@ def _full_chain(conn: Connection) -> dict[str, Any]:
         calibrated_probability=Decimal("0.6"),
         calibration_status="HEURISTIC",
         observed_at=NOW,
+        ingested_at=NOW,
         available_at=NOW,
         created_at=NOW,
     )
@@ -400,6 +402,7 @@ def test_invalid_enum_value_rejected(connection: Connection) -> None:
             event_type="X",
             observed_at=NOW,
             ingested_at=NOW,
+            available_at=NOW,
             content_hash=HASH,
             created_at=NOW,
         )

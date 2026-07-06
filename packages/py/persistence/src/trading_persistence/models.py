@@ -133,8 +133,15 @@ class SourceEvent(Base):
     source_type: Mapped[str] = mapped_column(Text, nullable=False)
     external_event_id: Mapped[str | None] = mapped_column(Text)
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    # Point-in-time fields (IMP-0202, Data_Model v0.6 section 24.2):
+    # observed = world time, ingested = system intake, effective = when the
+    # datum applies, available = first moment usable in a decision,
+    # superseded = when replaced by a newer revision.
     observed_at: Mapped[datetime] = _ts(nullable=False)
     ingested_at: Mapped[datetime] = _ts(nullable=False)
+    effective_at: Mapped[datetime | None] = _ts()
+    available_at: Mapped[datetime] = _ts(nullable=False)
+    superseded_at: Mapped[datetime | None] = _ts()
     content_language: Mapped[str | None] = mapped_column(Text)
     content_hash: Mapped[str] = mapped_column(Text, nullable=False)
     raw_object_id: Mapped[PyUUID | None] = mapped_column(
@@ -158,6 +165,7 @@ class SourceEvent(Base):
             postgresql_where=text("external_event_id IS NOT NULL"),
         ),
         Index("ix_source_events_observed_at", "observed_at"),
+        Index("ix_source_events_available_at", "available_at"),
         Index("ix_source_events_content_hash", "content_hash"),
     )
 
@@ -253,8 +261,12 @@ class SignalAssessment(Base):
     score: Mapped[object] = mapped_column(Numeric(18, 10), nullable=False)
     calibrated_probability: Mapped[object | None] = mapped_column(Numeric(18, 10))
     calibration_status: Mapped[str] = mapped_column(Text, nullable=False)
+    # Point-in-time fields (IMP-0202, Data_Model v0.6 section 24.2).
     observed_at: Mapped[datetime] = _ts(nullable=False)
+    ingested_at: Mapped[datetime] = _ts(nullable=False)
+    effective_at: Mapped[datetime | None] = _ts()
     available_at: Mapped[datetime] = _ts(nullable=False)
+    superseded_at: Mapped[datetime | None] = _ts()
     valid_until: Mapped[datetime | None] = _ts()
     created_at: Mapped[datetime] = _ts(nullable=False)
 

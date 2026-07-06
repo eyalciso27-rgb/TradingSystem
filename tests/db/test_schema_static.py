@@ -6,6 +6,7 @@ broker-neutrality and secret-hygiene done criteria at the metadata level.
 
 from pathlib import Path
 
+import trading_persistence.models  # noqa: F401  (populates Base.metadata)
 from sqlalchemy import Float, LargeBinary, Numeric
 from trading_persistence.base import Base
 
