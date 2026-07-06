@@ -1,0 +1,58 @@
+{
+  "$id": "trading-system/social/social_attachment/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Attachment metadata + storage reference; never raw bytes.\n\nData_Model v0.6: raw_objects carry URI, MIME, size and hash;\nsource_attachments link an event to a file. Integration v0.6: the file\nis downloaded separately through Trust/Quarantine, so hash and storage\nreference may be absent until the download completes.",
+  "properties": {
+    "content_hash": {
+      "anyOf": [
+        {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Content Hash"
+    },
+    "media_type": {
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*/[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*$",
+      "title": "Media Type",
+      "type": "string"
+    },
+    "raw_object_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Raw Object Ref"
+    },
+    "size_bytes": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Size Bytes"
+    }
+  },
+  "required": [
+    "media_type"
+  ],
+  "title": "SocialAttachment",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

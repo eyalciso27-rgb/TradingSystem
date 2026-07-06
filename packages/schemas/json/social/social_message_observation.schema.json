@@ -1,0 +1,109 @@
+{
+  "$defs": {
+    "SocialAccessMode": {
+      "description": "Cross-provider access mode of a social connection profile.\n\nAuthority: Data_Model_and_Retention_Specification_v0.6 section 31\n(social_connection_profile.access_mode).",
+      "enum": [
+        "WHATSAPP_USER",
+        "DISCORD_USER",
+        "TELEGRAM_USER_TDLIB",
+        "TELEGRAM_BOT"
+      ],
+      "title": "SocialAccessMode",
+      "type": "string"
+    },
+    "SourceType": {
+      "description": "Canonical source/evidence origin classification.\n\nAuthority: Integration_Specification_v0.6 section 2.4\n(Canonical Source Event, source_type).",
+      "enum": [
+        "WHATSAPP",
+        "DISCORD",
+        "TELEGRAM",
+        "INVESTINGPRO",
+        "NEWS",
+        "FILING",
+        "MARKET"
+      ],
+      "title": "SourceType",
+      "type": "string"
+    }
+  },
+  "$id": "trading-system/social/social_message_observation/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One adapter's observation of a canonical message (Data_Model 31).\n\nA separate observation exists per user/bot capture with its external IDs\nand received_at (the adapter-side receive time — source-native, distinct\nfrom the envelope's ingested_at, which is when the system stored the\nevent). message_dedup_key ties the observation to the canonical message,\nso user and bot observations of the same post never count twice.",
+  "properties": {
+    "access_mode": {
+      "$ref": "#/$defs/SocialAccessMode"
+    },
+    "channel_external_id": {
+      "minLength": 1,
+      "title": "Channel External Id",
+      "type": "string"
+    },
+    "connector_id": {
+      "minLength": 1,
+      "title": "Connector Id",
+      "type": "string"
+    },
+    "external_message_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "External Message Id"
+    },
+    "external_update_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "External Update Id"
+    },
+    "message_dedup_key": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Message Dedup Key",
+      "type": "string"
+    },
+    "received_at": {
+      "format": "date-time",
+      "title": "Received At",
+      "type": "string"
+    },
+    "revision": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Revision",
+      "type": "integer"
+    },
+    "source_account_id": {
+      "minLength": 1,
+      "title": "Source Account Id",
+      "type": "string"
+    },
+    "source_type": {
+      "$ref": "#/$defs/SourceType"
+    }
+  },
+  "required": [
+    "source_type",
+    "access_mode",
+    "connector_id",
+    "source_account_id",
+    "channel_external_id",
+    "received_at",
+    "message_dedup_key"
+  ],
+  "title": "SocialMessageObservation",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

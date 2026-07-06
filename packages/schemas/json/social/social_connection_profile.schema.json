@@ -1,0 +1,84 @@
+{
+  "$defs": {
+    "IntegrationHealthStatus": {
+      "description": "Health states of an integration/connector.\n\nAuthority: Integration_Specification_v0.6 section 2.3\n(full integration-state table; supersedes the abbreviated example in\nsection 2.2).",
+      "enum": [
+        "INITIALIZING",
+        "HEALTHY",
+        "DEGRADED",
+        "AUTH_REQUIRED",
+        "RATE_LIMITED",
+        "CIRCUIT_OPEN",
+        "PAUSED",
+        "DOWN"
+      ],
+      "title": "IntegrationHealthStatus",
+      "type": "string"
+    },
+    "SocialAccessMode": {
+      "description": "Cross-provider access mode of a social connection profile.\n\nAuthority: Data_Model_and_Retention_Specification_v0.6 section 31\n(social_connection_profile.access_mode).",
+      "enum": [
+        "WHATSAPP_USER",
+        "DISCORD_USER",
+        "TELEGRAM_USER_TDLIB",
+        "TELEGRAM_BOT"
+      ],
+      "title": "SocialAccessMode",
+      "type": "string"
+    },
+    "SourceType": {
+      "description": "Canonical source/evidence origin classification.\n\nAuthority: Integration_Specification_v0.6 section 2.4\n(Canonical Source Event, source_type).",
+      "enum": [
+        "WHATSAPP",
+        "DISCORD",
+        "TELEGRAM",
+        "INVESTINGPRO",
+        "NEWS",
+        "FILING",
+        "MARKET"
+      ],
+      "title": "SourceType",
+      "type": "string"
+    }
+  },
+  "$id": "trading-system/social/social_connection_profile/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A configured social connection (Data_Model v0.6 section 31).",
+  "properties": {
+    "access_mode": {
+      "$ref": "#/$defs/SocialAccessMode"
+    },
+    "enabled": {
+      "title": "Enabled",
+      "type": "boolean"
+    },
+    "health_status": {
+      "$ref": "#/$defs/IntegrationHealthStatus"
+    },
+    "identity_ref": {
+      "minLength": 1,
+      "title": "Identity Ref",
+      "type": "string"
+    },
+    "provider": {
+      "$ref": "#/$defs/SourceType"
+    },
+    "required_capability": {
+      "title": "Required Capability",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "provider",
+    "access_mode",
+    "identity_ref",
+    "required_capability",
+    "enabled",
+    "health_status"
+  ],
+  "title": "SocialConnectionProfile",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

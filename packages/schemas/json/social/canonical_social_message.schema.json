@@ -1,0 +1,258 @@
+{
+  "$defs": {
+    "SocialAttachment": {
+      "additionalProperties": false,
+      "description": "Attachment metadata + storage reference; never raw bytes.\n\nData_Model v0.6: raw_objects carry URI, MIME, size and hash;\nsource_attachments link an event to a file. Integration v0.6: the file\nis downloaded separately through Trust/Quarantine, so hash and storage\nreference may be absent until the download completes.",
+      "properties": {
+        "content_hash": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Content Hash"
+        },
+        "media_type": {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*/[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*$",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "raw_object_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Raw Object Ref"
+        },
+        "size_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Size Bytes"
+        }
+      },
+      "required": [
+        "media_type"
+      ],
+      "title": "SocialAttachment",
+      "type": "object"
+    },
+    "SourceType": {
+      "description": "Canonical source/evidence origin classification.\n\nAuthority: Integration_Specification_v0.6 section 2.4\n(Canonical Source Event, source_type).",
+      "enum": [
+        "WHATSAPP",
+        "DISCORD",
+        "TELEGRAM",
+        "INVESTINGPRO",
+        "NEWS",
+        "FILING",
+        "MARKET"
+      ],
+      "title": "SourceType",
+      "type": "string"
+    }
+  },
+  "$id": "trading-system/social/canonical_social_message/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Adapter-independent canonical social message (Data_Model section 31).\n\nIdentity does not depend on a single adapter or access mode: the same\npost captured by user mode and bot mode must map to the same dedup_key.\nEdits create revisions; deletion at the source is a tombstone flag; a\nreply/quote is stored as a link, not a copy.",
+  "properties": {
+    "attachments": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SocialAttachment"
+      },
+      "title": "Attachments",
+      "type": "array"
+    },
+    "author_display_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Author Display Name"
+    },
+    "author_external_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Author External Id"
+    },
+    "channel_external_id": {
+      "minLength": 1,
+      "title": "Channel External Id",
+      "type": "string"
+    },
+    "content_hash": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Content Hash",
+      "type": "string"
+    },
+    "content_language": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Content Language"
+    },
+    "content_text": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Content Text"
+    },
+    "dedup_key": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Dedup Key",
+      "type": "string"
+    },
+    "external_message_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "External Message Id"
+    },
+    "forward_origin_json": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Forward Origin Json"
+    },
+    "is_deleted_at_source": {
+      "default": false,
+      "title": "Is Deleted At Source",
+      "type": "boolean"
+    },
+    "media_group_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Media Group Id"
+    },
+    "raw_object_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Raw Object Ref"
+    },
+    "reply_to_external_message_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reply To External Message Id"
+    },
+    "revision": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Revision",
+      "type": "integer"
+    },
+    "source_edited_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Source Edited At"
+    },
+    "source_type": {
+      "$ref": "#/$defs/SourceType"
+    },
+    "thread_external_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Thread External Id"
+    }
+  },
+  "required": [
+    "source_type",
+    "channel_external_id",
+    "content_hash",
+    "dedup_key"
+  ],
+  "title": "CanonicalSocialMessage",
+  "type": "object",
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

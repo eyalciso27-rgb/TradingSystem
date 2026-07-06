@@ -29,18 +29,28 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
 from trading_contracts.enums import CANONICAL_ENUMS, SCHEMA_VERSION
 from trading_contracts.envelope import ENVELOPE_SCHEMA_ID, EventEnvelope
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_DIR = REPO_ROOT / "packages" / "schemas" / "json" / "enums"
-EVENTS_SCHEMA_DIR = REPO_ROOT / "packages" / "schemas" / "json" / "events"
-TS_FILE = REPO_ROOT / "packages" / "ts" / "contracts-generated" / "src" / "enums.ts"
-ENVELOPE_TS_FILE = (
-    REPO_ROOT / "packages" / "ts" / "contracts-generated" / "src" / "event-envelope.ts"
+from trading_contracts.social import (
+    SOCIAL_MODELS,
+    SOURCE_TYPE_BY_SOCIAL_ACCESS_MODE,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+TS_SRC = REPO_ROOT / "packages" / "ts" / "contracts-generated" / "src"
+SCHEMA_DIR = REPO_ROOT / "packages" / "schemas" / "json" / "enums"
+EVENTS_SCHEMA_DIR = REPO_ROOT / "packages" / "schemas" / "json" / "events"
+SOCIAL_SCHEMA_DIR = REPO_ROOT / "packages" / "schemas" / "json" / "social"
+TS_FILE = TS_SRC / "enums.ts"
+ENVELOPE_TS_FILE = TS_SRC / "event-envelope.ts"
+SOCIAL_TS_FILE = TS_SRC / "social.ts"
+
 GENERATED_HEADER = "GENERATED FILE — DO NOT EDIT"
+
+# Enum classes indexed by name, to resolve $ref enum fields when rendering
+# social models (single source of truth — values come from the enum classes).
+_ENUM_BY_NAME = {enum_class.__name__: enum_class for enum_class in CANONICAL_ENUMS}
 
 # Envelope string-field validation patterns for the generated TypeScript guard.
 UUID_TS_PATTERN = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -49,8 +59,12 @@ AWARE_DATETIME_TS_PATTERN = (
 )
 
 
+def _snake(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
 def snake_name(enum_class: type[StrEnum]) -> str:
-    return re.sub(r"(?<!^)(?=[A-Z])", "_", enum_class.__name__).lower()
+    return _snake(enum_class.__name__)
 
 
 def screaming_name(enum_class: type[StrEnum]) -> str:
@@ -208,6 +222,234 @@ def render_envelope_typescript() -> str:
     return "\n".join(lines)
 
 
+def social_json_schema(model: type[BaseModel]) -> dict[str, Any]:
+    """Self-contained JSON Schema for a social model (Pydantic-derived)."""
+    schema: dict[str, Any] = model.model_json_schema()
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["$id"] = f"trading-system/social/{_snake(model.__name__)}/v1"
+    schema["x-generated-by"] = "scripts/generate_contracts.py"
+    schema["x-generated-note"] = GENERATED_HEADER
+    return schema
+
+
+def render_social_schema(model: type[BaseModel]) -> str:
+    payload = json.dumps(social_json_schema(model), ensure_ascii=False, indent=2, sort_keys=True)
+    return payload + "\n"
+
+
+def _field_rule(model: type[BaseModel], name: str, prop: dict[str, Any]) -> dict[str, Any]:
+    """Classify one model field into a TS type + runtime validation rule.
+
+    Everything is derived from the Pydantic JSON schema (and, for enums, from
+    the canonical enum classes) so the TypeScript never restates values.
+    """
+    required = name in model.model_json_schema().get("required", [])
+    variants = prop.get("anyOf", [prop])
+    nullable = any(v.get("type") == "null" for v in variants)
+    core = next((v for v in variants if v.get("type") != "null"), prop)
+
+    ref = core.get("$ref")
+    if ref is not None:
+        enum_name = ref.split("/")[-1]
+        enum_class = _ENUM_BY_NAME[enum_name]
+        values = [member.value for member in enum_class]
+        return {
+            "ts_type": enum_name,
+            "kind": "enum",
+            "values": values,
+            "required": required,
+            "nullable": nullable,
+        }
+    if core.get("type") == "array":
+        return {
+            "ts_type": "SocialAttachment[]",
+            "kind": "attachments",
+            "required": required,
+            "nullable": nullable,
+        }
+    if core.get("type") == "integer":
+        return {
+            "ts_type": "number",
+            "kind": "integer",
+            "min": core.get("minimum", 0),
+            "required": required,
+            "nullable": nullable,
+        }
+    if core.get("type") == "boolean":
+        return {"ts_type": "boolean", "kind": "boolean", "required": required, "nullable": nullable}
+    if core.get("format") == "date-time":
+        return {
+            "ts_type": "string",
+            "kind": "pattern",
+            "pattern": AWARE_DATETIME_TS_PATTERN,
+            "required": required,
+            "nullable": nullable,
+        }
+    if "pattern" in core:
+        return {
+            "ts_type": "string",
+            "kind": "pattern",
+            "pattern": core["pattern"],
+            "required": required,
+            "nullable": nullable,
+        }
+    return {"ts_type": "string", "kind": "string", "required": required, "nullable": nullable}
+
+
+def _model_field_rules(model: type[BaseModel]) -> dict[str, dict[str, Any]]:
+    schema = model.model_json_schema()
+    return {name: _field_rule(model, name, prop) for name, prop in schema["properties"].items()}
+
+
+# Extra runtime guard clauses enforcing baseline cross-field rules that a
+# per-field schema cannot express (provider/access-mode agreement). Keyed by
+# model name; each entry is a list of TS boolean expressions over `record`.
+_SOCIAL_EXTRA_GUARDS: dict[str, list[str]] = {
+    "SocialConnectionProfile": [
+        "SOURCE_TYPE_BY_SOCIAL_ACCESS_MODE[record.access_mode as SocialAccessMode]"
+        " === record.provider",
+    ],
+    "SocialMessageObservation": [
+        "SOURCE_TYPE_BY_SOCIAL_ACCESS_MODE[record.access_mode as SocialAccessMode]"
+        " === record.source_type",
+    ],
+    "CanonicalSocialMessage": [
+        "(Object.values(SOURCE_TYPE_BY_SOCIAL_ACCESS_MODE) as string[])"
+        ".includes(record.source_type as string)",
+    ],
+}
+
+
+def _ts_interface(model: type[BaseModel], rules: dict[str, dict[str, Any]]) -> list[str]:
+    lines = [f"export interface {model.__name__} {{"]
+    for name, rule in rules.items():
+        ts_type = rule["ts_type"]
+        if rule["nullable"]:
+            ts_type = f"{ts_type} | null"
+        optional = "" if rule["required"] else "?"
+        lines.append(f"  {name}{optional}: {ts_type};")
+    lines.append("}")
+    return lines
+
+
+def _ts_rules_literal(rules: dict[str, dict[str, Any]]) -> list[str]:
+    lines = ["{"]
+    for name, rule in rules.items():
+        parts = [f'kind: "{rule["kind"]}"']
+        parts.append(f"required: {str(rule['required']).lower()}")
+        parts.append(f"nullable: {str(rule['nullable']).lower()}")
+        if rule["kind"] == "enum":
+            values = ", ".join(f'"{value}"' for value in rule["values"])
+            parts.append(f"values: [{values}]")
+        if rule["kind"] == "pattern":
+            escaped = rule["pattern"].replace("/", "\\/")
+            parts.append(f"pattern: /{escaped}/")
+        if rule["kind"] == "integer":
+            parts.append(f"min: {rule['min']}")
+        lines.append(f"    {name}: {{ {', '.join(parts)} }},")
+    lines.append("  }")
+    return lines
+
+
+def render_social_typescript() -> str:
+    used_enums = sorted(
+        {rule["ts_type"] for model in SOCIAL_MODELS for rule in _model_field_rules(model).values()
+         if rule["kind"] == "enum"}
+    )
+    mapping_entries = ", ".join(
+        f'{mode.value}: "{source.value}"'
+        for mode, source in SOURCE_TYPE_BY_SOCIAL_ACCESS_MODE.items()
+    )
+    lines: list[str] = [
+        f"// {GENERATED_HEADER}.",
+        "// Generated by scripts/generate_contracts.py from trading_contracts.social",
+        "// (single source of truth). Datetimes are timezone-aware ISO 8601 strings;",
+        "// attachments are references only (never raw bytes).",
+        "",
+        f"import {{ {', '.join(used_enums)} }} from \"./enums\";",
+        "",
+        "export const SOURCE_TYPE_BY_SOCIAL_ACCESS_MODE: Readonly<",
+        "  Record<SocialAccessMode, SourceType>",
+        f"> = {{ {mapping_entries} }} as const;",
+        "",
+        "type FieldKind ="
+        ' "string" | "pattern" | "enum" | "integer" | "boolean" | "attachments";',
+        "interface FieldRule {",
+        "  readonly kind: FieldKind;",
+        "  readonly required: boolean;",
+        "  readonly nullable: boolean;",
+        "  readonly pattern?: RegExp;",
+        "  readonly values?: readonly string[];",
+        "  readonly min?: number;",
+        "}",
+        "",
+        "function checkField(rule: FieldRule, value: unknown): boolean {",
+        "  if (value === undefined) return !rule.required;",
+        "  if (value === null) return rule.nullable;",
+        "  switch (rule.kind) {",
+        '    case "string":',
+        '      return typeof value === "string";',
+        '    case "pattern":',
+        '      return typeof value === "string" && rule.pattern!.test(value);',
+        '    case "enum":',
+        '      return typeof value === "string" && rule.values!.includes(value);',
+        '    case "integer":',
+        '      return (',
+        '        typeof value === "number" &&',
+        "        Number.isInteger(value) &&",
+        "        value >= (rule.min ?? 0)",
+        "      );",
+        '    case "boolean":',
+        '      return typeof value === "boolean";',
+        '    case "attachments":',
+        "      return Array.isArray(value) && value.every(isSocialAttachment);",
+        "  }",
+        "}",
+        "",
+        "function checkObject(",
+        "  rules: Readonly<Record<string, FieldRule>>,",
+        "  value: unknown,",
+        "): value is Record<string, unknown> {",
+        '  if (typeof value !== "object" || value === null || Array.isArray(value)) {',
+        "    return false;",
+        "  }",
+        "  const record = value as Record<string, unknown>;",
+        "  for (const key of Object.keys(record)) {",
+        "    if (!(key in rules)) return false;",
+        "  }",
+        "  for (const [key, rule] of Object.entries(rules)) {",
+        "    if (!checkField(rule, record[key])) return false;",
+        "  }",
+        "  return true;",
+        "}",
+        "",
+    ]
+    for model in SOCIAL_MODELS:
+        rules = _model_field_rules(model)
+        lines.extend(_ts_interface(model, rules))
+        lines.append("")
+    for model in SOCIAL_MODELS:
+        rules = _model_field_rules(model)
+        name = model.__name__
+        rules_const = f"{_snake(name).upper()}_RULES"
+        lines.append(
+            f"const {rules_const}: Readonly<Record<string, FieldRule>> = "
+            + "\n".join(_ts_rules_literal(rules))
+            + ";"
+        )
+        lines.append(f"export function is{name}(value: unknown): value is {name} {{")
+        lines.append(f"  if (!checkObject({rules_const}, value)) return false;")
+        extra = _SOCIAL_EXTRA_GUARDS.get(name)
+        if extra:
+            lines.append("  const record = value as Record<string, unknown>;")
+            for clause in extra:
+                lines.append(f"  if (!({clause})) return false;")
+        lines.append("  return true;")
+        lines.append("}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def expected_files() -> dict[Path, str]:
     files: dict[Path, str] = {
         SCHEMA_DIR / f"{snake_name(enum_class)}.schema.json": render_schema(enum_class)
@@ -216,6 +458,11 @@ def expected_files() -> dict[Path, str]:
     files[TS_FILE] = render_typescript()
     files[EVENTS_SCHEMA_DIR / "event_envelope.schema.json"] = render_envelope_schema()
     files[ENVELOPE_TS_FILE] = render_envelope_typescript()
+    for model in SOCIAL_MODELS:
+        files[SOCIAL_SCHEMA_DIR / f"{_snake(model.__name__)}.schema.json"] = render_social_schema(
+            model
+        )
+    files[SOCIAL_TS_FILE] = render_social_typescript()
     return files
 
 
@@ -240,7 +487,7 @@ def check_files() -> list[str]:
         elif path.read_text(encoding="utf-8") != content:
             problems.append(f"drift: {rel} differs from the canonical source")
     expected_schemas = {path for path in expected if path.suffix == ".json"}
-    for schema_dir in (SCHEMA_DIR, EVENTS_SCHEMA_DIR):
+    for schema_dir in (SCHEMA_DIR, EVENTS_SCHEMA_DIR, SOCIAL_SCHEMA_DIR):
         if not schema_dir.is_dir():
             continue
         for stray in sorted(schema_dir.glob("*.schema.json")):
