@@ -45,25 +45,61 @@ def _workspace_count(engine: Any) -> int:
         return int(conn.execute(select(func.count()).select_from(m.Workspace)).scalar_one())
 
 
+def test_unique_constraint_exists_on_consumer_inbox(engine: Any) -> None:
+    from sqlalchemy import inspect
+
+    uniques = inspect(engine).get_unique_constraints("consumer_inbox")
+    by_columns = {tuple(u["column_names"]) for u in uniques}
+    assert ("consumer_id", "message_id") in by_columns
+
+
+def test_direct_duplicate_insert_violates_constraint(clean_db: Any) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    engine = clean_db
+    message_id = uuid4()
+    row = dict(consumer_id="core-worker", message_id=message_id, status="X", first_seen_at=NOW)
+    with engine.begin() as conn:
+        conn.execute(insert(m.ConsumerInboxRecord).values(id=uuid4(), **row))
+    with pytest.raises(IntegrityError), engine.begin() as conn:
+        conn.execute(insert(m.ConsumerInboxRecord).values(id=uuid4(), **row))
+
+
 def test_duplicate_delivery_is_noop(clean_db: Any) -> None:
     engine = clean_db
     message_id = uuid4()
+    handler_runs: list[int] = []
+
+    def counting_handler(conn: Connection) -> str:
+        handler_runs.append(1)
+        return _handler(conn)
+
     with engine.begin() as conn:
         assert process_once(
-            conn, consumer_id="core-worker", message_id=message_id, handler=_handler, now=NOW
+            conn,
+            consumer_id="core-worker",
+            message_id=message_id,
+            handler=counting_handler,
+            now=NOW,
         )
     # At-least-once redelivery of the SAME message id: handler must not re-run.
     with engine.begin() as conn:
         assert not process_once(
-            conn, consumer_id="core-worker", message_id=message_id, handler=_handler, now=NOW
+            conn,
+            consumer_id="core-worker",
+            message_id=message_id,
+            handler=counting_handler,
+            now=NOW,
         )
+    assert handler_runs == [1]  # handler executed exactly once
     assert _workspace_count(engine) == 1  # state was not duplicated
     with engine.connect() as conn:
-        row = conn.execute(
+        inbox_rows = conn.execute(
             select(m.ConsumerInboxRecord.status, m.ConsumerInboxRecord.result_hash)
-        ).one()
-        assert row.status == "COMPLETED"
-        assert row.result_hash is not None
+        ).all()
+        assert len(inbox_rows) == 1  # no duplicate inbox rows after redelivery
+        assert inbox_rows[0].status == "COMPLETED"
+        assert inbox_rows[0].result_hash is not None
 
 
 def test_crash_mid_handler_allows_clean_retry(clean_db: Any) -> None:

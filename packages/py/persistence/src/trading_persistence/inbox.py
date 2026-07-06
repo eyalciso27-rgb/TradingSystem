@@ -39,6 +39,9 @@ def process_once(
     """
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
+    # RETURNING decides the claim: PostgreSQL returns the id iff a row was
+    # actually inserted. Driver rowcount is NOT reliable for
+    # INSERT .. ON CONFLICT DO NOTHING and must not be used here.
     claim = connection.execute(
         pg_insert(ConsumerInboxRecord)
         .values(
@@ -49,8 +52,9 @@ def process_once(
             first_seen_at=now,
         )
         .on_conflict_do_nothing(index_elements=["consumer_id", "message_id"])
+        .returning(ConsumerInboxRecord.id)
     )
-    if claim.rowcount == 0:
+    if claim.scalar_one_or_none() is None:
         return False  # already processed (or being processed): duplicate no-op
 
     result_hash = handler(connection)
