@@ -359,9 +359,8 @@ class RiskEvaluation(Base):
 
     __table_args__ = (
         enum_check("outcome", RiskDecisionOutcome, "risk_evaluations_outcome"),
-        values_check(
+        raw_check(
             "approved_quantity IS NULL OR approved_quantity > 0",
-            (),
             "risk_evaluations_quantity_positive",
         ),
     )
