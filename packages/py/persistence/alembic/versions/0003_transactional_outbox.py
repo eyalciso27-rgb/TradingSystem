@@ -1,5 +1,5 @@
-"""IMP-0203 transactional outbox.
 # ruff: noqa: E501
+"""IMP-0203 transactional outbox.
 
 Adds outbox_messages (Data_Model v0.6 section 24.3): domain state and the
 outbox row are written in one transaction; a publisher later marks rows
