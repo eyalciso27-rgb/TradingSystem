@@ -280,6 +280,41 @@ social/decision contracts — they are intentionally **not** part of
 `scripts/generate_contracts.py` (no JSON-Schema/TypeScript generation). A
 minimal valid example is exercised by the test fixtures in `tests/config`.
 
+## Database (core PostgreSQL schema)
+
+The core schema (IMP-0201) lives in `packages/py/persistence`
+(`trading_persistence.models` + Alembic under
+`packages/py/persistence/alembic`). PostgreSQL only (psycopg 3); enum-like
+values are `text` + CHECK against the canonical enums, money/quantity are
+NUMERIC (never FLOAT), timestamps are TIMESTAMPTZ, UUID primary keys are
+generated in the application layer. The schema is **broker-neutral** (no
+conId/permId/native order id/native status; `broker_orders` uses an opaque
+`external_order_ref` and `raw_payload_ref`) and holds **no secrets**.
+
+The connection URL comes only from `DATABASE_URL` — no credentials or
+production URL in code:
+
+```sh
+export DATABASE_URL=postgresql+psycopg://user:pass@localhost:5432/trading
+uv run alembic -c packages/py/persistence/alembic.ini upgrade head
+uv run alembic -c packages/py/persistence/alembic.ini downgrade base
+uv run alembic -c packages/py/persistence/alembic.ini upgrade head
+uv run alembic -c packages/py/persistence/alembic.ini check   # no metadata drift
+uv run pytest tests/db                                          # real-DB tests
+```
+
+The initial migration creates the schema from the SQLAlchemy metadata (so the
+migration can never drift from the models) and drops it on downgrade. Tests in
+`tests/db/test_migration.py` require a real PostgreSQL server and are **skipped
+locally** when `DATABASE_URL` is unset; they run in CI against a `postgres:16`
+service (the `db-migration` job). The no-DB static schema checks in
+`tests/db/test_schema_static.py` always run. Paper and Live are separated at
+the row level (`environment` columns + per-environment active pointers).
+
+Deferred to later phases: point-in-time as-of history (IMP-0202), transactional
+outbox / consumer inbox (IMP-0203/0204), tamper-evident audit (IMP-0304), and
+the analysis/news/fundamental/feature tables (engine phases).
+
 ## Baseline verification
 
 The specification baseline in `docs/baseline-v0.5/` is hash-locked (IMP-0003):

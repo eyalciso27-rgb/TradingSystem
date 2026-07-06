@@ -65,6 +65,43 @@ jobs:
       - name: Pytest
         run: uv run pytest -q
 
+  db-migration:
+    name: db-migration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: trading
+          POSTGRES_PASSWORD: trading
+          POSTGRES_DB: trading_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U trading"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+psycopg://trading:trading@localhost:5432/trading_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Alembic upgrade / downgrade / upgrade
+        run: |
+          uv run alembic -c packages/py/persistence/alembic.ini upgrade head
+          uv run alembic -c packages/py/persistence/alembic.ini downgrade base
+          uv run alembic -c packages/py/persistence/alembic.ini upgrade head
+      - name: Alembic drift check
+        run: uv run alembic -c packages/py/persistence/alembic.ini check
+      - name: PostgreSQL migration tests
+        run: uv run pytest tests/db -q
+
   node-quality:
     name: node-quality
     runs-on: ubuntu-latest
