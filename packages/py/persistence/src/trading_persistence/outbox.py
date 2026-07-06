@@ -10,8 +10,13 @@ with the row id as the message id and marks the row PUBLISHED.
 is what makes domain state + event atomic. A crash after commit leaves exactly
 one PENDING row (exactly one logical event); a rollback leaves neither the
 domain state nor the event. ``mark_published`` is idempotent: only a PENDING
-row transitions, so a publisher retry can never produce a second logical
-event. The event bus itself (NATS) is out of scope here.
+row transitions, so a publisher retry can never create a second outbox row.
+
+Delivery semantics are **at-least-once**, never exactly-once: a crash after
+publishing to the bus but before ``mark_published`` re-publishes the same
+message on restart. The message id stays constant across retries, so
+consumers deduplicate; end-to-end duplicate suppression is completed by the
+Consumer Inbox (IMP-0204). The event bus itself (NATS) is out of scope here.
 """
 
 from collections.abc import Mapping, Sequence

@@ -45,6 +45,7 @@ EXPECTED_TABLES = {
     "config_versions",
     "active_version_pointers",
     "outbox_messages",
+    "consumer_inbox",
 }
 
 FORBIDDEN_BROKER_TOKENS = [
@@ -159,6 +160,14 @@ def test_outbox_migration_exists_and_is_frozen() -> None:
     text = outbox.read_text(encoding="utf-8")
     assert 'down_revision: str | None = "0002_point_in_time_storage"' in text
     assert "outbox_messages" in text
+    assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
+
+
+def test_inbox_migration_exists_and_is_frozen() -> None:
+    inbox = MIGRATION.parent / "0004_consumer_inbox.py"
+    text = inbox.read_text(encoding="utf-8")
+    assert 'down_revision: str | None = "0003_transactional_outbox"' in text
+    assert "uq_consumer_inbox_consumer_id_message_id" in text
     assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
 
 

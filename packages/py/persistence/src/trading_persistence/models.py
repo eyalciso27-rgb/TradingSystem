@@ -602,6 +602,28 @@ class OutboxMessage(Base):
     )
 
 
+class ConsumerInboxRecord(Base):
+    """Consumer inbox row (IMP-0204, Data_Model v0.6 section 24.3).
+
+    One row per (consumer_id, message_id): the idempotency key at every
+    service boundary. The inbox row and the business effect are written in
+    the same transaction, so duplicate deliveries become no-ops and a crash
+    mid-processing rolls back both, allowing a clean retry.
+    """
+
+    __tablename__ = "consumer_inbox"
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    consumer_id: Mapped[str] = mapped_column(Text, nullable=False)
+    message_id: Mapped[PyUUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    first_seen_at: Mapped[datetime] = _ts(nullable=False)
+    completed_at: Mapped[datetime | None] = _ts()
+    result_hash: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (UniqueConstraint("consumer_id", "message_id"),)
+
+
 class ConfigVersion(Base):
     __tablename__ = "config_versions"
 
