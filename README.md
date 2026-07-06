@@ -303,8 +303,12 @@ uv run alembic -c packages/py/persistence/alembic.ini check   # no metadata drif
 uv run pytest tests/db                                          # real-DB tests
 ```
 
-The initial migration creates the schema from the SQLAlchemy metadata (so the
-migration can never drift from the models) and drops it on downgrade. Tests in
+**Migration policy (binding):** `0001_core_schema` and
+`0002_point_in_time_storage` are **frozen**. A published migration contains
+explicit, frozen DDL and never imports the live SQLAlchemy metadata; an
+existing revision must never be modified after it passed CI/merge. Every
+future schema change requires a **new** Alembic revision (with its own
+downgrade). Tests in
 `tests/db/test_migration.py` require a real PostgreSQL server and are **skipped
 locally** when `DATABASE_URL` is unset; they run in CI against a `postgres:16`
 service (the `db-migration` job). The no-DB static schema checks in
