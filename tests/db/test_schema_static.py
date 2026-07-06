@@ -144,11 +144,21 @@ def test_money_columns_use_numeric_not_float() -> None:
                 assert isinstance(column.type, Numeric), f"{table.name}.{column.name} not Numeric"
 
 
-def test_migration_is_initial_revision() -> None:
+def test_migration_is_initial_and_frozen() -> None:
+    """0001 must be frozen DDL, never referencing the live metadata."""
     text = MIGRATION.read_text(encoding="utf-8")
-    assert 'down_revision: str | None = None' in text
-    assert "create_all" in text
-    assert "drop_all" in text
+    assert "down_revision: str | None = None" in text
+    assert "create_all" not in text
+    assert "trading_persistence.models" not in text
+    assert text.count("CREATE TABLE") == len(EXPECTED_TABLES)
+
+
+def test_point_in_time_migration_exists() -> None:
+    pit = MIGRATION.parent / "0002_point_in_time_storage.py"
+    text = pit.read_text(encoding="utf-8")
+    assert 'down_revision: str | None = "0001_core_schema"' in text
+    for column in ("effective_at", "available_at", "superseded_at", "ingested_at"):
+        assert column in text
 
 
 def test_primary_keys_are_uuid() -> None:

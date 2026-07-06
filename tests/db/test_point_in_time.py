@@ -113,3 +113,15 @@ def test_source_events_as_of_on_postgresql(connection: Any) -> None:
     assert visible_id in ids
     assert future_id not in ids
     assert superseded_id not in ids
+
+    # Once as_of reaches its availability moment, the record becomes visible.
+    later_ids = {row.id for row in connection.execute(select_as_of(m.SourceEvent, AFTER))}
+    assert future_id in later_ids
+    assert superseded_id not in later_ids  # superseded stays invisible
+
+    # Timezone-aware round trip on PostgreSQL.
+    stored = connection.execute(
+        select(m.SourceEvent.available_at).where(m.SourceEvent.id == future_id)
+    ).scalar_one()
+    assert stored.tzinfo is not None
+    assert stored == AFTER
