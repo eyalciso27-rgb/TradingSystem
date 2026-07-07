@@ -1,0 +1,20 @@
+# Grafana datasource provisioning (IMP-0402): Prometheus (metrics) and Loki
+# (operational logs). Explore over these datasources provides browser-side
+# search and filtering by time, service, severity, environment and source
+# (labels) and by symbol, strategy_id, correlation_id, decision_id and
+# order_intent_id (JSON body fields via LogQL `| json`). Full dashboards
+# are out of scope for IMP-0402.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100

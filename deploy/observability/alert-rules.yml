@@ -1,0 +1,30 @@
+# Baseline alert rules (IMP-0402): service health only. More specific
+# trading alerts arrive with the services that emit those metrics.
+
+groups:
+  - name: service-health
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Scrape target {{ $labels.job }} is down"
+          description: "{{ $labels.instance }} has been unreachable for 2 minutes."
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is not accepting connections"
+
+      - alert: NatsServerUnavailable
+        expr: gnatsd_varz_connections < 0 or absent(gnatsd_varz_connections)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NATS monitoring endpoint is unreachable"

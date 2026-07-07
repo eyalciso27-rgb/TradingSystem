@@ -1,0 +1,13 @@
+# Alertmanager routing (IMP-0402): grouping and dedup are configured; the
+# actual notification channel (per Notifications spec) is wired in a later
+# task — no external endpoints and no credentials belong in this file.
+
+route:
+  receiver: default
+  group_by: ["alertname", "job"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: default

@@ -3,7 +3,10 @@ name = "trading-observability"
 version = "0.1.0"
 description = "Logging, metrics and tracing helpers"
 requires-python = ">=3.13,<3.14"
-dependencies = []
+dependencies = [
+    "opentelemetry-api>=1.30",
+    "opentelemetry-sdk>=1.30",
+]
 
 [build-system]
 requires = ["uv_build>=0.9,<0.10"]

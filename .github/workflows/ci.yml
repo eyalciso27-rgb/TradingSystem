@@ -43,10 +43,15 @@ jobs:
           POSTGRES_PASSWORD: ci-syntax-check
           PAPER_POSTGRES_USER: ci-syntax-check
           PAPER_POSTGRES_PASSWORD: ci-syntax-check
+          GRAFANA_ADMIN_USER: ci-syntax-check
+          GRAFANA_ADMIN_PASSWORD: ci-syntax-check
         run: |
           docker compose -f deploy/compose.yaml config -q
           docker compose -f deploy/compose.yaml -f deploy/compose.dev.yaml config -q
           docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml config -q
+          docker compose -f deploy/compose.yaml -f deploy/compose.observability.yaml config -q
+          docker compose -f deploy/compose.yaml -f deploy/compose.dev.yaml -f deploy/compose.observability.yaml config -q
+          docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml -f deploy/compose.observability.yaml config -q
       - name: Whitespace check
         run: git diff --check
       - name: Generators must not modify tracked files

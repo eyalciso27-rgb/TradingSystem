@@ -1,0 +1,58 @@
+// Grafana Alloy pipeline (IMP-0402, ADR-010: Alloy, not Promtail).
+// Collects container stdout (structured JSON lines) and ships to Loki.
+//
+// Only low-cardinality fields become labels (service, environment,
+// severity, source) so browser-side filtering works; high-cardinality
+// identifiers (symbol, strategy_id, correlation_id, decision_id,
+// order_intent_id) stay in the JSON body and are queried with
+// `| json | field="value"` per the Technology spec.
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  forward_to = [loki.process.structured.receiver]
+}
+
+loki.process "structured" {
+  // Structured records: promote canonical low-cardinality fields to labels.
+  stage.json {
+    expressions = {
+      service     = "service",
+      environment = "environment",
+      severity    = "severity",
+      source      = "source",
+    }
+    drop_malformed = false
+  }
+
+  stage.labels {
+    values = {
+      service     = "",
+      environment = "",
+      severity    = "",
+      source      = "",
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
