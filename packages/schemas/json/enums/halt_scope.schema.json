@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/halt_scope/v1",
+  "title": "HaltScope",
+  "description": "Scope levels of an emergency halt / kill switch.",
+  "type": "string",
+  "enum": [
+    "GLOBAL_ENTRY_HALT",
+    "ENVIRONMENT_HALT",
+    "BROKER_HALT",
+    "ACCOUNT_HALT",
+    "STRATEGY_HALT",
+    "SYMBOL_HALT",
+    "SOURCE_HALT",
+    "MODEL_HALT"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

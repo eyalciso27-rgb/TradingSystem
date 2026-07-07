@@ -41,7 +41,9 @@ from trading_contracts.enums import (
     AssessmentStatus,
     CalibrationStatus,
     DecisionOutcome,
+    EmergencyCommandType,
     Environment,
+    HaltScope,
     OperatingMode,
     OrderRole,
     OrderState,
@@ -655,6 +657,52 @@ class AuditEvent(Base):
         UniqueConstraint("sequence_no"),
         UniqueConstraint("current_hash"),
         Index("ix_audit_events_occurred_at", "occurred_at"),
+    )
+
+
+class EmergencyCommand(Base):
+    """Append-only emergency-control command log (IMP-0404).
+
+    Authority: Data_Model_and_Retention_Specification_v0.6 section 18
+    (emergency_commands: command, scope, actor, auth level, ack, result;
+    append-only, not normally deletable) and Security_and_Operations_
+    Specification_v0.6 section 12. The active-halt state is derived by
+    replaying this log (latest lifecycle command per scope+target); there is
+    no separate mutable state table, so the persistent record is
+    tamper-resistant by construction.
+    """
+
+    __tablename__ = "emergency_commands"
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    command: Mapped[str] = mapped_column(Text, nullable=False)
+    halt_scope: Mapped[str | None] = mapped_column(Text)
+    target_ref: Mapped[str | None] = mapped_column(Text)
+    environment: Mapped[str] = mapped_column(Text, nullable=False)
+    actor_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    auth_level: Mapped[str] = mapped_column(Text, nullable=False)
+    reason_code: Mapped[str] = mapped_column(Text, nullable=False)
+    reason_text: Mapped[str] = mapped_column(Text, nullable=False)
+    keep_protection: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    acknowledged: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    acknowledged_at: Mapped[datetime | None] = _ts()
+    acknowledged_by: Mapped[str | None] = mapped_column(Text)
+    result: Mapped[str] = mapped_column(Text, nullable=False)
+    correlation_id: Mapped[PyUUID | None] = mapped_column(UUID(as_uuid=True))
+    issued_at: Mapped[datetime] = _ts(nullable=False)
+    created_at: Mapped[datetime] = _ts(nullable=False)
+
+    __table_args__ = (
+        enum_check("command", EmergencyCommandType, "emergency_commands_command"),
+        raw_check(
+            "halt_scope IS NULL OR halt_scope IN ("
+            + ", ".join(f"'{m.value}'" for m in HaltScope)
+            + ")",
+            "emergency_commands_halt_scope",
+        ),
+        enum_check("environment", Environment, "emergency_commands_environment"),
+        Index("ix_emergency_commands_halt_scope_target_ref", "halt_scope", "target_ref"),
+        Index("ix_emergency_commands_issued_at", "issued_at"),
     )
 
 

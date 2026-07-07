@@ -313,6 +313,43 @@ class TradePlanStatus(StrEnum):
     EXPIRED = "EXPIRED"
 
 
+class HaltScope(StrEnum):
+    """Scope levels of an emergency halt / kill switch.
+
+    Authority: Security_and_Operations_Specification_v0.6 section 12 (Kill
+    Switch levels). A halt's default behavior is to stop new entries while
+    preserving existing protective orders (section 12 preamble, 24.1
+    KEEP_PROTECTION default).
+    """
+
+    GLOBAL_ENTRY_HALT = "GLOBAL_ENTRY_HALT"
+    ENVIRONMENT_HALT = "ENVIRONMENT_HALT"
+    BROKER_HALT = "BROKER_HALT"
+    ACCOUNT_HALT = "ACCOUNT_HALT"
+    STRATEGY_HALT = "STRATEGY_HALT"
+    SYMBOL_HALT = "SYMBOL_HALT"
+    SOURCE_HALT = "SOURCE_HALT"
+    MODEL_HALT = "MODEL_HALT"
+
+
+class EmergencyCommandType(StrEnum):
+    """Emergency commands recorded in the append-only emergency log.
+
+    Authority: Security_and_Operations_Specification_v0.6 section 12.2
+    (activation / cancellation of a Kill Switch — ACTIVATE_HALT / RESUME)
+    and section 12.1 (position emergency actions: cancel unfilled entries,
+    cancel-and-rebuild protection, reduce risk, flatten account). Flatten is
+    a separate, explicitly approved, re-authenticated action (12.2).
+    """
+
+    ACTIVATE_HALT = "ACTIVATE_HALT"
+    RESUME = "RESUME"
+    CANCEL_UNFILLED_ENTRIES = "CANCEL_UNFILLED_ENTRIES"
+    CANCEL_AND_REBUILD_PROTECTION = "CANCEL_AND_REBUILD_PROTECTION"
+    REDUCE_RISK = "REDUCE_RISK"
+    FLATTEN_ACCOUNT = "FLATTEN_ACCOUNT"
+
+
 CANONICAL_ENUMS: Final[tuple[type[StrEnum], ...]] = (
     SourceEntryType,
     DecisionOutcome,
@@ -334,6 +371,8 @@ CANONICAL_ENUMS: Final[tuple[type[StrEnum], ...]] = (
     ActionTier,
     RiskDecisionOutcome,
     TradePlanStatus,
+    HaltScope,
+    EmergencyCommandType,
 )
 
 # Canonical mapping from operating mode to its environment axis value

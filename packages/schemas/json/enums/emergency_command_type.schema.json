@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/emergency_command_type/v1",
+  "title": "EmergencyCommandType",
+  "description": "Emergency commands recorded in the append-only emergency log.",
+  "type": "string",
+  "enum": [
+    "ACTIVATE_HALT",
+    "RESUME",
+    "CANCEL_UNFILLED_ENTRIES",
+    "CANCEL_AND_REBUILD_PROTECTION",
+    "REDUCE_RISK",
+    "FLATTEN_ACCOUNT"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

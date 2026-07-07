@@ -291,3 +291,35 @@ export const TRADE_PLAN_STATUS_VALUES: readonly TradePlanStatus[] = Object.freez
 export function isTradePlanStatus(value: string): value is TradePlanStatus {
   return (TRADE_PLAN_STATUS_VALUES as readonly string[]).includes(value);
 }
+
+/** Scope levels of an emergency halt / kill switch. */
+export const HaltScope = {
+  GLOBAL_ENTRY_HALT: "GLOBAL_ENTRY_HALT",
+  ENVIRONMENT_HALT: "ENVIRONMENT_HALT",
+  BROKER_HALT: "BROKER_HALT",
+  ACCOUNT_HALT: "ACCOUNT_HALT",
+  STRATEGY_HALT: "STRATEGY_HALT",
+  SYMBOL_HALT: "SYMBOL_HALT",
+  SOURCE_HALT: "SOURCE_HALT",
+  MODEL_HALT: "MODEL_HALT",
+} as const;
+export type HaltScope = (typeof HaltScope)[keyof typeof HaltScope];
+export const HALT_SCOPE_VALUES: readonly HaltScope[] = Object.freeze(Object.values(HaltScope));
+export function isHaltScope(value: string): value is HaltScope {
+  return (HALT_SCOPE_VALUES as readonly string[]).includes(value);
+}
+
+/** Emergency commands recorded in the append-only emergency log. */
+export const EmergencyCommandType = {
+  ACTIVATE_HALT: "ACTIVATE_HALT",
+  RESUME: "RESUME",
+  CANCEL_UNFILLED_ENTRIES: "CANCEL_UNFILLED_ENTRIES",
+  CANCEL_AND_REBUILD_PROTECTION: "CANCEL_AND_REBUILD_PROTECTION",
+  REDUCE_RISK: "REDUCE_RISK",
+  FLATTEN_ACCOUNT: "FLATTEN_ACCOUNT",
+} as const;
+export type EmergencyCommandType = (typeof EmergencyCommandType)[keyof typeof EmergencyCommandType];
+export const EMERGENCY_COMMAND_TYPE_VALUES: readonly EmergencyCommandType[] = Object.freeze(Object.values(EmergencyCommandType));
+export function isEmergencyCommandType(value: string): value is EmergencyCommandType {
+  return (EMERGENCY_COMMAND_TYPE_VALUES as readonly string[]).includes(value);
+}

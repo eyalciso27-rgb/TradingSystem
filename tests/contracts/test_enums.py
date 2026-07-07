@@ -124,6 +124,26 @@ EXPECTED_VALUES: dict[str, list[str]] = {
     "RiskDecisionOutcome": ["APPROVE", "REDUCE", "VETO"],
     # Data_Model_and_Retention_Specification_v0.6 section 7.6
     "TradePlanStatus": ["DRAFT", "APPROVED", "ACTIVE", "COMPLETED", "CANCELLED", "EXPIRED"],
+    # Security_and_Operations_Specification_v0.6 section 12
+    "HaltScope": [
+        "GLOBAL_ENTRY_HALT",
+        "ENVIRONMENT_HALT",
+        "BROKER_HALT",
+        "ACCOUNT_HALT",
+        "STRATEGY_HALT",
+        "SYMBOL_HALT",
+        "SOURCE_HALT",
+        "MODEL_HALT",
+    ],
+    # Security_and_Operations_Specification_v0.6 sections 12.1/12.2
+    "EmergencyCommandType": [
+        "ACTIVATE_HALT",
+        "RESUME",
+        "CANCEL_UNFILLED_ENTRIES",
+        "CANCEL_AND_REBUILD_PROTECTION",
+        "REDUCE_RISK",
+        "FLATTEN_ACCOUNT",
+    ],
 }
 
 

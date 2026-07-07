@@ -47,6 +47,7 @@ EXPECTED_TABLES = {
     "outbox_messages",
     "consumer_inbox",
     "audit_events",
+    "emergency_commands",
 }
 
 FORBIDDEN_BROKER_TOKENS = [
@@ -177,6 +178,15 @@ def test_audit_migration_exists_and_is_frozen() -> None:
     text = audit.read_text(encoding="utf-8")
     assert 'down_revision: str | None = "0004_consumer_inbox"' in text
     assert "uq_audit_events_sequence_no" in text
+    assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
+
+
+def test_emergency_commands_migration_exists_and_is_frozen() -> None:
+    emergency = MIGRATION.parent / "0006_emergency_commands.py"
+    text = emergency.read_text(encoding="utf-8")
+    assert 'down_revision: str | None = "0005_tamper_evident_audit"' in text
+    assert "emergency_commands" in text
+    assert "ck_emergency_commands_emergency_commands_command" in text
     assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
 
 
