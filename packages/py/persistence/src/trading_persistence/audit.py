@@ -28,7 +28,7 @@ import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final, Protocol
+from typing import Final, Protocol, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, insert, select
@@ -215,10 +215,11 @@ def append_audit_record(
 
 
 def load_chain(connection: Connection) -> list[AuditRecordLike]:
-    rows = connection.execute(
-        select(AuditEvent).order_by(AuditEvent.sequence_no)
-    ).scalars()
-    return list(rows)
+    # Core connection: iterate full rows (named-attribute access). NEVER use
+    # .scalars() here — on a multi-column select it yields only the first
+    # column (id), not the records.
+    result = connection.execute(select(AuditEvent).order_by(AuditEvent.sequence_no))
+    return [cast("AuditRecordLike", row) for row in result]
 
 
 def verify_audit_chain(connection: Connection) -> list[str]:
