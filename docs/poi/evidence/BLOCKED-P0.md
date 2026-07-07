@@ -21,22 +21,17 @@ IMP-0302 (secret store) / IMP-0303 (session store) only.
 - **To run:** build app images on the ARM host, `docker compose up`, health +
   restart-preserves-volumes drill, resource report.
 
-## POI-SOC-WA-USER — WhatsApp user adapter
+## POI-SOC-WA-USER / POI-SOC-DC-USER / POI-SOC-TG-USER — personal user accounts
 
-- **Blocked on:** an authorized WhatsApp user account + pairing on a real
-  device/session, and explicit owner authorization of allowlisted groups.
-  Mandatory user-mode (baseline invariant) cannot be simulated by a bot.
-
-## POI-SOC-DC-USER — Discord user adapter
-
-- **Blocked on:** an authorized Discord user account/session and allowlisted
-  servers/channels. User-mode requirement cannot be substituted by a bot.
-
-## POI-SOC-TG-USER — Telegram user adapter (TDLib)
-
-- **Blocked on:** `api_id`/`api_hash` (my.telegram.org) provisioned via the
-  IMP-0302 secret store, an authorized user account for phone/QR/2FA login,
-  and a host decision for TDLib (arm64 build or documented x86 fallback).
+Per the binding clarification (2026-07-07): personal user accounts are the
+mandatory primary path; bots/business APIs are never substitutes, user and
+bot sessions are separate connector types with no automatic fallback, and a
+bot-only result may never be marked PASS. Detailed per-source evidence
+(user-account status, ToS limits, session lifecycle, reconnect, rate limits,
+ARM64, security risks) lives in dedicated files:
+[POI-SOC-WA-USER.md](POI-SOC-WA-USER.md),
+[POI-SOC-DC-USER.md](POI-SOC-DC-USER.md),
+[POI-SOC-TG-USER.md](POI-SOC-TG-USER.md).
 
 ## POI-SOC-TG-COEX — Telegram user/bot coexistence
 

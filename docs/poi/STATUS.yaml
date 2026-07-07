@@ -18,18 +18,18 @@ items:
   - id: POI-SOC-WA-USER
     priority: P0
     status: BLOCKED
-    evidence: evidence/BLOCKED-P0.md
-    blocked_on: authorized WhatsApp user account + device pairing
+    evidence: evidence/POI-SOC-WA-USER.md
+    blocked_on: owner's personal WhatsApp account + pairing + explicit ToS-risk acknowledgment
   - id: POI-SOC-DC-USER
     priority: P0
     status: BLOCKED
-    evidence: evidence/BLOCKED-P0.md
-    blocked_on: authorized Discord user account/session
+    evidence: evidence/POI-SOC-DC-USER.md
+    blocked_on: owner's Discord user session + owner decision on documented ToS conflict
   - id: POI-SOC-TG-USER
     priority: P0
     status: BLOCKED
-    evidence: evidence/BLOCKED-P0.md
-    blocked_on: api_id/api_hash + authorized user account + TDLib host decision
+    evidence: evidence/POI-SOC-TG-USER.md
+    blocked_on: api_id/api_hash via IMP-0302 + owner's account login + TDLib arm64 host proof
   - id: POI-SOC-TG-COEX
     priority: P0
     status: BLOCKED
