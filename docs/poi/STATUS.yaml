@@ -3,6 +3,23 @@
 # docs/baseline-v0.5/POI_BACKLOG.yaml. Evidence lives in docs/poi/evidence/.
 version: "0.1"
 updated: "2026-07-07"
+
+# PHASE-5 exit gate (DoD of IMP-0501: "Every P0 item PASS/approved alternate
+# ADR."). The three PHASE-5 tasks are implementation-complete (registry,
+# evidence, drills, provider catalog), but the phase exit gate is NOT
+# satisfied: 1 of 12 P0 items is PASS, 11 are BLOCKED on owner-supplied
+# accounts/credentials/hosts, and 0 alternate ADRs exist (an ADR may not be
+# created merely to paper over missing accounts/credentials/test
+# environments). PHASE-6 must not start for a connector whose PoI is BLOCKED.
+phase5_exit_gate:
+  status: BLOCKED_EXTERNAL
+  implementation_complete: true
+  gate_satisfied: false
+  p0_pass: 1
+  p0_blocked: 11
+  alternate_adrs_approved: 0
+  completion_requirements: PHASE5-COMPLETION-REQUIREMENTS.md
+
 items:
   - id: POI-PLAT-ARM-001
     priority: P0
