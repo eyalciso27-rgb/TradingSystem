@@ -1,0 +1,8 @@
+{
+  "schema_version": "v1",
+  "alert_id": "tv-2026-07-07-000124",
+  "symbol": "AAPL",
+  "side": "BUY",
+  "quantity": 100,
+  "action": "place_order_now"
+}

@@ -66,3 +66,21 @@ items:
     evidence: evidence/POI-EMERG-001.md
     drill: tests/poi/test_poi_emerg_001.py
     blocked_on: UI halt path (no dashboard yet) + cross-process restart on PostgreSQL
+  - id: POI-SOC-TG-BOT
+    priority: P1
+    status: BLOCKED
+    evidence: evidence/POI-SOC-TG-BOT.md
+    drill: tests/poi/test_poi_tg_bot.py
+    blocked_on: dedicated bot token (separate from ingestion) + authorized chats
+  - id: POI-TV-001
+    priority: P1
+    status: BLOCKED
+    evidence: evidence/POI-TV-001.md
+    drill: tests/poi/test_poi_tv_001.py
+    blocked_on: TradingView account + hosted TLS endpoint; contract/security fixtures done
+  - id: POI-OBS-001
+    priority: P1
+    status: BLOCKED
+    evidence: evidence/POI-OBS-001.md
+    drill: tests/poi/test_poi_obs_001.py
+    blocked_on: Docker host for live stack + Telegram alert token; local chain drills pass

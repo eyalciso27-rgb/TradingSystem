@@ -1,0 +1,11 @@
+{
+  "schema_version": "v1",
+  "alert_id": "tv-2026-07-07-000123",
+  "symbol": "AAPL",
+  "exchange": "NASDAQ",
+  "condition": "close crossed above sma(20)",
+  "triggered_at": "2026-07-07T14:30:05Z",
+  "interval": "5m",
+  "price": "212.4400",
+  "strategy_ref": "tv-watch-breakout"
+}

@@ -1,0 +1,16 @@
+{
+  "update_id": 900000103,
+  "message": {
+    "message_id": 777,
+    "from": {"id": 111111111, "is_bot": false, "first_name": "Author"},
+    "chat": {"id": -100987654321, "title": "Example Group", "type": "supergroup"},
+    "date": 1783520000,
+    "text": "watching TSLA into the close",
+    "reply_to_message": {
+      "message_id": 770,
+      "chat": {"id": -100987654321, "title": "Example Group", "type": "supergroup"},
+      "date": 1783519000,
+      "text": "any setups today?"
+    }
+  }
+}

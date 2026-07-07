@@ -1,0 +1,10 @@
+{
+  "update_id": 900000101,
+  "channel_post": {
+    "message_id": 5123,
+    "sender_chat": {"id": -1001234567890, "title": "Example Signals", "type": "channel"},
+    "chat": {"id": -1001234567890, "title": "Example Signals", "type": "channel"},
+    "date": 1783519805,
+    "text": "AAPL setting up above 212, watching for volume"
+  }
+}
