@@ -37,6 +37,16 @@ jobs:
         run: uv run python scripts/check_architecture.py
       - name: Contract generation drift check
         run: uv run python scripts/generate_contracts.py --check
+      - name: Docker Compose config validation
+        env:
+          POSTGRES_USER: ci-syntax-check
+          POSTGRES_PASSWORD: ci-syntax-check
+          PAPER_POSTGRES_USER: ci-syntax-check
+          PAPER_POSTGRES_PASSWORD: ci-syntax-check
+        run: |
+          docker compose -f deploy/compose.yaml config -q
+          docker compose -f deploy/compose.yaml -f deploy/compose.dev.yaml config -q
+          docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml config -q
       - name: Whitespace check
         run: git diff --check
       - name: Generators must not modify tracked files

@@ -1,0 +1,28 @@
+# Development override (IMP-0401): persistent local volumes and loopback-only
+# port bindings. Only approved endpoints are exposed, and only on 127.0.0.1 —
+# PostgreSQL and NATS are never reachable from outside the developer machine.
+#
+# Usage:
+#   docker compose -f deploy/compose.yaml -f deploy/compose.dev.yaml up -d
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pg-data-dev:/var/lib/postgresql/data
+
+  nats:
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - nats-data-dev:/data
+
+networks:
+  trading:
+    name: trading-dev
+
+volumes:
+  pg-data-dev:
+  nats-data-dev:

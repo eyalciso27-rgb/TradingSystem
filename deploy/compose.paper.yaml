@@ -1,0 +1,32 @@
+# PAPER environment override (IMP-0401, Security spec section 6).
+#
+# Paper is fully isolated from dev/test and from any future Live stack:
+# its own network, its own volumes, its own credentials (PAPER_* variables,
+# provided at deploy time from the PAPER secret store per IMP-0302 — never
+# shared with any other environment and never written into this file).
+# No ports are published: services are reachable only on the internal
+# trading-paper network. LIVE remains disabled — no live stack exists.
+#
+# Usage:
+#   docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml up -d
+
+services:
+  postgres:
+    environment:
+      POSTGRES_USER: ${PAPER_POSTGRES_USER:?PAPER credentials come from the PAPER secret store}
+      POSTGRES_PASSWORD: ${PAPER_POSTGRES_PASSWORD:?PAPER credentials come from the PAPER secret store}
+      POSTGRES_DB: ${PAPER_POSTGRES_DB:-trading_paper}
+    volumes:
+      - pg-data-paper:/var/lib/postgresql/data
+
+  nats:
+    volumes:
+      - nats-data-paper:/data
+
+networks:
+  trading:
+    name: trading-paper
+
+volumes:
+  pg-data-paper:
+  nats-data-paper:

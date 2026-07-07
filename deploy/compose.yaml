@@ -1,0 +1,42 @@
+# Base / test-CI stack (IMP-0401, ADR-009: Docker Compose on Oracle ARM64).
+#
+# Infrastructure services only (PostgreSQL 18 per ADR-006, NATS JetStream per
+# ADR-007); application services join once their canonical Dockerfiles exist.
+# Used directly for ephemeral test/CI runs (no published ports, no volumes);
+# development and paper are overrides (compose.dev.yaml / compose.paper.yaml).
+#
+# No credentials live in this file: every secret value comes from the
+# environment at run time (`:?` fails closed when unset — no defaults). Both
+# images are official multi-arch (amd64 + arm64) and are never tagged latest.
+
+name: trading-system
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be provided; no default credentials}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be provided; no default credentials}
+      POSTGRES_DB: ${POSTGRES_DB:-trading}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - trading
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - trading
+
+networks:
+  trading:
+    name: trading-test
