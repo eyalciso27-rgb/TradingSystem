@@ -46,7 +46,9 @@ items:
     priority: P0
     status: BLOCKED
     evidence: evidence/POI-SOC-TG-USER.md
-    blocked_on: api_id/api_hash via IMP-0302 + owner's account login + TDLib arm64 host proof
+    blocked_on: waiting for TDLib build (Windows x64 build tools approved/installed by
+      owner) + api_id/api_hash via IMP-0302 + owner's account login + TDLib arm64 host
+      proof. Harness + drills ready (scripts/poi_tg_user.py, tests/poi).
   - id: POI-SOC-TG-COEX
     priority: P0
     status: BLOCKED
