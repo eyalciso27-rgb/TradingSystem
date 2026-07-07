@@ -1,0 +1,123 @@
+# Canonical provider / runtime capability catalog (IMP-0503).
+#
+# Every provider/runtime assumption used by implementation tasks is either
+# FROZEN (decided by the authority documents / ADRs listed) or PENDING_POI
+# (explicitly unresolved, pointing at the exact blocking PoI in
+# docs/poi/STATUS.yaml). Nothing may rely on an assumption absent from this
+# catalog. Statuses: FROZEN | PENDING_POI.
+#
+# Binding: user and bot sessions are separate connector types with NO
+# automatic fallback; personal user accounts are the mandatory primary path
+# for social sources (clarification 2026-07-07). LIVE stays disabled.
+
+version: "0.1"
+updated: "2026-07-07"
+
+runtime:
+  - id: python
+    status: FROZEN
+    decision: Python 3.13 + uv workspace (ruff, mypy strict, pytest)
+    authority: Technology spec section 3
+  - id: node
+    status: FROZEN
+    decision: Node 24 + pnpm via corepack (TypeScript, eslint, vitest)
+    authority: Technology spec section 3
+  - id: database
+    status: FROZEN
+    decision: PostgreSQL 18.x, SQLAlchemy 2.0 + Alembic, frozen explicit-DDL migrations
+    authority: ADR-006; Technology spec section 7
+  - id: message-bus
+    status: FROZEN
+    decision: NATS JetStream (nats:2.10-alpine image, multi-arch)
+    authority: ADR-007
+  - id: orchestration
+    status: FROZEN
+    decision: Docker Compose stacks (dev/test/paper + observability profile); no Kubernetes
+    authority: ADR-009; deploy/compose*.yaml
+  - id: observability
+    status: FROZEN
+    decision: Prometheus + Grafana + Loki (single binary) + Alloy + Alertmanager + exporters
+    authority: ADR-010; IMP-0402
+  - id: secrets-at-rest
+    status: FROZEN
+    decision: SOPS + age encrypted files; FileSecretStore (IMP-0302); no defaults
+    authority: Technology spec section 14
+  - id: runtime-sessions
+    status: FROZEN
+    decision: Fernet-encrypted per-connector RuntimeSessionStore (IMP-0303); PoI PASS (POI-SEC-SESS-002)
+    authority: Integration spec section 20.7; docs/poi/evidence/POI-SEC-SESS-002.md
+  - id: deployment-target
+    status: FROZEN
+    decision: Oracle Linux ARM64 server; local dev stays portable (Windows x64)
+    authority: Technology spec sections 2/16
+  - id: arm64-app-images
+    status: PENDING_POI
+    blocking_poi: POI-PLAT-ARM-001
+    note: app Dockerfiles + arm64 build/run proof on the target host
+
+connectors:
+  - id: whatsapp-user
+    status: PENDING_POI
+    blocking_poi: POI-SOC-WA-USER
+    note: mandatory primary path (owner's personal account); client library choice decided by the PoI; never replaced by Business API/bot
+  - id: discord-user
+    status: PENDING_POI
+    blocking_poi: POI-SOC-DC-USER
+    note: mandatory primary path; documented ToS conflict requires owner decision; never replaced by a bot
+  - id: telegram-user-tdlib
+    status: FROZEN
+    decision: TDLib (MTProto user client) is the mandatory primary Telegram path; encrypted TDLib DB via IMP-0303
+    authority: baseline invariant; Integration spec section 33
+    note: host/arm64 build proof still owed by POI-SOC-TG-USER (execution pending, choice frozen)
+  - id: telegram-bot
+    status: FROZEN
+    decision: Bot API supplemental only; separate connector type + separate token; never a substitute or fallback
+    authority: baseline invariant; Technology spec section 32.3; docs/poi/evidence/POI-SOC-TG-BOT.md
+  - id: tradingview-webhook
+    status: FROZEN
+    decision: authenticated schema-v1 webhook -> external signal only (no order semantics); alert_id dedup; secret via IMP-0302
+    authority: docs/poi/evidence/POI-TV-001.md; Integration spec (external signals)
+  - id: investingpro
+    status: PENDING_POI
+    blocking_poi: POI-INVPRO-001
+    note: parser/browser-automation approach + field catalog decided by the PoI
+
+market_data:
+  - id: market-data-primary
+    status: PENDING_POI
+    blocking_poi: POI-MD-001
+    note: primary provider for quotes/bars/corporate actions/calendar
+  - id: market-data-fallback
+    status: PENDING_POI
+    blocking_poi: POI-MD-001
+    note: fallback provider + field-ownership matrix; no delayed-data fallback in Auto
+  - id: news-filings
+    status: PENDING_POI
+    blocking_poi: POI-NEWS-001
+    note: primary-source (SEC/IR) path + news provider; point-in-time timestamp rules
+
+brokers:
+  - id: first-broker-adapter
+    status: FROZEN
+    decision: IBKR is the first broker adapter (isolated package; no IBKR identifiers outside it); Paper only
+    authority: baseline invariant; Technology spec
+  - id: ibkr-host-and-capabilities
+    status: PENDING_POI
+    blocking_poi: POI-IBKR-001
+    note: TWS vs IB Gateway host decision + capability matrix + reconciliation fixtures
+
+ai:
+  - id: provider-abstraction
+    status: FROZEN
+    decision: ModelProvider port (budget, timeout, schema validation, no broker tools); output is untrusted structured input
+    authority: Integration spec section 33.1; baseline invariants
+  - id: per-task-providers
+    status: PENDING_POI
+    blocking_poi: POI-AI-001
+    note: model/provider per task + thresholds; no self-reported-confidence gate
+
+notifications:
+  - id: channels
+    status: FROZEN
+    decision: UI + Telegram private alerts (separate notification token); dedup/correlation/ack; never a command channel
+    authority: IMP-0405; Technology spec section 32.3
