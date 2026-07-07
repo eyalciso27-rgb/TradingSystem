@@ -1,0 +1,18 @@
+# POI-PLAT-ARM-001 — proves the Python runtime stack builds and runs on
+# linux/arm64. PoI artifact only (canonical backlog output), NOT the
+# production app image (canonical Dockerfiles arrive with their app tasks).
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+
+WORKDIR /repo
+COPY . .
+
+ENV UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
+
+# Locked resolve + install of the full workspace (native wheels included),
+# then prove imports + architecture guardrails inside the image.
+RUN uv sync --locked \
+    && uv run python scripts/check_architecture.py \
+    && uv run python -c "import platform, trading_persistence, trading_application, trading_observability, cryptography, sqlalchemy, psycopg; print('poi-python build ok on', platform.machine())"
+
+CMD ["uv", "run", "python", "-c", "import platform; print('poi-python runtime ok on', platform.machine())"]

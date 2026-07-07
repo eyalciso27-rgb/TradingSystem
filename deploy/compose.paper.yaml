@@ -17,7 +17,9 @@ services:
       POSTGRES_PASSWORD: ${PAPER_POSTGRES_PASSWORD:?PAPER credentials come from the PAPER secret store}
       POSTGRES_DB: ${PAPER_POSTGRES_DB:-trading_paper}
     volumes:
-      - pg-data-paper:/var/lib/postgresql/data
+      # postgres:18 image layout: single mount at /var/lib/postgresql (data
+      # lives in a versioned subdirectory, enabling pg_upgrade --link).
+      - pg-data-paper:/var/lib/postgresql
 
   nats:
     volumes:

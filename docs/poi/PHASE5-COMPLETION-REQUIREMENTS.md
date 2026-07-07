@@ -1,7 +1,8 @@
 # PHASE-5 Completion Requirements — Blocked P0 Matrix
 
 Exit gate (DoD of IMP-0501): **"Every P0 item PASS/approved alternate ADR."**
-Current: 1/12 P0 PASS (POI-SEC-SESS-002), 11/12 BLOCKED, 0 alternate ADRs.
+Current: 2/12 P0 PASS (POI-SEC-SESS-002, POI-PLAT-ARM-001 — passed 2026-07-07
+on the real Oracle ARM64 host), 10/12 BLOCKED, 0 alternate ADRs.
 PHASE-5 is therefore **implementation complete** but the **exit gate is not
 satisfied** (`phase5_exit_gate: BLOCKED_EXTERNAL` in `STATUS.yaml`).
 
@@ -76,20 +77,14 @@ sessions only via the IMP-0303 encrypted store — never plaintext.
 | ADR possibly needed | No (dedup algorithm decision is an output, not a deviation) |
 | downstream tasks blocked | IMP-0605 (cross-adapter normalization DoD: "Same Telegram post via user/bot creates one candidate") |
 
-## POI-PLAT-ARM-001 — ARM64 Docker stack (P0)
+## POI-PLAT-ARM-001 — ARM64 Docker stack (P0) — ✅ PASS 2026-07-07
 
-| Field | Value |
-|---|---|
-| current_status | BLOCKED |
-| exact blocking dependency | Docker host (target Oracle Linux ARM64) + app Dockerfiles (not yet a task deliverable) |
-| action required from owner | Provide/authorize the Oracle ARM64 server (or a local Docker host for a first pass) |
-| secret/account/environment required | Server access; no secrets beyond compose runtime env vars |
-| explicit ToS/risk approval required | No |
-| minimum real test for PASS | Build Python+Node images arm64 → start postgres/NATS/observability → all healthchecks green → restart preserves volumes → no privileged containers |
-| ARM64 validation required | This PoI **is** the ARM64 validation |
-| expected evidence artifact | compose-poi log + image matrix + resource report appended to a new `evidence/POI-PLAT-ARM-001.md` |
-| ADR possibly needed | Only if a core component cannot run on arm64 |
-| downstream tasks blocked | Every containerized runtime proof; deployment portions of PHASE-6..13; unblocks POI-SOC-TG-USER (host), POI-OBS-001, POI-EMERG-001 (cross-process) |
+Executed on the real Oracle Linux 9.7 aarch64 host: all 9 canonical images
+arm64, full stack healthy, migrations + 72 real-DB tests + 643 focused tests
+on aarch64, PoI Python/Node images built natively, restart preserved volumes,
+no privileged containers. Evidence: `evidence/POI-PLAT-ARM-001.md`.
+Remaining side-note: `age` not installed on the host (encrypted-backup smoke
+only); production app Dockerfiles arrive with their app tasks.
 
 ## POI-MD-001 — Market data provider benchmark (P0)
 

@@ -10,7 +10,9 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
-      - pg-data-dev:/var/lib/postgresql/data
+      # postgres:18 image layout: single mount at /var/lib/postgresql (data
+      # lives in a versioned subdirectory, enabling pg_upgrade --link).
+      - pg-data-dev:/var/lib/postgresql
 
   nats:
     ports:

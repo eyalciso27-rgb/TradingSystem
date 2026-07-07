@@ -7,7 +7,7 @@ updated: "2026-07-07"
 # PHASE-5 exit gate (DoD of IMP-0501: "Every P0 item PASS/approved alternate
 # ADR."). The three PHASE-5 tasks are implementation-complete (registry,
 # evidence, drills, provider catalog), but the phase exit gate is NOT
-# satisfied: 1 of 12 P0 items is PASS, 11 are BLOCKED on owner-supplied
+# satisfied: 2 of 12 P0 items are PASS, 10 are BLOCKED on owner-supplied
 # accounts/credentials/hosts, and 0 alternate ADRs exist (an ADR may not be
 # created merely to paper over missing accounts/credentials/test
 # environments). PHASE-6 must not start for a connector whose PoI is BLOCKED.
@@ -15,17 +15,18 @@ phase5_exit_gate:
   status: BLOCKED_EXTERNAL
   implementation_complete: true
   gate_satisfied: false
-  p0_pass: 1
-  p0_blocked: 11
+  p0_pass: 2
+  p0_blocked: 10
   alternate_adrs_approved: 0
   completion_requirements: PHASE5-COMPLETION-REQUIREMENTS.md
 
 items:
   - id: POI-PLAT-ARM-001
     priority: P0
-    status: BLOCKED
-    evidence: evidence/BLOCKED-P0.md
-    blocked_on: Docker host (target Oracle ARM64) + app Dockerfiles
+    status: PASS
+    evidence: evidence/POI-PLAT-ARM-001.md
+    limitations: encrypted backup smoke still needs `age` on the host; production
+      app Dockerfiles arrive with their app tasks (PoI images proved the toolchains)
   - id: POI-SEC-SESS-002
     priority: P0
     status: PASS
@@ -84,7 +85,8 @@ items:
     status: BLOCKED
     evidence: evidence/POI-EMERG-001.md
     drill: tests/poi/test_poi_emerg_001.py
-    blocked_on: UI halt path (no dashboard yet) + cross-process restart on PostgreSQL
+    blocked_on: UI halt path (no dashboard yet); ARM64/Docker host now available
+      (POI-PLAT-ARM-001 PASS)
   - id: POI-SOC-TG-BOT
     priority: P1
     status: BLOCKED
@@ -102,4 +104,5 @@ items:
     status: BLOCKED
     evidence: evidence/POI-OBS-001.md
     drill: tests/poi/test_poi_obs_001.py
-    blocked_on: Docker host for live stack + Telegram alert token; local chain drills pass
+    blocked_on: Telegram alert token; live stack proven healthy on the ARM64 host
+      (POI-PLAT-ARM-001) — remaining is alert routing end-to-end

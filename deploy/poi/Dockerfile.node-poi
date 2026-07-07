@@ -1,0 +1,16 @@
+# POI-PLAT-ARM-001 — proves the Node 24 / pnpm / TypeScript stack builds and
+# runs on linux/arm64. PoI artifact only, NOT the production connector/UI
+# image.
+FROM node:24-slim
+
+WORKDIR /repo
+COPY . .
+
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+
+RUN corepack enable \
+    && corepack pnpm install --frozen-lockfile \
+    && corepack pnpm typecheck \
+    && node -e "console.log('poi-node build ok on', process.arch)"
+
+CMD ["node", "-e", "console.log('poi-node runtime ok on', process.arch)"]

@@ -51,9 +51,12 @@ runtime:
     decision: Oracle Linux ARM64 server; local dev stays portable (Windows x64)
     authority: Technology spec sections 2/16
   - id: arm64-app-images
-    status: PENDING_POI
-    blocking_poi: POI-PLAT-ARM-001
-    note: app Dockerfiles + arm64 build/run proof on the target host
+    status: FROZEN
+    decision: linux/arm64 proven on the target Oracle host (PoI Python/Node images
+      built and ran natively; full compose stack healthy; all 9 canonical images
+      pulled as arm64; migrations + real-DB tests passed on aarch64). Production
+      app Dockerfiles arrive with their app tasks.
+    authority: docs/poi/evidence/POI-PLAT-ARM-001.md; deploy/poi/compose-poi.yaml
 
 connectors:
   - id: whatsapp-user

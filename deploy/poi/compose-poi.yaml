@@ -1,0 +1,21 @@
+# POI-PLAT-ARM-001 canonical output: builds both PoI runtime images on the
+# target architecture. Run from the repository root:
+#   docker compose -f deploy/poi/compose-poi.yaml build
+# No ports, no volumes, no privileges — build/run proof only.
+
+name: trading-poi-arm
+
+services:
+  poi-python:
+    build:
+      context: ../..
+      dockerfile: deploy/poi/Dockerfile.python-poi
+    image: trading-poi-python:local
+    network_mode: none
+
+  poi-node:
+    build:
+      context: ../..
+      dockerfile: deploy/poi/Dockerfile.node-poi
+    image: trading-poi-node:local
+    network_mode: none
