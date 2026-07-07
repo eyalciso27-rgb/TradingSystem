@@ -323,3 +323,27 @@ export const EMERGENCY_COMMAND_TYPE_VALUES: readonly EmergencyCommandType[] = Ob
 export function isEmergencyCommandType(value: string): value is EmergencyCommandType {
   return (EMERGENCY_COMMAND_TYPE_VALUES as readonly string[]).includes(value);
 }
+
+/** Severity of an operational notification / alert. */
+export const NotificationSeverity = {
+  CRITICAL: "CRITICAL",
+  HIGH: "HIGH",
+  MEDIUM: "MEDIUM",
+  LOW: "LOW",
+} as const;
+export type NotificationSeverity = (typeof NotificationSeverity)[keyof typeof NotificationSeverity];
+export const NOTIFICATION_SEVERITY_VALUES: readonly NotificationSeverity[] = Object.freeze(Object.values(NotificationSeverity));
+export function isNotificationSeverity(value: string): value is NotificationSeverity {
+  return (NOTIFICATION_SEVERITY_VALUES as readonly string[]).includes(value);
+}
+
+/** Delivery channel for an operational notification (MVP). */
+export const NotificationChannel = {
+  UI: "UI",
+  TELEGRAM: "TELEGRAM",
+} as const;
+export type NotificationChannel = (typeof NotificationChannel)[keyof typeof NotificationChannel];
+export const NOTIFICATION_CHANNEL_VALUES: readonly NotificationChannel[] = Object.freeze(Object.values(NotificationChannel));
+export function isNotificationChannel(value: string): value is NotificationChannel {
+  return (NOTIFICATION_CHANNEL_VALUES as readonly string[]).includes(value);
+}

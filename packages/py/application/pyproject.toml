@@ -3,10 +3,11 @@ name = "trading-application"
 version = "0.1.0"
 description = "Application services and use-case orchestration"
 requires-python = ">=3.13,<3.14"
-dependencies = ["trading-config"]
+dependencies = ["trading-config", "trading-observability"]
 
 [tool.uv.sources]
 trading-config = { workspace = true }
+trading-observability = { workspace = true }
 
 [build-system]
 requires = ["uv_build>=0.9,<0.10"]

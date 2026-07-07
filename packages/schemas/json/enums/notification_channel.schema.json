@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/notification_channel/v1",
+  "title": "NotificationChannel",
+  "description": "Delivery channel for an operational notification (MVP).",
+  "type": "string",
+  "enum": [
+    "UI",
+    "TELEGRAM"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

@@ -493,10 +493,14 @@ version = "0.1.0"
 source = { editable = "packages/py/application" }
 dependencies = [
     { name = "trading-config" },
+    { name = "trading-observability" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "trading-config", editable = "packages/py/config" }]
+requires-dist = [
+    { name = "trading-config", editable = "packages/py/config" },
+    { name = "trading-observability", editable = "packages/py/observability" },
+]
 
 [[package]]
 name = "trading-broker-core"

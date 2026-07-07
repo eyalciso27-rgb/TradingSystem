@@ -44,6 +44,8 @@ from trading_contracts.enums import (
     EmergencyCommandType,
     Environment,
     HaltScope,
+    NotificationChannel,
+    NotificationSeverity,
     OperatingMode,
     OrderRole,
     OrderState,
@@ -60,6 +62,12 @@ from trading_contracts.enums import (
 from trading_persistence.base import Base, enum_check, raw_check, values_check
 
 CONFIG_TYPES = ("POLICY", "STRATEGY", "PROVIDER", "SOURCE")
+
+# Delivery outcome of a notification (IMP-0405). Operational status, not a
+# cross-service contract enum: PENDING before dispatch, DELIVERED on provider
+# success, FAILED on provider error (a failed critical alert is retried /
+# escalated by the service rather than silently dropped).
+NOTIFICATION_DELIVERY_STATUSES = ("PENDING", "DELIVERED", "FAILED")
 
 
 def _uuid_pk() -> Mapped[PyUUID]:
@@ -703,6 +711,51 @@ class EmergencyCommand(Base):
         enum_check("environment", Environment, "emergency_commands_environment"),
         Index("ix_emergency_commands_halt_scope_target_ref", "halt_scope", "target_ref"),
         Index("ix_emergency_commands_issued_at", "issued_at"),
+    )
+
+
+class NotificationEvent(Base):
+    """Operational notification / alert (IMP-0405).
+
+    Authority: Data_Model_and_Retention_Specification_v0.6 section 18
+    (notification_events: severity, channel, delivery status, dedup key and
+    ack) and Technology spec section 32.3 (critical alerts require dedup,
+    correlation_id and acknowledgement). ``dedup_key`` is UNIQUE, giving
+    idempotent alert delivery (section 7.6.3). Bodies carry no sensitive
+    material by default (Security spec section 33.2). This is an outbound
+    record only — a notification never carries a trading command.
+    """
+
+    __tablename__ = "notification_events"
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    severity: Mapped[str] = mapped_column(Text, nullable=False)
+    channel: Mapped[str] = mapped_column(Text, nullable=False)
+    dedup_key: Mapped[str] = mapped_column(Text, nullable=False)
+    delivery_status: Mapped[str] = mapped_column(Text, nullable=False)
+    environment: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    correlation_id: Mapped[PyUUID | None] = mapped_column(UUID(as_uuid=True))
+    acknowledged: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    acknowledged_at: Mapped[datetime | None] = _ts()
+    acknowledged_by: Mapped[str | None] = mapped_column(Text)
+    escalated: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    escalated_at: Mapped[datetime | None] = _ts()
+    created_at: Mapped[datetime] = _ts(nullable=False)
+    delivered_at: Mapped[datetime | None] = _ts()
+
+    __table_args__ = (
+        enum_check("severity", NotificationSeverity, "notification_events_severity"),
+        enum_check("channel", NotificationChannel, "notification_events_channel"),
+        values_check(
+            "delivery_status",
+            NOTIFICATION_DELIVERY_STATUSES,
+            "notification_events_delivery_status",
+        ),
+        enum_check("environment", Environment, "notification_events_environment"),
+        UniqueConstraint("dedup_key"),
+        Index("ix_notification_events_severity_created_at", "severity", "created_at"),
     )
 
 

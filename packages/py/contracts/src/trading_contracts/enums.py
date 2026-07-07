@@ -313,6 +313,35 @@ class TradePlanStatus(StrEnum):
     EXPIRED = "EXPIRED"
 
 
+class NotificationSeverity(StrEnum):
+    """Severity of an operational notification / alert.
+
+    Authority: System_Functional_Specification_v0.7 section 20 and
+    Integration_Specification_v0.6 section 20 (CRITICAL / HIGH / MEDIUM /
+    LOW). Critical notifications additionally require dedup, correlation_id
+    and acknowledgement (Technology spec section 32.3).
+    """
+
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+
+class NotificationChannel(StrEnum):
+    """Delivery channel for an operational notification (MVP).
+
+    Authority: Claude_Code_Implementation_Plan IMP-0405 scope (UI + Telegram
+    private alerts); Operations_Console_and_UX_Specification_v0.4 section 14
+    (in-app alert drawer) and Integration_Specification_v0.6 section 33.4
+    (Telegram send_notification to a defined private chat). Notification
+    channels are outbound only and never carry trading commands.
+    """
+
+    UI = "UI"
+    TELEGRAM = "TELEGRAM"
+
+
 class HaltScope(StrEnum):
     """Scope levels of an emergency halt / kill switch.
 
@@ -373,6 +402,8 @@ CANONICAL_ENUMS: Final[tuple[type[StrEnum], ...]] = (
     TradePlanStatus,
     HaltScope,
     EmergencyCommandType,
+    NotificationSeverity,
+    NotificationChannel,
 )
 
 # Canonical mapping from operating mode to its environment axis value

@@ -48,6 +48,7 @@ EXPECTED_TABLES = {
     "consumer_inbox",
     "audit_events",
     "emergency_commands",
+    "notification_events",
 }
 
 FORBIDDEN_BROKER_TOKENS = [
@@ -187,6 +188,15 @@ def test_emergency_commands_migration_exists_and_is_frozen() -> None:
     assert 'down_revision: str | None = "0005_tamper_evident_audit"' in text
     assert "emergency_commands" in text
     assert "ck_emergency_commands_emergency_commands_command" in text
+    assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
+
+
+def test_notification_events_migration_exists_and_is_frozen() -> None:
+    notif = MIGRATION.parent / "0007_notification_events.py"
+    text = notif.read_text(encoding="utf-8")
+    assert 'down_revision: str | None = "0006_emergency_commands"' in text
+    assert "notification_events" in text
+    assert "uq_notification_events_dedup_key" in text
     assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
 
 

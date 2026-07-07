@@ -144,6 +144,10 @@ EXPECTED_VALUES: dict[str, list[str]] = {
         "REDUCE_RISK",
         "FLATTEN_ACCOUNT",
     ],
+    # System_Functional_Specification_v0.7 section 20
+    "NotificationSeverity": ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+    # Claude_Code_Implementation_Plan IMP-0405 scope; UX section 14 / Integration 33.4
+    "NotificationChannel": ["UI", "TELEGRAM"],
 }
 
 
