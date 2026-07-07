@@ -121,9 +121,12 @@ class Principal:
 
 @dataclass(frozen=True)
 class AuthorizationDecision:
+    """One audited decision; ``action`` may be an RBAC action or another
+    audited event name (e.g. quarantine transitions)."""
+
     allowed: bool
     principal_id: str
-    action: AuthAction
+    action: AuthAction | str
     reason: str
 
 
