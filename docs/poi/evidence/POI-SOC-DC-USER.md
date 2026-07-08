@@ -1,7 +1,22 @@
 # POI-SOC-DC-USER — Discord personal user account
 
-**Status: BLOCKED** — the mandatory experiment (the owner's personal Discord
-account/session) has not run. Nothing here substitutes for it.
+**Status: BLOCKED — risk accepted, PoI still required** (ADR-0013,
+2026-07-08). The owner explicitly approved working with the personal Discord
+user account despite the documented ToS violation / account-termination
+risk; the decision gate is resolved, but the mandatory experiment (the
+owner's real session) has not run and nothing here substitutes for it. This
+is NOT a PASS and does not claim the connection works.
+
+Conditions of the acceptance (binding):
+
+- No bypassing of platform security mechanisms, permissions, rate limits or
+  controls; no cookie theft; no malware/spyware techniques; read-only access
+  to servers/channels the account is legitimately a member of.
+- No plaintext token/cookie/session anywhere — session material only via the
+  IMP-0303 RuntimeSessionStore; static secrets only via IMP-0302.
+- All ingestion goes through a `DiscordSourceAdapter` port so a future
+  migration to compliant paths (official Bot API, channel Webhooks, manual
+  forwarding) is an adapter swap, not a rewrite. No automatic fallback.
 
 | Question (binding clarification 2026-07-07) | Answer |
 |---|---|

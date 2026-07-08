@@ -37,12 +37,16 @@ items:
     priority: P0
     status: BLOCKED
     evidence: evidence/POI-SOC-WA-USER.md
-    blocked_on: owner's personal WhatsApp account + pairing + explicit ToS-risk acknowledgment
+    blocked_on: owner's personal WhatsApp account + QR pairing on a controlled host.
+      Risk accepted per ADR-0013 (2026-07-08) — decision gate resolved; PoI run
+      still required; adapter port obligation applies.
   - id: POI-SOC-DC-USER
     priority: P0
     status: BLOCKED
     evidence: evidence/POI-SOC-DC-USER.md
-    blocked_on: owner's Discord user session + owner decision on documented ToS conflict
+    blocked_on: owner's Discord user session run on a controlled host. Risk accepted
+      per ADR-0013 (2026-07-08) — decision gate resolved; PoI run still required;
+      adapter port obligation applies.
   - id: POI-SOC-TG-USER
     priority: P0
     status: BLOCKED

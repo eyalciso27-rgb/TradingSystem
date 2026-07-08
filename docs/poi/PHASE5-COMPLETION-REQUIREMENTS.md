@@ -21,9 +21,9 @@ sessions only via the IMP-0303 encrypted store — never plaintext.
 
 | Field | Value |
 |---|---|
-| current_status | BLOCKED |
+| current_status | BLOCKED — **risk accepted per ADR-0013 (2026-07-08), PoI still required** |
 | exact blocking dependency | Owner's personal WhatsApp account + device pairing (QR) in a controlled environment |
-| action required from owner | Provide the authorized personal account; perform pairing; approve allowlisted groups; **explicitly acknowledge stability/ToS/ban risk in writing before the run** |
+| action required from owner | Provide the authorized personal account; perform pairing; approve allowlisted groups. ~~Acknowledge risk~~ **Done — ToS/ban/lockout + QR-pairing risk accepted in ADR-0013; ingestion must stay behind a `WhatsAppSourceAdapter` port (future: Business API / Green API / manual forwarding)** |
 | secret/account/environment required | Personal WhatsApp account; pairing device; runtime host (dev, later ARM64); session key via IMP-0303 |
 | explicit ToS/risk approval required | **Yes.** No official API exists for personal accounts. Options are (a) unofficial multi-device protocol clients, (b) WhatsApp-Web browser automation, (c) hosted third-party gateways such as **Green API** — all automate a personal account against WhatsApp's terms, all carry account-restriction/ban risk, and a hosted gateway additionally routes message content and the session through a third party's servers (security/privacy exposure). Owner must choose the variant and accept its documented risk; a hosted gateway also requires a data-exposure decision. |
 | minimum real test for PASS | Pair real session → persist (IMP-0303) → restart → reconnect → expiry + revocation → read-only ingestion of allowlisted groups → stable IDs/dedup → attachment capture → gap behavior |
@@ -36,9 +36,9 @@ sessions only via the IMP-0303 encrypted store — never plaintext.
 
 | Field | Value |
 |---|---|
-| current_status | BLOCKED |
-| exact blocking dependency | Owner decision on the documented ToS conflict + owner's user session |
-| action required from owner | **Decide explicitly**, with the risk stated: automating a Discord user account (self-bot — e.g. discord.py-self, discord.js-selfbot-v13, or any user-token automation) is **explicitly prohibited by Discord's Terms of Service** and risks account termination. There is **no approved way to automate a user account.** |
+| current_status | BLOCKED — **risk accepted per ADR-0013 (2026-07-08), PoI still required** |
+| exact blocking dependency | Owner's user session on a controlled host (decision gate resolved) |
+| action required from owner | ~~Decide~~ **Decided — ADR-0013 accepts the risk**: automating a Discord user account (self-bot — e.g. discord.py-self, discord.js-selfbot-v13, or any user-token automation) is **explicitly prohibited by Discord's ToS** and risks account termination; there is no approved way to automate a user account. Conditions: no security-mechanism bypass, no cookie theft, no malware/spyware, read-only, sessions only via IMP-0303; ingestion must stay behind a `DiscordSourceAdapter` port (future: official Bot / Webhook / manual forwarding) |
 | secret/account/environment required | If owner proceeds despite ToS: user session via IMP-0303 (never a plaintext token/cookie); allowlisted servers/channels the user is already a member of |
 | explicit ToS/risk approval required | **Yes — mandatory.** Unlike WhatsApp (where third-party gateways like Green API exist, equally unofficial), **Discord has no equivalent**: no official or third-party sanctioned user-account API. The only officially supported programmatic path is the Bot API/OAuth2 — which, per the binding requirement, is NOT a substitute for user mode. |
 | minimum real test for PASS | Authorize session → reconnect/resume vs re-identify → expiry/revocation → read-only reading of member servers/channels/threads (within the account's own permissions only) → edits/deletes/attachments → dedup/stable IDs → rate-limit behavior |

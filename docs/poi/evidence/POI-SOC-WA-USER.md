@@ -1,7 +1,24 @@
 # POI-SOC-WA-USER — WhatsApp personal user account
 
-**Status: BLOCKED** — the mandatory experiment (the owner's personal WhatsApp
-account) has not run. Nothing here substitutes for it.
+**Status: BLOCKED — risk accepted, PoI still required** (ADR-0013,
+2026-07-08). The owner explicitly approved working with the personal
+WhatsApp user account despite the documented risks: ToS violation, account
+ban/lockout, and the operational dependency on QR device pairing. The
+decision gate is resolved, but the mandatory experiment (real pairing +
+session lifecycle) has not run and nothing here substitutes for it. This is
+NOT a PASS and does not claim the connection works.
+
+Conditions of the acceptance (binding):
+
+- No plaintext storage of secrets, QR material, cookies or sessions —
+  session material only via the IMP-0303 RuntimeSessionStore; static secrets
+  only via IMP-0302.
+- No bypassing of platform security mechanisms or rate limits; read-only
+  ingestion of groups the account is legitimately a member of.
+- All ingestion goes through a `WhatsAppSourceAdapter` port so a future
+  migration to compliant paths (WhatsApp Business API, Green API / an
+  approved hosted provider, manual forwarding) is an adapter swap, not a
+  rewrite. No automatic fallback.
 
 | Question (binding clarification 2026-07-07) | Answer |
 |---|---|
