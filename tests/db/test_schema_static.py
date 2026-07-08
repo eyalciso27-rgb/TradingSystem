@@ -25,6 +25,9 @@ EXPECTED_TABLES = {
     "workspaces",
     "instruments",
     "instrument_aliases",
+    "instrument_symbols",
+    "provider_instrument_mappings",
+    "broker_instrument_mappings",
     "raw_objects",
     "source_events",
     "source_attachments",
@@ -197,6 +200,19 @@ def test_notification_events_migration_exists_and_is_frozen() -> None:
     assert 'down_revision: str | None = "0006_emergency_commands"' in text
     assert "notification_events" in text
     assert "uq_notification_events_dedup_key" in text
+    assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
+
+
+def test_instrument_master_migration_exists_and_is_frozen() -> None:
+    inst = MIGRATION.parent / "0008_instrument_master.py"
+    text = inst.read_text(encoding="utf-8")
+    assert 'down_revision: str | None = "0007_notification_events"' in text
+    for table in (
+        "instrument_symbols",
+        "provider_instrument_mappings",
+        "broker_instrument_mappings",
+    ):
+        assert table in text
     assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
 
 

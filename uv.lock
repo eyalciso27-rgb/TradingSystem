@@ -607,6 +607,7 @@ dependencies = [
     { name = "psycopg", extra = ["binary"] },
     { name = "sqlalchemy" },
     { name = "trading-contracts" },
+    { name = "trading-domain" },
 ]
 
 [package.metadata]
@@ -615,6 +616,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
     { name = "sqlalchemy", specifier = ">=2.0,<2.1" },
     { name = "trading-contracts", editable = "packages/py/contracts" },
+    { name = "trading-domain", editable = "packages/py/domain" },
 ]
 
 [[package]]

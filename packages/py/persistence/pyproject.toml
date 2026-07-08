@@ -5,6 +5,7 @@ description = "Repositories, outbox/inbox and migrations support"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "trading-contracts",
+    "trading-domain",
     "sqlalchemy>=2.0,<2.1",
     "alembic>=1.13,<2",
     "psycopg[binary]>=3.2,<4",
@@ -12,6 +13,7 @@ dependencies = [
 
 [tool.uv.sources]
 trading-contracts = { workspace = true }
+trading-domain = { workspace = true }
 
 [build-system]
 requires = ["uv_build>=0.9,<0.10"]

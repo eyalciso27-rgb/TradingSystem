@@ -117,6 +117,81 @@ class InstrumentAlias(Base):
     __table_args__ = (Index("ix_instrument_aliases_instrument_id", "instrument_id"),)
 
 
+class InstrumentSymbol(Base):
+    """Time-aware symbol/exchange listing (IMP-0701, Data_Model v0.6 section 24.1).
+
+    Separate from the ``instruments`` identity row: a symbol can move venue or
+    be re-listed over time. Resolution is point-in-time (valid_from/valid_to).
+    """
+
+    __tablename__ = "instrument_symbols"
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    instrument_id: Mapped[PyUUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("instruments.id"), nullable=False
+    )
+    symbol: Mapped[str] = mapped_column(Text, nullable=False)
+    exchange: Mapped[str | None] = mapped_column(Text)
+    valid_from: Mapped[datetime] = _ts(nullable=False)
+    valid_to: Mapped[datetime | None] = _ts()
+
+    __table_args__ = (
+        Index("ix_instrument_symbols_symbol", "symbol"),
+        Index("ix_instrument_symbols_instrument_id", "instrument_id"),
+    )
+
+
+class ProviderInstrumentMapping(Base):
+    """Versioned mapping to a data provider's external id (IMP-0701, section 24.1)."""
+
+    __tablename__ = "provider_instrument_mappings"
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    instrument_id: Mapped[PyUUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("instruments.id"), nullable=False
+    )
+    provider_id: Mapped[str] = mapped_column(Text, nullable=False)
+    external_instrument_id: Mapped[str] = mapped_column(Text, nullable=False)
+    valid_from: Mapped[datetime] = _ts(nullable=False)
+    valid_to: Mapped[datetime | None] = _ts()
+
+    __table_args__ = (
+        Index(
+            "ix_provider_instrument_mappings_provider_id_instrument_id",
+            "provider_id",
+            "instrument_id",
+        ),
+    )
+
+
+class BrokerInstrumentMapping(Base):
+    """Versioned mapping to a broker's external id + capabilities (section 24.1).
+
+    Broker-neutral: no broker-specific identifier names or SDK fields; the
+    external id and capability tokens are opaque text.
+    """
+
+    __tablename__ = "broker_instrument_mappings"
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    instrument_id: Mapped[PyUUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("instruments.id"), nullable=False
+    )
+    broker_id: Mapped[str] = mapped_column(Text, nullable=False)
+    external_instrument_id: Mapped[str] = mapped_column(Text, nullable=False)
+    capabilities: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    valid_from: Mapped[datetime] = _ts(nullable=False)
+    valid_to: Mapped[datetime | None] = _ts()
+
+    __table_args__ = (
+        Index(
+            "ix_broker_instrument_mappings_broker_id_instrument_id",
+            "broker_id",
+            "instrument_id",
+        ),
+    )
+
+
 class RawObject(Base):
     __tablename__ = "raw_objects"
 
