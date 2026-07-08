@@ -190,3 +190,18 @@ only); production app Dockerfiles arrive with their app tasks.
 No ADR is created for any of the above while the blocker is merely a missing
 account/credential/host. The Discord ToS conflict is the one item where an
 ADR is the *expected* outcome if the owner declines the risk.
+
+## Owner deferral (ADR-0014, 2026-07-08)
+
+The 10 external P0 PoIs above are **deferred, not passed**. Core development
+proceeds in parallel on mock connectors, golden/synthetic fixtures, replay
+datasets, synthetic market data, manual sample import and **broker-less paper
+simulation**. Forbidden until the relevant PoI PASSes: LIVE trading, real
+PAPER_AUTO against a broker, any order to IBKR, any real
+Telegram/Discord/WhatsApp/InvestingPro/news/market-data/AI call, any claim
+that an external source is validated, and use of unsupplied secrets.
+
+**Binding gate rule:** before any real run against an external source or
+broker, that source's/broker's PoI must be PASS. Mock/fixture implementations
+may be built and tested first; flipping to a live provider is gated on the
+PoI. The PHASE-5 exit gate itself remains UNSATISFIED.

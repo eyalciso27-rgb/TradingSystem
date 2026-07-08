@@ -19,6 +19,14 @@ phase5_exit_gate:
   p0_blocked: 10
   alternate_adrs_approved: 0
   completion_requirements: PHASE5-COMPLETION-REQUIREMENTS.md
+  # Owner deferral (ADR-0014, 2026-07-08): the external P0 PoIs are DEFERRED,
+  # not passed. Core development may proceed on mocks/fixtures/replay/synthetic
+  # data and broker-less paper simulation. Binding rule: before any real run
+  # against an external source or broker, that PoI must be PASS. This does NOT
+  # satisfy the exit gate; the 10 items below stay BLOCKED and OPEN.
+  deferred_by_owner: ADR-0014
+  core_development_allowed: true
+  real_external_activation_allowed: false
 
 items:
   - id: POI-PLAT-ARM-001
