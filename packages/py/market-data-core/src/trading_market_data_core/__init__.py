@@ -5,6 +5,7 @@ port; primary/fallback and freshness policies enforced by the service. No
 real provider is wired (ADR-0014) — only the deterministic fixture provider.
 """
 
+from trading_market_data_core.features import FeatureComputationError
 from trading_market_data_core.fixtures import FixtureMarketDataProvider
 from trading_market_data_core.port import MarketDataProviderPort
 from trading_market_data_core.service import (
@@ -16,6 +17,13 @@ from trading_market_data_core.service import (
     MarketDataService,
     MarketDataUnavailableError,
 )
+from trading_market_data_core.snapshot import (
+    FEATURE_AVAILABLE,
+    FEATURE_UNAVAILABLE,
+    FeatureSnapshot,
+    FeatureSnapshotBuilder,
+    FeatureValue,
+)
 from trading_market_data_core.types import (
     Bar,
     BarSeries,
@@ -25,8 +33,14 @@ from trading_market_data_core.types import (
 )
 
 __all__ = [
+    "FEATURE_AVAILABLE",
+    "FEATURE_UNAVAILABLE",
     "Bar",
     "BarSeries",
+    "FeatureComputationError",
+    "FeatureSnapshot",
+    "FeatureSnapshotBuilder",
+    "FeatureValue",
     "FixtureMarketDataProvider",
     "FreshnessPolicy",
     "FreshnessViolationError",
