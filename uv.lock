@@ -511,12 +511,14 @@ version = "0.1.0"
 source = { editable = "packages/py/application" }
 dependencies = [
     { name = "trading-config" },
+    { name = "trading-market-data-core" },
     { name = "trading-observability" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "trading-config", editable = "packages/py/config" },
+    { name = "trading-market-data-core", editable = "packages/py/market-data-core" },
     { name = "trading-observability", editable = "packages/py/observability" },
 ]
 
