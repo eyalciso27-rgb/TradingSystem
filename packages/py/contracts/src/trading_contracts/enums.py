@@ -358,6 +358,22 @@ class FreshnessClass(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class MarketSessionStatus(StrEnum):
+    """Session status of a market at a point in time.
+
+    Authority: Integration_Specification_v0.6 section 7.2 (Session: Regular,
+    Pre-market, After-hours, Halt/Closed) and System_Functional v0.7 section
+    40.5 (the authoritative calendar defines Open, Close, Early Close,
+    Holiday and Halt).
+    """
+
+    PRE_MARKET = "PRE_MARKET"
+    REGULAR = "REGULAR"
+    AFTER_HOURS = "AFTER_HOURS"
+    HALTED = "HALTED"
+    CLOSED = "CLOSED"
+
+
 class HaltScope(StrEnum):
     """Scope levels of an emergency halt / kill switch.
 
@@ -421,6 +437,7 @@ CANONICAL_ENUMS: Final[tuple[type[StrEnum], ...]] = (
     NotificationSeverity,
     NotificationChannel,
     FreshnessClass,
+    MarketSessionStatus,
 )
 
 # Canonical mapping from operating mode to its environment axis value

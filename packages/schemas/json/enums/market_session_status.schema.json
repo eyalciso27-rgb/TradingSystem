@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/market_session_status/v1",
+  "title": "MarketSessionStatus",
+  "description": "Session status of a market at a point in time.",
+  "type": "string",
+  "enum": [
+    "PRE_MARKET",
+    "REGULAR",
+    "AFTER_HOURS",
+    "HALTED",
+    "CLOSED"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

@@ -361,3 +361,17 @@ export const FRESHNESS_CLASS_VALUES: readonly FreshnessClass[] = Object.freeze(O
 export function isFreshnessClass(value: string): value is FreshnessClass {
   return (FRESHNESS_CLASS_VALUES as readonly string[]).includes(value);
 }
+
+/** Session status of a market at a point in time. */
+export const MarketSessionStatus = {
+  PRE_MARKET: "PRE_MARKET",
+  REGULAR: "REGULAR",
+  AFTER_HOURS: "AFTER_HOURS",
+  HALTED: "HALTED",
+  CLOSED: "CLOSED",
+} as const;
+export type MarketSessionStatus = (typeof MarketSessionStatus)[keyof typeof MarketSessionStatus];
+export const MARKET_SESSION_STATUS_VALUES: readonly MarketSessionStatus[] = Object.freeze(Object.values(MarketSessionStatus));
+export function isMarketSessionStatus(value: string): value is MarketSessionStatus {
+  return (MARKET_SESSION_STATUS_VALUES as readonly string[]).includes(value);
+}
