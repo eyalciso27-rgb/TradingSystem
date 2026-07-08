@@ -40,6 +40,7 @@ from trading_contracts.enums import (
     ActionTier,
     AssessmentStatus,
     CalibrationStatus,
+    CorporateActionType,
     DecisionOutcome,
     EmergencyCommandType,
     Environment,
@@ -188,6 +189,51 @@ class BrokerInstrumentMapping(Base):
             "ix_broker_instrument_mappings_broker_id_instrument_id",
             "broker_id",
             "instrument_id",
+        ),
+    )
+
+
+class CorporateAction(Base):
+    """Corporate action event (IMP-0705, Data_Model v0.6 section 24.1).
+
+    Ratio is stored as an exact integer fraction (numerator/denominator) —
+    never a float. Status follows the workflow lifecycle
+    (OBSERVED/VALIDATED/CONFLICT/RESOLVED); an unresolved action blocks the
+    affected instrument only (enforced by the application workflow).
+    """
+
+    __tablename__ = "corporate_actions"
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    instrument_id: Mapped[PyUUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("instruments.id"), nullable=False
+    )
+    action_type: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    announced_at: Mapped[datetime | None] = _ts()
+    effective_at: Mapped[datetime] = _ts(nullable=False)
+    available_at: Mapped[datetime] = _ts(nullable=False)
+    ratio_numerator: Mapped[int | None] = mapped_column(BigInteger)
+    ratio_denominator: Mapped[int | None] = mapped_column(BigInteger)
+    new_symbol: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _ts(nullable=False)
+
+    __table_args__ = (
+        enum_check("action_type", CorporateActionType, "corporate_actions_action_type"),
+        values_check(
+            "status",
+            ("OBSERVED", "VALIDATED", "CONFLICT", "RESOLVED"),
+            "corporate_actions_status",
+        ),
+        raw_check(
+            "(ratio_numerator IS NULL) = (ratio_denominator IS NULL)",
+            "corporate_actions_ratio_pair",
+        ),
+        Index(
+            "ix_corporate_actions_instrument_id_available_at",
+            "instrument_id",
+            "available_at",
         ),
     )
 

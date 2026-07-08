@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/corporate_action_type/v1",
+  "title": "CorporateActionType",
+  "description": "Type of a corporate action event.",
+  "type": "string",
+  "enum": [
+    "SPLIT",
+    "REVERSE_SPLIT",
+    "SYMBOL_CHANGE",
+    "DELISTING",
+    "MERGER"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

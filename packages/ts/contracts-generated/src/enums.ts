@@ -375,3 +375,17 @@ export const MARKET_SESSION_STATUS_VALUES: readonly MarketSessionStatus[] = Obje
 export function isMarketSessionStatus(value: string): value is MarketSessionStatus {
   return (MARKET_SESSION_STATUS_VALUES as readonly string[]).includes(value);
 }
+
+/** Type of a corporate action event. */
+export const CorporateActionType = {
+  SPLIT: "SPLIT",
+  REVERSE_SPLIT: "REVERSE_SPLIT",
+  SYMBOL_CHANGE: "SYMBOL_CHANGE",
+  DELISTING: "DELISTING",
+  MERGER: "MERGER",
+} as const;
+export type CorporateActionType = (typeof CorporateActionType)[keyof typeof CorporateActionType];
+export const CORPORATE_ACTION_TYPE_VALUES: readonly CorporateActionType[] = Object.freeze(Object.values(CorporateActionType));
+export function isCorporateActionType(value: string): value is CorporateActionType {
+  return (CORPORATE_ACTION_TYPE_VALUES as readonly string[]).includes(value);
+}

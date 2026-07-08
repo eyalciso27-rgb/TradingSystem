@@ -358,6 +358,21 @@ class FreshnessClass(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class CorporateActionType(StrEnum):
+    """Type of a corporate action event.
+
+    Authority: System_Functional_Specification_v0.7 section 40.6 (Split,
+    Reverse Split, Symbol Change, Delisting and Merger create a
+    CorporateActionEvent) and the IMP-0705 scope.
+    """
+
+    SPLIT = "SPLIT"
+    REVERSE_SPLIT = "REVERSE_SPLIT"
+    SYMBOL_CHANGE = "SYMBOL_CHANGE"
+    DELISTING = "DELISTING"
+    MERGER = "MERGER"
+
+
 class MarketSessionStatus(StrEnum):
     """Session status of a market at a point in time.
 
@@ -438,6 +453,7 @@ CANONICAL_ENUMS: Final[tuple[type[StrEnum], ...]] = (
     NotificationChannel,
     FreshnessClass,
     MarketSessionStatus,
+    CorporateActionType,
 )
 
 # Canonical mapping from operating mode to its environment axis value

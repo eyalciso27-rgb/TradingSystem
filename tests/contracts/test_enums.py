@@ -152,6 +152,14 @@ EXPECTED_VALUES: dict[str, list[str]] = {
     "FreshnessClass": ["REALTIME", "NEAR_REALTIME", "DELAYED", "STALE", "UNKNOWN"],
     # Integration_Specification_v0.6 section 7.2 / System_Functional 40.5
     "MarketSessionStatus": ["PRE_MARKET", "REGULAR", "AFTER_HOURS", "HALTED", "CLOSED"],
+    # System_Functional_Specification_v0.7 section 40.6
+    "CorporateActionType": [
+        "SPLIT",
+        "REVERSE_SPLIT",
+        "SYMBOL_CHANGE",
+        "DELISTING",
+        "MERGER",
+    ],
 }
 
 

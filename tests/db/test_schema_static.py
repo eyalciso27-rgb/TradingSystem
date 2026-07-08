@@ -28,6 +28,7 @@ EXPECTED_TABLES = {
     "instrument_symbols",
     "provider_instrument_mappings",
     "broker_instrument_mappings",
+    "corporate_actions",
     "raw_objects",
     "source_events",
     "source_attachments",
@@ -213,6 +214,15 @@ def test_instrument_master_migration_exists_and_is_frozen() -> None:
         "broker_instrument_mappings",
     ):
         assert table in text
+    assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
+
+
+def test_corporate_actions_migration_exists_and_is_frozen() -> None:
+    corp = MIGRATION.parent / "0009_corporate_actions.py"
+    text = corp.read_text(encoding="utf-8")
+    assert 'down_revision: str | None = "0008_instrument_master"' in text
+    assert "corporate_actions" in text
+    assert "ck_corporate_actions_corporate_actions_ratio_pair" in text
     assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
 
 
