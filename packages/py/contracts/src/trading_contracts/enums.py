@@ -358,6 +358,21 @@ class FreshnessClass(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class MarketRegime(StrEnum):
+    """Market regime classification.
+
+    Authority: Portfolio_Capital_Allocation_and_Market_Regime_v0.1 section 5.
+    UNKNOWN is an explicit state and is never treated as NORMAL (section 10).
+    """
+
+    TRENDING_RISK_ON = "TRENDING_RISK_ON"
+    RANGE_BOUND = "RANGE_BOUND"
+    HIGH_VOLATILITY = "HIGH_VOLATILITY"
+    RISK_OFF = "RISK_OFF"
+    EVENT_STRESS = "EVENT_STRESS"
+    UNKNOWN = "UNKNOWN"
+
+
 class CorporateActionType(StrEnum):
     """Type of a corporate action event.
 
@@ -454,6 +469,7 @@ CANONICAL_ENUMS: Final[tuple[type[StrEnum], ...]] = (
     FreshnessClass,
     MarketSessionStatus,
     CorporateActionType,
+    MarketRegime,
 )
 
 # Canonical mapping from operating mode to its environment axis value

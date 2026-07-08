@@ -160,6 +160,15 @@ EXPECTED_VALUES: dict[str, list[str]] = {
         "DELISTING",
         "MERGER",
     ],
+    # Portfolio_Capital_Allocation_and_Market_Regime_v0.1 section 5
+    "MarketRegime": [
+        "TRENDING_RISK_ON",
+        "RANGE_BOUND",
+        "HIGH_VOLATILITY",
+        "RISK_OFF",
+        "EVENT_STRESS",
+        "UNKNOWN",
+    ],
 }
 
 

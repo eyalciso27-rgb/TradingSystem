@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/market_regime/v1",
+  "title": "MarketRegime",
+  "description": "Market regime classification.",
+  "type": "string",
+  "enum": [
+    "TRENDING_RISK_ON",
+    "RANGE_BOUND",
+    "HIGH_VOLATILITY",
+    "RISK_OFF",
+    "EVENT_STRESS",
+    "UNKNOWN"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

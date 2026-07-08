@@ -389,3 +389,18 @@ export const CORPORATE_ACTION_TYPE_VALUES: readonly CorporateActionType[] = Obje
 export function isCorporateActionType(value: string): value is CorporateActionType {
   return (CORPORATE_ACTION_TYPE_VALUES as readonly string[]).includes(value);
 }
+
+/** Market regime classification. */
+export const MarketRegime = {
+  TRENDING_RISK_ON: "TRENDING_RISK_ON",
+  RANGE_BOUND: "RANGE_BOUND",
+  HIGH_VOLATILITY: "HIGH_VOLATILITY",
+  RISK_OFF: "RISK_OFF",
+  EVENT_STRESS: "EVENT_STRESS",
+  UNKNOWN: "UNKNOWN",
+} as const;
+export type MarketRegime = (typeof MarketRegime)[keyof typeof MarketRegime];
+export const MARKET_REGIME_VALUES: readonly MarketRegime[] = Object.freeze(Object.values(MarketRegime));
+export function isMarketRegime(value: string): value is MarketRegime {
+  return (MARKET_REGIME_VALUES as readonly string[]).includes(value);
+}
