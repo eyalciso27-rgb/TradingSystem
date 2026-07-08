@@ -342,6 +342,22 @@ class NotificationChannel(StrEnum):
     TELEGRAM = "TELEGRAM"
 
 
+class FreshnessClass(StrEnum):
+    """Freshness class of a market datum.
+
+    Authority: Integration_Specification_v0.6 section 7.3. STALE is never
+    allowed for a new decision; UNKNOWN fails closed. DELAYED serves
+    research/replay only — never automatic trading, and there is no fallback
+    to DELAYED when a strategy requires REALTIME (section 7.4).
+    """
+
+    REALTIME = "REALTIME"
+    NEAR_REALTIME = "NEAR_REALTIME"
+    DELAYED = "DELAYED"
+    STALE = "STALE"
+    UNKNOWN = "UNKNOWN"
+
+
 class HaltScope(StrEnum):
     """Scope levels of an emergency halt / kill switch.
 
@@ -404,6 +420,7 @@ CANONICAL_ENUMS: Final[tuple[type[StrEnum], ...]] = (
     EmergencyCommandType,
     NotificationSeverity,
     NotificationChannel,
+    FreshnessClass,
 )
 
 # Canonical mapping from operating mode to its environment axis value

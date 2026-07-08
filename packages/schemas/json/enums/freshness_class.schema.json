@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/freshness_class/v1",
+  "title": "FreshnessClass",
+  "description": "Freshness class of a market datum.",
+  "type": "string",
+  "enum": [
+    "REALTIME",
+    "NEAR_REALTIME",
+    "DELAYED",
+    "STALE",
+    "UNKNOWN"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

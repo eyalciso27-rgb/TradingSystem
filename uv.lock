@@ -582,6 +582,16 @@ source = { editable = "apps/execution-agent" }
 name = "trading-market-data-core"
 version = "0.1.0"
 source = { editable = "packages/py/market-data-core" }
+dependencies = [
+    { name = "trading-contracts" },
+    { name = "trading-domain" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "trading-contracts", editable = "packages/py/contracts" },
+    { name = "trading-domain", editable = "packages/py/domain" },
+]
 
 [[package]]
 name = "trading-observability"

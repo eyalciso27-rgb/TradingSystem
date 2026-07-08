@@ -347,3 +347,17 @@ export const NOTIFICATION_CHANNEL_VALUES: readonly NotificationChannel[] = Objec
 export function isNotificationChannel(value: string): value is NotificationChannel {
   return (NOTIFICATION_CHANNEL_VALUES as readonly string[]).includes(value);
 }
+
+/** Freshness class of a market datum. */
+export const FreshnessClass = {
+  REALTIME: "REALTIME",
+  NEAR_REALTIME: "NEAR_REALTIME",
+  DELAYED: "DELAYED",
+  STALE: "STALE",
+  UNKNOWN: "UNKNOWN",
+} as const;
+export type FreshnessClass = (typeof FreshnessClass)[keyof typeof FreshnessClass];
+export const FRESHNESS_CLASS_VALUES: readonly FreshnessClass[] = Object.freeze(Object.values(FreshnessClass));
+export function isFreshnessClass(value: string): value is FreshnessClass {
+  return (FRESHNESS_CLASS_VALUES as readonly string[]).includes(value);
+}

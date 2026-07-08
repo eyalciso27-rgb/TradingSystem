@@ -148,6 +148,8 @@ EXPECTED_VALUES: dict[str, list[str]] = {
     "NotificationSeverity": ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
     # Claude_Code_Implementation_Plan IMP-0405 scope; UX section 14 / Integration 33.4
     "NotificationChannel": ["UI", "TELEGRAM"],
+    # Integration_Specification_v0.6 section 7.3
+    "FreshnessClass": ["REALTIME", "NEAR_REALTIME", "DELAYED", "STALE", "UNKNOWN"],
 }
 
 
