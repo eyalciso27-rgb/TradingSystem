@@ -358,6 +358,21 @@ class FreshnessClass(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class PortfolioAction(StrEnum):
+    """Portfolio pre-check action for a candidate.
+
+    Authority: Portfolio_Capital_Allocation_and_Market_Regime_v0.1 section 8
+    (portfolio action: ALLOW | REDUCE | MANUAL | REJECT). The Portfolio
+    Engine may only reduce quantity, never increase beyond the Risk Engine
+    (section 3).
+    """
+
+    ALLOW = "ALLOW"
+    REDUCE = "REDUCE"
+    MANUAL = "MANUAL"
+    REJECT = "REJECT"
+
+
 class MarketRegime(StrEnum):
     """Market regime classification.
 
@@ -470,6 +485,7 @@ CANONICAL_ENUMS: Final[tuple[type[StrEnum], ...]] = (
     MarketSessionStatus,
     CorporateActionType,
     MarketRegime,
+    PortfolioAction,
 )
 
 # Canonical mapping from operating mode to its environment axis value

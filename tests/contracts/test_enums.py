@@ -169,6 +169,8 @@ EXPECTED_VALUES: dict[str, list[str]] = {
         "EVENT_STRESS",
         "UNKNOWN",
     ],
+    # Portfolio_Capital_Allocation_and_Market_Regime_v0.1 section 8
+    "PortfolioAction": ["ALLOW", "REDUCE", "MANUAL", "REJECT"],
 }
 
 

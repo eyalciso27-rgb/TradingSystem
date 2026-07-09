@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/portfolio_action/v1",
+  "title": "PortfolioAction",
+  "description": "Portfolio pre-check action for a candidate.",
+  "type": "string",
+  "enum": [
+    "ALLOW",
+    "REDUCE",
+    "MANUAL",
+    "REJECT"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

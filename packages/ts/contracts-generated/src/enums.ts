@@ -404,3 +404,16 @@ export const MARKET_REGIME_VALUES: readonly MarketRegime[] = Object.freeze(Objec
 export function isMarketRegime(value: string): value is MarketRegime {
   return (MARKET_REGIME_VALUES as readonly string[]).includes(value);
 }
+
+/** Portfolio pre-check action for a candidate. */
+export const PortfolioAction = {
+  ALLOW: "ALLOW",
+  REDUCE: "REDUCE",
+  MANUAL: "MANUAL",
+  REJECT: "REJECT",
+} as const;
+export type PortfolioAction = (typeof PortfolioAction)[keyof typeof PortfolioAction];
+export const PORTFOLIO_ACTION_VALUES: readonly PortfolioAction[] = Object.freeze(Object.values(PortfolioAction));
+export function isPortfolioAction(value: string): value is PortfolioAction {
+  return (PORTFOLIO_ACTION_VALUES as readonly string[]).includes(value);
+}
