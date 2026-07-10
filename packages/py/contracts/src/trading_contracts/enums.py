@@ -358,6 +358,41 @@ class FreshnessClass(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class ExitTriggerType(StrEnum):
+    """Exit/position-management trigger types.
+
+    Authority: System_Functional_v0.7 section 16 (position and exit
+    management trigger table).
+    """
+
+    PROTECTIVE_STOP = "PROTECTIVE_STOP"
+    TAKE_PROFIT = "TAKE_PROFIT"
+    TRAILING_POLICY = "TRAILING_POLICY"
+    THESIS_INVALIDATED = "THESIS_INVALIDATED"
+    TIME_EXIT = "TIME_EXIT"
+    RISK_REDUCTION = "RISK_REDUCTION"
+    NEW_MATERIAL_EVENT = "NEW_MATERIAL_EVENT"
+    MANUAL_EXIT = "MANUAL_EXIT"
+    SYSTEM_SAFETY_EXIT = "SYSTEM_SAFETY_EXIT"
+
+
+class ExitReason(StrEnum):
+    """Canonical recorded exit reason.
+
+    Authority: System_Functional_v0.7 section 31.1 ("the system records
+    the actual exit reason: STOP, TARGET, INVALIDATION, TIME, RISK, MANUAL
+    or ERROR").
+    """
+
+    STOP = "STOP"
+    TARGET = "TARGET"
+    INVALIDATION = "INVALIDATION"
+    TIME = "TIME"
+    RISK = "RISK"
+    MANUAL = "MANUAL"
+    ERROR = "ERROR"
+
+
 class PortfolioAction(StrEnum):
     """Portfolio pre-check action for a candidate.
 
@@ -484,6 +519,8 @@ CANONICAL_ENUMS: Final[tuple[type[StrEnum], ...]] = (
     FreshnessClass,
     MarketSessionStatus,
     CorporateActionType,
+    ExitReason,
+    ExitTriggerType,
     MarketRegime,
     PortfolioAction,
 )

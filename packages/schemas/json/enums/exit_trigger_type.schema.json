@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/exit_trigger_type/v1",
+  "title": "ExitTriggerType",
+  "description": "Exit/position-management trigger types.",
+  "type": "string",
+  "enum": [
+    "PROTECTIVE_STOP",
+    "TAKE_PROFIT",
+    "TRAILING_POLICY",
+    "THESIS_INVALIDATED",
+    "TIME_EXIT",
+    "RISK_REDUCTION",
+    "NEW_MATERIAL_EVENT",
+    "MANUAL_EXIT",
+    "SYSTEM_SAFETY_EXIT"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}

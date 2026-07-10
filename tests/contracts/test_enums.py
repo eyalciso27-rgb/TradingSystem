@@ -171,6 +171,20 @@ EXPECTED_VALUES: dict[str, list[str]] = {
     ],
     # Portfolio_Capital_Allocation_and_Market_Regime_v0.1 section 8
     "PortfolioAction": ["ALLOW", "REDUCE", "MANUAL", "REJECT"],
+    # System_Functional_v0.7 section 16 (exit trigger table)
+    "ExitTriggerType": [
+        "PROTECTIVE_STOP",
+        "TAKE_PROFIT",
+        "TRAILING_POLICY",
+        "THESIS_INVALIDATED",
+        "TIME_EXIT",
+        "RISK_REDUCTION",
+        "NEW_MATERIAL_EVENT",
+        "MANUAL_EXIT",
+        "SYSTEM_SAFETY_EXIT",
+    ],
+    # System_Functional_v0.7 section 31.1 (recorded exit reasons)
+    "ExitReason": ["STOP", "TARGET", "INVALIDATION", "TIME", "RISK", "MANUAL", "ERROR"],
 }
 
 
