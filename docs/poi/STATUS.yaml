@@ -2,7 +2,7 @@
 # States: PASS | FAIL | BLOCKED. The backlog itself is frozen in
 # docs/baseline-v0.5/POI_BACKLOG.yaml. Evidence lives in docs/poi/evidence/.
 version: "0.1"
-updated: "2026-07-07"
+updated: "2026-07-10"
 
 # PHASE-5 exit gate (DoD of IMP-0501: "Every P0 item PASS/approved alternate
 # ADR."). The three PHASE-5 tasks are implementation-complete (registry,
@@ -72,11 +72,20 @@ items:
     status: BLOCKED
     evidence: evidence/BLOCKED-P0.md
     blocked_on: IBKR paper market-data entitlement + external provider trial
+  - id: POI-IBKR-READONLY
+    priority: P0
+    status: PASS
+    evidence: evidence/POI-IBKR-READONLY.md
+    note: read-only infrastructure pre-check only (2026-07-10, owner manual run on
+      Oracle Linux ARM64; official installer; paper account masked DU*****32; no
+      order API callable). Does NOT mark POI-IBKR-001 as PASS.
   - id: POI-IBKR-001
     priority: P0
     status: BLOCKED
     evidence: evidence/BLOCKED-P0.md
-    blocked_on: IBKR paper account + TWS/IB Gateway host; depends POI-MD-001
+    blocked_on: IBKR paper account + TWS/IB Gateway host; depends POI-MD-001.
+      Read-only pre-check POI-IBKR-READONLY is PASS; the order-lifecycle paper
+      experiment itself has not run.
   - id: POI-INVPRO-001
     priority: P0
     status: BLOCKED
