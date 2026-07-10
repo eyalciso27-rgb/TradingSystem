@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 from trading_broker_core.conformance import BrokerPortConformance
 from trading_broker_core.port import (
+    BrokerCapabilityMode,
     BrokerErrorCode,
     BrokerInstrument,
     BrokerPortError,
@@ -192,6 +193,57 @@ def test_live_environment_intent_rejected() -> None:
     adapter.connect()
     with pytest.raises(BrokerPortError, match="PAPER only"):
         adapter.submit_order(make_intent("live-1", environment=Environment.LIVE))
+
+
+# -- capability honesty --------------------------------------------------------
+
+
+def test_unimplemented_capabilities_are_never_advertised() -> None:
+    """A capability may be NATIVE/EMULATED only if the adapter implements it.
+
+    This adapter has no bracket/OCO wiring yet, so it must not advertise
+    them as available at any level — and there must be no silent emulation
+    path (Integration 20.4: emulation requires explicit policy).
+    """
+    from trading_broker_ibkr.paper_adapter import IBKR_PAPER_CAPABILITIES
+
+    capabilities = make_adapter_capabilities()
+    assert capabilities == IBKR_PAPER_CAPABILITIES  # adapter publishes the module matrix
+    # not implemented => not advertised as usable
+    unusable = (BrokerCapabilityMode.UNSUPPORTED, BrokerCapabilityMode.DISABLED)
+    assert capabilities.bracket in unusable
+    assert capabilities.oco in unusable
+    # no silent emulation anywhere in the matrix
+    for mode in (
+        capabilities.bracket,
+        capabilities.oco,
+        capabilities.trailing,
+        capabilities.fractional,
+        capabilities.outside_rth,
+        *capabilities.order_types.values(),
+    ):
+        assert mode is not BrokerCapabilityMode.EMULATED
+    # nothing NATIVE that the adapter cannot actually do today: the only
+    # NATIVE entries are the four wired order types + preview + events
+    assert set(capabilities.order_types) == {
+        OrderType.LIMIT,
+        OrderType.STOP,
+        OrderType.STOP_LIMIT,
+        OrderType.MARKET,
+    }
+    # and there is no bracket/OCO surface on the adapter to call silently
+    bracket_like = [
+        name
+        for name in dir(IbkrPaperAdapter)
+        if not name.startswith("_") and ("bracket" in name.lower() or "oco" in name.lower())
+    ]
+    assert bracket_like == []
+
+
+def make_adapter_capabilities() -> Any:
+    adapter = make_adapter()
+    adapter.connect()
+    return adapter.capabilities()
 
 
 # -- status mapping / unknown broker response --------------------------------------

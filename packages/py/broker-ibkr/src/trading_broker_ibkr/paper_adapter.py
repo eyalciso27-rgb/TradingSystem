@@ -72,6 +72,12 @@ DEFAULT_TIMEOUT_SECONDS = 15.0
 
 #: IBKR paper capability matrix (Integration 20.4). MVP hard rules:
 #: fractional and outside-RTH DISABLED; trailing not auto-approved.
+#: HONESTY RULE: a capability is advertised only at the level this adapter
+#: actually implements TODAY. Bracket/OCA are broker-native at IBKR, but
+#: this adapter has no bracket/OCO wiring yet (execution tasks), so they
+#: are declared UNSUPPORTED — never NATIVE-by-promise and never silently
+#: emulated (20.4: emulation requires explicit policy). Flip to NATIVE only
+#: together with the actual implementation + conformance coverage.
 IBKR_PAPER_CAPABILITIES = BrokerCapabilities(
     order_types={
         OrderType.LIMIT: BrokerCapabilityMode.NATIVE,
@@ -79,8 +85,8 @@ IBKR_PAPER_CAPABILITIES = BrokerCapabilities(
         OrderType.STOP_LIMIT: BrokerCapabilityMode.NATIVE,
         OrderType.MARKET: BrokerCapabilityMode.NATIVE,
     },
-    bracket=BrokerCapabilityMode.NATIVE,
-    oco=BrokerCapabilityMode.NATIVE,
+    bracket=BrokerCapabilityMode.UNSUPPORTED,
+    oco=BrokerCapabilityMode.UNSUPPORTED,
     trailing=BrokerCapabilityMode.MANUAL_ONLY,
     fractional=BrokerCapabilityMode.DISABLED,
     outside_rth=BrokerCapabilityMode.DISABLED,
