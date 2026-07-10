@@ -1,0 +1,172 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+}
+
+.console {
+  padding: 1rem;
+  max-width: 80rem;
+  margin: 0 auto;
+}
+
+.halt-banner {
+  background: #b00020;
+  color: #fff;
+  font-weight: 700;
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.console-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: baseline;
+  margin-bottom: 1rem;
+}
+
+.console-header h1 {
+  font-size: 1.25rem;
+  margin: 0;
+}
+
+.mode {
+  font-weight: 700;
+  padding: 0.15rem 0.5rem;
+  border-radius: 0.35rem;
+  background: #e0e0e0;
+  color: #000;
+}
+
+.stream-state,
+.operator {
+  font-size: 0.85rem;
+  opacity: 0.85;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 1rem;
+}
+
+.panel {
+  border: 1px solid rgba(128, 128, 128, 0.45);
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem;
+}
+
+.panel h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.panel-wide {
+  grid-column: 1 / -1;
+}
+
+.panel table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.panel th,
+.panel td {
+  text-align: left;
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.3);
+}
+
+.ok::marker {
+  color: #2e7d32;
+}
+
+.bad {
+  color: #b00020;
+  font-weight: 700;
+}
+
+.alert-CRITICAL {
+  color: #b00020;
+  font-weight: 700;
+}
+
+.alert-WARNING {
+  color: #b26a00;
+}
+
+.actions {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.actions button[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.action-reason {
+  margin-left: 0.5rem;
+  font-size: 0.8rem;
+  opacity: 0.8;
+}
+
+.login {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+
+.login-card {
+  display: grid;
+  gap: 0.5rem;
+  width: min(24rem, 100%);
+  border: 1px solid rgba(128, 128, 128, 0.45);
+  border-radius: 0.5rem;
+  padding: 1.5rem;
+}
+
+.login-card input {
+  padding: 0.5rem;
+  font-size: 1rem;
+}
+
+.login-card button {
+  padding: 0.5rem;
+  font-size: 1rem;
+}
+
+.env-tag {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: #b26a00;
+}
+
+.hint {
+  font-size: 0.75rem;
+  opacity: 0.75;
+}
+
+@media (max-width: 40rem) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .console-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}

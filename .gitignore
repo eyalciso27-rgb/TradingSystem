@@ -34,3 +34,4 @@ TradingSystem/
 
 # Local conversation export
 ��������� ��� ����.txt
+*.tsbuildinfo

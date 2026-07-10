@@ -2,10 +2,22 @@
   "name": "@trading-system/dashboard",
   "version": "0.1.0",
   "private": true,
-  "description": "Operations Console placeholder; Next.js app arrives with the Operations Console phase",
+  "description": "Operations Console dashboard shell (IMP-1101): mode, health, P&L, risk, positions, alerts, halt banner over authenticated SSE",
   "type": "module",
   "scripts": {
+    "dev": "next dev",
+    "build": "next build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
+  },
+  "dependencies": {
+    "next": "^15.1.6",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0"
   }
 }
