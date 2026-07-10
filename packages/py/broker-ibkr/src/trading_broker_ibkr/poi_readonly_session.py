@@ -160,35 +160,25 @@ class IbkrReadOnlySession:
 
 
 def _build_ibapi_client() -> RawReadOnlyClient:
-    """Construct the SDK-backed read-only client (PoI run time only).
+    """Construct the concrete SDK-backed read-only client (PoI run time only).
 
-    The IBKR Python SDK is imported here, lazily, so this module stays
-    importable and unit-testable without the SDK and without any network.
-    This function is exercised only during the manual PoI on the host where
-    IB Gateway runs; it performs no login (the owner logs in via the Gateway
-    UI) and uses only read-only request calls.
+    Imported lazily from ``poi_readonly_client`` so this module stays
+    importable and unit-testable without the SDK and without any network. The
+    concrete client only ever performs the five read-only calls; the IBKR SDK
+    is imported lazily inside it and only on the host where IB Gateway runs.
     """
-    try:
-        import ibapi  # type: ignore[import-not-found]  # noqa: F401  # SDK confined here
-    except ImportError as error:  # pragma: no cover - depends on host install
-        raise PoiSessionError(
-            "the IBKR Python API (ibapi) is not installed on this host; install it"
-            " inside the broker-ibkr environment before running the PoI"
-        ) from error
-    # The concrete ibapi EClient/EWrapper read-only wiring is intentionally
-    # deferred to the real adapter work (IMP-1002); this PoI session is not a
-    # full adapter. Until that wiring lands, fail closed rather than pretend.
-    raise PoiSessionError(
-        "read-only ibapi client wiring is provided by the IBKR adapter task"
-        " (IMP-1002); supply a RawReadOnlyClient explicitly for the PoI"
-    )
+    from trading_broker_ibkr.poi_readonly_client import build_readonly_client
+
+    return build_readonly_client()
 
 
 def create_session(client: RawReadOnlyClient | None = None) -> IbkrReadOnlySession:
     """Return a read-only session for the harness.
 
     ``client`` is injectable for tests and for a hand-wired PoI transport;
-    when omitted, the SDK-backed client is built lazily (host-only).
+    when omitted, the concrete SDK-backed read-only client is built. The
+    IBKR SDK is imported only when that client actually connects, so it
+    fails closed on a host without ``ibapi`` rather than pretending.
     """
     raw = client if client is not None else _build_ibapi_client()
     return IbkrReadOnlySession(raw)

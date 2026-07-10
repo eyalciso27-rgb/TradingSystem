@@ -157,11 +157,13 @@ def test_methods_require_connection() -> None:
         session.req_current_time()
 
 
-def test_missing_ibapi_client_fails_closed() -> None:
-    # No injected client: the lazy SDK path must fail closed (SDK absent /
-    # wiring deferred to IMP-1002), never silently connect.
+def test_default_client_defers_sdk_and_fails_closed_on_connect() -> None:
+    # No injected client: create_session builds the concrete client WITHOUT
+    # importing the SDK; the lazy ibapi import happens only on connect, which
+    # fails closed on a host without ibapi (dev/CI) rather than pretend.
+    session = create_session()
     with pytest.raises(PoiSessionError):
-        create_session()
+        session.connect("127.0.0.1", 4002)
 
 
 # -- masking ------------------------------------------------------------------------
