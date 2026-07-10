@@ -47,6 +47,15 @@ Safety preconditions (all mandatory before running the harness):
 
 ## 4. Harness run (scripts/poi_ibkr_readonly.py)
 
+Run command (manual, on the Oracle ARM64 host via PuTTY, after the owner has
+logged in to PAPER in the Gateway VNC session and enabled Read-Only API):
+
+```bash
+uv run python scripts/poi_ibkr_readonly.py \
+  --host 127.0.0.1 --port 4002 \
+  --session-module trading_broker_ibkr.poi_readonly_session
+```
+
 Paste the harness checklist output here (it is already sanitized/masked):
 
 ```text
