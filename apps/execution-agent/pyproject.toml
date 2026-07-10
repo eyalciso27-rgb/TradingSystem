@@ -3,7 +3,12 @@ name = "trading-execution-agent"
 version = "0.1.0"
 description = "Broker adapter runtime, orders, events and reconciliation"
 requires-python = ">=3.13,<3.14"
-dependencies = []
+dependencies = ["trading-application", "trading-broker-core", "trading-broker-ibkr"]
+
+[tool.uv.sources]
+trading-application = { workspace = true }
+trading-broker-core = { workspace = true }
+trading-broker-ibkr = { workspace = true }
 
 [build-system]
 requires = ["uv_build>=0.9,<0.10"]
