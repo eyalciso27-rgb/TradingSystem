@@ -390,6 +390,40 @@ export function isCorporateActionType(value: string): value is CorporateActionTy
   return (CORPORATE_ACTION_TYPE_VALUES as readonly string[]).includes(value);
 }
 
+/** Canonical recorded exit reason. */
+export const ExitReason = {
+  STOP: "STOP",
+  TARGET: "TARGET",
+  INVALIDATION: "INVALIDATION",
+  TIME: "TIME",
+  RISK: "RISK",
+  MANUAL: "MANUAL",
+  ERROR: "ERROR",
+} as const;
+export type ExitReason = (typeof ExitReason)[keyof typeof ExitReason];
+export const EXIT_REASON_VALUES: readonly ExitReason[] = Object.freeze(Object.values(ExitReason));
+export function isExitReason(value: string): value is ExitReason {
+  return (EXIT_REASON_VALUES as readonly string[]).includes(value);
+}
+
+/** Exit/position-management trigger types. */
+export const ExitTriggerType = {
+  PROTECTIVE_STOP: "PROTECTIVE_STOP",
+  TAKE_PROFIT: "TAKE_PROFIT",
+  TRAILING_POLICY: "TRAILING_POLICY",
+  THESIS_INVALIDATED: "THESIS_INVALIDATED",
+  TIME_EXIT: "TIME_EXIT",
+  RISK_REDUCTION: "RISK_REDUCTION",
+  NEW_MATERIAL_EVENT: "NEW_MATERIAL_EVENT",
+  MANUAL_EXIT: "MANUAL_EXIT",
+  SYSTEM_SAFETY_EXIT: "SYSTEM_SAFETY_EXIT",
+} as const;
+export type ExitTriggerType = (typeof ExitTriggerType)[keyof typeof ExitTriggerType];
+export const EXIT_TRIGGER_TYPE_VALUES: readonly ExitTriggerType[] = Object.freeze(Object.values(ExitTriggerType));
+export function isExitTriggerType(value: string): value is ExitTriggerType {
+  return (EXIT_TRIGGER_TYPE_VALUES as readonly string[]).includes(value);
+}
+
 /** Market regime classification. */
 export const MarketRegime = {
   TRENDING_RISK_ON: "TRENDING_RISK_ON",

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trading-system/enums/exit_reason/v1",
+  "title": "ExitReason",
+  "description": "Canonical recorded exit reason.",
+  "type": "string",
+  "enum": [
+    "STOP",
+    "TARGET",
+    "INVALIDATION",
+    "TIME",
+    "RISK",
+    "MANUAL",
+    "ERROR"
+  ],
+  "x-generated-by": "scripts/generate_contracts.py",
+  "x-generated-note": "GENERATED FILE — DO NOT EDIT"
+}
