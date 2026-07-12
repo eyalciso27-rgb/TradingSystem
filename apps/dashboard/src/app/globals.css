@@ -233,6 +233,21 @@ body {
   color: #b26a00;
 }
 
+.danger-card {
+  border: 2px solid #b00020;
+  background: rgba(176, 0, 32, 0.06);
+}
+
+.danger-card h2 {
+  color: #b00020;
+}
+
+.danger-card input {
+  padding: 0.4rem;
+  margin-right: 0.5rem;
+  max-width: 18rem;
+}
+
 .hint {
   font-size: 0.75rem;
   opacity: 0.75;
