@@ -617,6 +617,25 @@ input {
   padding: 0.55rem;
 }
 
+.danger-card {
+  border: 2px solid var(--danger);
+  background: var(--danger-bg);
+}
+
+.danger-card h2 {
+  color: var(--danger);
+}
+
+.danger-card input {
+  padding: 0.4rem;
+  margin-right: 0.5rem;
+  max-width: 18rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+}
+
 .hint {
   font-size: 0.75rem;
   color: var(--muted);
