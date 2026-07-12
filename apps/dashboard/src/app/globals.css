@@ -80,6 +80,58 @@ body {
   max-width: 22rem;
 }
 
+.muted {
+  opacity: 0.7;
+  font-size: 0.85rem;
+}
+
+.candidate-layout {
+  display: grid;
+  grid-template-columns: minmax(12rem, 16rem) 1fr;
+  gap: 1rem;
+}
+
+.candidate-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 0.5rem;
+  align-content: start;
+}
+
+.candidate-list button {
+  width: 100%;
+  text-align: left;
+  padding: 0.5rem;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  border-radius: 0.4rem;
+  background: transparent;
+  cursor: pointer;
+}
+
+.candidate-list button.selected {
+  border-color: currentColor;
+  font-weight: 600;
+}
+
+.candidate-detail h3 {
+  margin: 1rem 0 0.35rem;
+  font-size: 0.95rem;
+  border-top: 1px solid rgba(128, 128, 128, 0.3);
+  padding-top: 0.5rem;
+}
+
+.plan dt {
+  font-weight: 600;
+}
+
+@media (max-width: 40rem) {
+  .candidate-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));

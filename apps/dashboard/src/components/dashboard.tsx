@@ -45,6 +45,9 @@ export function Dashboard({ operator, role }: { operator: string; role: string }
         <a className="nav-link" href="/sources">
           Source connections →
         </a>
+        <a className="nav-link" href="/candidates">
+          Candidates →
+        </a>
         <span className="operator">
           {operator} ({role}, read-only)
         </span>
