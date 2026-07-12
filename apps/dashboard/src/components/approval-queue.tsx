@@ -10,6 +10,7 @@
 
 import { useState } from "react";
 
+import { AppNav } from "./app-nav";
 import {
   APPROVAL_FIXTURE_NOW,
   APPROVAL_QUEUE,
@@ -22,18 +23,7 @@ import {
   refreshItem,
   requiresRefresh,
 } from "../lib/approvals";
-
-function StaleBanner({ item, now }: { item: ApprovalItem; now: string }) {
-  if (!requiresRefresh(item, now)) {
-    return null;
-  }
-  const cause = isExpired(item, now) ? "EXPIRED" : "PLAN CHANGED";
-  return (
-    <p className="runtime-bad" role="alert">
-      REFRESH REQUIRED ({cause}) — approve/reduce/reanalyse are blocked until refresh.
-    </p>
-  );
-}
+import { chipClass, explain } from "../lib/explain";
 
 export function ApprovalQueue({ operator, role }: { operator: string; role: string }) {
   // Fixture clock: deterministic review time (no live clock in the shell).
@@ -42,6 +32,11 @@ export function ApprovalQueue({ operator, role }: { operator: string; role: stri
   const [audit, setAudit] = useState<readonly ApprovalAuditRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [reduceTo, setReduceTo] = useState<string>("");
+
+  const staleCount = items.filter(
+    (item) =>
+      requiresRefresh(item, now) && item.status !== "APPROVED" && item.status !== "REJECTED",
+  ).length;
 
   function replaceItem(updated: ApprovalItem): void {
     setItems((current) =>
@@ -71,135 +66,160 @@ export function ApprovalQueue({ operator, role }: { operator: string; role: stri
 
   function refresh(item: ApprovalItem): void {
     setError(null);
-    // Fixture refresh: re-issue against the current plan (upstream hash).
     const refreshed = refreshItem(item, item.plan, now, APPROVAL_TTL_SECONDS, operator);
     replaceItem({ ...refreshed.item, currentPlanHash: refreshed.item.reviewedPlanHash });
     setAudit((current) => [...current, refreshed.record]);
   }
 
   return (
-    <main className="console">
-      <header className="console-header">
-        <h1>Approval Queue</h1>
-        <a className="nav-link" href="/">
-          ← Dashboard
-        </a>
-        <a className="nav-link" href="/candidates">
-          Candidates →
-        </a>
-        <span className="operator">
-          {operator} ({role})
-        </span>
-      </header>
-      <p className="env-tag">
-        Review recording only. APPROVE creates an audit record — never a
-        SubmitAuthorization, never an order.
-      </p>
-      {error === null ? null : (
-        <p className="runtime-bad" role="alert">
-          {error}
+    <>
+      <AppNav current="approvals" operator={operator} role={role} />
+      <main className="console">
+        <header className="console-header">
+          <h1>Approval Queue</h1>
+        </header>
+        <p className="page-intro">
+          Human review only. <strong>Approve records a decision</strong> — it never creates a
+          SubmitAuthorization and never sends an order.
         </p>
-      )}
 
-      <section className="grid">
-        {items.map((item) => {
-          const stale = requiresRefresh(item, now);
-          const terminal = item.status !== "PENDING" && item.status !== "WATCH";
-          return (
-            <article className="panel" key={item.approvalId}>
-              <h2>
-                {item.symbol} · {item.direction} ·{" "}
-                <span className={stale || terminal ? "runtime-bad" : "runtime-ok"}>
-                  {stale && !terminal ? "REFRESH_REQUIRED" : item.status}
-                </span>
-              </h2>
-              <p className="muted">
-                {item.approvalId} · candidate {item.candidateId} · issued {item.issuedAt} ·
-                expires {item.expiresAt}
-              </p>
-              <StaleBanner item={item} now={now} />
-              {isMateriallyChanged(item) ? (
+        {staleCount > 0 ? (
+          <div className="callout callout-danger" role="alert">
+            <span className="callout-body">
+              <strong>{staleCount} item(s) need a refresh</strong>
+              {explain("REFRESH_REQUIRED")}
+            </span>
+          </div>
+        ) : null}
+        {error === null ? null : (
+          <div className="callout callout-warn" role="alert">
+            <span className="callout-body">
+              <strong>Blocked</strong>
+              {error}
+            </span>
+          </div>
+        )}
+
+        <section className="grid">
+          {items.map((item) => {
+            const stale = requiresRefresh(item, now);
+            const terminal = item.status !== "PENDING" && item.status !== "WATCH";
+            const displayStatus = stale && !terminal ? "REFRESH_REQUIRED" : item.status;
+            const cause = isExpired(item, now)
+              ? "the review window expired"
+              : isMateriallyChanged(item)
+                ? "the plan changed since review"
+                : "";
+            return (
+              <article className="panel" key={item.approvalId}>
+                <h2>
+                  {item.symbol} · {item.direction}
+                  <span className={chipClass(displayStatus)}>{displayStatus}</span>
+                </h2>
                 <p className="muted">
-                  reviewed plan {item.reviewedPlanHash} ≠ current {item.currentPlanHash}
+                  {item.approvalId} · candidate {item.candidateId} · expires {item.expiresAt}
                 </p>
-              ) : null}
-              <dl className="plan">
-                <dt>Plan</dt>
-                <dd>
-                  {item.plan.entryType} · qty {item.plan.quantity} @ {item.plan.entryPrice} ·
-                  stop {item.plan.stopPrice} · target {item.plan.targetPrice ?? "—"} · risk{" "}
-                  {item.plan.riskAmount}
-                </dd>
-              </dl>
-              <ul className="actions">
-                <li>
-                  <button
-                    type="button"
-                    disabled={stale || terminal}
-                    title="records a human review decision only"
-                    onClick={() => act(item, "APPROVE")}
-                  >
-                    APPROVE (record only)
-                  </button>
-                </li>
-                <li>
-                  <button type="button" disabled={terminal} onClick={() => act(item, "REJECT")}>
-                    REJECT
-                  </button>
-                  <button type="button" disabled={terminal} onClick={() => act(item, "WATCH")}>
-                    WATCH
-                  </button>
-                  <button
-                    type="button"
-                    disabled={stale || terminal}
-                    onClick={() => act(item, "REANALYSE")}
-                  >
-                    REANALYSE
-                  </button>
-                </li>
-                <li>
-                  <input
-                    aria-label={`reduce quantity for ${item.approvalId}`}
-                    placeholder="reduce qty to…"
-                    value={reduceTo}
-                    onChange={(event) => setReduceTo(event.target.value)}
-                  />
-                  <button
-                    type="button"
-                    disabled={stale || terminal}
-                    onClick={() => act(item, "REDUCE_QUANTITY")}
-                  >
-                    REDUCE
-                  </button>
-                </li>
+
                 {stale && !terminal ? (
+                  <div className="callout callout-danger" role="status">
+                    <span className="callout-body">
+                      <strong>Refresh required</strong>
+                      {explain("REFRESH_REQUIRED")}
+                      {cause ? <small> Reason: {cause}.</small> : null}
+                    </span>
+                  </div>
+                ) : null}
+
+                <dl className="plan">
+                  <dt>Plan</dt>
+                  <dd>
+                    {item.plan.entryType} · qty {item.plan.quantity} @ {item.plan.entryPrice}
+                  </dd>
+                  <dt>Stop / target</dt>
+                  <dd>
+                    {item.plan.stopPrice} / {item.plan.targetPrice ?? "—"} · risk{" "}
+                    {item.plan.riskAmount}
+                  </dd>
+                </dl>
+
+                <ul className="actions">
                   <li>
-                    <button type="button" onClick={() => refresh(item)}>
-                      REFRESH PLAN
+                    <button
+                      type="button"
+                      disabled={stale || terminal}
+                      title={
+                        stale
+                          ? "blocked: refresh the plan first"
+                          : "records a human review decision only"
+                      }
+                      onClick={() => act(item, "APPROVE")}
+                    >
+                      Approve
+                    </button>
+                    <span className="action-reason">record only — no order is sent</span>
+                  </li>
+                  <li>
+                    <button type="button" disabled={terminal} onClick={() => act(item, "REJECT")}>
+                      Reject
+                    </button>
+                    <button type="button" disabled={terminal} onClick={() => act(item, "WATCH")}>
+                      Watch
+                    </button>
+                    <button
+                      type="button"
+                      disabled={stale || terminal}
+                      onClick={() => act(item, "REANALYSE")}
+                    >
+                      Reanalyse
                     </button>
                   </li>
-                ) : null}
-              </ul>
-            </article>
-          );
-        })}
+                  <li>
+                    <input
+                      aria-label={`reduce quantity for ${item.approvalId}`}
+                      placeholder="reduce qty to…"
+                      value={reduceTo}
+                      onChange={(event) => setReduceTo(event.target.value)}
+                    />
+                    <button
+                      type="button"
+                      disabled={stale || terminal}
+                      onClick={() => act(item, "REDUCE_QUANTITY")}
+                    >
+                      Reduce (down only)
+                    </button>
+                  </li>
+                  {stale && !terminal ? (
+                    <li>
+                      <button type="button" onClick={() => refresh(item)}>
+                        Refresh plan
+                      </button>
+                    </li>
+                  ) : null}
+                </ul>
+              </article>
+            );
+          })}
 
-        <article className="panel panel-wide">
-          <h2>Audit trail (fixture records only)</h2>
-          {audit.length === 0 ? (
-            <p className="muted">no actions recorded yet</p>
-          ) : (
-            <ul>
-              {audit.map((entry, index) => (
-                <li key={`${entry.approvalId}-${entry.action}-${index}`}>
-                  [{entry.at}] {entry.operator}: {entry.action} on {entry.approvalId} →{" "}
-                  {entry.resultingStatus} · {entry.detail}
-                </li>
-              ))}
-            </ul>
-          )}
-        </article>
-      </section>
-    </main>
+          <article className="panel panel-wide">
+            <h2>Audit trail</h2>
+            {audit.length === 0 ? (
+              <p className="empty">No actions recorded yet.</p>
+            ) : (
+              <ul>
+                {audit.map((entry, index) => (
+                  <li key={`${entry.approvalId}-${entry.action}-${index}`}>
+                    <span className="chip chip-info">{entry.action}</span>{" "}
+                    {entry.approvalId} → {entry.resultingStatus} ·{" "}
+                    <span className="muted">
+                      {entry.operator} at {entry.at}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </article>
+        </section>
+      </main>
+    </>
   );
 }
