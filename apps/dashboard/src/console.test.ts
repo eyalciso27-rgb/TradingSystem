@@ -7,7 +7,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   SESSION_COOKIE,
@@ -83,18 +83,18 @@ describe("session route", () => {
   });
 });
 
-describe("SSE status stream", () => {
-  it("refuses unauthenticated subscribers", async () => {
-    const { GET } = await import("./app/api/events/route");
-    const response = await GET(new Request("http://localhost/api/events"));
+describe("SSE status stream (/api/session/events)", () => {
+  it("refuses unauthenticated subscribers with 401 (not 404)", async () => {
+    const { GET } = await import("./app/api/session/events/route");
+    const response = await GET(new Request("http://localhost/api/session/events"));
     expect(response.status).toBe(401);
   });
 
   it("streams the fixture status to an authenticated subscriber", async () => {
-    const { GET } = await import("./app/api/events/route");
+    const { GET } = await import("./app/api/session/events/route");
     const token = issueSessionToken("eyal", "VIEWER", Math.floor(Date.now() / 1000));
     const response = await GET(
-      new Request("http://localhost/api/events", {
+      new Request("http://localhost/api/session/events", {
         headers: { cookie: `${SESSION_COOKIE}=${token}` },
       }),
     );
@@ -112,6 +112,33 @@ describe("SSE status stream", () => {
 
   it("encodes SSE frames correctly", () => {
     expect(encodeSseEvent("status", { a: 1 })).toBe('event: status\ndata: {"a":1}\n\n');
+  });
+
+  it("the client subscribes to the same path the route is served at", async () => {
+    // Single source of truth: the dashboard imports STATUS_STREAM_PATH, and
+    // the route file lives at src/app/api/session/events/route.ts. If the
+    // constant changes without moving the route folder, this fails.
+    const { STATUS_STREAM_PATH } = await import("./lib/routes");
+    expect(STATUS_STREAM_PATH).toBe("/api/session/events");
+    const routeFile = join(
+      HERE,
+      "app",
+      ...STATUS_STREAM_PATH.replace(/^\/api\//, "api/").split("/"),
+      "route.ts",
+    );
+    expect(statSync(routeFile).isFile()).toBe(true);
+  });
+});
+
+describe("session signing key stability", () => {
+  it("is shared across module instances so a cookie is never wrongly rejected", async () => {
+    // Re-importing the module must not mint a new key: both the RSC layer
+    // and the route-handler layer have to verify the SAME token. A token
+    // issued now must still verify after a fresh module evaluation.
+    const token = issueSessionToken("eyal", "VIEWER", NOW);
+    vi.resetModules();
+    const reloaded = await import("./lib/auth");
+    expect(reloaded.verifySessionToken(token, NOW + 60)?.operator).toBe("eyal");
   });
 });
 

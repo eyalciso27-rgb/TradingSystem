@@ -38,8 +38,20 @@ export const fixtureVerifier: OperatorVerifier = {
   },
 };
 
-// Per-process key: rotating on restart is intentional (no stored secret).
-const signingKey = randomBytes(32);
+// Per-process signing key. It must be identical for every module instance
+// in the process: Next.js evaluates this module separately in the RSC layer
+// (the page's server component) and in the route-handler layer (the login +
+// SSE routes), so a plain module-level `randomBytes` would produce TWO keys
+// and a cookie signed by one layer would be rejected by the other — the page
+// would bounce a freshly-logged-in operator back to /login and the SSE would
+// 401 ("disconnected"). Stash the key on the process global so both layers
+// share it. Still no stored secret and no ENV: it rotates on a real process
+// restart, which is the intended shell behaviour.
+const KEY_GLOBAL = Symbol.for("trading.ops-console.session-key");
+type KeyHolder = { [KEY_GLOBAL]?: Buffer };
+const holder = globalThis as unknown as KeyHolder;
+holder[KEY_GLOBAL] ??= randomBytes(32);
+const signingKey: Buffer = holder[KEY_GLOBAL];
 
 function sign(payload: string): string {
   return createHmac("sha256", signingKey).update(payload).digest("base64url");
