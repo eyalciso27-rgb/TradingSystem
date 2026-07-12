@@ -8,3 +8,6 @@
  */
 
 export const STATUS_STREAM_PATH = "/api/session/events";
+
+/** Source-connections re-auth request endpoint (IMP-1102). */
+export const SOURCE_REAUTH_PATH = "/api/session/sources/reauth";
