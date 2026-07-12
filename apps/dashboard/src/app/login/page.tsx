@@ -27,8 +27,11 @@ export default function LoginPage() {
   return (
     <main className="login">
       <form onSubmit={submit} className="login-card">
-        <h1>Operations Console</h1>
-        <p className="env-tag">PAPER observation only — no trading actions</p>
+        <h1>Trading Ops Console</h1>
+        <p>
+          <span className="env-pill">PAPER</span>{" "}
+          <span className="muted">observation only — no trading actions</span>
+        </p>
         <label htmlFor="operator">Operator name</label>
         <input
           id="operator"
