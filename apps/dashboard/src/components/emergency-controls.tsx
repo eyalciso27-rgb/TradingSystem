@@ -11,6 +11,7 @@
 
 import { useState } from "react";
 
+import { AppNav } from "./app-nav";
 import {
   FLATTEN_DISABLED_REASON,
   FLATTEN_ENABLED,
@@ -64,30 +65,28 @@ export function EmergencyControls({ operator, role }: { operator: string; role: 
   }
 
   return (
-    <main className="console">
-      {state.haltActive ? (
-        <div className="halt-banner" role="alert">
-          DRILL: HALT ACTIVE — {state.scope} ({state.reason}). New entries blocked in this
-          drill; protective stop orders are KEPT.
-        </div>
-      ) : null}
+    <>
+      <AppNav current="emergency" operator={operator} role={role} />
+      <main className="console">
+        {state.haltActive ? (
+          <div className="halt-banner" role="alert">
+            DRILL: HALT ACTIVE — {state.scope} ({state.reason}). New entries blocked in this
+            drill; protective stop orders are KEPT.
+          </div>
+        ) : null}
 
-      <header className="console-header">
-        <h1>Emergency Controls</h1>
-        <a className="nav-link" href="/">
-          ← Dashboard
-        </a>
-        <a className="nav-link" href="/positions">
-          Positions →
-        </a>
-        <span className="operator">
-          {operator} ({role})
-        </span>
-      </header>
-      <p className="env-tag">
-        DRILL MODE — everything on this screen changes fixtures on this page
-        only. No broker is contacted and no order is ever cancelled or sent.
-      </p>
+        <header className="console-header">
+          <h1>Emergency Controls</h1>
+        </header>
+        <div className="callout callout-info" role="note">
+          <span className="callout-body">
+            <strong>Drill mode</strong>
+            <small>
+              Everything on this screen changes fixtures on this page only. No
+              broker is contacted and no order is ever cancelled or sent.
+            </small>
+          </span>
+        </div>
 
       <section className="grid">
         {/* -- halt card -------------------------------------------------- */}
@@ -263,6 +262,7 @@ export function EmergencyControls({ operator, role }: { operator: string; role: 
           )}
         </article>
       </section>
-    </main>
+      </main>
+    </>
   );
 }
