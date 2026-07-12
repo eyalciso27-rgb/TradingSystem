@@ -42,6 +42,9 @@ export function Dashboard({ operator, role }: { operator: string; role: string }
         <span className="stream-state">
           SSE: {connected ? "live" : "disconnected"} · as of {status?.asOf ?? "—"}
         </span>
+        <a className="nav-link" href="/sources">
+          Source connections →
+        </a>
         <span className="operator">
           {operator} ({role}, read-only)
         </span>

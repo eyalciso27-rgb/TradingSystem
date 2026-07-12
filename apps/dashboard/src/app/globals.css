@@ -54,6 +54,32 @@ body {
   opacity: 0.85;
 }
 
+.nav-link {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.capability {
+  font-weight: 700;
+}
+
+.runtime-ok {
+  color: #2e7d32;
+  font-weight: 700;
+}
+
+.runtime-bad {
+  color: #b26a00;
+  font-weight: 700;
+}
+
+.reauth-msg {
+  font-size: 0.75rem;
+  opacity: 0.85;
+  margin: 0.25rem 0 0;
+  max-width: 22rem;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
