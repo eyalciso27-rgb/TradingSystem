@@ -10,7 +10,8 @@ export type ConsoleSection =
   | "candidates"
   | "approvals"
   | "positions"
-  | "emergency";
+  | "emergency"
+  | "research";
 
 const SECTIONS: readonly { readonly id: ConsoleSection; readonly label: string; readonly href: string }[] = [
   { id: "dashboard", label: "Dashboard", href: "/" },
@@ -19,6 +20,7 @@ const SECTIONS: readonly { readonly id: ConsoleSection; readonly label: string; 
   { id: "approvals", label: "Approvals", href: "/approvals" },
   { id: "positions", label: "Positions", href: "/positions" },
   { id: "emergency", label: "Emergency", href: "/emergency" },
+  { id: "research", label: "Research", href: "/research" },
 ];
 
 export function AppNav({
