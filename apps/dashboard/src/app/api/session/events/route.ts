@@ -1,15 +1,17 @@
 /**
  * Authenticated live status stream (SSE) for the console shell.
  *
+ * Path: `/api/session/events` — the session-scoped live stream. The
+ * dashboard's EventSource points at this exact path; keep the two in sync.
  * Serves the deterministic PAPER-observation fixtures (ADR-0014); the real
  * feed replaces the provider, not this contract. Unauthenticated requests
- * are refused with 401 — the stream never leaks anything to an anonymous
- * client.
+ * are refused with 401 (never 404) — the stream never leaks anything to an
+ * anonymous client.
  */
 
-import { sessionFromCookieHeader } from "../../../lib/auth";
-import { encodeSseEvent } from "../../../lib/sse";
-import { fixtureStatus } from "../../../lib/status";
+import { sessionFromCookieHeader } from "../../../../lib/auth";
+import { encodeSseEvent } from "../../../../lib/sse";
+import { fixtureStatus } from "../../../../lib/status";
 
 export const dynamic = "force-dynamic";
 

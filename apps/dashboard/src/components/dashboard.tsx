@@ -10,6 +10,7 @@
 
 import { useEffect, useState } from "react";
 
+import { STATUS_STREAM_PATH } from "../lib/routes";
 import { DANGEROUS_ACTIONS, type DashboardStatus } from "../lib/status";
 
 export function Dashboard({ operator, role }: { operator: string; role: string }) {
@@ -17,7 +18,7 @@ export function Dashboard({ operator, role }: { operator: string; role: string }
   const [connected, setConnected] = useState(false);
 
   useEffect(() => {
-    const source = new EventSource("/api/events");
+    const source = new EventSource(STATUS_STREAM_PATH);
     source.addEventListener("status", (event) => {
       setConnected(true);
       setStatus(JSON.parse((event as MessageEvent<string>).data) as DashboardStatus);
