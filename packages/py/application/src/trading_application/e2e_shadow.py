@@ -24,10 +24,10 @@ Shadow-only, by construction:
   fixture events. No adapter, connector, network, broker or database is
   ever touched; a source marked unavailable is recorded DEGRADED — never
   CONNECTED and never a PoI pass.
-- The pre-submit stage uses ``FinalPreSubmitCheck`` as an EVALUATION
-  only. The engine's ephemeral authorization object is discarded
-  immediately, never stored, never exposed and never handed to any
-  execution component — ALLOW/RESIZE in a shadow scenario is a research
+- The pre-submit stage calls the canonical EVALUATION-ONLY API
+  (``FinalPreSubmitCheck.evaluate_only``): the same deterministic gate
+  logic, but no authorization object of any kind is constructed anywhere
+  on this path — ALLOW/RESIZE in a shadow scenario is a research
   outcome, not an execution permission. Nothing here imports an
   execution agent or a broker package.
 - Every failure produces an explicit, attributed, traceable state: a
@@ -817,7 +817,7 @@ class E2EShadowHarness:
 
         # -- final pre-submit: EVALUATION ONLY ----------------------------------------------
         market_raw = _text(payload, "market_price")
-        check = self._pre_submit.check(
+        gate = self._pre_submit.evaluate_only(
             PreSubmitRequest(
                 allocation=allocation,
                 risk_result=risk,
@@ -841,17 +841,17 @@ class E2EShadowHarness:
             ExecutionContext(),
             as_of=as_of,
         )
-        # SHADOW ONLY: the engine's ephemeral authorization is discarded on
-        # the spot — never stored, never exposed, never executed. ALLOW /
-        # RESIZE here is a research outcome, not an execution permission.
-        action = check.action
+        # SHADOW ONLY: evaluate_only never constructs an authorization —
+        # ALLOW / RESIZE here is a research outcome, not an execution
+        # permission.
+        action = gate.action
         self._record(
             cid, "PRE_SUBMIT_EVALUATED", "pre-submit-check", PRE_SUBMIT_VERSION, as_of,
             source_refs=refs, inputs=f"alloc-qty={allocation.allocated_quantity}",
-            outputs=f"action={action.value}|qty={check.authorized_quantity}",
+            outputs=f"action={action.value}|qty={gate.evaluated_quantity}",
             outcome=f"SHADOW_{action.value}",
-            finding="research outcome only; no authorization retained, nothing"
-            " submitted",
+            finding="research outcome only; evaluation-only API — no"
+            " authorization exists, nothing submitted",
         )
         self._advance(cid, FunnelStage.PRE_SUBMIT, as_of)
         if action in (PreSubmitAction.ALLOW, PreSubmitAction.RESIZE):
@@ -863,7 +863,7 @@ class E2EShadowHarness:
                 "pre-submit-check", PRE_SUBMIT_VERSION, as_of, payload,
             )
             return f"active:{cid}:NEEDS_REVIEW"
-        reason = check.reason_codes[0] if check.reason_codes else "PRE_SUBMIT_CANCEL"
+        reason = gate.reason_codes[0] if gate.reason_codes else "PRE_SUBMIT_CANCEL"
         self._terminal(
             cid, FunnelStage.PRE_SUBMIT, TransitionOutcome.REJECTED,
             reason, "pre-submit-check", PRE_SUBMIT_VERSION, as_of,
