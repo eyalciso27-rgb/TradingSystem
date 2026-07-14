@@ -531,7 +531,7 @@ def test_pre_submit_failure_creates_no_authorization() -> None:
     history = next(h for h in report.funnel.histories if h.candidate_id == "c1")
     assert history.terminal_outcome is TransitionOutcome.REJECTED
     pre_submit = next(e for e in report.trace if e.stage == "PRE_SUBMIT_EVALUATED")
-    assert "no authorization retained" in pre_submit.finding
+    assert "no authorization exists" in pre_submit.finding
     for attr in ("authorization", "authorizations"):
         assert not hasattr(report, attr)
 
@@ -710,6 +710,40 @@ def test_all_outputs_are_marked_virtual_and_non_executable() -> None:
             engine_version="1", input_fingerprint="f", output_fingerprint="f",
             outcome="o", research_only=False,
         )
+
+
+def test_authorization_constructor_is_never_called_in_shadow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No SubmitAuthorization/SingleUseAuthorization/OrderIntent is ever
+    constructed in an E2E shadow scenario — even on the ALLOW path."""
+    import trading_application.pre_submit_check as pre_submit_module
+
+    class _Exploding:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("authorization constructed in a shadow scenario")
+
+    monkeypatch.setattr(pre_submit_module, "SubmitAuthorization", _Exploding)
+    _, report, _ = run_scenario(list(HAPPY_PATH))  # reaches the ALLOW path
+    pre_submit = next(e for e in report.trace if e.stage == "PRE_SUBMIT_EVALUATED")
+    assert pre_submit.outcome == "SHADOW_ALLOW"
+
+
+def test_allow_resize_are_research_outcomes_with_no_authorization_anywhere() -> None:
+    from dataclasses import fields
+
+    from trading_application.pre_submit_check import PreSubmitEvaluation
+
+    _, report, _ = run_scenario(list(HAPPY_PATH))
+    pre_submit = next(e for e in report.trace if e.stage == "PRE_SUBMIT_EVALUATED")
+    assert pre_submit.outcome == "SHADOW_ALLOW"
+    assert "research outcome only" in pre_submit.finding
+    assert "no authorization exists" in pre_submit.finding
+    # The evaluation-only result type has no authorization surface at all,
+    # and nothing authorization-like leaks into the report.
+    assert not any("authoriz" in field.name for field in fields(PreSubmitEvaluation))
+    assert "SubmitAuthorization" not in repr(report)
+    assert "SingleUseAuthorization" not in repr(report)
 
 
 def test_no_execution_surface_exists_on_the_harness() -> None:

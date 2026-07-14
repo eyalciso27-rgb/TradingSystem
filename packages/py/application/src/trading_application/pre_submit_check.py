@@ -17,6 +17,12 @@ execution-context fixtures and a ``PreSubmitPolicy``. Output is a
 order id. On ALLOW/RESIZE it mints a single-use ``SubmitAuthorization``
 (not a submission; execution-agent-only).
 
+Research/shadow callers must use ``evaluate_only`` instead: the same
+deterministic gate logic (one shared implementation), returning a
+``PreSubmitEvaluation`` that carries only ALLOW / RESIZE / CANCEL /
+NEEDS_REVIEW plus the explanation — no authorization object is
+constructed anywhere on that path.
+
 Hard rules:
 
 - A rejected/vetoed allocation or risk VETO can never become ALLOW.
@@ -31,7 +37,7 @@ Hard rules:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
@@ -206,6 +212,31 @@ class PreSubmitCheckResult:
     input_refs: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class PreSubmitEvaluation:
+    """Evaluation-only pre-submit outcome for research/shadow callers.
+
+    Deliberately carries NO authorization field of any kind: ALLOW/RESIZE
+    here is a research outcome, never an execution permission.
+    """
+
+    candidate_id: str
+    action: PreSubmitAction
+    evaluated_quantity: Decimal
+    allocation_ref: str
+    risk_ref: str
+    decision_ref: str
+    policy_ref: str
+    checks: tuple[PreSubmitCheck, ...]
+    reason_codes: tuple[str, ...]
+    input_refs: tuple[str, ...]
+    research_only: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.research_only:
+            raise PreSubmitError("a pre-submit evaluation is research-only; fail closed")
+
+
 def _floor(value: Decimal) -> Decimal:
     return value.to_integral_value(rounding=ROUND_FLOOR)
 
@@ -217,6 +248,69 @@ class FinalPreSubmitCheck:
         self._policy = policy
 
     def check(
+        self,
+        request: PreSubmitRequest,
+        market: RefreshedMarket,
+        account: RefreshedAccount,
+        approval: ApprovalState,
+        context: ExecutionContext,
+        *,
+        as_of: datetime,
+    ) -> PreSubmitCheckResult:
+        """Production path: evaluate, then mint the one-time authorization.
+
+        The authorization exists ONLY here — the shared evaluation core
+        (``_evaluate_result``) never constructs one.
+        """
+        result = self._evaluate_result(
+            request, market, account, approval, context, as_of=as_of
+        )
+        if (
+            result.action in (PreSubmitAction.ALLOW, PreSubmitAction.RESIZE)
+            and result.authorized_quantity > 0
+        ):
+            return replace(
+                result,
+                authorization=SubmitAuthorization(
+                    candidate_id=result.candidate_id,
+                    authorized_quantity=result.authorized_quantity,
+                    authorized_at=as_of,
+                ),
+            )
+        return result
+
+    def evaluate_only(
+        self,
+        request: PreSubmitRequest,
+        market: RefreshedMarket,
+        account: RefreshedAccount,
+        approval: ApprovalState,
+        context: ExecutionContext,
+        *,
+        as_of: datetime,
+    ) -> PreSubmitEvaluation:
+        """Research/shadow path: the SAME gate logic, no authorization.
+
+        Returns only ALLOW / RESIZE / CANCEL / NEEDS_REVIEW with the full
+        explanation. No authorization constructor runs on this path.
+        """
+        result = self._evaluate_result(
+            request, market, account, approval, context, as_of=as_of
+        )
+        return PreSubmitEvaluation(
+            candidate_id=result.candidate_id,
+            action=result.action,
+            evaluated_quantity=result.authorized_quantity,
+            allocation_ref=result.allocation_ref,
+            risk_ref=result.risk_ref,
+            decision_ref=result.decision_ref,
+            policy_ref=result.policy_ref,
+            checks=result.checks,
+            reason_codes=result.reason_codes,
+            input_refs=result.input_refs,
+        )
+
+    def _evaluate_result(
         self,
         request: PreSubmitRequest,
         market: RefreshedMarket,
@@ -246,20 +340,13 @@ class FinalPreSubmitCheck:
         ) -> PreSubmitCheckResult:
             if code:
                 reasons.append(code)
-            authorization = (
-                SubmitAuthorization(
-                    candidate_id=allocation.candidate_id,
-                    authorized_quantity=quantity,
-                    authorized_at=as_of,
-                )
-                if action in (PreSubmitAction.ALLOW, PreSubmitAction.RESIZE) and quantity > 0
-                else None
-            )
+            # The evaluation core NEVER constructs an authorization; the
+            # production ``check`` wrapper mints it afterwards.
             return PreSubmitCheckResult(
                 candidate_id=allocation.candidate_id,
                 action=action,
                 authorized_quantity=quantity,
-                authorization=authorization,
+                authorization=None,
                 allocation_ref=(
                     f"allocation:{allocation.candidate_id}@{allocation.action.value}"
                 ),
@@ -495,6 +582,7 @@ __all__ = [
     "PreSubmitCheck",
     "PreSubmitCheckResult",
     "PreSubmitError",
+    "PreSubmitEvaluation",
     "PreSubmitPolicy",
     "PreSubmitRequest",
     "RefreshedAccount",

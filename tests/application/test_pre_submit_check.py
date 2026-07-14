@@ -434,3 +434,68 @@ def test_check_creates_no_broker_action_or_submit() -> None:
     for line in import_lines:
         for name in ("trading_persistence", "httpx", "requests", "subprocess", "broker_ibkr"):
             assert name not in line, line
+
+
+# -- evaluation-only API (research/shadow callers, IMP-1301) ------------------------
+
+
+def test_evaluate_only_matches_check_and_never_constructs_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared core drives both paths; evaluate_only never mints."""
+    import trading_application.pre_submit_check as module
+
+    production = run()
+    assert production.action is PreSubmitAction.ALLOW
+    assert production.authorization is not None  # production path unchanged
+
+    class _Exploding:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError(
+                "authorization constructor called on the evaluation-only path"
+            )
+
+    monkeypatch.setattr(module, "SubmitAuthorization", _Exploding)
+    evaluation = CHECK.evaluate_only(
+        request(),
+        market(),
+        acct(),
+        ApprovalState(approved=True, approved_at=RECENT),
+        ExecutionContext(),
+        as_of=AS_OF,
+    )
+    # Same deterministic gate outcome, no authorization anywhere.
+    assert evaluation.action is production.action
+    assert evaluation.evaluated_quantity == production.authorized_quantity
+    assert evaluation.checks == production.checks
+    assert evaluation.reason_codes == production.reason_codes
+    assert evaluation.research_only is True
+    assert not hasattr(evaluation, "authorization")
+
+
+def test_evaluation_dataclass_has_no_authorization_surface() -> None:
+    from dataclasses import fields
+
+    from trading_application.pre_submit_check import PreSubmitEvaluation
+
+    names = {field.name for field in fields(PreSubmitEvaluation)}
+    assert not any("authoriz" in name for name in names)
+    with pytest.raises(PreSubmitError, match="research-only"):
+        evaluation = CHECK.evaluate_only(
+            request(), market(), acct(),
+            ApprovalState(approved=True, approved_at=RECENT), ExecutionContext(),
+            as_of=AS_OF,
+        )
+        PreSubmitEvaluation(
+            candidate_id=evaluation.candidate_id,
+            action=evaluation.action,
+            evaluated_quantity=evaluation.evaluated_quantity,
+            allocation_ref=evaluation.allocation_ref,
+            risk_ref=evaluation.risk_ref,
+            decision_ref=evaluation.decision_ref,
+            policy_ref=evaluation.policy_ref,
+            checks=evaluation.checks,
+            reason_codes=evaluation.reason_codes,
+            input_refs=evaluation.input_refs,
+            research_only=False,
+        )
