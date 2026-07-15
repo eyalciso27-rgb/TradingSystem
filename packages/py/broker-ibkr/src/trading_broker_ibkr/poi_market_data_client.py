@@ -20,10 +20,14 @@ Design (ADR-0014; PoI plan v2), mirroring the merged read-only client:
   contract-details / market-data-snapshot requests plus their read-only
   cancels. ``EClient`` order methods are never referenced.
 - HONEST DATA: the ACTUAL ``marketDataType`` reported by IBKR is recorded
-  (``reqMarketDataType(1)`` is a request, never a guarantee). An exchange
-  timestamp is recorded only if IBKR actually sent tick 45 — never invented.
-  Entitlement/permission notices are surfaced explicitly, never silently
-  downgraded to "delayed". Missing bid/ask/last is reported as a fact.
+  (``reqMarketDataType(1)`` is a request, never a guarantee). Realtime and
+  delayed ticks are captured separately (realtime 0-5/45, delayed 66-71/88)
+  and never mixed; the quote is drawn from the family matching the served
+  type, so a realtime -1 placeholder can never clobber a delayed price. An
+  exchange timestamp is recorded only if IBKR actually sent the family's
+  last-timestamp tick (45/88) — never invented. Entitlement/permission
+  notices are surfaced explicitly, never silently downgraded. Missing
+  bid/ask/last is reported as a fact.
 - SAFETY: the endpoint is re-validated here (localhost + paper port 4002;
   live port 4001 rejected) as defence in depth on top of the session gate.
   The DU-account gate and masking live in the session. Every timeout or
@@ -58,14 +62,33 @@ _ACCOUNT_SUMMARY_TAGS = "NetLiquidation,TotalCashValue,BuyingPower"
 #: ``marketDataType`` callback (1 live, 2 frozen, 3 delayed, 4 delayed-frozen).
 _REQUESTED_MARKET_DATA_TYPE = 1
 
-#: IBKR tick-type ids (realtime + their DELAYED_* equivalents).
-_BID_PRICE_TICKS: frozenset[int] = frozenset({1, 66})
-_ASK_PRICE_TICKS: frozenset[int] = frozenset({2, 67})
-_LAST_PRICE_TICKS: frozenset[int] = frozenset({4, 68})
-_BID_SIZE_TICKS: frozenset[int] = frozenset({0, 69})
-_ASK_SIZE_TICKS: frozenset[int] = frozenset({3, 70})
-_LAST_SIZE_TICKS: frozenset[int] = frozenset({5, 71})
-_LAST_TIMESTAMP_TICK = 45
+#: IBKR tick-type ids are split by FAMILY so realtime and delayed ticks are
+#: never silently mixed. Realtime (0-5, 45) and delayed (66-71, 88) values are
+#: captured into separate buffers; the quote is drawn from the family that
+#: matches the ACTUAL ``marketDataType`` served (3/4 => delayed). A realtime -1
+#: placeholder can therefore never clobber a good delayed price.
+#: (tick_type -> (family, field))
+_PRICE_FIELD_BY_TICK: dict[int, tuple[str, str]] = {
+    1: ("realtime", "bid"),
+    2: ("realtime", "ask"),
+    4: ("realtime", "last"),
+    66: ("delayed", "bid"),
+    67: ("delayed", "ask"),
+    68: ("delayed", "last"),
+}
+_SIZE_FIELD_BY_TICK: dict[int, tuple[str, str]] = {
+    0: ("realtime", "bid_size"),
+    3: ("realtime", "ask_size"),
+    5: ("realtime", "last_size"),
+    69: ("delayed", "bid_size"),
+    70: ("delayed", "ask_size"),
+    71: ("delayed", "last_size"),
+}
+#: Last-timestamp ticks: 45 realtime, 88 delayed.
+_TIMESTAMP_FAMILY_BY_TICK: dict[int, str] = {45: "realtime", 88: "delayed"}
+
+#: IBKR marketDataType values that mean delayed data (3 delayed, 4 delayed-frozen).
+_DELAYED_MARKET_DATA_TYPES: frozenset[int] = frozenset({3, 4})
 
 #: Canonical freshness (Integration spec 7.3). A frozen/delayed-frozen
 #: snapshot is a non-updating value => STALE; unknown/missing => UNKNOWN
@@ -127,8 +150,10 @@ class MarketDataQuote:
     """One read-only market-data snapshot (duck-typed to the harness).
 
     ``received_at`` is the client's own capture time; ``exchange_timestamp``
-    is present only if IBKR actually sent tick 45. ``freshness`` mirrors the
-    canonical mapping; the harness re-derives it for its gate.
+    is present only if IBKR actually sent the family's last-timestamp tick (45
+    realtime / 88 delayed). ``freshness`` mirrors the canonical mapping.
+    ``data_classification`` (REALTIME/DELAYED/UNKNOWN) and ``source_tick_ids``
+    record, for audit, which family and exact IBKR tick ids produced this quote.
     """
 
     symbol: str
@@ -144,6 +169,17 @@ class MarketDataQuote:
     entitlement_errors: tuple[str, ...]
     missing_fields: tuple[str, ...]
     freshness: str
+    data_classification: str = "UNKNOWN"
+    source_tick_ids: tuple[int, ...] = ()
+
+
+def data_classification(market_data_type: int | None) -> str:
+    """REALTIME / DELAYED / UNKNOWN for the ACTUAL served ``marketDataType``."""
+    if market_data_type in _DELAYED_MARKET_DATA_TYPES:
+        return "DELAYED"
+    if market_data_type in (1, 2):
+        return "REALTIME"
+    return "UNKNOWN"
 
 
 def classify_freshness(market_data_type: int | None) -> str:
@@ -169,16 +205,20 @@ class MarketDataSink:
     contract_con_ids: list[int] = field(default_factory=list)
     contract_error: str | None = None
     market_data_type: int | None = None
-    bid: str | None = None
-    ask: str | None = None
-    last: str | None = None
-    bid_size: str | None = None
-    ask_size: str | None = None
-    last_size: str | None = None
-    exchange_timestamp: str | None = None
+    # Realtime and delayed ticks are captured into SEPARATE buffers and never
+    # merged; the client picks the family matching the served marketDataType.
+    families: dict[str, dict[str, str]] = field(
+        default_factory=lambda: {"realtime": {}, "delayed": {}}
+    )
+    source_tick_ids: list[int] = field(default_factory=list)
     entitlement_errors: list[str] = field(default_factory=list)
     got_tick: bool = False
     fatal_error: str | None = None
+
+    def _note_tick(self, tick_type: int) -> None:
+        self.got_tick = True
+        if tick_type not in self.source_tick_ids:
+            self.source_tick_ids.append(tick_type)
 
     # -- connection / time / account ---------------------------------------
     def on_ready(self) -> None:
@@ -212,35 +252,33 @@ class MarketDataSink:
             self.market_data_type = int(market_data_type)
 
     def on_tick_price(self, tick_type: int, price: object) -> None:
-        value = str(price)
+        mapping = _PRICE_FIELD_BY_TICK.get(tick_type)
         with self._lock:
-            self.got_tick = True
-            if tick_type in _BID_PRICE_TICKS:
-                self.bid = value
-            elif tick_type in _ASK_PRICE_TICKS:
-                self.ask = value
-            elif tick_type in _LAST_PRICE_TICKS:
-                self.last = value
+            self._note_tick(tick_type)
+            if mapping is not None:
+                family, key = mapping
+                self.families[family][key] = str(price)
 
     def on_tick_size(self, tick_type: int, size: object) -> None:
-        value = str(size)
+        mapping = _SIZE_FIELD_BY_TICK.get(tick_type)
         with self._lock:
-            self.got_tick = True
-            if tick_type in _BID_SIZE_TICKS:
-                self.bid_size = value
-            elif tick_type in _ASK_SIZE_TICKS:
-                self.ask_size = value
-            elif tick_type in _LAST_SIZE_TICKS:
-                self.last_size = value
+            self._note_tick(tick_type)
+            if mapping is not None:
+                family, key = mapping
+                self.families[family][key] = str(size)
 
     def on_tick_string(self, tick_type: int, value: str) -> None:
-        if tick_type != _LAST_TIMESTAMP_TICK:
+        family = _TIMESTAMP_FAMILY_BY_TICK.get(tick_type)
+        if family is None:
             return
         raw = str(value).strip()
         if not raw or raw == "0":
             return  # nothing received => never invent a timestamp
         with self._lock:
-            self.exchange_timestamp = datetime.fromtimestamp(int(raw), tz=UTC).isoformat()
+            self._note_tick(tick_type)
+            self.families[family]["timestamp"] = (
+                datetime.fromtimestamp(int(raw), tz=UTC).isoformat()
+            )
 
     def on_snapshot_end(self) -> None:
         self.mkt_data_ready.set()
@@ -362,30 +400,39 @@ class IbkrMarketDataRawClient:
         self._await(sink.mkt_data_ready, "market data snapshot")
         transport.cancel_market_data(_MARKET_DATA_REQ_ID)  # read-only cleanup only
 
-        received_at = self._now() if sink.got_tick else None
+        # Draw the quote from the family matching the ACTUAL served type, so a
+        # delayed quote uses only delayed ticks (66-71, 88) and a realtime -1
+        # placeholder can never clobber it (and vice versa).
+        classification = data_classification(sink.market_data_type)
+        family = (
+            "delayed" if sink.market_data_type in _DELAYED_MARKET_DATA_TYPES else "realtime"
+        )
+        values = sink.families[family]
+        bid, ask, last = values.get("bid"), values.get("ask"), values.get("last")
+        # received_at reflects capture of the SELECTED family's data (not any
+        # stray off-family placeholder tick).
+        received_at = self._now() if values else None
         missing = tuple(
             name
-            for name, value in (
-                ("bid", sink.bid),
-                ("ask", sink.ask),
-                ("last", sink.last),
-            )
+            for name, value in (("bid", bid), ("ask", ask), ("last", last))
             if value is None or str(value).strip() == ""
         )
         return MarketDataQuote(
             symbol=symbol,
             market_data_type=sink.market_data_type,
-            bid=sink.bid,
-            ask=sink.ask,
-            last=sink.last,
-            bid_size=sink.bid_size,
-            ask_size=sink.ask_size,
-            last_size=sink.last_size,
-            exchange_timestamp=sink.exchange_timestamp,
+            bid=bid,
+            ask=ask,
+            last=last,
+            bid_size=values.get("bid_size"),
+            ask_size=values.get("ask_size"),
+            last_size=values.get("last_size"),
+            exchange_timestamp=values.get("timestamp"),
             received_at=received_at,
             entitlement_errors=tuple(sink.entitlement_errors),
             missing_fields=missing,
             freshness=classify_freshness(sink.market_data_type),
+            data_classification=classification,
+            source_tick_ids=tuple(sink.source_tick_ids),
         )
 
     def close(self) -> None:
@@ -566,4 +613,5 @@ __all__ = [
     "MarketDataTransport",
     "build_market_data_client",
     "classify_freshness",
+    "data_classification",
 ]
