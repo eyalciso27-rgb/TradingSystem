@@ -284,7 +284,7 @@ def test_missing_bid_ask_last_fails() -> None:
     session = FakeSession(quote=make_quote(bid=None, last="  "))
     report = run(session)
     assert not report.passed
-    assert "missing field(s)" in report.render()
+    assert "invalid/missing price(s)" in report.render()
 
 
 def test_missing_timestamp_fails() -> None:
@@ -423,3 +423,114 @@ def test_unknown_mode_fails_closed() -> None:
     report = run(FakeSession(), mode="live")
     assert not report.passed
     assert "unknown mode" in report.render()
+
+
+# -- price validity (IBKR -1 / negative / NaN / None are NOT valid quotes) ---------
+
+
+def test_minus_one_prices_fail_in_realtime_and_delayed() -> None:
+    for mode, mdt in (("realtime", 1), ("delayed", 3)):
+        session = FakeSession(
+            quote=make_quote(market_data_type=mdt, bid="-1", ask="-1", last="-1")
+        )
+        report = run(session, mode=mode)
+        assert not report.passed, mode
+        assert "invalid/missing price(s)" in report.render()
+
+
+def test_none_price_fails() -> None:
+    session = FakeSession(quote=make_quote(bid=None))
+    report = run(session)
+    assert not report.passed
+    assert "invalid/missing price(s)" in report.render()
+
+
+def test_nan_and_inf_prices_fail() -> None:
+    for bad in ("NaN", "nan", "Infinity", "-Infinity"):
+        session = FakeSession(quote=make_quote(last=bad))
+        report = run(session)
+        assert not report.passed, bad
+        assert "invalid/missing price(s)" in report.render()
+
+
+def test_zero_price_fails() -> None:
+    session = FakeSession(quote=make_quote(ask="0"))
+    report = run(session)
+    assert not report.passed
+
+
+def test_valid_positive_delayed_quote_passes_development() -> None:
+    session = FakeSession(
+        quote=make_quote(market_data_type=3, bid="191.10", ask="191.14", last="191.12")
+    )
+    report = run(session, mode="delayed")
+    assert report.passed
+    assert report.result_label == "PASS_DEVELOPMENT_DELAYED"
+
+
+# -- 10167 "displaying delayed data" in delayed mode -------------------------------
+
+
+def test_delayed_10167_with_valid_quote_is_documented_not_fatal() -> None:
+    session = FakeSession(
+        quote=make_quote(
+            market_data_type=3,
+            entitlement_errors=("10167: Market data farm - displaying delayed data",),
+        )
+    )
+    report = run(session, mode="delayed")
+    assert report.passed  # a valid delayed quote is not blocked by the notice
+    assert report.result_label == "PASS_DEVELOPMENT_DELAYED"
+    rendered = report.render()
+    assert "DISPLAYING DELAYED DATA" in rendered
+    assert "10167" in rendered
+
+
+def test_delayed_10167_with_invalid_quote_still_fails() -> None:
+    session = FakeSession(
+        quote=make_quote(
+            market_data_type=3,
+            bid="-1",
+            ask="-1",
+            last="-1",
+            entitlement_errors=("10167: displaying delayed data",),
+        )
+    )
+    report = run(session, mode="delayed")
+    assert not report.passed  # invalid prices => FAIL despite the notice
+    assert "invalid/missing price(s)" in report.render()
+
+
+def test_delayed_blocking_entitlement_error_still_fails() -> None:
+    session = FakeSession(
+        quote=make_quote(
+            market_data_type=3,
+            entitlement_errors=("354: requested market data is not subscribed",),
+        )
+    )
+    report = run(session, mode="delayed")
+    assert not report.passed  # 354 is a blocking entitlement error, not a notice
+    assert "blocking entitlement error" in report.render()
+
+
+# -- sizes + received_at labeling --------------------------------------------------
+
+
+def test_zero_size_is_valid_but_noted_not_proof() -> None:
+    session = FakeSession(
+        quote=make_quote(bid_size="0", ask_size="0", last_size="0")
+    )
+    report = run(session)
+    assert report.passed  # zero sizes do not fail; prices drive the gate
+    assert "does not" in report.render()  # the "does not prove a usable quote" note
+
+
+def test_negative_size_fails() -> None:
+    session = FakeSession(quote=make_quote(bid_size="-1"))
+    report = run(session)
+    assert not report.passed
+
+
+def test_received_at_is_labeled_local_not_exchange() -> None:
+    report = run(FakeSession())
+    assert "local capture time, NOT an exchange timestamp" in report.render()

@@ -46,6 +46,7 @@ import argparse
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
 HARNESS_VERSION = "poi-ibkr-market-data-readonly-1.0.0"
@@ -94,6 +95,11 @@ MARKET_DATA_MODES: dict[str, int] = {"realtime": 1, "delayed": 3}
 
 #: In delayed mode, only these IBKR types are accepted, with these labels.
 DELAYED_MODE_CLASSES: dict[int, str] = {3: "DELAYED", 4: "DELAYED_FROZEN"}
+
+#: IBKR "displaying delayed data" notices. In delayed mode these are EXPECTED
+#: and documented explicitly; they do not block a valid delayed quote. Any
+#: other entitlement/permission code is treated as blocking.
+DELAYED_DATA_NOTICE_CODES: frozenset[str] = frozenset({"10167", "10168", "10169", "10197"})
 
 
 class PoiFailure(Exception):
@@ -276,6 +282,41 @@ def _has_value(value: str | None) -> bool:
     return value is not None and str(value).strip() != ""
 
 
+def _valid_price(value: str | None) -> bool:
+    """A usable quote price: a finite number strictly greater than 0.
+
+    IBKR uses -1 (and sometimes other non-positive sentinels) to mean "no
+    value"; None/blank/non-numeric/NaN/Infinity/<=0 are all invalid.
+    """
+    if not _has_value(value):
+        return False
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation:
+        return False
+    return number.is_finite() and number > 0
+
+
+def _valid_size(value: str | None) -> bool:
+    """A size is valid when absent, or a finite number >= 0.
+
+    A size of 0 is valid but does NOT prove a usable quote; a negative or
+    non-finite size is invalid.
+    """
+    if value is None or str(value).strip() == "":
+        return True  # sizes are not part of the PASS gate; absence is tolerated
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation:
+        return False
+    return number.is_finite() and number >= 0
+
+
+def _error_code(entitlement_error: str) -> str:
+    """The leading numeric code of an entitlement error string ("354: …")."""
+    return entitlement_error.split(":", 1)[0].strip()
+
+
 def run_market_data_poi(
     session_factory: Callable[[], object],
     *,
@@ -349,15 +390,48 @@ def run_market_data_poi(
         )
 
         # -- entitlement / permission errors ------------------------------
-        report.record(
-            "entitlement",
-            not quote.entitlement_errors,
-            (
-                "no entitlement/permission error"
-                if not quote.entitlement_errors
-                else f"entitlement/permission error(s): {'; '.join(quote.entitlement_errors)}"
-            ),
-        )
+        # In delayed mode a "displaying delayed data" notice (e.g. 10167) is
+        # EXPECTED and documented; it never blocks a valid delayed quote. Any
+        # other code is blocking. In realtime mode every entitlement error is
+        # blocking (a realtime run must not silently accept a delayed feed).
+        if mode == "delayed":
+            blocking = [
+                error
+                for error in quote.entitlement_errors
+                if _error_code(error) not in DELAYED_DATA_NOTICE_CODES
+            ]
+            notices = [
+                error
+                for error in quote.entitlement_errors
+                if _error_code(error) in DELAYED_DATA_NOTICE_CODES
+            ]
+            report.record(
+                "entitlement",
+                not blocking,
+                (
+                    "no blocking entitlement error"
+                    if not blocking
+                    else f"blocking entitlement error(s): {'; '.join(blocking)}"
+                ),
+            )
+            if notices:
+                report.record(
+                    "delayed_data_notice",
+                    True,
+                    "IBKR reports it is DISPLAYING DELAYED DATA"
+                    f" ({'; '.join(notices)}); expected in delayed mode,"
+                    " non-blocking for a valid quote",
+                )
+        else:
+            report.record(
+                "entitlement",
+                not quote.entitlement_errors,
+                (
+                    "no entitlement/permission error"
+                    if not quote.entitlement_errors
+                    else f"entitlement/permission error(s): {'; '.join(quote.entitlement_errors)}"
+                ),
+            )
 
         # -- market data type identified ----------------------------------
         label = market_data_type_label(quote.market_data_type)
@@ -367,28 +441,34 @@ def run_market_data_poi(
             f"marketDataType={quote.market_data_type} ({label})",
         )
 
-        # -- bid/ask/last present -----------------------------------------
-        fields_present = all(_has_value(v) for v in (quote.bid, quote.ask, quote.last))
+        # -- bid/ask/last VALID (finite and > 0; -1/negative/NaN => FAIL) --
+        fields_present = all(_valid_price(v) for v in (quote.bid, quote.ask, quote.last))
         report.record(
             "quote_fields",
             fields_present,
             (
                 f"bid={quote.bid} ask={quote.ask} last={quote.last}"
                 if fields_present
-                else f"missing field(s): bid={quote.bid} ask={quote.ask} last={quote.last}"
+                else "invalid/missing price(s) (must be finite and > 0;"
+                f" -1/negative/NaN rejected): bid={quote.bid} ask={quote.ask}"
+                f" last={quote.last}"
             ),
         )
         report.record(
             "quote_sizes",
-            all(_has_value(v) for v in (quote.bid_size, quote.ask_size, quote.last_size)),
-            f"bid_size={quote.bid_size} ask_size={quote.ask_size} last_size={quote.last_size}",
+            all(_valid_size(v) for v in (quote.bid_size, quote.ask_size, quote.last_size)),
+            f"bid_size={quote.bid_size} ask_size={quote.ask_size}"
+            f" last_size={quote.last_size} (must be >= 0; a size of 0 does not"
+            " prove a usable quote)",
         )
 
-        # -- timestamp present --------------------------------------------
+        # -- timestamp present (LOCAL capture time, not an exchange stamp) --
+        exchange_timestamp = getattr(quote, "exchange_timestamp", None)
         report.record(
             "timestamp",
             _has_value(quote.received_at),
-            f"received_at={quote.received_at}",
+            f"received_at={quote.received_at} (local capture time, NOT an"
+            f" exchange timestamp); exchange_timestamp={exchange_timestamp}",
         )
 
         # -- explicit classification per mode (never a silent fallback) ---
