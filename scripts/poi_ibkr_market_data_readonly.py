@@ -86,6 +86,15 @@ FRESHNESS_BY_IBKR_TYPE: dict[int, str] = {
     4: "STALE",
 }
 
+#: Explicit market-data modes -> the ``reqMarketDataType`` value requested.
+#: ``realtime`` (default) asks for live data; ``delayed`` is an EXPLICIT
+#: development/research mode that asks for delayed data and can never yield a
+#: POI-MD-001 PASS. There is never a silent fallback between them.
+MARKET_DATA_MODES: dict[str, int] = {"realtime": 1, "delayed": 3}
+
+#: In delayed mode, only these IBKR types are accepted, with these labels.
+DELAYED_MODE_CLASSES: dict[int, str] = {3: "DELAYED", 4: "DELAYED_FROZEN"}
+
 
 class PoiFailure(Exception):
     """Fail-closed PoI failure; carries the checklist reason."""
@@ -147,7 +156,9 @@ class ReadOnlySession(Protocol):
 
     def resolve_contract(self, symbol: str) -> ContractResolution: ...
 
-    def req_market_data(self, symbol: str) -> MarketDataQuote: ...
+    def req_market_data(
+        self, symbol: str, requested_market_data_type: int = 1
+    ) -> MarketDataQuote: ...
 
     def disconnect(self) -> None: ...
 
@@ -215,6 +226,8 @@ class CheckOutcome:
 
 @dataclass(slots=True)
 class PoiReport:
+    mode: str = "realtime"
+    execution_eligible: bool = False
     checks: list[CheckOutcome] = field(default_factory=list)
 
     def record(self, name: str, passed: bool, detail: str) -> None:
@@ -224,15 +237,37 @@ class PoiReport:
     def passed(self) -> bool:
         return bool(self.checks) and all(check.passed for check in self.checks)
 
+    @property
+    def result_label(self) -> str:
+        """PASS / FAIL, or the development-only PASS_DEVELOPMENT_DELAYED.
+
+        A delayed-mode success is DELIBERATELY never a plain "PASS": it is
+        research/development only and is never a POI-MD-001 PASS.
+        """
+        if not self.passed:
+            return "FAIL"
+        return "PASS_DEVELOPMENT_DELAYED" if self.mode == "delayed" else "PASS"
+
     def render(self) -> str:
         lines = [f"POI-IBKR market-data read-only harness {HARNESS_VERSION}"]
+        lines.append(f"MODE: {self.mode}")
         for check in self.checks:
             status = "PASS" if check.passed else "FAIL"
             lines.append(f"  [{status}] {check.name}: {check.detail}")
-        lines.append(f"RESULT: {'PASS' if self.passed else 'FAIL'}")
+        lines.append(f"RESULT: {self.result_label}")
+        lines.append(
+            f"EXECUTION_ELIGIBLE: {'true' if self.execution_eligible else 'false'}"
+        )
+        if self.mode == "delayed":
+            lines.append("WARNING: DELAYED DATA - RESEARCH/DEVELOPMENT ONLY.")
+            lines.append(
+                "NOTE: PASS_DEVELOPMENT_DELAYED is development-only; it is NOT a"
+                " POI-MD-001 PASS and never authorizes execution."
+            )
         lines.append(
             "(read-only allowlist enforced; no order/cancel API was ever callable;"
-            " account id masked, account values withheld)"
+            " account id masked, account values withheld; execution stays gated by"
+            " POI-IBKR-001 regardless of data freshness)"
         )
         return "\n".join(lines)
 
@@ -247,16 +282,32 @@ def run_market_data_poi(
     symbol: str = "AAPL",
     host: str = "127.0.0.1",
     port: int = PAPER_API_PORT,
+    mode: str = "realtime",
     require_realtime: bool = True,
 ) -> PoiReport:
     """Execute the read-only market-data checklist; fail closed on any error.
 
-    ``require_realtime`` (the default) fails the run if the canonical
-    freshness is not REALTIME — run during market hours. Pass
-    ``require_realtime=False`` (``--off-hours``) to record a FROZEN/DELAYED
-    class without failing, purely to observe what the Gateway returns.
+    ``mode`` is ``realtime`` (default) or ``delayed``:
+
+    - ``realtime`` requests ``reqMarketDataType(1)``. With ``require_realtime``
+      (the default) the run FAILS unless the canonical freshness is REALTIME —
+      a delayed downgrade is never silently accepted. ``require_realtime=False``
+      (``--off-hours``) tolerates a FROZEN off-hours snapshot but STILL fails
+      on a delayed downgrade (no silent fallback).
+    - ``delayed`` requests ``reqMarketDataType(3)`` EXPLICITLY for development/
+      research. It accepts only IBKR types 3 (DELAYED) or 4 (DELAYED_FROZEN),
+      is always ``execution_eligible=false``, and its success is reported as
+      PASS_DEVELOPMENT_DELAYED — never a POI-MD-001 PASS.
     """
-    report = PoiReport()
+    report = PoiReport(mode=mode if mode in MARKET_DATA_MODES else "realtime")
+    if mode not in MARKET_DATA_MODES:
+        report.record(
+            "market_data_mode",
+            False,
+            f"unknown mode {mode!r}; use one of {sorted(MARKET_DATA_MODES)}",
+        )
+        return report
+    requested_type = MARKET_DATA_MODES[mode]
     validate_endpoint(host, port)
     report.record("endpoint", True, f"{host}:{port} (localhost + paper API port only)")
 
@@ -293,7 +344,9 @@ def run_market_data_poi(
             f"{symbol} resolved (broker contract id present, not shown)",
         )
 
-        quote = guarded.req_market_data(symbol)
+        quote = guarded.req_market_data(
+            symbol, requested_market_data_type=requested_type
+        )
 
         # -- entitlement / permission errors ------------------------------
         report.record(
@@ -338,29 +391,64 @@ def run_market_data_poi(
             f"received_at={quote.received_at}",
         )
 
-        # -- explicit canonical freshness classification ------------------
-        freshness = classify_freshness(quote.market_data_type)
-        report.record(
-            "freshness_classification",
-            freshness != "UNKNOWN",
-            f"canonical freshness={freshness} (from IBKR {label})",
-        )
-        if require_realtime:
+        # -- explicit classification per mode (never a silent fallback) ---
+        mdt = quote.market_data_type
+        delayed_label = DELAYED_MODE_CLASSES.get(mdt) if mdt is not None else None
+        is_delayed_type = delayed_label is not None
+        if mode == "delayed":
+            # Development/research mode: accept ONLY delayed (3) or
+            # delayed-frozen (4). Realtime (or anything else) received while
+            # DELAYED was requested is reported explicitly, never reclassified.
             report.record(
-                "realtime_expectation",
-                freshness == "REALTIME",
+                "delayed_classification",
+                is_delayed_type,
                 (
-                    "REALTIME as expected"
-                    if freshness == "REALTIME"
-                    else f"expected REALTIME but classified {freshness}"
-                    " (run during market hours, or pass --off-hours to only observe)"
+                    f"delayed-mode class={delayed_label} (marketDataType={mdt})"
+                    if is_delayed_type
+                    else f"requested DELAYED (type 3) but received marketDataType={mdt}"
+                    f" ({label}); reported explicitly, not reclassified"
                 ),
             )
+            report.execution_eligible = False
         else:
+            freshness = classify_freshness(mdt)
             report.record(
-                "realtime_expectation",
-                True,
-                f"off-hours observe mode: recorded {freshness} without requiring REALTIME",
+                "freshness_classification",
+                freshness != "UNKNOWN",
+                f"canonical freshness={freshness} (from IBKR {label})",
+            )
+            if require_realtime:
+                report.record(
+                    "realtime_expectation",
+                    freshness == "REALTIME",
+                    (
+                        "REALTIME as expected"
+                        if freshness == "REALTIME"
+                        else f"expected REALTIME but classified {freshness}"
+                        " (run during market hours, or pass --off-hours to only observe)"
+                    ),
+                )
+            elif is_delayed_type:
+                # Off-hours tolerates a frozen snapshot but NEVER a delayed
+                # downgrade — that would be a silent realtime->delayed fallback.
+                report.record(
+                    "realtime_expectation",
+                    False,
+                    f"requested REALTIME but received DELAYED ({label});"
+                    " no silent fallback to delayed",
+                )
+            else:
+                report.record(
+                    "realtime_expectation",
+                    True,
+                    f"off-hours observe mode: recorded {freshness} without requiring"
+                    " REALTIME",
+                )
+            report.execution_eligible = (
+                require_realtime
+                and freshness == "REALTIME"
+                and not quote.entitlement_errors
+                and fields_present
             )
     except PoiFailure as failure:
         report.record("fail_closed", False, str(failure))
@@ -402,9 +490,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=PAPER_API_PORT, help="paper API port only")
     parser.add_argument("--symbol", default="AAPL", help="one liquid symbol to probe")
     parser.add_argument(
+        "--market-data-mode",
+        choices=sorted(MARKET_DATA_MODES),
+        default="realtime",
+        help=(
+            "realtime (default) requests live data and fails on a delayed"
+            " downgrade; delayed EXPLICITLY requests delayed data for"
+            " development/research (never a POI-MD-001 PASS, never executable)"
+        ),
+    )
+    parser.add_argument(
         "--off-hours",
         action="store_true",
-        help="observe FROZEN/DELAYED without failing (do not require REALTIME)",
+        help=(
+            "realtime mode only: tolerate a FROZEN off-hours snapshot without"
+            " failing (still fails on a delayed downgrade)"
+        ),
     )
     parser.add_argument(
         "--session-module",
@@ -426,6 +527,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         symbol=args.symbol,
         host=args.host,
         port=args.port,
+        mode=args.market_data_mode,
         require_realtime=not args.off_hours,
     )
     print(report.render())

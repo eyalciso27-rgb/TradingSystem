@@ -349,11 +349,15 @@ class IbkrMarketDataRawClient:
             )
         return ContractResolution(symbol, True, True, "single contract resolved")
 
-    def market_data(self, symbol: str) -> MarketDataQuote:
+    def market_data(
+        self, symbol: str, requested_market_data_type: int = _REQUESTED_MARKET_DATA_TYPE
+    ) -> MarketDataQuote:
         sink, transport = self._require_open()
         sink.mkt_data_ready.clear()
-        # Ask for live data; the ACTUAL type is read from the callback below.
-        transport.set_market_data_type(_REQUESTED_MARKET_DATA_TYPE)
+        # Request the caller's mode explicitly (1 realtime / 3 delayed); the
+        # ACTUAL type served is read from the marketDataType callback below and
+        # never assumed from the request.
+        transport.set_market_data_type(requested_market_data_type)
         transport.request_market_data(_MARKET_DATA_REQ_ID, symbol)
         self._await(sink.mkt_data_ready, "market data snapshot")
         transport.cancel_market_data(_MARKET_DATA_REQ_ID)  # read-only cleanup only

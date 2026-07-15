@@ -82,8 +82,10 @@ class FakeClient:
         self.calls.append(f"resolve_contract:{symbol}")
         return self._resolution
 
-    def market_data(self, symbol: str) -> MarketDataQuote:
-        self.calls.append(f"market_data:{symbol}")
+    def market_data(
+        self, symbol: str, requested_market_data_type: int = 1
+    ) -> MarketDataQuote:
+        self.calls.append(f"market_data:{symbol}:{requested_market_data_type}")
         return self._quote
 
     def close(self) -> None:
@@ -150,13 +152,25 @@ def test_requests_before_connect_fail_closed() -> None:
 
 def test_client_exception_is_wrapped_fail_closed() -> None:
     class Boom(FakeClient):
-        def market_data(self, symbol: str) -> MarketDataQuote:
+        def market_data(
+            self, symbol: str, requested_market_data_type: int = 1
+        ) -> MarketDataQuote:
             raise RuntimeError("socket dropped")
 
     sess = session(Boom())
     sess.connect("127.0.0.1", 4002)
     with pytest.raises(PoiSessionError, match="failing closed"):
         sess.req_market_data("AAPL")
+
+
+def test_req_market_data_forwards_requested_type_to_client() -> None:
+    client = FakeClient()
+    sess = session(client)
+    sess.connect("127.0.0.1", 4002)
+    sess.req_market_data("AAPL", 3)  # delayed
+    assert "market_data:AAPL:3" in client.calls
+    sess.req_market_data("AAPL")  # default realtime
+    assert "market_data:AAPL:1" in client.calls
 
 
 # -- read-only surface -------------------------------------------------------------
