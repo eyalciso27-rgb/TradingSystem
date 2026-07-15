@@ -1,0 +1,31 @@
+# IB Gateway watchdog — one supervision cycle per activation (driven by the
+# timer). It never handles credentials, never places orders and never bypasses
+# 2FA. Distinct exit codes carry severity to the journal.
+
+[Unit]
+Description=IB Gateway (Paper) watchdog cycle
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=opc
+Group=opc
+ExecStart=/usr/bin/env python3 /opt/trading/scripts/ib_gateway_watchdog.py \
+  --host 127.0.0.1 --port 4002 \
+  --log-path /home/opc/ibc/logs/ibc.log \
+  --state-file /run/ibgateway/watchdog-state.json \
+  --lock-file /run/ibgateway/watchdog.lock \
+  --reconciliation-marker /run/ibgateway/order-lifecycle.active \
+  --unit ibgateway-ibc.service
+# Waiting states (e.g. TWO_FA_PENDING, exit 20/21/22) are not failures; only
+# genuine fail-closed codes (30/40/41) mark the unit failed.
+SuccessExitStatus=0 10 11 12 20 21 22
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/ibgateway
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
