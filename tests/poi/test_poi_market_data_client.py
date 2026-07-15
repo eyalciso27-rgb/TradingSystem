@@ -217,6 +217,15 @@ def test_reqmarketdatatype_one_does_not_force_realtime() -> None:
     assert quote.freshness == "DELAYED"
 
 
+def test_requested_market_data_type_is_forwarded_to_reqmarketdatatype() -> None:
+    realtime = FakeTransport()
+    opened(realtime).market_data("AAPL")  # default realtime
+    assert "set_market_data_type:1" in realtime.calls
+    delayed = FakeTransport(market_data_type=3)
+    opened(delayed).market_data("AAPL", 3)  # explicit delayed
+    assert "set_market_data_type:3" in delayed.calls
+
+
 # -- honest timestamp / missing fields ---------------------------------------------
 
 

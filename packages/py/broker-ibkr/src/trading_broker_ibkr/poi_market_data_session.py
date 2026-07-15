@@ -81,7 +81,9 @@ class RawMarketDataClient(Protocol):
 
     def resolve_contract(self, symbol: str) -> ContractResolution: ...
 
-    def market_data(self, symbol: str) -> MarketDataQuote: ...
+    def market_data(
+        self, symbol: str, requested_market_data_type: int = 1
+    ) -> MarketDataQuote: ...
 
     def close(self) -> None: ...
 
@@ -127,9 +129,13 @@ class IbkrMarketDataSession:
         self._require_connected()
         return self._guarded(lambda: self._client.resolve_contract(symbol))
 
-    def req_market_data(self, symbol: str) -> MarketDataQuote:
+    def req_market_data(
+        self, symbol: str, requested_market_data_type: int = 1
+    ) -> MarketDataQuote:
         self._require_connected()
-        return self._guarded(lambda: self._client.market_data(symbol))
+        return self._guarded(
+            lambda: self._client.market_data(symbol, requested_market_data_type)
+        )
 
     def disconnect(self) -> None:
         if not self._connected:

@@ -72,6 +72,7 @@ class FakeSession:
         fail_time: bool = False,
     ) -> None:
         self.calls: list[str] = []
+        self.requested_types: list[int] = []
         self._account_id = account_id
         self._quote = quote if quote is not None else make_quote()
         self._resolved = resolved
@@ -100,8 +101,9 @@ class FakeSession:
             detail="" if self._resolved else "no security definition",
         )
 
-    def req_market_data(self, symbol: str) -> Any:
+    def req_market_data(self, symbol: str, requested_market_data_type: int = 1) -> Any:
         self.calls.append(f"req_market_data:{symbol}")
+        self.requested_types.append(requested_market_data_type)
         return self._quote
 
     def disconnect(self) -> None:
@@ -325,3 +327,99 @@ def test_masking() -> None:
     assert harness.mask_account_id(PAPER_ACCOUNT) == "DU" + "*" * 5 + PAPER_ACCOUNT[-2:]
     assert PAPER_ACCOUNT[2:-2] not in harness.mask_account_id(PAPER_ACCOUNT)
     assert harness.mask_account_id("DU12") == "DU**"
+
+
+# -- market-data mode: realtime vs. explicit delayed -------------------------------
+
+
+def test_realtime_mode_requests_type_1() -> None:
+    session = FakeSession()
+    report = run(session, mode="realtime")
+    assert report.passed
+    assert session.requested_types == [1]  # reqMarketDataType(1)
+    assert "MODE: realtime" in report.render()
+
+
+def test_delayed_mode_requests_type_3() -> None:
+    session = FakeSession(quote=make_quote(market_data_type=3))
+    run(session, mode="delayed")
+    assert session.requested_types == [3]  # reqMarketDataType(3)
+
+
+def test_delayed_mode_passes_development_only_never_poi_md_pass() -> None:
+    session = FakeSession(quote=make_quote(market_data_type=3))
+    report = run(session, mode="delayed")
+    assert report.passed
+    assert report.result_label == "PASS_DEVELOPMENT_DELAYED"
+    rendered = report.render()
+    assert "RESULT: PASS_DEVELOPMENT_DELAYED" in rendered
+    assert "RESULT: PASS\n" not in rendered  # never a plain POI-MD-001 PASS
+    assert "DELAYED DATA - RESEARCH/DEVELOPMENT ONLY" in rendered
+    assert "NOT a POI-MD-001 PASS" in rendered
+
+
+def test_delayed_mode_is_never_execution_eligible() -> None:
+    session = FakeSession(quote=make_quote(market_data_type=4))  # delayed-frozen
+    report = run(session, mode="delayed")
+    assert report.execution_eligible is False
+    rendered = report.render()
+    assert "EXECUTION_ELIGIBLE: false" in rendered
+    assert "delayed-mode class=DELAYED_FROZEN" in rendered
+
+
+def test_delayed_quote_with_bid_ask_last_accepted_as_development_only() -> None:
+    session = FakeSession(
+        quote=make_quote(market_data_type=3, bid="191.10", ask="191.14", last="191.12")
+    )
+    report = run(session, mode="delayed")
+    assert report.passed
+    rendered = report.render()
+    assert "bid=191.10 ask=191.14 last=191.12" in rendered
+    assert report.result_label == "PASS_DEVELOPMENT_DELAYED"
+
+
+def test_no_silent_fallback_realtime_requested_delayed_received_fails() -> None:
+    session = FakeSession(quote=make_quote(market_data_type=3))
+    # default realtime, require_realtime True
+    report = run(session)
+    assert not report.passed
+    assert "expected REALTIME but classified DELAYED" in report.render()
+
+
+def test_off_hours_still_fails_on_delayed_downgrade() -> None:
+    session = FakeSession(quote=make_quote(market_data_type=3))
+    report = run(session, require_realtime=False)  # off-hours, realtime mode
+    assert not report.passed
+    assert "no silent fallback to delayed" in report.render()
+
+
+def test_delayed_requested_but_realtime_received_reported_explicitly() -> None:
+    session = FakeSession(quote=make_quote(market_data_type=1))
+    report = run(session, mode="delayed")
+    assert not report.passed  # type 1 is not an accepted delayed class
+    rendered = report.render()
+    assert "reported explicitly, not reclassified" in rendered
+    assert "marketDataType=1" in rendered
+
+
+def test_realtime_mode_clean_data_is_execution_eligible_as_data_freshness() -> None:
+    session = FakeSession()  # realtime type 1, clean
+    report = run(session)
+    assert report.execution_eligible is True
+    assert "EXECUTION_ELIGIBLE: true" in report.render()
+
+
+def test_entitlement_error_still_preserved_in_realtime_mode() -> None:
+    session = FakeSession(
+        quote=make_quote(entitlement_errors=("354: not subscribed",))
+    )
+    report = run(session)
+    assert not report.passed
+    assert report.execution_eligible is False
+    assert "entitlement/permission error" in report.render()
+
+
+def test_unknown_mode_fails_closed() -> None:
+    report = run(FakeSession(), mode="live")
+    assert not report.passed
+    assert "unknown mode" in report.render()
