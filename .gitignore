@@ -35,3 +35,11 @@ TradingSystem/
 # Local conversation export
 ��������� ��� ����.txt
 *.tsbuildinfo
+
+# IBC / IB Gateway auto-login: never commit real credentials or a filled
+# config. Only the example (scripts/ibc/config.example.ini) is tracked.
+**/ibc/config.ini
+config.ini
+*.credentials
+ibc-credentials*
+.config/ibc/

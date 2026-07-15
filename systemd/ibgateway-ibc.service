@@ -1,0 +1,38 @@
+# IB Gateway (Paper) via IBC — auto-start unit.
+#
+# Credentials are NOT here: they live only in the IBC config file (chmod 600),
+# read by IBC itself. No credential appears in this unit, in the command line
+# or in a visible Environment= entry. Restart is managed by the watchdog (the
+# single restart manager), so this unit does NOT auto-restart on its own.
+#
+# Install: copy to /etc/systemd/system/, then `systemctl daemon-reload`.
+# Do NOT enable/start until the owner has completed secure IBC setup and is
+# ready to approve the IBKR Mobile 2FA prompt.
+
+[Unit]
+Description=IB Gateway (Paper) via IBC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opc
+Group=opc
+# Non-secret paths only. The IB login id/password are read by IBC from
+# IBC_INI (chmod 600), never from here.
+Environment=IBC_PATH=/opt/ibc
+Environment=IBC_INI=/home/opc/.config/ibc/config.ini
+Environment=TWS_MAJOR_VRSN=1048
+Environment=IBC_LOG_PATH=/home/opc/ibc/logs
+ExecStart=/usr/bin/env bash /opt/trading/scripts/start_ibc_gateway.sh
+# The watchdog is the single restart manager (avoids double management).
+Restart=no
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/opc/ibc /home/opc/.config/ibc /run/ibgateway
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

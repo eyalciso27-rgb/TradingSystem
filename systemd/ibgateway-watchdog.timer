@@ -1,0 +1,15 @@
+# Runs the IB Gateway watchdog cycle shortly after boot and then periodically.
+# The watchdog itself is lock-guarded and rate-limited, so overlapping or rapid
+# firings can never cause a restart loop.
+
+[Unit]
+Description=Periodic IB Gateway (Paper) watchdog
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=ibgateway-watchdog.service
+
+[Install]
+WantedBy=timers.target
