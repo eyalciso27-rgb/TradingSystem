@@ -30,10 +30,14 @@ PAPER_ACCOUNT = "DU" + "1234567"
 FEED_EPOCH = 1752518400
 FEED_EPOCH_ISO = datetime.fromtimestamp(FEED_EPOCH, tz=UTC).isoformat()
 
-# IBKR tick-type ids used by the fake feed.
+# IBKR realtime tick-type ids used by the default fake feed.
 BID, ASK, LAST = 1, 2, 4
 BID_SIZE, ASK_SIZE, LAST_SIZE = 0, 3, 5
 LAST_TIMESTAMP = 45
+# IBKR delayed tick-type ids.
+DELAYED_BID, DELAYED_ASK, DELAYED_LAST = 66, 67, 68
+DELAYED_BID_SIZE, DELAYED_ASK_SIZE, DELAYED_LAST_SIZE = 69, 70, 71
+DELAYED_LAST_TIMESTAMP = 88
 
 
 class FakeTransport:
@@ -50,6 +54,9 @@ class FakeTransport:
         mkt_errors: tuple[tuple[int, str], ...] = (),
         snapshot_end: bool = True,
         drop_time: bool = False,
+        price_ticks: dict[int, float] | None = None,
+        size_ticks: dict[int, int] | None = None,
+        string_ticks: dict[int, str] | None = None,
     ) -> None:
         self.calls: list[str] = []
         self._sink: MarketDataSink | None = None
@@ -61,6 +68,9 @@ class FakeTransport:
         self._mkt_errors = mkt_errors
         self._snapshot_end = snapshot_end
         self._drop_time = drop_time
+        self._price_ticks = price_ticks
+        self._size_ticks = size_ticks
+        self._string_ticks = string_ticks
 
     def start(self, host: str, port: int, client_id: int, sink: MarketDataSink) -> None:
         self.calls.append(f"start:{host}:{port}:{client_id}")
@@ -103,7 +113,15 @@ class FakeTransport:
         assert self._sink is not None
         if self._market_data_type is not None:
             self._sink.on_market_data_type(self._market_data_type)
-        if self._ticks:
+        custom = self._price_ticks or self._size_ticks or self._string_ticks
+        if custom is not None:
+            for tick_id, price in (self._price_ticks or {}).items():
+                self._sink.on_tick_price(tick_id, price)
+            for tick_id, size in (self._size_ticks or {}).items():
+                self._sink.on_tick_size(tick_id, size)
+            for tick_id, text in (self._string_ticks or {}).items():
+                self._sink.on_tick_string(tick_id, text)
+        elif self._ticks:
             self._sink.on_tick_price(BID, 191.20)
             self._sink.on_tick_price(ASK, 191.24)
             self._sink.on_tick_price(LAST, 191.22)
@@ -224,6 +242,88 @@ def test_requested_market_data_type_is_forwarded_to_reqmarketdatatype() -> None:
     delayed = FakeTransport(market_data_type=3)
     opened(delayed).market_data("AAPL", 3)  # explicit delayed
     assert "set_market_data_type:3" in delayed.calls
+
+
+# -- delayed tick ids 66-71 + 88 -------------------------------------------------
+
+
+def test_delayed_tick_ids_66_to_71_and_88_are_mapped() -> None:
+    transport = FakeTransport(
+        market_data_type=3,
+        price_ticks={
+            DELAYED_BID: 191.10,
+            DELAYED_ASK: 191.14,
+            DELAYED_LAST: 191.12,
+        },
+        size_ticks={
+            DELAYED_BID_SIZE: 120,
+            DELAYED_ASK_SIZE: 340,
+            DELAYED_LAST_SIZE: 55,
+        },
+        string_ticks={DELAYED_LAST_TIMESTAMP: str(FEED_EPOCH)},
+    )
+    quote = opened(transport).market_data("AAPL", 3)
+    assert quote.market_data_type == 3
+    assert quote.data_classification == "DELAYED"
+    assert (quote.bid, quote.ask, quote.last) == ("191.1", "191.14", "191.12")
+    assert (quote.bid_size, quote.ask_size, quote.last_size) == ("120", "340", "55")
+    assert quote.exchange_timestamp == FEED_EPOCH_ISO  # from tick 88, not 45
+    assert quote.missing_fields == ()
+    # source tick ids are recorded for audit
+    for tick_id in (66, 67, 68, 69, 70, 71, 88):
+        assert tick_id in quote.source_tick_ids
+
+
+def test_delayed_prices_do_not_remain_minus_one_or_zero() -> None:
+    # IBKR sends realtime placeholders (-1 / 0) AND the real delayed ticks.
+    # The delayed quote must use the positive delayed values, never the
+    # realtime placeholders.
+    transport = FakeTransport(
+        market_data_type=3,
+        price_ticks={
+            BID: -1.0, ASK: -1.0, LAST: 0.0,          # realtime placeholders
+            DELAYED_BID: 191.10, DELAYED_ASK: 191.14, DELAYED_LAST: 191.12,
+        },
+    )
+    quote = opened(transport).market_data("AAPL", 3)
+    assert (quote.bid, quote.ask, quote.last) == ("191.1", "191.14", "191.12")
+    for value in (quote.bid, quote.ask, quote.last):
+        assert value not in ("-1", "-1.0", "0", "0.0")
+
+
+def test_realtime_mode_ignores_delayed_ticks() -> None:
+    # Delayed ticks arriving in a realtime run must not leak into the quote.
+    transport = FakeTransport(
+        market_data_type=1,
+        price_ticks={BID: 191.20, ASK: 191.24, LAST: 191.22, DELAYED_BID: 999.0},
+    )
+    quote = opened(transport).market_data("AAPL", 1)
+    assert quote.data_classification == "REALTIME"
+    assert quote.bid == "191.2"  # never 999 from the delayed tick
+
+
+def test_delayed_run_with_only_realtime_placeholders_is_missing() -> None:
+    # Requested/served delayed but only realtime -1/0 ticks arrived => the
+    # delayed family is empty => prices missing (fail-closed upstream).
+    transport = FakeTransport(
+        market_data_type=3,
+        price_ticks={BID: -1.0, ASK: -1.0, LAST: 0.0},
+    )
+    quote = opened(transport).market_data("AAPL", 3)
+    assert set(quote.missing_fields) == {"bid", "ask", "last"}
+    assert quote.received_at is None  # no delayed data captured
+    assert quote.data_classification == "DELAYED"
+
+
+def test_data_classification_helper() -> None:
+    from trading_broker_ibkr.poi_market_data_client import data_classification
+
+    assert data_classification(1) == "REALTIME"
+    assert data_classification(2) == "REALTIME"
+    assert data_classification(3) == "DELAYED"
+    assert data_classification(4) == "DELAYED"
+    assert data_classification(None) == "UNKNOWN"
+    assert data_classification(99) == "UNKNOWN"
 
 
 # -- honest timestamp / missing fields ---------------------------------------------
