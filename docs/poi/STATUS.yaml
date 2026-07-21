@@ -71,7 +71,20 @@ items:
     priority: P0
     status: BLOCKED
     evidence: evidence/BLOCKED-P0.md
-    blocked_on: IBKR paper market-data entitlement + external provider trial
+    blocked_on: external provider benchmark + outage/fallback test + field
+      ownership matrix + provider ADR. The IBKR realtime path itself is proven
+      (see realtime_subgate); the aggregate PoI is NOT PASS.
+    # IBKR realtime market-data sub-gate only (not a frozen-backlog PoI id, so
+    # not a separate registry item): PASS on 2026-07-21, owner manual run on
+    # Oracle Linux ARM64 (IB Gateway 10.48, official ibapi 10.48.1,
+    # 127.0.0.1:4002, AAPL, paper account masked; marketDataType=1 REALTIME, no
+    # entitlement error, valid bid/ask/last + sizes, clean disconnect; no order
+    # API callable). This does NOT make POI-MD-001 PASS and does NOT affect
+    # POI-IBKR-001.
+    realtime_subgate:
+      status: PASS
+      date: "2026-07-21"
+      evidence: evidence/POI-MD-001-REALTIME.md
   - id: POI-IBKR-001
     priority: P0
     status: BLOCKED

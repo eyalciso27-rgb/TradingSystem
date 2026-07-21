@@ -22,8 +22,8 @@ Goal: prove the built execution machine against the real world, minimally.
 
 | # | Item | Status today | Exit criterion |
 |---|---|---|---|
-| A1 | Realtime market-data evidence (entitlement window) | BLOCKED (delayed-mode dev PASS only) | `marketDataType=1`, valid positive bid/ask/last, masked transcript |
-| A2 | **POI-MD-001** close-out (realtime + external-provider benchmark/fallback decision) | BLOCKED (partial) | owner marks PASS with field-ownership matrix + provider ADR |
+| A1 | Realtime market-data evidence (entitlement window) | ✅ **DONE 2026-07-21** — owner run: `marketDataType=1` REALTIME, no entitlement error, valid bid/ask/last + sizes, clean disconnect (`docs/poi/evidence/POI-MD-001-REALTIME.md`) | met |
+| A2 | **POI-MD-001** close-out: external-provider benchmark, outage/fallback test, field-ownership matrix, provider ADR | **BLOCKED (aggregate)** — IBKR realtime path proven (A1); external provider work not started | owner marks PASS with field-ownership matrix + provider ADR |
 | A3 | Owner-approved **Paper lifecycle CLI** (separate PR; first real-submit code path; localhost/4002/DU gates; one order at a time; no retry) | not built (deliberately) | owner approves build; PR reviewed & merged |
 | A4 | **POI-IBKR-001** owner-run: submit / ack / partial fill / fill / protection / cancel / reconnect / reconciliation | NOT RUN / BLOCKED | owner marks PASS per frozen backlog criteria |
 | A5 | **Short Paper Manual** — integration proof ONLY (one-trade runbook; not an operating model) | prepared | IMP-1302 DoD: zero duplicate orders, zero required unprotected positions |
@@ -157,6 +157,7 @@ positive marginal value.
 
 ## Next task (single)
 
-> **Freeze and approve the Evidence Roadmap and status model.**
-> No implementation task is selected until the owner approves this document
-> and the status model. After approval: Track A item A1.
+> **Track A / A2 — external market-data provider benchmark and outage/fallback
+> test**, producing the field-ownership matrix and provider ADR that close
+> POI-MD-001. (A1 realtime evidence: **done 2026-07-21**.)
+> No parallel implementation task is opened.
