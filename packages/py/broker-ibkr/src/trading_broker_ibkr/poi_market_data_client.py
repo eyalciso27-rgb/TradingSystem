@@ -43,6 +43,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from trading_broker_ibkr.ibkr_error_callback import (
+    ErrorCallbackShapeError,
+    normalize_error_callback,
+    normalize_message,
+)
 from trading_broker_ibkr.poi_readonly_session import (
     PoiSessionError,
     ReadOnlyAccountSummary,
@@ -284,8 +289,23 @@ class MarketDataSink:
         self.mkt_data_ready.set()
 
     # -- errors ------------------------------------------------------------
-    def on_error(self, code: int, message: str) -> None:
-        text = f"{code}: {message[:120]}"
+    def on_callback_shape_error(self, detail: str) -> None:
+        """An unsupported/malformed error callback: fail closed, sanitized."""
+        with self._lock:
+            self.fatal_error = f"IBKR callback incompatibility: {detail}"
+        for event in (
+            self.ready,
+            self.time_ready,
+            self.account_ready,
+            self.contract_ready,
+            self.mkt_data_ready,
+        ):
+            event.set()
+
+    def on_error(self, code: int, message: object) -> None:
+        # ``message`` is normalized defensively: the wrapper already delivers a
+        # str, but a non-str payload must never raise (that is the 10.48 bug).
+        text = f"{code}: {normalize_message(message)}"
         if code in _SUBSCRIPTION_ERROR_CODES:
             with self._lock:
                 self.entitlement_errors.append(text)
@@ -537,11 +557,19 @@ def _build_ibapi_transport() -> MarketDataTransport:
             if self._sink is not None:
                 self._sink.on_snapshot_end()
 
-        def error(  # noqa: N802
-            self, req_id: int, code: int, message: str, advanced: str = ""
-        ) -> None:
-            if self._sink is not None:
-                self._sink.on_error(code, message)
+        def error(self, *args: object, **kwargs: object) -> None:  # noqa: N802
+            # Accepts the IBKR 10.48 shape (reqId, errorTime, errorCode,
+            # errorString, advancedOrderRejectJson="") and the legacy shape;
+            # an unsupported shape fails closed with a sanitized diagnostic
+            # instead of raising an unrelated TypeError.
+            if self._sink is None:
+                return
+            try:
+                normalized = normalize_error_callback(*args, **kwargs)
+            except ErrorCallbackShapeError as shape_error:
+                self._sink.on_callback_shape_error(str(shape_error))
+                return
+            self._sink.on_error(normalized.code, normalized.message)
 
     class _IbApiTransport:  # pragma: no cover - exercised only on the host
         """Adapts ``_MarketDataApp`` to the ``MarketDataTransport`` seam."""

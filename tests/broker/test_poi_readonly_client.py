@@ -141,6 +141,41 @@ def test_benign_info_message_is_not_fatal() -> None:
     assert sink.fatal_error is None
 
 
+# -- IBKR 10.48 error-callback compatibility (blocking defect regression) -----
+
+
+def test_sink_survives_non_string_message_without_typeerror() -> None:
+    # The 10.48 defect delivered an int where a message was expected; the sink
+    # must normalize it instead of raising 'int' object is not subscriptable.
+    sink = ReadOnlySink()
+    sink.on_error(502, 502)
+    assert sink.fatal_error is not None
+    assert "502" in sink.fatal_error
+
+
+def test_real_ibkr_connect_error_is_not_masked_by_typeerror() -> None:
+    # A genuine CONNECT_FAIL must surface as the real IBKR error text, not as
+    # "connect failed: TypeError".
+    transport = FakeTransport(
+        fatal=(502, "Couldn't connect to TWS. Confirm that API is enabled.")
+    )
+    session = create_session(make_client(transport))
+    with pytest.raises(PoiSessionError) as excinfo:
+        session.connect("127.0.0.1", 4002)
+    detail = str(excinfo.value)
+    assert "IBKR error 502" in detail
+    assert "Couldn't connect to TWS" in detail
+    assert "TypeError" not in detail
+
+
+def test_callback_shape_error_fails_closed_with_sanitized_detail() -> None:
+    sink = ReadOnlySink()
+    sink.on_callback_shape_error("unsupported IBKR error callback shape; 2 arg(s)")
+    assert sink.fatal_error is not None
+    assert "callback incompatibility" in sink.fatal_error
+    assert sink.ready.is_set()  # waiters unblocked -> fail closed, no hang
+
+
 def test_request_before_open_fails_closed() -> None:
     client = make_client(FakeTransport())
     with pytest.raises(PoiSessionError, match="not open"):

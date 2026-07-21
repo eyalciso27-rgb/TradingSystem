@@ -315,6 +315,30 @@ def test_delayed_run_with_only_realtime_placeholders_is_missing() -> None:
     assert quote.data_classification == "DELAYED"
 
 
+def test_market_data_sink_survives_non_string_message() -> None:
+    # IBKR 10.48 defect regression: an int message must not raise TypeError.
+    sink = MarketDataSink()
+    sink.on_error(354, 354)
+    assert any("354" in entry for entry in sink.entitlement_errors)
+
+
+def test_market_data_callback_shape_error_fails_closed() -> None:
+    sink = MarketDataSink()
+    sink.on_callback_shape_error("unsupported IBKR error callback shape; 2 arg(s)")
+    assert sink.fatal_error is not None
+    assert "callback incompatibility" in sink.fatal_error
+    assert sink.mkt_data_ready.is_set()  # waiters unblocked -> no hang
+
+
+def test_real_ibkr_error_surfaces_through_market_data_client() -> None:
+    client = opened(FakeTransport(contract_error=(502, "Couldn't connect to TWS")))
+    with pytest.raises(PoiSessionError) as excinfo:
+        client.resolve_contract("AAPL")
+    detail = str(excinfo.value)
+    assert "IBKR error 502" in detail
+    assert "TypeError" not in detail
+
+
 def test_data_classification_helper() -> None:
     from trading_broker_ibkr.poi_market_data_client import data_classification
 
