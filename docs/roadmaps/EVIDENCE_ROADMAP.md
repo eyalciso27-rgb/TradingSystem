@@ -1,10 +1,13 @@
 # Evidence Roadmap — from Feature Delivery to Evidence Delivery
 
-> Status: **DRAFT — pending owner freeze/approval.** Documentation only: no
-> application code, no IBKR connection, no orders, no API keys, no PoI status
-> change. No canonical task is deleted; tasks are Continue / Evidence /
-> Frozen with explicit unfreeze conditions. Status vocabulary:
-> `docs/status/CURRENT_PROJECT_STATUS.md` §1.
+> Status: **APPROVED / FROZEN by
+> [ADR-0015](../adr/ADR-0015-evidence-delivery-governance.md)** (owner
+> decision, 2026-07-17). Documentation only: no application code, no IBKR
+> connection, no orders, no API keys, no PoI status change. No canonical task
+> is deleted; tasks are Continue / Evidence / Frozen with explicit unfreeze
+> conditions. Status vocabulary: `docs/status/CURRENT_PROJECT_STATUS.md` §1.
+> Authority boundaries, the no-auto-promotion rule and the process for making
+> EVD tasks canonical are binding per ADR-0015.
 
 **The pivot:** 72/82 canonical tasks are `IMPLEMENTED`, but almost everything
 is only `TESTED_WITH_FAKES`. The scarce resource is now **evidence** — real
@@ -52,8 +55,12 @@ ablations (below), with evaluation metrics + statistical uncertainty
 (expectancy, drawdown, hit rate, confidence intervals; decision quality
 separated from luck/data/execution per IMP-1502's standard).
 
-### Proposed Evidence tasks (proposed IDs only — NOT added to
-`CLAUDE_CODE_TASKS.yaml` without a governance ADR)
+### Proposed Evidence tasks — **non-canonical**
+
+Per [ADR-0015 §9](../adr/ADR-0015-evidence-delivery-governance.md) these IDs
+are **proposals only**: they are not canonical tasks, confer no authority to
+write application code, and become canonical only through an amendment ADR +
+owner approval + a dedicated "Amend CLAUDE_CODE_TASKS.yaml" task.
 
 | Proposed ID | Title | Exit criterion |
 |---|---|---|

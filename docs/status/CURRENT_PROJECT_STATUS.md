@@ -5,8 +5,12 @@
 > `main` @ `624343b` (PR #34 merged). Tests passing is **never** integration
 > evidence; nothing is marked verified without real masked evidence.
 >
-> **Mode: EVIDENCE DELIVERY.** Automatic feature progression through the old
-> backlog is paused. The plan forward is `docs/roadmaps/EVIDENCE_ROADMAP.md`.
+> **Mode: EVIDENCE DELIVERY**, approved and frozen by
+> [ADR-0015](../adr/ADR-0015-evidence-delivery-governance.md). Automatic
+> feature progression through the old backlog is paused. The plan forward is
+> `docs/roadmaps/EVIDENCE_ROADMAP.md`; the status vocabulary below (§1),
+> the authority boundaries, the no-auto-promotion rule and the EVD→canonical
+> process are binding per that ADR.
 
 ## 1. Status vocabulary (binding)
 
@@ -124,11 +128,17 @@ cancelled.
 
 ## 9. Single next task
 
-> **Freeze and approve the Evidence Roadmap and status model**
-> (owner approval of `docs/roadmaps/EVIDENCE_ROADMAP.md` + this document).
-> No implementation task is selected until then. After approval, the first
-> evidence action is Track A item 1: POI-MD-001 realtime evidence when the
-> entitlement becomes active.
+The freeze/approval task is **complete**: ADR-0015 formally approves the
+Evidence Delivery pivot, this status model, the three tracks, the authority
+boundaries, Paper Manual as an integration-validation stage only, the
+Shadow → Restricted Paper Auto → validation → future Live progression, the
+prohibition on automatic strategy promotion, and the process for making EVD
+tasks canonical.
+
+> **Next task: Track A / A1 — run POI-MD-001 realtime evidence when the
+> market-data entitlement becomes active.**
+> No parallel implementation task is opened. `EVD-0001…EVD-0013` remain
+> **non-canonical** until the ADR-0015 §9 amendment process completes.
 
 ## 10. Update policy & repo-vs-summary discrepancies
 
