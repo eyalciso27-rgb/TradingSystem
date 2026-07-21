@@ -36,7 +36,7 @@
 | Canonical tasks (counted from YAML) | **82** |
 | `IMPLEMENTED` canonical tasks | **72** (IMP-0001…IMP-1206 + IMP-1301) |
 | Current stage | **Evidence Delivery** (feature delivery paused after PHASE-13/IMP-1301) |
-| Single next task | **Freeze and approve the Evidence Roadmap and status model** (§9) |
+| Single next task | **Track A / A2 — external market-data provider benchmark + outage/fallback test** (§9) |
 
 ## 3. What is completed in code (`IMPLEMENTED`)
 
@@ -76,7 +76,7 @@ invalid prices fail; 10167 = non-blocking delayed notice).
 | PoI | Status | Evidence / gap | Next action |
 |---|---|---|---|
 | POI-IBKR-READONLY | **PASS** (read-only scope only) | `evidence/POI-IBKR-READONLY.md`, 2026-07-10, DU*****32 | none |
-| POI-MD-001 | **BLOCKED** (partial) | delayed-mode `PASS_DEVELOPMENT_DELAYED` achieved on the real host (`execution_eligible=false`); missing: realtime `marketDataType=1` evidence + external-provider benchmark | realtime run when entitlement active (Track A) |
+| POI-MD-001 | **BLOCKED** (aggregate) — **realtime sub-gate PASS** | `evidence/POI-MD-001-REALTIME.md` (owner run 2026-07-21): `marketDataType=1` REALTIME, no entitlement error, valid bid/ask/last + sizes, timestamp, clean disconnect, read-only. Missing for aggregate PASS: external-provider benchmark, outage/fallback test, field-ownership matrix, provider ADR | run the external-provider benchmark + fallback test (Track A / A2) |
 | POI-IBKR-001 | **NOT RUN / BLOCKED** | read-only pre-check only; missing: real submit/ack/fill/cancel/protection/reconciliation evidence | after POI-MD-001 + owner-approved CLI (Track A) |
 | Other P0/P1 PoIs | per `docs/poi/STATUS.yaml` | social/news/AI/TV remain BLOCKED on external accounts/hosts (ADR-0014) | Track A/C |
 
@@ -98,8 +98,12 @@ owner-run CLI is deliberately unbuilt.
 
 ## 7. Current blockers (`BLOCKED`)
 
-1. Realtime market-data entitlement (activation window).
-2. POI-MD-001 realtime evidence + external-provider benchmark.
+1. ~~Realtime market-data entitlement~~ — **CLEARED 2026-07-21**: owner run
+   observed `marketDataType=1` (REALTIME) with no entitlement error
+   (`evidence/POI-MD-001-REALTIME.md`). IBKR realtime path proven; nothing
+   else is implied.
+2. POI-MD-001 **aggregate** still BLOCKED: external-provider benchmark,
+   outage/fallback test, field-ownership matrix and provider ADR are missing.
 3. Real Paper submit/ack/fill/cancel never run (POI-IBKR-001).
 4. Owner-run lifecycle CLI not built (requires explicit owner approval).
 5. IMP-1302 gated on POI-IBKR-001 PASS.
@@ -135,8 +139,15 @@ Shadow → Restricted Paper Auto → validation → future Live progression, the
 prohibition on automatic strategy promotion, and the process for making EVD
 tasks canonical.
 
-> **Next task: Track A / A1 — run POI-MD-001 realtime evidence when the
-> market-data entitlement becomes active.**
+**Track A / A1 is complete:** the realtime market-data sub-gate PASSED on the
+owner host (2026-07-21) — `marketDataType=1`, entitlement confirmed, valid
+quote fields, clean disconnect (`docs/poi/evidence/POI-MD-001-REALTIME.md`).
+This proves the **IBKR realtime path only**; POI-MD-001 aggregate stays
+BLOCKED and execution stays gated by POI-IBKR-001.
+
+> **Next task: Track A / A2 — external market-data provider benchmark and
+> outage/fallback test**, producing the field-ownership matrix and the
+> provider ADR needed to close POI-MD-001.
 > No parallel implementation task is opened. `EVD-0001…EVD-0013` remain
 > **non-canonical** until the ADR-0015 §9 amendment process completes.
 
