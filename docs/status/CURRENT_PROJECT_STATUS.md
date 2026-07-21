@@ -36,7 +36,7 @@
 | Canonical tasks (counted from YAML) | **82** |
 | `IMPLEMENTED` canonical tasks | **72** (IMP-0001…IMP-1206 + IMP-1301) |
 | Current stage | **Evidence Delivery** (feature delivery paused after PHASE-13/IMP-1301) |
-| Single next task | **Track A / A2 — external market-data provider benchmark + outage/fallback test** (§9) |
+| Single next task | **ADR-0016 — decide the scope of POI-IBKR-001's `POI-MD-001` dependency** (§9; needs no external provider) |
 
 ## 3. What is completed in code (`IMPLEMENTED`)
 
@@ -76,7 +76,7 @@ invalid prices fail; 10167 = non-blocking delayed notice).
 | PoI | Status | Evidence / gap | Next action |
 |---|---|---|---|
 | POI-IBKR-READONLY | **PASS** (read-only scope only) | `evidence/POI-IBKR-READONLY.md`, 2026-07-10, DU*****32 | none |
-| POI-MD-001 | **BLOCKED** (aggregate) — **realtime sub-gate PASS** | `evidence/POI-MD-001-REALTIME.md` (owner run 2026-07-21): `marketDataType=1` REALTIME, no entitlement error, valid bid/ask/last + sizes, timestamp, clean disconnect, read-only. Missing for aggregate PASS: external-provider benchmark, outage/fallback test, field-ownership matrix, provider ADR | run the external-provider benchmark + fallback test (Track A / A2) |
+| POI-MD-001 | **BLOCKED** (aggregate) — **realtime sub-gate PASS** | `evidence/POI-MD-001-REALTIME.md` (owner run 2026-07-21): `marketDataType=1` REALTIME, no entitlement error, valid bid/ask/last + sizes, timestamp, clean disconnect, read-only. Blocker: *"External provider not selected; benchmark/fallback/provider ADR deferred until owner-approved provider availability."* | deferred to a future provider-selection task; unfreeze only on an owner-approved provider (Track A / A2) |
 | POI-IBKR-001 | **NOT RUN / BLOCKED** | read-only pre-check only; missing: real submit/ack/fill/cancel/protection/reconciliation evidence | after POI-MD-001 + owner-approved CLI (Track A) |
 | Other P0/P1 PoIs | per `docs/poi/STATUS.yaml` | social/news/AI/TV remain BLOCKED on external accounts/hosts (ADR-0014) | Track A/C |
 
@@ -102,8 +102,15 @@ owner-run CLI is deliberately unbuilt.
    observed `marketDataType=1` (REALTIME) with no entitlement error
    (`evidence/POI-MD-001-REALTIME.md`). IBKR realtime path proven; nothing
    else is implied.
-2. POI-MD-001 **aggregate** still BLOCKED: external-provider benchmark,
-   outage/fallback test, field-ownership matrix and provider ADR are missing.
+2. POI-MD-001 **aggregate** BLOCKED — *"External provider not selected;
+   benchmark/fallback/provider ADR deferred until owner-approved provider
+   availability."* (owner decision 2026-07-21). The four sub-items are
+   **deferred to a future provider-selection task**; no provider is selected,
+   assumed, purchased or integrated. **Unfreeze condition:** an external
+   provider is selected and owner-approved, with access, commercial terms,
+   data scope, freshness class and test credentials available.
+   *(`DEFERRED` is not used as a status: it is absent from the ADR-0015
+   vocabulary and is not a canonical registry state.)*
 3. Real Paper submit/ack/fill/cancel never run (POI-IBKR-001).
 4. Owner-run lifecycle CLI not built (requires explicit owner approval).
 5. IMP-1302 gated on POI-IBKR-001 PASS.
@@ -145,11 +152,22 @@ quote fields, clean disconnect (`docs/poi/evidence/POI-MD-001-REALTIME.md`).
 This proves the **IBKR realtime path only**; POI-MD-001 aggregate stays
 BLOCKED and execution stays gated by POI-IBKR-001.
 
-> **Next task: Track A / A2 — external market-data provider benchmark and
-> outage/fallback test**, producing the field-ownership matrix and the
-> provider ADR needed to close POI-MD-001.
+**Track A / A2 is deferred** (no approved external provider), and because the
+frozen backlog declares `POI-IBKR-001 depends: [POI-PLAT-ARM-001, POI-MD-001]`,
+that deferral currently also stalls A3–A6. The next active task must therefore
+need **no external provider**:
+
+> **Next task: ADR-0016 — decide the scope of POI-IBKR-001's `POI-MD-001`
+> dependency** — whether the proven realtime market-data sub-gate satisfies
+> what the order-lifecycle PoI actually needs (allowing Track A / A3–A6 to
+> proceed while provider selection stays deferred), or whether POI-IBKR-001
+> stays blocked until the full provider benchmark exists.
+> Documentation/governance only; owner decision required.
+>
+> Alternative non-provider path, if the owner prefers Track B: the ADR-0015 §9
+> amendment ADR that would make `EVD-0001…EVD-0013` canonical.
 > No parallel implementation task is opened. `EVD-0001…EVD-0013` remain
-> **non-canonical** until the ADR-0015 §9 amendment process completes.
+> **non-canonical** until that amendment process completes.
 
 ## 10. Update policy & repo-vs-summary discrepancies
 

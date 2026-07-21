@@ -71,9 +71,16 @@ items:
     priority: P0
     status: BLOCKED
     evidence: evidence/BLOCKED-P0.md
-    blocked_on: external provider benchmark + outage/fallback test + field
-      ownership matrix + provider ADR. The IBKR realtime path itself is proven
-      (see realtime_subgate); the aggregate PoI is NOT PASS.
+    blocked_on: "External provider not selected; benchmark/fallback/provider ADR
+      deferred until owner-approved provider availability."
+    # Deferred sub-items (owner decision 2026-07-21): external-provider
+    # benchmark, outage/fallback test, field-ownership matrix and provider ADR.
+    # No provider is selected, assumed, purchased or integrated. Unfreeze only
+    # when an external provider is selected AND owner-approved, with access,
+    # commercial terms, data scope, freshness class and test credentials
+    # available. The IBKR realtime path is proven (realtime_subgate) but the
+    # aggregate PoI is NOT PASS. "DEFERRED" is deliberately not used: it is not
+    # in the ADR-0015 status vocabulary and not a canonical registry state.
     # IBKR realtime market-data sub-gate only (not a frozen-backlog PoI id, so
     # not a separate registry item): PASS on 2026-07-21, owner manual run on
     # Oracle Linux ARM64 (IB Gateway 10.48, official ibapi 10.48.1,
