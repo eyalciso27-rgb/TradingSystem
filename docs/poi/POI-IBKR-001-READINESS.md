@@ -41,7 +41,7 @@ of IBKR fields.
 | Real disconnect/reconnect mid-order | Requires the live Gateway session |
 | Commission/fill reports normalization | Real `commissionReport` / execution details arrive only from IBKR |
 | ~~**Realtime market data**~~ | **CLEARED 2026-07-21** — realtime sub-gate PASS (`evidence/POI-MD-001-REALTIME.md`); per [ADR-0016](../adr/ADR-0016-poi-ibkr-001-market-data-dependency.md) that satisfies the market-data dependency for this PoI. POI-MD-001 aggregate stays BLOCKED |
-| ~~Owner-run CLI~~ | **BUILT (WP-A3, not run):** `scripts/poi_ibkr_lifecycle.py` reuses ExecutionAgent + ProtectionManager + ReconciliationEngine over `BrokerPort`; localhost/4002-only with an explicit LIVE-port refusal, fixed instrument allowlist, ≤1 share and ≤$50, BUY+LIMIT entries only, dry-run-first with a parameter-bound confirmation token, fail-closed with cleanup, masked output. Proven with fakes only (`tests/poi/test_poi_ibkr_lifecycle_cli.py`) |
+| ~~Owner-run CLI~~ | **BUILT (WP-A3, not run):** `scripts/poi_ibkr_lifecycle.py` reuses ExecutionAgent + ProtectionManager + ReconciliationEngine over `BrokerPort`; localhost/4002-only with an explicit LIVE-port refusal, fixed instrument allowlist, ≤1 share and ≤$50, BUY+LIMIT entries only, dry-run-first with a parameter-bound confirmation token, fail-closed with cleanup, masked output. Proven with fakes only (`tests/poi/test_poi_ibkr_lifecycle_cli.py`), incl. the pre-merge safety review: rejected protection, partial-fill remainder, surprise cancel-path fill, unknown broker state, cross-day token/order-id scoping, protective-leg envelope |
 | Watchdog deep-probe dependency + `gatewaystart.sh` patches back into repo | Operational fixes made on the host (version/config/java paths, systemd drop-ins) must be folded into the repo scripts (separate PR) |
 | Paper-account evidence | Masked account snapshot, order ids, state transitions, reconciliation transcript — only from the real run |
 
@@ -97,4 +97,4 @@ IBKR-field leakage ⇒ FAIL.
 | ~~Realtime window~~ | **cleared** 2026-07-21 (realtime sub-gate PASS; ADR-0016) |
 | ~~Owner-run CLI~~ | **built** (WP-A3), fakes-only proof; never executed |
 | **Owner execution (only remaining blocker)** | the seven-step run in `docs/runbooks/POI_IBKR_001_OWNER_RUN.md`; the evidence file; the PASS mark; and therefore IMP-1302 |
-| **Not blocked** | the fakes-only matrix (16 scenarios + 46 harness drills, green); runbooks (`PAPER_MANUAL_ONE_TRADE.md`, `POI_IBKR_001_OWNER_RUN.md`) |
+| **Not blocked** | the fakes-only matrix (16 scenarios + 66 harness drills, green); runbooks (`PAPER_MANUAL_ONE_TRADE.md`, `POI_IBKR_001_OWNER_RUN.md`) |

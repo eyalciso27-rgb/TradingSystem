@@ -97,7 +97,8 @@ from a dry run of identical parameters, and it is `TESTED_WITH_FAKES` only.
   (`preflight | dry-run | cancel-path | fill-path | reconnect | cleanup`)
   reusing ExecutionAgent + ProtectionManager + ReconciliationEngine, plus the
   7-step sequence in `docs/runbooks/POI_IBKR_001_OWNER_RUN.md`. Proven with
-  fakes only (`tests/poi/test_poi_ibkr_lifecycle_cli.py`, 46 drills) —
+  fakes only (`tests/poi/test_poi_ibkr_lifecycle_cli.py`, 66 drills incl. a
+  pre-merge safety review of 12 failure modes) —
   **never run against IBKR**.
 - IBC/watchdog host deployment: code merged (PR #31); the owner reports the
   Gateway auto-starts, but host patches (gateway version/config/java paths,

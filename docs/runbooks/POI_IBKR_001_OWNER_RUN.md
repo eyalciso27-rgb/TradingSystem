@@ -27,12 +27,14 @@
 | BUY entries only | a SELL entry (which could open a short) is refused |
 | LIMIT entries only | the only STOP is the protective leg the ProtectionManager produces |
 | no unrestricted submit surface | every order is built from a validated `LifecycleEnvelope`; there is no free-form intent path |
-| dry-run first | `--execute` requires `--confirm <token>`; the token is derived from scenario+symbol+side+quantity+price+alias+port, so a stale or copied token fails closed |
-| one order at a time | the `client_order_id` is deterministic per scenario; a re-run returns the original outcome and sends nothing |
+| dry-run first | `--execute` requires `--confirm <token>`; the token is derived from run-date+scenario+symbol+side+quantity+limit+reference price+alias+port, so a stale or copied token fails closed — **a token from an earlier day can never be replayed** |
+| one order at a time | the `client_order_id` is deterministic per scenario **and per run-date**; a re-run on the same day returns the original outcome and sends nothing, while a run on another day never collides with an earlier one |
 | no blind retry | broker `UNKNOWN` ⇒ `NEEDS_REVIEW` ⇒ reconciliation only |
 | fail-closed + cleanup | any error aborts, attempts to cancel what was sent, and reports FAIL |
 | no flatten | not implemented; positions are closed by the owner in the Gateway UI |
-| crash-safe | the `client_order_id` is deterministic per scenario, so a re-run after a crash reuses it and the broker returns the original receipt; preflight separately refuses to start on top of a leftover PoI order |
+| protective leg checked too | the generated STOP is re-validated before sending: SELL only, STOP only, positive stop price, quantity > 0 and never more than the position held (a larger SELL would open a short) |
+| loud abort | any state that may leave real exposure records a FAILED `owner_action_required` check plus `>>> OWNER ACTION REQUIRED <<<` steps; the artifact can then never read `RESULT: PASS` |
+| crash-safe | a re-run after a crash reuses the same day's `client_order_id`, so the broker returns the original receipt; preflight separately refuses to start on top of a leftover PoI order or a pre-existing position in the traded symbol |
 | sanitized output | account ids masked (`DU*****xx`); no credential is read, prompted for or printed |
 
 ## Preconditions
@@ -85,8 +87,9 @@ Nothing is sent. Record the printed `Confirmation token`.
 ### Step 3 — cancel path (**first real order**; must not fill)
 
 Pick `--limit-price` at least **20 % below** the current bid and pass the
-current price as `--reference-price` so the harness proves the order cannot
-fill.
+current price as `--reference-price`. Both are **mandatory** for this
+scenario — without them the envelope refuses to build, and a limit closer than
+20 % is refused before any connection is made.
 
 ```bash
 uv run python scripts/poi_ibkr_lifecycle.py \
@@ -98,8 +101,14 @@ uv run python scripts/poi_ibkr_lifecycle.py \
 ```
 
 Proves: submit → ACKNOWLEDGED → duplicate delivery creates **no** second order
-→ cancel → CANCELLED → clean reconciliation. **Stop here if the cancel is not
-confirmed**; clear the order in the Gateway UI and re-run step 1.
+→ cancel → CANCELLED → `never_filled` → clean reconciliation. **Stop here if
+the cancel is not confirmed**; clear the order in the Gateway UI and re-run
+step 1.
+
+If a rapid market move fills it anyway (either before the acknowledgement is
+matched or while the cancel is in flight), the harness aborts with
+`>>> OWNER ACTION REQUIRED <<<`: a real unprotected position exists and the
+cancel path has no protection machinery. Follow the printed steps by hand.
 
 ### Step 4 — verify flat, then re-dry-run the fill path
 
@@ -130,9 +139,20 @@ protective STOP 2 % below the average fill price → the STOP is submitted
 through the same Execution Agent → no unprotected position → reconciliation
 sees position **and** protection.
 
+On a **partial** fill the harness first cancels the working remainder (so no
+unprotected quantity can arrive later), then protects what filled.
+
 If no fill arrives within the timeout the harness **cancels the entry** rather
 than leaving it resting. That is a valid, recordable outcome — not a failure
 of the safety envelope.
+
+If anything prevents protection — the stop is rejected, the broker reports no
+position or a non-positive `average_price`, or the generated stop falls outside
+the envelope — the harness stops and prints
+`>>> OWNER ACTION REQUIRED <<< UNPROTECTED PAPER POSITION MAY BE OPEN` with the
+exact manual steps. **It never places a corrective order and never flattens.**
+Reconciliation is fed the protection actually **accepted**, never the protection
+merely planned, so this failure shows up as a real `PROTECTION_MISMATCH`.
 
 ### Step 6 — reconnect / restart evidence
 
@@ -171,10 +191,13 @@ the 1-share position manually in the Gateway UI, then re-run step 1 until
 
 ## Abort at any point
 
+- **`>>> OWNER ACTION REQUIRED <<<` printed → do exactly what it says, by hand,
+  before running anything else.** It appears only when the run may have left
+  real exposure.
 - Order behaving unexpectedly → `--scenario cleanup`; if the harness is dead,
   cancel in the Gateway UI (VNC), then re-run preflight.
 - Position left over → close it manually in the Gateway UI. Never from code.
-- Anything `UNKNOWN` → stop. Reconcile. **Never resend.**
+- Anything `UNKNOWN` → stop. The harness prints that an order **may** exist at the broker; inspect the Gateway UI by hand. **Never resend.**
 - Gateway unstable → stop the run (that is itself a FAIL criterion) and keep
   the logs.
 
