@@ -23,11 +23,26 @@ Goal: prove the built execution machine against the real world, minimally.
 | # | Item | Status today | Exit criterion |
 |---|---|---|---|
 | A1 | Realtime market-data evidence (entitlement window) | ✅ **DONE 2026-07-21** — owner run: `marketDataType=1` REALTIME, no entitlement error, valid bid/ask/last + sizes, clean disconnect (`docs/poi/evidence/POI-MD-001-REALTIME.md`) | met |
-| A2 | **POI-MD-001** close-out: external-provider benchmark, outage/fallback test, field-ownership matrix, provider ADR | **BLOCKED (aggregate)** — IBKR realtime path proven (A1); external provider work not started | owner marks PASS with field-ownership matrix + provider ADR |
+| A2 | **POI-MD-001** close-out: external-provider benchmark, outage/fallback test, field-ownership matrix, provider ADR | **BLOCKED — deferred**: *"External provider not selected; benchmark/fallback/provider ADR deferred until owner-approved provider availability."* (owner decision 2026-07-21). IBKR realtime path proven in A1 | owner marks PASS with field-ownership matrix + provider ADR — only after the unfreeze condition below |
 | A3 | Owner-approved **Paper lifecycle CLI** (separate PR; first real-submit code path; localhost/4002/DU gates; one order at a time; no retry) | not built (deliberately) | owner approves build; PR reviewed & merged |
 | A4 | **POI-IBKR-001** owner-run: submit / ack / partial fill / fill / protection / cancel / reconnect / reconciliation | NOT RUN / BLOCKED | owner marks PASS per frozen backlog criteria |
 | A5 | **Short Paper Manual** — integration proof ONLY (one-trade runbook; not an operating model) | prepared | IMP-1302 DoD: zero duplicate orders, zero required unprotected positions |
 | A6 | **IMP-1302 → IMP-1303 → IMP-1304** (Paper Manual, chaos/recovery drills, close operational defects) | gated on A4 | phase regression passes |
+
+**A2 deferral (owner decision, 2026-07-21).** There is currently **no approved
+external market-data provider**. No provider is selected, assumed, purchased,
+recommended or integrated; no API key is added and no adapter is built. The
+four sub-items — external-provider benchmark, outage/fallback test,
+field-ownership matrix, provider ADR — are deferred to a future
+**provider-selection task**.
+
+> **Unfreeze / activation condition for A2:** an external provider is
+> **selected and owner-approved**, with access, commercial terms, data scope,
+> freshness class and test credentials available.
+
+Because POI-IBKR-001 declares `depends: [POI-PLAT-ARM-001, POI-MD-001]` in the
+frozen backlog, this deferral currently also stalls A3–A6. Resolving that is a
+governance question (see "Next task"), not something to assume away.
 
 Paper Manual is **only** integration evidence. The target operating model is
 **Restricted Paper Auto** (IMP-1402) — reached only after Track B evidence.
@@ -157,7 +172,20 @@ positive marginal value.
 
 ## Next task (single)
 
-> **Track A / A2 — external market-data provider benchmark and outage/fallback
-> test**, producing the field-ownership matrix and provider ADR that close
-> POI-MD-001. (A1 realtime evidence: **done 2026-07-21**.)
-> No parallel implementation task is opened.
+A1 realtime evidence is **done** (2026-07-21). A2 is **deferred** — no
+approved external provider exists — and that deferral currently also stalls
+A3–A6 through POI-IBKR-001's declared dependency on POI-MD-001. The next
+active task must therefore be one that needs **no external provider**:
+
+> **ADR-0016 — decide the scope of POI-IBKR-001's `POI-MD-001` dependency:**
+> whether the proven **realtime market-data sub-gate** satisfies what the
+> order-lifecycle PoI actually needs, so Track A (A3–A6) may proceed while
+> provider selection stays deferred; or whether POI-IBKR-001 remains blocked
+> until the full provider benchmark exists.
+>
+> Documentation/governance only — no provider, no code, no broker connection.
+> Owner decision required; nothing on the critical path moves without it.
+
+If the owner prefers to work Track B instead, the equivalent non-provider task
+is the **ADR-0015 §9 amendment ADR** that would make `EVD-0001…0013` canonical.
+No parallel implementation task is opened either way.
