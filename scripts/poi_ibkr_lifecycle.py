@@ -81,6 +81,7 @@ from trading_execution_agent.protection import (
     FillEvent,
     MissingCapabilityAction,
     ProtectionManager,
+    ProtectionOrderSpec,
     ProtectionPolicy,
     ProtectionStructure,
 )
@@ -134,6 +135,10 @@ LEFTOVER_TOLERANT_SCENARIOS: frozenset[str] = frozenset({"reconnect", "cleanup"}
 
 POLICY_REF = "poi-ibkr-001-lifecycle-policy-1"
 
+#: Prefix on every owner-visible abort instruction, so it cannot be missed
+#: in a long transcript.
+OWNER_ACTION_BANNER = ">>> OWNER ACTION REQUIRED <<<"
+
 
 class LifecycleRefused(Exception):
     """The safety envelope refused the run (always before any broker call)."""
@@ -163,11 +168,22 @@ class LifecycleEnvelope:
     account_alias: str
     host: str
     port: int
+    #: UTC date of the owner-run (``YYYY-MM-DD``). It scopes BOTH the
+    #: confirmation token and the ``client_order_id``: identical parameters
+    #: on a LATER day produce a different token (an old token cannot be
+    #: replayed) and a different order id (two owner-runs never collide),
+    #: while a repeat on the SAME day stays identical so a crash-restart
+    #: resumes instead of duplicating.
+    run_date: str
     reference_price: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.scenario not in SCENARIOS:
             raise LifecycleRefused(f"unknown scenario {self.scenario!r}")
+        try:
+            datetime.strptime(self.run_date, "%Y-%m-%d").replace(tzinfo=UTC)
+        except ValueError as error:
+            raise LifecycleRefused(f"run_date must be YYYY-MM-DD: {self.run_date!r}") from error
         if self.host not in ALLOWED_HOSTS:
             raise LifecycleRefused(
                 f"host {self.host!r} refused: localhost only ({sorted(ALLOWED_HOSTS)})"
@@ -205,10 +221,26 @@ class LifecycleEnvelope:
         notional = self.quantity * self.limit_price
         if notional > MAX_NOTIONAL:
             raise LifecycleRefused(f"estimated notional {notional} exceeds the {MAX_NOTIONAL} cap")
+        if self.scenario == "cancel-path":
+            # The whole point of the cancel path is an order that CANNOT
+            # fill. Without a reference price that is unprovable, so the
+            # guard is mandatory rather than best-effort.
+            if self.reference_price is None or self.reference_price <= 0:
+                raise LifecycleRefused(
+                    "--reference-price (current market price) is mandatory for the"
+                    " cancel path: it is what proves the limit cannot fill"
+                )
+            floor = self.reference_price * (Decimal("1") - CANCEL_PATH_MIN_DISCOUNT)
+            if self.limit_price > floor:
+                raise LifecycleRefused(
+                    f"limit {self.limit_price} is too close to the market"
+                    f" ({self.reference_price}); it must be <= {floor}"
+                    f" ({CANCEL_PATH_MIN_DISCOUNT:%} below) so it cannot fill"
+                )
 
     @property
     def client_order_id(self) -> str:
-        return f"{CLIENT_ORDER_PREFIX}-{self.scenario}-{self.symbol}"
+        return f"{CLIENT_ORDER_PREFIX}-{self.run_date}-{self.scenario}-{self.symbol}"
 
 
 def confirmation_token(envelope: LifecycleEnvelope) -> str:
@@ -217,16 +249,22 @@ def confirmation_token(envelope: LifecycleEnvelope) -> str:
     The owner obtains it from a dry run and must pass it back verbatim; a
     token from different parameters (or from an older run with a different
     price) does not match, so ``--execute`` fails closed.
+
+    ``run_date`` is part of the material, so a token from a previous day
+    cannot be replayed even when every other parameter is identical — the
+    owner must always dry-run again on the day they execute.
     """
     material = "|".join(
         (
             TOKEN_DOMAIN,
             HARNESS_VERSION,
+            envelope.run_date,
             envelope.scenario,
             envelope.symbol,
             envelope.side.value,
             str(envelope.quantity),
             str(envelope.limit_price),
+            str(envelope.reference_price),
             envelope.account_alias,
             str(envelope.port),
         )
@@ -359,6 +397,80 @@ def _authorized_request(
     )
 
 
+def _owner_action_required(report: LifecycleReport, headline: str, *steps: str) -> None:
+    """Record a loud, unmissable, owner-visible abort instruction.
+
+    Used whenever the run may have left real exposure at the broker. It
+    records a FAILED check (so the artifact can never read PASS) *and*
+    spells out what the owner must do by hand — the harness itself never
+    flattens and never places a corrective order.
+    """
+    report.record("owner_action_required", False, headline)
+    report.note(f"**{OWNER_ACTION_BANNER}** {headline}")
+    for index, step in enumerate(steps, start=1):
+        report.note(f"{OWNER_ACTION_BANNER} step {index}: {step}")
+    report.note(
+        f"{OWNER_ACTION_BANNER} do NOT run another scenario until the account is"
+        " flat and clean; re-run --scenario reconnect to re-inspect."
+    )
+
+
+def _submit_failure_abort(report: LifecycleReport, status: ExecutionStatus) -> None:
+    """A submit that did not confirm may still have reached the broker."""
+    if status is ExecutionStatus.NEEDS_REVIEW:
+        # UNKNOWN broker state: an order MAY exist. Never resend.
+        _owner_action_required(
+            report,
+            "broker state is UNKNOWN after submit — an order MAY exist at the broker",
+            "do NOT re-run this scenario and do NOT resend anything",
+            "inspect open orders and positions in the IB Gateway/TWS UI (VNC)",
+            "cancel anything this run may have left, by hand",
+            "only then re-run --scenario reconnect to confirm the account is clean",
+        )
+    else:
+        report.note(
+            f"submit terminated as {status.value} before any order was accepted;"
+            " nothing was sent and no retry was attempted"
+        )
+
+
+def _protective_spec_refusal(spec: ProtectionOrderSpec, position_quantity: Decimal) -> str | None:
+    """Envelope check for the protective leg; ``None`` means acceptable.
+
+    The protective order is generated, not owner-supplied, so it needs its
+    own guard: it must be a STOP that REDUCES the open long by at most the
+    quantity actually held, priced positively, within the harness cap.
+    """
+    if spec.order_type is not OrderType.STOP:
+        return f"protective order type {spec.order_type.value} is not a plain STOP"
+    if spec.side is not OrderSide.SELL:
+        return f"protective side {spec.side.value} would not reduce a long position"
+    if spec.quantity <= 0:
+        return f"protective quantity {spec.quantity} is not positive"
+    if spec.quantity > position_quantity:
+        return (
+            f"protective quantity {spec.quantity} exceeds the {position_quantity}"
+            " held — sending it would open a short"
+        )
+    if spec.quantity > MAX_QUANTITY:
+        return f"protective quantity {spec.quantity} exceeds the {MAX_QUANTITY} cap"
+    if spec.stop_price is None or spec.stop_price <= 0:
+        return f"protective stop price {spec.stop_price} is not positive"
+    return None
+
+
+def _unprotected_position_abort(report: LifecycleReport, reason: str) -> None:
+    """The most dangerous state this harness can reach: a naked position."""
+    _owner_action_required(
+        report,
+        f"UNPROTECTED PAPER POSITION MAY BE OPEN — {reason}",
+        "open the IB Gateway/TWS UI (VNC) NOW and inspect the account",
+        "close the position manually, or place a protective stop by hand",
+        "cancel any leftover working order for this symbol",
+        "record what happened in the POI-IBKR-001 evidence file; this run is a FAIL",
+    )
+
+
 def _event_id(event: BrokerOrderEvent) -> str:
     """The engine's canonical id for one normalized broker event."""
     return f"{event.sequence}:{event.client_order_id}:{event.state.value}"
@@ -394,6 +506,19 @@ def _await_state(
             return None, seen
         sleep(poll_seconds)
         elapsed += poll_seconds
+
+
+def _first_fill(events: Sequence[BrokerOrderEvent]) -> BrokerOrderEvent | None:
+    """The earliest fill among the observed events, if any.
+
+    ``_await_state`` returns as soon as ANY wanted state matches, so a fill
+    that arrives after an acknowledgement would be invisible if callers
+    only inspected the matched event.
+    """
+    for event in events:
+        if event.state in (OrderState.FILLED, OrderState.PARTIALLY_FILLED):
+            return event
+    return None
 
 
 def _all_events(broker: BrokerPort, client_order_ids: Sequence[str]) -> list[BrokerOrderEvent]:
@@ -504,6 +629,19 @@ def _preflight(broker: BrokerPort, envelope: LifecycleEnvelope, report: Lifecycl
     else:
         report.record("open_poi_orders", True, f"{len(stale)} still open at the broker")
     positions = broker.get_positions(envelope.account_alias)
+    existing = tuple(p for p in positions if p.symbol == envelope.symbol and p.quantity != 0)
+    if envelope.scenario in SUBMITTING_SCENARIOS:
+        # A pre-existing holding in the SAME symbol would blend the average
+        # price the protective stop is derived from, and would make
+        # "protected quantity vs. position" ambiguous. Refuse to start.
+        report.record(
+            "no_preexisting_position_in_symbol",
+            not existing,
+            "none"
+            if not existing
+            else f"{envelope.symbol} already held ({existing[0].quantity}); close it"
+            " first — this run must own the whole position it protects",
+        )
     report.record(
         "position_snapshot",
         True,
@@ -522,14 +660,16 @@ def _run_cancel_path(
     timeout_seconds: float,
 ) -> None:
     """Submit a far-from-market resting LIMIT, acknowledge, then cancel."""
-    if envelope.reference_price is not None:
-        floor = envelope.reference_price * (Decimal("1") - CANCEL_PATH_MIN_DISCOUNT)
-        report.record(
-            "cancel_path_price_safe",
-            envelope.limit_price <= floor,
-            f"limit {envelope.limit_price} must be <= {floor}"
-            f" ({CANCEL_PATH_MIN_DISCOUNT:%} below reference) so it cannot fill",
-        )
+    # LifecycleEnvelope already refused to construct without a reference
+    # price and a limit far enough below it; this records the proof.
+    reference = envelope.reference_price or Decimal(0)
+    floor = reference * (Decimal("1") - CANCEL_PATH_MIN_DISCOUNT)
+    report.record(
+        "cancel_path_price_safe",
+        reference > 0 and envelope.limit_price <= floor,
+        f"limit {envelope.limit_price} <= {floor}"
+        f" ({CANCEL_PATH_MIN_DISCOUNT:%} below reference {reference}) so it cannot fill",
+    )
 
     correlation_id = f"{CLIENT_ORDER_PREFIX}-cancel-{int(now.timestamp())}"
     request = _authorized_request(
@@ -550,6 +690,7 @@ def _run_cancel_path(
         f"status={outcome.status.value} codes={','.join(outcome.reason_codes)}",
     )
     if outcome.status is not ExecutionStatus.SUBMITTED:
+        _submit_failure_abort(report, outcome.status)
         return
 
     # Idempotency proof: the identical queue item must NOT create a second
@@ -573,6 +714,26 @@ def _run_cancel_path(
         ack is not None and ack.state is OrderState.ACKNOWLEDGED,
         f"observed states: {[e.state.value for e in seen] or 'none'}",
     )
+    # A rapid market move can fill an order that was priced never to fill,
+    # and the fill can arrive AFTER the acknowledgement — so scan every
+    # event seen for this order, not just the first one that matched.
+    fill = _first_fill(seen)
+    if fill is not None:
+        _unprotected_position_abort(
+            report,
+            f"the cancel-path order unexpectedly reached {fill.state.value}"
+            f" ({fill.filled_quantity} filled) despite being priced"
+            f" {CANCEL_PATH_MIN_DISCOUNT:%} below the market",
+        )
+        # Still try to cancel any working remainder, then stop: the cancel
+        # path has no protection machinery, so the owner takes over.
+        remainder = agent.cancel(envelope.client_order_id, correlation_id=correlation_id)
+        report.record(
+            "unexpected_fill_remainder_cancelled",
+            remainder.status is ExecutionStatus.CANCEL_SENT,
+            f"status={remainder.status.value}",
+        )
+        return
 
     cancel_outcome = agent.cancel(envelope.client_order_id, correlation_id=correlation_id)
     report.record(
@@ -592,6 +753,20 @@ def _run_cancel_path(
         cancelled is not None,
         f"observed states: {[e.state.value for e in seen_after] or 'none'}",
     )
+    # Last look: a fill that landed while the cancel was in flight.
+    late_fill = _first_fill(seen_after)
+    report.record(
+        "never_filled",
+        late_fill is None,
+        "no fill event on the cancel path"
+        if late_fill is None
+        else f"a fill arrived during cancellation: {late_fill.state.value}",
+    )
+    if late_fill is not None:
+        _unprotected_position_abort(
+            report, "the cancel-path order filled while the cancel was in flight"
+        )
+        return
     _reconcile(
         broker,
         envelope,
@@ -635,6 +810,7 @@ def _run_fill_path(
         f"status={outcome.status.value} codes={','.join(outcome.reason_codes)}",
     )
     if outcome.status is not ExecutionStatus.SUBMITTED:
+        _submit_failure_abort(report, outcome.status)
         return
 
     fill, seen = _await_state(
@@ -659,6 +835,25 @@ def _run_fill_path(
         )
         return
 
+    # A PARTIALLY_FILLED entry still has a working remainder that could
+    # fill later and add quantity nothing is protecting. Close that door
+    # before protecting what already filled.
+    if fill.state is OrderState.PARTIALLY_FILLED:
+        remainder = agent.cancel(envelope.client_order_id, correlation_id=correlation_id)
+        report.record(
+            "entry_remainder_cancelled",
+            remainder.status is ExecutionStatus.CANCEL_SENT,
+            f"partial fill {fill.filled_quantity}/{envelope.quantity}: cancelled the"
+            f" working remainder (status={remainder.status.value}) so no unprotected"
+            " quantity can arrive later",
+        )
+        if remainder.status is not ExecutionStatus.CANCEL_SENT:
+            _unprotected_position_abort(
+                report,
+                "partially filled entry whose remainder could NOT be cancelled",
+            )
+            return
+
     positions = {p.symbol: p for p in broker.get_positions(envelope.account_alias)}
     position = positions.get(envelope.symbol)
     report.record(
@@ -667,11 +862,32 @@ def _run_fill_path(
         f"quantity={position.quantity if position else 0}",
     )
     if position is None:
+        _unprotected_position_abort(
+            report, "a fill was observed but the broker reports no position"
+        )
+        return
+
+    # The real adapter's average_price is not proven by fakes. A missing or
+    # non-positive price would otherwise raise deep inside ProtectionManager
+    # AFTER the position exists — fail loudly and explicitly instead.
+    if position.average_price <= 0:
+        _unprotected_position_abort(
+            report,
+            f"broker reported average_price={position.average_price} so no valid"
+            " protective stop can be computed",
+        )
         return
 
     stop_price = (position.average_price * (Decimal("1") - PROTECTION_STOP_FRACTION)).quantize(
         Decimal("0.01")
     )
+    if stop_price <= 0 or stop_price >= position.average_price:
+        _unprotected_position_abort(
+            report,
+            f"computed stop {stop_price} is not strictly below the entry price"
+            f" {position.average_price}",
+        )
+        return
     manager = ProtectionManager(
         ProtectionPolicy(
             policy_version=POLICY_REF,
@@ -703,8 +919,27 @@ def _run_fill_path(
     )
 
     protective_ids: list[str] = []
+    protected_quantity = Decimal(0)
     for action in plan.actions:
         spec = action.spec
+        # The protective leg bypasses LifecycleEnvelope validation (it is
+        # built from the plan, not from CLI input), so it gets its own
+        # envelope check: it must REDUCE the position, never exceed it —
+        # a SELL larger than the holding would open a short.
+        refusal = _protective_spec_refusal(spec, position.quantity)
+        report.record(
+            f"protection_within_envelope[{spec.spec_ref}]",
+            refusal is None,
+            refusal
+            or f"{spec.side.value} {spec.quantity} {spec.order_type.value}"
+            f" stop={spec.stop_price} reduces a {position.quantity} long",
+        )
+        if refusal is not None:
+            _unprotected_position_abort(
+                report, f"refused to send an out-of-envelope protective order: {refusal}"
+            )
+            continue
+
         protective_id = f"{envelope.client_order_id}-{spec.spec_ref}"
         protective = _authorized_request(
             envelope,
@@ -718,21 +953,38 @@ def _run_fill_path(
             now=now,
         )
         protective_outcome = agent.process(protective)
+        accepted = protective_outcome.status is ExecutionStatus.SUBMITTED
         report.record(
             f"protection_submitted[{spec.spec_ref}]",
-            protective_outcome.status is ExecutionStatus.SUBMITTED,
+            accepted,
             f"{spec.side.value} {spec.quantity} {spec.order_type.value}"
             f" stop={spec.stop_price} status={protective_outcome.status.value}",
         )
-        if protective_outcome.status is ExecutionStatus.SUBMITTED:
+        if accepted:
             protective_ids.append(protective_id)
+            protected_quantity += spec.quantity
+        else:
+            _unprotected_position_abort(
+                report,
+                "the protective stop was NOT accepted by the broker"
+                f" (status={protective_outcome.status.value})",
+            )
 
+    fully_protected = (
+        protected_quantity >= position.quantity and not manager.unprotected_positions()
+    )
     report.record(
         "no_unprotected_position",
-        not manager.unprotected_positions() and len(protective_ids) == len(plan.actions),
-        f"unprotected={list(manager.unprotected_positions())};"
-        f" protective orders live={len(protective_ids)}",
+        fully_protected,
+        f"protected {protected_quantity} of a {position.quantity} position via"
+        f" {len(protective_ids)} accepted order(s);"
+        f" manager unprotected={list(manager.unprotected_positions())}",
     )
+    if not fully_protected:
+        _unprotected_position_abort(
+            report,
+            f"only {protected_quantity} of {position.quantity} is protected at the broker",
+        )
     _reconcile(
         broker,
         envelope,
@@ -746,18 +998,21 @@ def _run_fill_path(
             for order_id in protective_ids
         ),
         positions={envelope.symbol: position.quantity},
-        protected={envelope.symbol: plan.protected_quantity},
+        # ACCEPTED protection, never PLANNED protection: feeding the plan
+        # here would hide the exact failure this run must surface.
+        protected={envelope.symbol: protected_quantity},
         processed_event_ids=frozenset(
             _event_id(e) for e in (*seen, *_all_events(broker, protective_ids))
         ),
         now=now,
         trigger=ReconciliationTrigger.PERIODIC,
     )
-    report.note(
-        "The position and its protective stop are still open on the paper"
-        " account: close them manually in the Gateway/TWS UI (this harness"
-        " never flattens — flatten stays hard-disabled)."
-    )
+    if fully_protected:
+        report.note(
+            "The position and its protective stop are still open on the paper"
+            " account: close them manually in the Gateway/TWS UI (this harness"
+            " never flattens — flatten stays hard-disabled)."
+        )
 
 
 def _run_reconnect(
@@ -986,8 +1241,19 @@ def _emergency_cleanup(
             envelope.client_order_id, correlation_id=f"{CLIENT_ORDER_PREFIX}-abort"
         )
         report.note(f"abort cleanup: cancel status={outcome.status.value}")
+        confirmed = outcome.status is ExecutionStatus.CANCEL_SENT
     except Exception:  # noqa: BLE001
-        report.note("abort cleanup FAILED — inspect open orders in the Gateway UI manually")
+        confirmed = False
+    if not confirmed:
+        # The harness could not prove it left nothing behind. Everything
+        # after this point is the owner's call, by hand.
+        _owner_action_required(
+            report,
+            "the run aborted and the harness could NOT confirm its order was cancelled",
+            "inspect open orders AND positions in the IB Gateway/TWS UI (VNC)",
+            "cancel any working order from this run by hand",
+            "if a position was opened, close it or place a protective stop manually",
+        )
 
 
 def _load_broker_factory(
@@ -1037,7 +1303,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reference-price",
         default=None,
-        help="cancel path: current price, used to prove the limit cannot fill",
+        help=(
+            "current market price. MANDATORY for the cancel path: it is what"
+            " proves the resting limit cannot fill"
+        ),
+    )
+    parser.add_argument(
+        "--run-date",
+        default=None,
+        help=(
+            "UTC YYYY-MM-DD scoping the token and the client_order_id"
+            " (default: today). Two owner-runs on different days never collide,"
+            " and a token from an earlier day cannot be replayed"
+        ),
     )
     parser.add_argument("--host", default="127.0.0.1", help="127.0.0.1/localhost only")
     parser.add_argument("--port", type=int, default=PAPER_API_PORT, help="paper API port only")
@@ -1083,6 +1361,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             account_alias=args.account_alias,
             host=args.host,
             port=args.port,
+            run_date=args.run_date or datetime.now(tz=UTC).strftime("%Y-%m-%d"),
             reference_price=reference,
         )
         factory = _load_broker_factory(
