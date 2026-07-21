@@ -76,6 +76,33 @@ sudo systemctl enable --now ibgateway-watchdog.timer
 manager** (IBC owns only the 2FA relogin). This avoids two mechanisms fighting
 over restarts.
 
+## 4b. IBKR Python API (`ibapi`) — owner-run host prerequisite
+
+The read-only PoI clients import `ibapi` **lazily, on the host only**. It is
+deliberately **not** a declared dependency of `packages/py/broker-ibkr`
+(`dependencies = []`) and is **not installed in CI**:
+
+- The old PyPI package `ibapi==9.81.1.post1` is **forbidden** — it predates the
+  10.48 callback signature and would reintroduce the error-callback defect.
+- No public pin exists for 10.48.1; the supported build comes from the
+  **official IBKR source distribution**, so it cannot be reproduced in CI.
+
+Owner-run installation on the ARM64 host (already performed for the current
+box — recorded here for reproducibility):
+
+```bash
+# from the IBKR TWS API source distribution, e.g. /home/opc/twsapi
+cd /home/opc/twsapi/IBJts/source/pythonclient
+python3 -m pip install --user .        # installs ibapi 10.48.1
+python3 -c "import ibapi; print(getattr(ibapi, '__version__', 'unknown'))"
+```
+
+Verified host baseline: `ibapi==10.48.1`, `protobuf==5.29.5`, IB Gateway 10.48,
+Oracle Linux ARM64. The code detects the runtime via
+`trading_broker_ibkr.ibkr_error_callback.ibapi_runtime_diagnostic()`, which
+reports the installed version (or a clear "NOT INSTALLED" message) without
+touching credentials.
+
 ## 5. 2FA flow (never bypassed)
 
 1. Server boots / Gateway falls / a relogin is needed.
