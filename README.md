@@ -1,8 +1,12 @@
 # Trading System (Monorepo)
 
 Skeleton created by task **IMP-0001** of `docs/baseline-v0.5/CLAUDE_CODE_TASKS.yaml`.
-No business logic exists yet. The authoritative specification baseline is
-`docs/baseline-v0.5/` (see `CLAUDE.md`).
+The authoritative specification baseline is `docs/baseline-v0.5/` (see
+`CLAUDE.md`).
+
+📊 **Current project status:** [`docs/status/CURRENT_PROJECT_STATUS.md`](docs/status/CURRENT_PROJECT_STATUS.md)
+— progress, blockers and the next canonical task (the repo is authoritative;
+any PR that changes a milestone, PoI, blocker or next task updates it).
 
 > **Live trading is prohibited.** Paper Auto and Live modes are disabled by
 > baseline policy. The current approved activity is Phase 0 and isolated
