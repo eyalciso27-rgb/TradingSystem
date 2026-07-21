@@ -40,38 +40,30 @@ of IBKR fields.
 | Real partial fill | Cannot be forced deterministically on Paper; observed opportunistically or documented honestly as not reproduced |
 | Real disconnect/reconnect mid-order | Requires the live Gateway session |
 | Commission/fill reports normalization | Real `commissionReport` / execution details arrive only from IBKR |
-| **Realtime market data** | Marketable-limit fill scenario needs live quotes — **blocked ~3 days on the realtime subscription window**; the cancel-path scenario (far-from-market DAY limit) can run on delayed data with owner care, but the recorded evidence should note the data mode |
-| Owner-run CLI (`scripts/poi_ibkr_lifecycle.py`) | Not yet written — deliberately gated: it is the first code path that submits a real order; build it only under an explicit owner approval, wired to `IbkrPaperAdapter` with the same allowlist/DU/4002 gates as the read-only harnesses |
+| ~~**Realtime market data**~~ | **CLEARED 2026-07-21** — realtime sub-gate PASS (`evidence/POI-MD-001-REALTIME.md`); per [ADR-0016](../adr/ADR-0016-poi-ibkr-001-market-data-dependency.md) that satisfies the market-data dependency for this PoI. POI-MD-001 aggregate stays BLOCKED |
+| ~~Owner-run CLI~~ | **BUILT (WP-A3, not run):** `scripts/poi_ibkr_lifecycle.py` reuses ExecutionAgent + ProtectionManager + ReconciliationEngine over `BrokerPort`; localhost/4002-only with an explicit LIVE-port refusal, fixed instrument allowlist, ≤1 share and ≤$50, BUY+LIMIT entries only, dry-run-first with a parameter-bound confirmation token, fail-closed with cleanup, masked output. Proven with fakes only (`tests/poi/test_poi_ibkr_lifecycle_cli.py`) |
 | Watchdog deep-probe dependency + `gatewaystart.sh` patches back into repo | Operational fixes made on the host (version/config/java paths, systemd drop-ins) must be folded into the repo scripts (separate PR) |
 | Paper-account evidence | Masked account snapshot, order ids, state transitions, reconciliation transcript — only from the real run |
 
-## 2. Owner-run steps (when approved — not now)
+## 2. Owner-run steps (prepared — **not run**)
 
-1. Owner approves opening POI-IBKR-001 (explicit message) and decides on the
-   POI-MD-001 dependency (realtime evidence vs. documented deviation).
-2. Build the owner-run CLI (separate PR): `scripts/poi_ibkr_lifecycle.py`
-   with `--scenario snapshot|reject|cancel|fill|reconnect|reconcile`,
-   localhost+4002+DU gates, masked output, one order at a time, no retry.
-3. Owner runs scenario-by-scenario over PuTTY, pasting masked output here.
+1. ~~Owner approves opening POI-IBKR-001 and decides the POI-MD-001
+   dependency~~ — done: [ADR-0016](../adr/ADR-0016-poi-ibkr-001-market-data-dependency.md).
+2. ~~Build the owner-run CLI~~ — done (WP-A3): `scripts/poi_ibkr_lifecycle.py`,
+   `--scenario preflight|dry-run|cancel-path|fill-path|reconnect|cleanup`.
+3. **Next (owner):** run the seven-step sequence in
+   [`docs/runbooks/POI_IBKR_001_OWNER_RUN.md`](../runbooks/POI_IBKR_001_OWNER_RUN.md)
+   — exact commands, preconditions, abort paths and PASS/FAIL criteria.
 4. Evidence recorded to `docs/poi/evidence/POI-IBKR-001.md`; owner marks PASS.
 
-### Exact commands (future, after the CLI PR is approved & merged)
-
-```bash
-# on the ARM64 host, Gateway up via IBC/systemd, VNC visible:
-uv run python scripts/poi_ibkr_lifecycle.py --scenario snapshot
-uv run python scripts/poi_ibkr_lifecycle.py --scenario reject     # no fill risk
-uv run python scripts/poi_ibkr_lifecycle.py --scenario cancel     # far-limit DAY
-uv run python scripts/poi_ibkr_lifecycle.py --scenario fill       # 1 share, marketable limit
-uv run python scripts/poi_ibkr_lifecycle.py --scenario reconnect
-uv run python scripts/poi_ibkr_lifecycle.py --scenario reconcile
-```
+Until step 3 produces real evidence, POI-IBKR-001 is **BLOCKED / NOT RUN**.
 
 ## 3. Required evidence
 
-**Realtime evidence (blocked ~3 days):** marketable-limit fill with
-`marketDataType=1`, valid positive bid/ask/last at submit time, fill price
-sanity vs. quote.
+**Realtime evidence — obtained 2026-07-21** (`evidence/POI-MD-001-REALTIME.md`):
+`marketDataType=1`, valid positive bid/ask/last with sizes, clean disconnect.
+At fill time the owner still records the quote context (limit vs. ask, fill
+price sanity) in the run evidence.
 
 **Paper-account evidence (owner-run):** masked account id (`DU*****xx`),
 account snapshot before/after, order id + full normalized state transitions
@@ -81,10 +73,10 @@ mismatch), gateway/IBC/adapter versions.
 
 ## 4. Rollback / abort procedure
 
-- **Abort at any step:** cancel the open order in the CLI; if the CLI is
-  dead, cancel manually in the Gateway UI (VNC). Verify with `reconcile`.
+- **Abort at any step:** `--scenario cleanup`; if the harness is dead, cancel
+  manually in the Gateway UI (VNC). Verify with `--scenario reconnect`.
 - **Position left over:** close manually in the Gateway UI (never from
-  code; flatten stays hard-disabled). Re-run `reconcile` until clean.
+  code; flatten stays hard-disabled). Re-run `reconnect` until clean.
 - **Gateway unstable:** stop the run (that is a FAIL criterion), keep logs.
 - **Anything UNKNOWN:** stop; reconciliation before any further action —
   never a blind resend.
@@ -102,6 +94,7 @@ IBKR-field leakage ⇒ FAIL.
 
 | Blocker | Items |
 |---|---|
-| **Realtime window (~3 days)** | fill-scenario evidence; POI-MD-001 realtime PASS |
-| **Owner approval (explicit)** | building the owner-run CLI; any real submit; opening IMP-1302 |
-| **Neither (ready now)** | everything in the fakes-only matrix (16 scenarios, green); runbook + checklists (`docs/runbooks/PAPER_MANUAL_ONE_TRADE.md`) |
+| ~~Realtime window~~ | **cleared** 2026-07-21 (realtime sub-gate PASS; ADR-0016) |
+| ~~Owner-run CLI~~ | **built** (WP-A3), fakes-only proof; never executed |
+| **Owner execution (only remaining blocker)** | the seven-step run in `docs/runbooks/POI_IBKR_001_OWNER_RUN.md`; the evidence file; the PASS mark; and therefore IMP-1302 |
+| **Not blocked** | the fakes-only matrix (16 scenarios + 46 harness drills, green); runbooks (`PAPER_MANUAL_ONE_TRADE.md`, `POI_IBKR_001_OWNER_RUN.md`) |
