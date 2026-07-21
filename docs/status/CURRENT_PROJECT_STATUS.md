@@ -36,7 +36,7 @@
 | Canonical tasks (counted from YAML) | **82** |
 | `IMPLEMENTED` canonical tasks | **72** (IMP-0001…IMP-1206 + IMP-1301) |
 | Current stage | **Evidence Delivery** (feature delivery paused after PHASE-13/IMP-1301) |
-| Single next task | **ADR-0016 — decide the scope of POI-IBKR-001's `POI-MD-001` dependency** (§9; needs no external provider) |
+| Single next task | **Owner executes the POI-IBKR-001 Paper lifecycle run** (§9) — `docs/runbooks/POI_IBKR_001_OWNER_RUN.md`; no code task remains open |
 
 ## 3. What is completed in code (`IMPLEMENTED`)
 
@@ -77,11 +77,13 @@ invalid prices fail; 10167 = non-blocking delayed notice).
 |---|---|---|---|
 | POI-IBKR-READONLY | **PASS** (read-only scope only) | `evidence/POI-IBKR-READONLY.md`, 2026-07-10, DU*****32 | none |
 | POI-MD-001 | **BLOCKED** (aggregate) — **realtime sub-gate PASS** | `evidence/POI-MD-001-REALTIME.md` (owner run 2026-07-21): `marketDataType=1` REALTIME, no entitlement error, valid bid/ask/last + sizes, timestamp, clean disconnect, read-only. Blocker: *"External provider not selected; benchmark/fallback/provider ADR deferred until owner-approved provider availability."* | deferred to a future provider-selection task; unfreeze only on an owner-approved provider (Track A / A2) |
-| POI-IBKR-001 | **NOT RUN / BLOCKED** | read-only pre-check only; missing: real submit/ack/fill/cancel/protection/reconciliation evidence | after POI-MD-001 + owner-approved CLI (Track A) |
+| POI-IBKR-001 | **NOT RUN / BLOCKED** | read-only pre-check only; missing: real submit/ack/fill/cancel/protection/reconciliation evidence. Market-data dependency narrowed by [ADR-0016](../adr/ADR-0016-poi-ibkr-001-market-data-dependency.md); owner-run CLI **built but never executed** (WP-A3) | owner runs `docs/runbooks/POI_IBKR_001_OWNER_RUN.md` (7 steps) and marks the PoI |
 | Other P0/P1 PoIs | per `docs/poi/STATUS.yaml` | social/news/AI/TV remain BLOCKED on external accounts/hosts (ADR-0014) | Track A/C |
 
-No other integration is verified. **No real submit path exists** — the
-owner-run CLI is deliberately unbuilt.
+No other integration is verified. A real submit path now **exists in code**
+(`scripts/poi_ibkr_lifecycle.py`, WP-A3) but has **never been executed**: it
+refuses to send anything without `--execute` plus a confirmation token derived
+from a dry run of identical parameters, and it is `TESTED_WITH_FAKES` only.
 
 ## 6. Prepared but not run
 
@@ -91,6 +93,12 @@ owner-run CLI is deliberately unbuilt.
   smallest-safe-order policy, allowlist (F/T; AAPL cancel-path only), abort
   conditions, reconciliation checklist, post-run template
   (`docs/runbooks/PAPER_MANUAL_ONE_TRADE.md`).
+- POI-IBKR-001 owner-run harness (WP-A3): `scripts/poi_ibkr_lifecycle.py`
+  (`preflight | dry-run | cancel-path | fill-path | reconnect | cleanup`)
+  reusing ExecutionAgent + ProtectionManager + ReconciliationEngine, plus the
+  7-step sequence in `docs/runbooks/POI_IBKR_001_OWNER_RUN.md`. Proven with
+  fakes only (`tests/poi/test_poi_ibkr_lifecycle_cli.py`, 46 drills) —
+  **never run against IBKR**.
 - IBC/watchdog host deployment: code merged (PR #31); the owner reports the
   Gateway auto-starts, but host patches (gateway version/config/java paths,
   systemd drop-ins) are **not yet upstreamed** and no host transcript is
@@ -111,8 +119,11 @@ owner-run CLI is deliberately unbuilt.
    data scope, freshness class and test credentials available.
    *(`DEFERRED` is not used as a status: it is absent from the ADR-0015
    vocabulary and is not a canonical registry state.)*
-3. Real Paper submit/ack/fill/cancel never run (POI-IBKR-001).
-4. Owner-run lifecycle CLI not built (requires explicit owner approval).
+3. Real Paper submit/ack/fill/cancel never run (POI-IBKR-001) — **the only
+   remaining blocker is the owner executing the run**; ADR-0016 cleared the
+   market-data dependency and the CLI is built.
+4. ~~Owner-run lifecycle CLI not built~~ — **built 2026-07-21 (WP-A3)**,
+   `TESTED_WITH_FAKES`, never executed.
 5. IMP-1302 gated on POI-IBKR-001 PASS.
 6. Strategy profitability: **PROFITABILITY_NOT_PROVEN** for every strategy —
    no hypothesis freeze, no point-in-time dataset, no out-of-sample, no
@@ -139,6 +150,19 @@ cancelled.
 
 ## 9. Single next task
 
+> **Next: the owner executes the POI-IBKR-001 Paper lifecycle run** — the
+> seven steps in
+> [`docs/runbooks/POI_IBKR_001_OWNER_RUN.md`](../runbooks/POI_IBKR_001_OWNER_RUN.md)
+> (preflight → dry-run → cancel-path → verify flat → fill-path → reconnect →
+> cleanup), then records `docs/poi/evidence/POI-IBKR-001.md` and marks the
+> PoI. Only the owner may run it; only the owner may mark it.
+>
+> No coding task is open. WP-A3 delivered ADR-0016, the owner-run CLI and its
+> fakes-only proof; everything downstream (IMP-1302 → 1303 → 1304) stays gated
+> on the owner-run evidence, and PAPER_AUTO and LIVE stay prohibited.
+
+### Background (how we got here)
+
 The freeze/approval task is **complete**: ADR-0015 formally approves the
 Evidence Delivery pivot, this status model, the three tracks, the authority
 boundaries, Paper Manual as an integration-validation stage only, the
@@ -152,22 +176,22 @@ quote fields, clean disconnect (`docs/poi/evidence/POI-MD-001-REALTIME.md`).
 This proves the **IBKR realtime path only**; POI-MD-001 aggregate stays
 BLOCKED and execution stays gated by POI-IBKR-001.
 
-**Track A / A2 is deferred** (no approved external provider), and because the
+**Track A / A2 is deferred** (no approved external provider). Because the
 frozen backlog declares `POI-IBKR-001 depends: [POI-PLAT-ARM-001, POI-MD-001]`,
-that deferral currently also stalls A3–A6. The next active task must therefore
-need **no external provider**:
+that deferral also stalled A3–A6 — until
+[ADR-0016](../adr/ADR-0016-poi-ibkr-001-market-data-dependency.md) (2026-07-21)
+narrowed the dependency: the proven realtime sub-gate satisfies the market-data
+dependency **for POI-IBKR-001 only**, while POI-MD-001 stays BLOCKED. The ADR
+is reversible if the lifecycle run reveals a market-data need it does not
+cover.
 
-> **Next task: ADR-0016 — decide the scope of POI-IBKR-001's `POI-MD-001`
-> dependency** — whether the proven realtime market-data sub-gate satisfies
-> what the order-lifecycle PoI actually needs (allowing Track A / A3–A6 to
-> proceed while provider selection stays deferred), or whether POI-IBKR-001
-> stays blocked until the full provider benchmark exists.
-> Documentation/governance only; owner decision required.
->
-> Alternative non-provider path, if the owner prefers Track B: the ADR-0015 §9
-> amendment ADR that would make `EVD-0001…EVD-0013` canonical.
-> No parallel implementation task is opened. `EVD-0001…EVD-0013` remain
-> **non-canonical** until that amendment process completes.
+**Track A / A3 is complete in code:** the owner-run lifecycle CLI is built and
+proven with fakes; it has never contacted IBKR.
+
+If the owner prefers Track B instead, the equivalent non-broker task is the
+ADR-0015 §9 amendment ADR that would make `EVD-0001…EVD-0013` canonical.
+No parallel implementation task is opened. `EVD-0001…EVD-0013` remain
+**non-canonical** until that amendment process completes.
 
 ## 10. Update policy & repo-vs-summary discrepancies
 

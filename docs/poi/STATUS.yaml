@@ -96,8 +96,23 @@ items:
     priority: P0
     status: BLOCKED
     evidence: evidence/BLOCKED-P0.md
-    blocked_on: IBKR paper account + TWS/IB Gateway host; depends POI-MD-001.
-      The order-lifecycle paper experiment itself has not run.
+    blocked_on: "Owner has not executed the Paper lifecycle run. The
+      order-lifecycle experiment itself has not run: no real submit, ack,
+      fill, protection, cancel or reconciliation evidence exists."
+    # Market-data dependency (ADR-0016, 2026-07-21): the proven
+    # POI-MD-001.realtime_subgate satisfies the market-data dependency for
+    # THIS PoI only. The POI-MD-001 aggregate stays BLOCKED (external
+    # provider deferred). This narrows dependency semantics; it does not
+    # mark anything PASS.
+    market_data_dependency: ADR-0016
+    # Owner-run harness prepared but NEVER executed (WP-A3): the CLI
+    # scripts/poi_ibkr_lifecycle.py is proven with fakes only
+    # (tests/poi/test_poi_ibkr_lifecycle_cli.py). Building it changes no
+    # status; only the owner's real run can.
+    owner_run_harness:
+      status: NOT_RUN
+      cli: scripts/poi_ibkr_lifecycle.py
+      runbook: ../runbooks/POI_IBKR_001_OWNER_RUN.md
     # Read-only infrastructure pre-check only (not a frozen-backlog PoI id, so
     # not a separate registry item): PASS on 2026-07-10, owner manual run on
     # Oracle Linux ARM64 (official installer; paper account masked DU*****32;
