@@ -277,7 +277,7 @@ def test_token_is_deterministic_and_short() -> None:
     envelope = _envelope()
     token = harness.confirmation_token(envelope)
     assert token == harness.confirmation_token(_envelope())
-    assert len(token) == harness.TOKEN_LENGTH
+    assert len(token) == harness.CONFIRM_DIGEST_LENGTH
     assert token == token.upper()
 
 

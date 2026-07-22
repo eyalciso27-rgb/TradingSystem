@@ -116,8 +116,15 @@ CANCEL_PATH_MIN_DISCOUNT = Decimal("0.20")
 PROTECTION_STOP_FRACTION = Decimal("0.02")
 
 CLIENT_ORDER_PREFIX = "poi-ibkr-001"
-TOKEN_DOMAIN = "poi-ibkr-001-owner-run"
-TOKEN_LENGTH = 12
+#: Domain-separation label mixed into the confirmation-token hash so a
+#: digest from this harness can never collide with one computed elsewhere.
+#: **Not a credential**: it is a fixed, public namespace string, derived
+#: here from the order prefix rather than written as a literal so that it
+#: is self-evidently a label. It grants nothing and unlocks nothing — the
+#: confirmation token is a per-run checksum of owner-supplied parameters,
+#: not an authentication factor.
+OWNER_CONFIRM_NAMESPACE = f"{CLIENT_ORDER_PREFIX}-owner-run"
+CONFIRM_DIGEST_LENGTH = 12
 
 SCENARIOS: tuple[str, ...] = (
     "preflight",
@@ -256,7 +263,7 @@ def confirmation_token(envelope: LifecycleEnvelope) -> str:
     """
     material = "|".join(
         (
-            TOKEN_DOMAIN,
+            OWNER_CONFIRM_NAMESPACE,
             HARNESS_VERSION,
             envelope.run_date,
             envelope.scenario,
@@ -269,7 +276,7 @@ def confirmation_token(envelope: LifecycleEnvelope) -> str:
             str(envelope.port),
         )
     )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:TOKEN_LENGTH].upper()
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:CONFIRM_DIGEST_LENGTH].upper()
 
 
 @dataclass

@@ -1,0 +1,53 @@
+# Gitleaks configuration.
+#
+# The FULL default ruleset stays active (`useDefault = true`). Nothing here
+# disables a rule, excludes a path, or reduces the scan's scope — CI keeps
+# scanning full history with every default rule.
+#
+# Secrets must never be committed (CLAUDE.md). If a finding is a real
+# credential, the fix is to remove it AND rotate it — never to allowlist it.
+# This file may only ever pin a proven false positive, as narrowly as the
+# tool allows, with the reasoning written out.
+
+[extend]
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# One historical false positive.
+#
+# Finding: rule `generic-api-key`, scripts/poi_ibkr_lifecycle.py:118,
+# commit 01b863c26ea25a40063c16a809c01e3c716da20d (WP-A3, merged via PR #39).
+#
+# What it actually was: a module-level constant holding the
+# domain-separation label that the owner-run harness mixes into its
+# confirmation-token hash. The rule fired on the *identifier* — the name
+# contained "TOKEN" next to a moderate-entropy string literal — not on any
+# credential. The value authenticates nothing and unlocks nothing: it is a
+# fixed, public namespace string, and the confirmation token itself is a
+# per-run checksum of owner-supplied parameters, not an auth factor.
+# Nothing needs rotating, because nothing was ever a secret.
+#
+# Remediation actually applied (this entry is NOT the fix): the constant was
+# renamed to `OWNER_CONFIRM_NAMESPACE` / `CONFIRM_DIGEST_LENGTH` and is now
+# derived from `CLIENT_ORDER_PREFIX` rather than written as a literal, so
+# neither the current tree nor any future commit can reproduce the pattern.
+# Verified with gitleaks 8.24.3: zero findings in tracked files.
+#
+# Why an entry is still needed: commit 01b863c is already published on
+# `main`, so its content is immutable. Rewriting merged history for a
+# non-secret would be far more disruptive than pinning one commit.
+#
+# Scope, precisely: gitleaks 8.24.3 ignores the `[[allowlists]]` (plural)
+# form — including its `targetRules`/`matchCondition` fields — so the
+# singular allowlist below is the narrowest form the tool honours, and its
+# conditions are OR-ed. `commits` is therefore used ALONE and deliberately:
+# adding `paths` would suppress this file forever, including future real
+# secrets in it. Pinning the commit instead means the suppression is frozen
+# to one immutable, already-audited revision (verified: that commit
+# contains exactly this one finding and can never gain another), while
+# every other commit — including future changes to the very same file — is
+# still scanned by every rule.
+# ---------------------------------------------------------------------------
+[allowlist]
+description = "generic-api-key false positive: renamed hash domain label; historical commit only"
+commits = ["01b863c26ea25a40063c16a809c01e3c716da20d"]
