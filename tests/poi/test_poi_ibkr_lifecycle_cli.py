@@ -1180,3 +1180,112 @@ def test_gap5_cancel_path_fill_seen_before_the_ack_also_aborts() -> None:
         "the pre-cancel guard must fire when the fill is the matched event"
     )
     assert "UNPROTECTED PAPER POSITION" in report.render()
+
+
+# -- 12. account-id resolution (WP-A4 operational blocker) -----------------
+#
+# The adapter maps alias -> real DU account id and refuses anything else.
+# Passing the alias as its own account id made the harness unable to
+# construct the real adapter at all. These lock the secret-store wiring.
+
+
+def _secrets_root(tmp_path: Path, value: str) -> Path:
+    target = tmp_path / "paper" / "ibkr"
+    target.mkdir(parents=True)
+    (target / "paper-account-id").write_text(value + "\n", encoding="utf-8")
+    return tmp_path
+
+
+class _StubAdapterModule:
+    """Stands in for trading_broker_ibkr.paper_adapter (no SDK, no socket)."""
+
+    seen: dict[str, Any] = {}
+
+    @staticmethod
+    def build_paper_adapter(**kwargs: Any) -> Any:
+        _StubAdapterModule.seen = dict(kwargs)
+        return _broker()
+
+
+def _install_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    sys.modules["stub_adapter_module"] = _StubAdapterModule  # type: ignore[assignment]
+    monkeypatch.delitem(sys.modules, "stub_adapter_module", raising=False)
+    sys.modules["stub_adapter_module"] = _StubAdapterModule  # type: ignore[assignment]
+
+
+def test_alias_is_mapped_to_the_du_account_id_from_the_secret_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SECRETS_ROOT", str(_secrets_root(tmp_path, PAPER_ACCOUNT)))
+    _install_stub(monkeypatch)
+    factory = harness._load_broker_factory(
+        "stub_adapter_module",
+        account_alias=ALIAS,
+        account_secret="ibkr/paper-account-id",
+        host="127.0.0.1",
+        port=4002,
+        client_id=7,
+    )
+    factory()
+    # The adapter must receive alias -> DU id, never alias -> alias.
+    assert _StubAdapterModule.seen["account_aliases"] == {ALIAS: PAPER_ACCOUNT}
+
+
+def test_missing_secrets_root_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SECRETS_ROOT", raising=False)
+    _install_stub(monkeypatch)
+    with pytest.raises(harness.LifecycleRefused) as error:
+        harness._load_broker_factory(
+            "stub_adapter_module",
+            account_alias=ALIAS,
+            account_secret="ibkr/paper-account-id",
+            host="127.0.0.1",
+            port=4002,
+            client_id=7,
+        )
+    assert "SECRETS_ROOT" in str(error.value)
+
+
+def test_missing_account_secret_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "paper").mkdir(parents=True)
+    monkeypatch.setenv("SECRETS_ROOT", str(tmp_path))
+    _install_stub(monkeypatch)
+    with pytest.raises(harness.LifecycleRefused):
+        harness._load_broker_factory(
+            "stub_adapter_module",
+            account_alias=ALIAS,
+            account_secret="ibkr/paper-account-id",
+            host="127.0.0.1",
+            port=4002,
+            client_id=7,
+        )
+
+
+def test_non_paper_account_secret_is_refused_with_a_masked_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live_account = "U" + "7654321"
+    monkeypatch.setenv("SECRETS_ROOT", str(_secrets_root(tmp_path, live_account)))
+    _install_stub(monkeypatch)
+    with pytest.raises(harness.LifecycleRefused) as error:
+        harness._load_broker_factory(
+            "stub_adapter_module",
+            account_alias=ALIAS,
+            account_secret="ibkr/paper-account-id",
+            host="127.0.0.1",
+            port=4002,
+            client_id=7,
+        )
+    message = str(error.value)
+    assert live_account not in message, "the refusal must not echo the account id"
+    assert "DU* only" in message
+
+
+def test_account_id_never_appears_in_argv_help() -> None:
+    """The id comes from the secret store, so no flag can carry it."""
+    text = harness.build_parser().format_help()
+    assert "--account-secret" in text
+    assert "SECRETS_ROOT" in text
+    assert "--account-id" not in text

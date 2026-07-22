@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -114,6 +115,9 @@ MAX_NOTIONAL = Decimal("50")
 CANCEL_PATH_MIN_DISCOUNT = Decimal("0.20")
 #: Protective stop distance below (BUY) the observed average fill price.
 PROTECTION_STOP_FRACTION = Decimal("0.02")
+
+#: Secret name (under $SECRETS_ROOT/paper) holding the DU paper account id.
+DEFAULT_ACCOUNT_SECRET = "ibkr/paper-account-id"
 
 CLIENT_ORDER_PREFIX = "poi-ibkr-001"
 #: Domain-separation label mixed into the confirmation-token hash so a
@@ -1263,8 +1267,43 @@ def _emergency_cleanup(
         )
 
 
+def _resolve_paper_account_id(secret_name: str) -> str:
+    """Resolve the DU account id for the alias from the PAPER secret store.
+
+    The adapter maps alias -> real broker account id and refuses anything
+    that is not a ``DU`` paper account. That id must never reach argv (it
+    would be visible in ``ps`` and in shell history), so it is read from
+    the environment-scoped secret store the repository already uses —
+    ``SECRETS_ROOT`` with no default, PAPER and LIVE physically separate
+    (see scripts/poi_tg_user.py for the same wiring). The value is used
+    only to construct the adapter and is never printed; every report line
+    goes through ``mask_account``.
+    """
+    from trading_config.secrets import FileSecretStore, SecretError
+
+    secrets_root = os.environ.get("SECRETS_ROOT")
+    if not secrets_root:
+        raise LifecycleRefused(
+            "SECRETS_ROOT is required so the paper account id is read from the"
+            " secret store instead of the command line (no default; secrets"
+            " never live in the repo)"
+        )
+    try:
+        store = FileSecretStore(Path(secrets_root), Environment.PAPER)
+        return store.get(secret_name).reveal()
+    except SecretError as error:
+        # The message names the reference, never the value.
+        raise LifecycleRefused(f"could not resolve the paper account id: {error}") from error
+
+
 def _load_broker_factory(
-    module_name: str, *, account_alias: str, host: str, port: int, client_id: int
+    module_name: str,
+    *,
+    account_alias: str,
+    account_secret: str,
+    host: str,
+    port: int,
+    client_id: int,
 ) -> Callable[[], BrokerPort]:
     """Late, isolated import of the run-time adapter module (never at top).
 
@@ -1280,10 +1319,18 @@ def _load_broker_factory(
         raise LifecycleRefused(
             f"broker module {module_name!r} must expose create_broker() or build_paper_adapter()"
         )
+    account_id = _resolve_paper_account_id(account_secret)
+    if not account_id.startswith(PAPER_ACCOUNT_PREFIX):
+        # Fail here with a masked message rather than letting the adapter
+        # raise: this harness must never be pointed at a non-paper account.
+        raise LifecycleRefused(
+            f"secret {account_secret!r} does not hold a paper account"
+            f" ({mask_account(account_id)}); {PAPER_ACCOUNT_PREFIX}* only"
+        )
 
     def factory() -> BrokerPort:
         broker: BrokerPort = builder(
-            account_aliases={account_alias: account_alias},
+            account_aliases={account_alias: account_id},
             host=host,
             port=port,
             client_id=client_id,
@@ -1303,7 +1350,22 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--scenario", choices=SCENARIOS, required=True)
-    parser.add_argument("--account-alias", required=True, help="alias, never a broker account id")
+    parser.add_argument(
+        "--account-alias",
+        required=True,
+        help=(
+            "alias, never a broker account id; the real DU account id is read"
+            " from the PAPER secret store via SECRETS_ROOT"
+        ),
+    )
+    parser.add_argument(
+        "--account-secret",
+        default=DEFAULT_ACCOUNT_SECRET,
+        help=(
+            "name of the secret under $SECRETS_ROOT/paper holding the DU paper"
+            f" account id (default: {DEFAULT_ACCOUNT_SECRET})"
+        ),
+    )
     parser.add_argument("--symbol", default="F", help=f"one of {sorted(ALLOWED_SYMBOLS)}")
     parser.add_argument("--quantity", default="1", help=f"<= {MAX_QUANTITY}")
     parser.add_argument("--limit-price", default=None, help="required for submitting scenarios")
@@ -1374,6 +1436,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         factory = _load_broker_factory(
             args.broker_module,
             account_alias=args.account_alias,
+            account_secret=args.account_secret,
             host=args.host,
             port=args.port,
             client_id=args.client_id,
