@@ -39,6 +39,7 @@ from trading_broker_core.port import (
     OrderSide,
 )
 from trading_contracts.enums import Environment, OrderState, OrderType
+from trading_execution_agent.protection import ProtectionOrderSpec
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _SPEC = importlib.util.spec_from_file_location(
@@ -54,6 +55,7 @@ _SPEC.loader.exec_module(harness)
 PAPER_ACCOUNT = "DU" + "1234567"
 ALIAS = "paper-poi"
 AS_OF = datetime(2026, 7, 21, 14, 30, tzinfo=UTC)
+RUN_DATE = "2026-07-21"
 
 
 def _frozen_clock() -> datetime:
@@ -145,6 +147,8 @@ def _envelope(**kwargs: Any) -> Any:
         "account_alias": ALIAS,
         "host": "127.0.0.1",
         "port": 4002,
+        "run_date": RUN_DATE,
+        "reference_price": Decimal("10"),
     }
     defaults.update(kwargs)
     return harness.LifecycleEnvelope(**defaults)
@@ -381,14 +385,11 @@ def test_cancel_path_submits_acknowledges_cancels_and_reconciles() -> None:
     assert report.passed
 
 
-def test_cancel_path_limit_too_close_to_the_market_fails() -> None:
-    broker = _broker()
-    envelope = _envelope(reference_price=Decimal("10"), limit_price=Decimal("9.9"))
-    report = _run(
-        broker, envelope, execute=True, confirm_token=harness.confirmation_token(envelope)
-    )
-    assert not report.passed
-    assert any(name == "cancel_path_price_safe" and not ok for name, ok, _ in report.checks)
+def test_cancel_path_limit_too_close_to_the_market_is_refused_at_construction() -> None:
+    """Stronger than a failed check: the envelope cannot even be built."""
+    with pytest.raises(harness.LifecycleRefused) as error:
+        _envelope(reference_price=Decimal("10"), limit_price=Decimal("9.9"))
+    assert "too close to the market" in str(error.value)
 
 
 def test_duplicate_delivery_creates_no_second_broker_order() -> None:
@@ -813,3 +814,369 @@ def test_polling_is_bounded_by_the_timeout() -> None:
     )
     assert len(calls) <= 4, "polling must stop at the timeout"
     assert any(name == "unfilled_entry_cancelled" and ok for name, ok, _ in report.checks)
+
+
+# -- 11. safety-review regressions (PR #39 final review) --------------------
+#
+# One focused test per gap found in the pre-merge safety review. Each
+# reproduces the exact failure mode the corresponding fix closes.
+
+
+class ProtectionRejectingBroker(FillingBroker):
+    """Fills the entry, then refuses the protective STOP (gap 1)."""
+
+    def submit_order(self, intent: OrderIntent) -> BrokerOrderReceipt:
+        if intent.order_type is OrderType.STOP:
+            raise BrokerPortError(BrokerErrorCode.BROKER_REJECTED, "stop rejected")
+        return super().submit_order(intent)
+
+
+def _fill_broker(broker_type: type[FakeBroker] = FillingBroker, **kwargs: Any) -> Any:
+    defaults: dict[str, Any] = {
+        "accounts": {ALIAS: _snapshot()},
+        "instruments": {
+            "F": BrokerInstrument(
+                broker_instrument_ref="ref-F", symbol="F", exchange="SMART", currency="USD"
+            )
+        },
+        "clock": _frozen_clock,
+    }
+    defaults.update(kwargs)
+    return broker_type(**defaults)
+
+
+def _fill_envelope(**kwargs: Any) -> Any:
+    defaults: dict[str, Any] = {
+        "scenario": "fill-path",
+        "symbol": "F",
+        "limit_price": Decimal("12"),
+        "reference_price": None,
+    }
+    defaults.update(kwargs)
+    return _envelope(**defaults)
+
+
+def _execute(broker: Any, envelope: Any) -> Any:
+    return _run(broker, envelope, execute=True, confirm_token=harness.confirmation_token(envelope))
+
+
+def test_gap1_rejected_protection_aborts_loudly_and_never_claims_protection() -> None:
+    """Entry fills but the protective stop is refused by the broker."""
+    report = _execute(_fill_broker(ProtectionRejectingBroker), _fill_envelope())
+    rendered = report.render()
+
+    assert not report.passed
+    assert any(name == "owner_action_required" and not ok for name, ok, _ in report.checks)
+    assert harness.OWNER_ACTION_BANNER in rendered
+    assert "UNPROTECTED PAPER POSITION" in rendered
+    assert "close the position manually" in rendered
+    # It must NOT tell the owner a stop is resting.
+    assert "its protective stop are still open" not in rendered
+    assert any(name == "no_unprotected_position" and not ok for name, ok, _ in report.checks)
+
+
+def test_gap1_reconciliation_receives_accepted_protection_not_planned() -> None:
+    """Feeding the PLAN would hide the very failure this run must surface."""
+    report = _execute(_fill_broker(ProtectionRejectingBroker), _fill_envelope())
+    assert any(name == "reconciliation" and not ok for name, ok, _ in report.checks)
+    assert any("PROTECTION_MISMATCH" in note for note in report.notes)
+
+
+class PartialThenWorkingBroker(FillingBroker):
+    """Reports PARTIALLY_FILLED, leaving a working remainder (gap 2)."""
+
+    def submit_order(self, intent: OrderIntent) -> BrokerOrderReceipt:
+        receipt = super().submit_order(intent)
+        if intent.order_type is OrderType.LIMIT:
+            self._events[-1] = BrokerOrderEvent(
+                sequence=self._events[-1].sequence,
+                client_order_id=receipt.client_order_id,
+                broker_order_ref=receipt.broker_order_ref,
+                state=OrderState.PARTIALLY_FILLED,
+                filled_quantity=intent.quantity,
+                observed_at=AS_OF,
+            )
+            self._orders[receipt.client_order_id] = BrokerOrderReceipt(
+                client_order_id=receipt.client_order_id,
+                broker_order_ref=receipt.broker_order_ref,
+                state=OrderState.PARTIALLY_FILLED,
+                authorization_ref=receipt.authorization_ref,
+                correlation_id=receipt.correlation_id,
+                received_at=AS_OF,
+            )
+        return receipt
+
+
+def test_gap2_partial_fill_cancels_the_working_remainder_before_protecting() -> None:
+    broker = _fill_broker(PartialThenWorkingBroker)
+    envelope = _fill_envelope()
+    report = _execute(broker, envelope)
+    names = {name: ok for name, ok, _ in report.checks}
+    assert names["entry_remainder_cancelled"], "a working remainder must not survive"
+    assert names["no_unprotected_position"]
+    states = [
+        e.state for e in broker.order_events() if e.client_order_id == envelope.client_order_id
+    ]
+    assert OrderState.CANCELLED in states
+
+
+def test_gap2_preexisting_position_in_the_symbol_blocks_a_submitting_run() -> None:
+    """A prior holding would blend the average price the stop derives from."""
+    broker = _broker()
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="F", quantity=Decimal("5"), average_price=Decimal("9")),
+    )
+    report = _execute(broker, _fill_envelope())
+    assert not report.passed
+    assert any(
+        name == "no_preexisting_position_in_symbol" and not ok for name, ok, _ in report.checks
+    )
+    assert _open_orders(broker) == (), "nothing may be submitted"
+
+
+def test_gap3_client_order_id_differs_across_owner_runs_on_different_days() -> None:
+    today = _envelope(run_date="2026-07-21")
+    tomorrow = _envelope(run_date="2026-07-22")
+    assert today.client_order_id != tomorrow.client_order_id
+    # ...but stays identical within the day, so a crash-restart resumes.
+    assert today.client_order_id == _envelope(run_date="2026-07-21").client_order_id
+
+
+def test_gap3_run_date_must_be_a_valid_date() -> None:
+    for bad in ("21-07-2026", "2026/07/21", "today", ""):
+        with pytest.raises(harness.LifecycleRefused):
+            _envelope(run_date=bad)
+
+
+def test_gap4_token_from_an_earlier_day_cannot_be_replayed() -> None:
+    """Identical parameters, different day => the old token is worthless."""
+    yesterday = _envelope(run_date="2026-07-20")
+    today = _envelope(run_date="2026-07-21")
+    assert harness.confirmation_token(yesterday) != harness.confirmation_token(today)
+    with pytest.raises(harness.LifecycleRefused):
+        _run(_broker(), today, execute=True, confirm_token=harness.confirmation_token(yesterday))
+
+
+def test_gap4_token_is_bound_to_the_reference_price_too() -> None:
+    """A different market context must invalidate the token."""
+    assert harness.confirmation_token(
+        _envelope(reference_price=Decimal("10"))
+    ) != harness.confirmation_token(_envelope(reference_price=Decimal("11")))
+
+
+def test_gap5_cancel_path_requires_a_reference_price() -> None:
+    with pytest.raises(harness.LifecycleRefused) as error:
+        _envelope(scenario="cancel-path", reference_price=None)
+    assert "mandatory" in str(error.value)
+
+
+class SurpriseFillBroker(FakeBroker):
+    """The cancel-path order fills anyway during a rapid move (gap 5)."""
+
+    def submit_order(self, intent: OrderIntent) -> BrokerOrderReceipt:
+        receipt = super().submit_order(intent)
+        self._events.append(
+            BrokerOrderEvent(
+                sequence=len(self._events) + 1,
+                client_order_id=receipt.client_order_id,
+                broker_order_ref=receipt.broker_order_ref,
+                state=OrderState.FILLED,
+                filled_quantity=intent.quantity,
+                observed_at=AS_OF,
+            )
+        )
+        return receipt
+
+
+def test_gap5_unexpected_cancel_path_fill_raises_an_unprotected_position_abort() -> None:
+    broker = _fill_broker(SurpriseFillBroker)
+    report = _execute(broker, _envelope(reference_price=Decimal("10"), limit_price=Decimal("5")))
+    rendered = report.render()
+    assert not report.passed
+    # The order was legitimately acknowledged first; the fill arrived after,
+    # so scanning only the matched ack event would have missed it entirely.
+    assert any(name == "acknowledged" and ok for name, ok, _ in report.checks)
+    assert any(name == "owner_action_required" and not ok for name, ok, _ in report.checks)
+    assert harness.OWNER_ACTION_BANNER in rendered
+    assert "UNPROTECTED PAPER POSITION" in rendered
+    # Two independent guards cover the two orderings a fill can arrive in:
+    # before the ack was matched, or afterwards while cancelling.
+    names = {name for name, _, _ in report.checks}
+    assert "unexpected_fill_remainder_cancelled" in names or "never_filled" in names
+    assert not any(name == "never_filled" and ok for name, ok, _ in report.checks)
+
+
+def test_gap6_unknown_broker_state_tells_the_owner_an_order_may_exist() -> None:
+    class UnknownStateBroker(FakeBroker):
+        def submit_order(self, intent: OrderIntent) -> BrokerOrderReceipt:
+            raise BrokerPortError(BrokerErrorCode.UNKNOWN_BROKER_RESPONSE, "timeout")
+
+    report = _execute(_fill_broker(UnknownStateBroker), _envelope(reference_price=Decimal("10")))
+    rendered = report.render()
+    assert not report.passed
+    assert "an order MAY exist at the broker" in rendered
+    assert "do NOT re-run this scenario and do NOT resend anything" in rendered
+
+
+class BadAveragePriceBroker(FillingBroker):
+    """The real adapter's average_price is unproven by fakes (gap 7)."""
+
+    def get_positions(self, account_alias: str) -> tuple[BrokerPosition, ...]:
+        return tuple(
+            BrokerPosition(symbol=p.symbol, quantity=p.quantity, average_price=Decimal("0"))
+            for p in super().get_positions(account_alias)
+        )
+
+
+def test_gap7_missing_average_price_aborts_explicitly_not_opaquely() -> None:
+    report = _execute(_fill_broker(BadAveragePriceBroker), _fill_envelope())
+    rendered = report.render()
+    assert not report.passed
+    assert "average_price=0" in rendered
+    assert harness.OWNER_ACTION_BANNER in rendered
+    # An explicit abort, not a generic "unknown error, failing closed".
+    assert not any(name == "fail_closed" for name, _, _ in report.checks)
+
+
+def _spec(**kwargs: Any) -> ProtectionOrderSpec:
+    defaults: dict[str, Any] = {
+        "spec_ref": "protection:x:stop:1",
+        "position_ref": "x",
+        "symbol": "F",
+        "side": OrderSide.SELL,
+        "order_type": OrderType.STOP,
+        "quantity": Decimal("1"),
+        "stop_price": Decimal("9"),
+        "limit_price": None,
+        "oca_group": None,
+    }
+    defaults.update(kwargs)
+    return ProtectionOrderSpec(**defaults)
+
+
+def test_gap8_protective_order_larger_than_the_position_is_refused() -> None:
+    """A SELL bigger than the holding would open a short - never send it."""
+    refusal = harness._protective_spec_refusal(_spec(quantity=Decimal("5")), Decimal("1"))
+    assert refusal is not None
+    assert "would open a short" in refusal
+
+
+def test_gap8_protective_order_must_be_a_positive_priced_sell_stop() -> None:
+    assert harness._protective_spec_refusal(_spec(), Decimal("1")) is None
+    assert harness._protective_spec_refusal(_spec(side=OrderSide.BUY), Decimal("1"))
+    assert harness._protective_spec_refusal(_spec(order_type=OrderType.MARKET), Decimal("1"))
+    assert harness._protective_spec_refusal(_spec(stop_price=None), Decimal("1"))
+    assert harness._protective_spec_refusal(_spec(stop_price=Decimal("0")), Decimal("1"))
+    assert harness._protective_spec_refusal(_spec(quantity=Decimal("0")), Decimal("1"))
+
+
+def test_gap9_every_scenario_masks_the_account_in_its_artifact() -> None:
+    """Sanitization must hold on failing runs too, not just the happy path."""
+    cases = (
+        (_broker(), "preflight"),
+        (_broker(), "dry-run"),
+        (_broker(), "reconnect"),
+        (_broker(healthy=False), "preflight"),
+    )
+    for broker, scenario in cases:
+        broker._accounts[PAPER_ACCOUNT] = AccountSnapshot(
+            account_alias=PAPER_ACCOUNT,
+            environment=Environment.PAPER,
+            net_liquidation_value=Decimal("1"),
+            cash=Decimal("1"),
+            buying_power=Decimal("1"),
+            observed_at=AS_OF,
+        )
+        envelope = _envelope(scenario=scenario, account_alias=PAPER_ACCOUNT)
+        assert PAPER_ACCOUNT not in _run(broker, envelope).render(), scenario
+
+
+def test_gap10_adapter_assumptions_match_the_real_ibkr_paper_capabilities() -> None:
+    """What the fakes assume must hold for the adapter the owner will use.
+
+    Read from the adapter's declared capability matrix (no connection, no
+    SDK call) so a future adapter change cannot silently invalidate the
+    protection strategy this harness depends on.
+    """
+    from trading_broker_ibkr.paper_adapter import IBKR_PAPER_CAPABILITIES
+
+    # PLAIN_STOP protection needs a NATIVE stop and nothing else.
+    assert IBKR_PAPER_CAPABILITIES.order_types[OrderType.STOP] is BrokerCapabilityMode.NATIVE
+    assert IBKR_PAPER_CAPABILITIES.order_types[OrderType.LIMIT] is BrokerCapabilityMode.NATIVE
+    # The harness must NOT rely on bracket/OCA - the adapter has neither.
+    assert IBKR_PAPER_CAPABILITIES.bracket is BrokerCapabilityMode.UNSUPPORTED
+    assert IBKR_PAPER_CAPABILITIES.oco is BrokerCapabilityMode.UNSUPPORTED
+    assert IBKR_PAPER_CAPABILITIES.what_if is BrokerCapabilityMode.NATIVE
+
+    source = (REPO_ROOT / "scripts" / "poi_ibkr_lifecycle.py").read_text(encoding="utf-8")
+    assert "ProtectionStructure.PLAIN_STOP" in source
+    assert "ProtectionStructure.BRACKET" not in source
+    assert "ProtectionStructure.OCA" not in source
+
+
+def test_gap10_adapter_replays_events_from_the_start_like_the_fake() -> None:
+    """``_await_state`` polls ``order_events()`` repeatedly and assumes a full
+    replay each call; a draining iterator would silently lose events."""
+    adapter = (
+        REPO_ROOT / "packages/py/broker-ibkr/src/trading_broker_ibkr/paper_adapter.py"
+    ).read_text(encoding="utf-8")
+    body = adapter.split("def order_events(self)", 1)[1].splitlines()[1].strip()
+    assert body == "return iter(tuple(self._events))", (
+        f"adapter order_events() must replay from the start, got: {body}"
+    )
+
+
+def test_gap11_abort_that_cannot_confirm_a_cancel_demands_owner_action() -> None:
+    class CancelFailingBroker(FakeBroker):
+        def get_positions(self, account_alias: str) -> tuple[BrokerPosition, ...]:
+            raise RuntimeError("connection dropped")
+
+        def cancel_order(self, request: Any) -> Any:
+            raise BrokerPortError(BrokerErrorCode.NOT_CONNECTED, "gone")
+
+    report = _execute(_fill_broker(CancelFailingBroker), _envelope(reference_price=Decimal("10")))
+    rendered = report.render()
+    assert not report.passed
+    assert harness.OWNER_ACTION_BANNER in rendered
+    assert "could NOT confirm its order was cancelled" in rendered
+
+
+def test_gap12_a_failing_run_can_never_render_result_pass() -> None:
+    """Any owner_action_required check forces the artifact to read FAIL."""
+    rendered = _execute(_fill_broker(ProtectionRejectingBroker), _fill_envelope()).render()
+    assert "RESULT: FAIL" in rendered
+    assert "RESULT: PASS" not in rendered
+
+
+class EarlyFillBroker(FakeBroker):
+    """The fill is already visible when the acknowledgement is polled.
+
+    Covers the OTHER ordering: ``_await_state`` matches the fill itself,
+    so the guard before the cancel must catch it.
+    """
+
+    def submit_order(self, intent: OrderIntent) -> BrokerOrderReceipt:
+        receipt = super().submit_order(intent)
+        self._events.clear()
+        self._events.append(
+            BrokerOrderEvent(
+                sequence=1,
+                client_order_id=receipt.client_order_id,
+                broker_order_ref=receipt.broker_order_ref,
+                state=OrderState.FILLED,
+                filled_quantity=intent.quantity,
+                observed_at=AS_OF,
+            )
+        )
+        return receipt
+
+
+def test_gap5_cancel_path_fill_seen_before_the_ack_also_aborts() -> None:
+    broker = _fill_broker(EarlyFillBroker)
+    report = _execute(broker, _envelope(reference_price=Decimal("10"), limit_price=Decimal("5")))
+    assert not report.passed
+    assert any(name == "acknowledged" and not ok for name, ok, _ in report.checks)
+    assert any(name == "unexpected_fill_remainder_cancelled" for name, _, _ in report.checks), (
+        "the pre-cancel guard must fire when the fill is the matched event"
+    )
+    assert "UNPROTECTED PAPER POSITION" in report.render()
