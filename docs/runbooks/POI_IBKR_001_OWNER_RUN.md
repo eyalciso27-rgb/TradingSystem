@@ -50,6 +50,14 @@
 4. Regular US market hours for the fill path. Outside them run steps 1–4 only.
 5. `--broker-module` must point at a module exposing `create_broker()` or
    `build_paper_adapter()` — i.e. `trading_broker_ibkr.paper_adapter`.
+6. `SECRETS_ROOT` must be exported. `--account-alias` is an **alias only**;
+   the real `DU` account id is read from
+   `$SECRETS_ROOT/PAPER/ibkr/paper-account-id` — the directory is the
+   canonical environment name, **uppercase** (override the reference with
+   `--account-secret`). The id never appears in argv, in shell history or in
+   any output — every report line is masked. A missing `SECRETS_ROOT`, a
+   missing secret file, or a non-`DU` value all fail closed before the
+   adapter is constructed.
 
 ## The seven steps
 
@@ -59,6 +67,7 @@ Replace `<ALIAS>` with the configured account **alias** (never a `DU` id) and
 ```bash
 cd ~/TradingSystem
 BM=trading_broker_ibkr.paper_adapter
+export SECRETS_ROOT=/path/to/runtime/secrets   # no default; never in the repo
 ```
 
 ### Step 1 — preflight (read-only; nothing is built)
@@ -75,14 +84,22 @@ protective_stop_supported, no_stale_poi_orders, position_snapshot, disconnect.
 
 ### Step 2 — dry run of the cancel path (what-if only; prints the token)
 
+The confirmation token is **scenario-bound**: it is derived from the scenario
+together with symbol, side, quantity, limit, reference price, alias, port and
+run date. The dry run must therefore name **the same `--scenario` you intend
+to execute**, simply without `--execute`. A token produced by
+`--scenario dry-run` is rejected by `--scenario cancel-path --execute`.
+
 ```bash
 uv run python scripts/poi_ibkr_lifecycle.py \
-  --scenario dry-run --account-alias <ALIAS> --broker-module "$BM" \
+  --scenario cancel-path --account-alias <ALIAS> --broker-module "$BM" \
   --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET> \
+  --reference-price <CURRENT_PRICE> \
   --evidence-out /tmp/poi-ibkr-001-step2-dryrun.md
 ```
 
-Nothing is sent. Record the printed `Confirmation token`.
+Nothing is sent — without `--execute` the run takes the what-if branch.
+Record the printed `Confirmation token`.
 
 ### Step 3 — cancel path (**first real order**; must not fill)
 
@@ -117,12 +134,14 @@ uv run python scripts/poi_ibkr_lifecycle.py \
   --scenario preflight --account-alias <ALIAS> --broker-module "$BM"
 
 uv run python scripts/poi_ibkr_lifecycle.py \
-  --scenario dry-run --account-alias <ALIAS> --broker-module "$BM" \
+  --scenario fill-path --account-alias <ALIAS> --broker-module "$BM" \
   --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT>
 ```
 
+Again: the same `--scenario` you intend to execute, without `--execute`.
 `<MARKETABLE_LIMIT>`: at or just above the ask, still ≤ $50 notional. Record
-the new token — it differs from step 2's because the price changed.
+the new token — it differs from step 2's because both the scenario and the
+price changed.
 
 ### Step 5 — fill path (**one share; a real position is opened**)
 
