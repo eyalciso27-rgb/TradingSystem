@@ -52,7 +52,8 @@
    `build_paper_adapter()` — i.e. `trading_broker_ibkr.paper_adapter`.
 6. `SECRETS_ROOT` must be exported. `--account-alias` is an **alias only**;
    the real `DU` account id is read from
-   `$SECRETS_ROOT/paper/ibkr/paper-account-id` (override the reference with
+   `$SECRETS_ROOT/PAPER/ibkr/paper-account-id` — the directory is the
+   canonical environment name, **uppercase** (override the reference with
    `--account-secret`). The id never appears in argv, in shell history or in
    any output — every report line is masked. A missing `SECRETS_ROOT`, a
    missing secret file, or a non-`DU` value all fail closed before the

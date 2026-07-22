@@ -1190,7 +1190,10 @@ def test_gap5_cancel_path_fill_seen_before_the_ack_also_aborts() -> None:
 
 
 def _secrets_root(tmp_path: Path, value: str) -> Path:
-    target = tmp_path / "paper" / "ibkr"
+    # The environment subdirectory comes from the enum, never a literal:
+    # Environment.PAPER.value is "PAPER", and a case-insensitive filesystem
+    # would otherwise hide a mismatch that fails on the Linux host.
+    target = tmp_path / Environment.PAPER.value / "ibkr"
     target.mkdir(parents=True)
     (target / "paper-account-id").write_text(value + "\n", encoding="utf-8")
     return tmp_path
@@ -1249,7 +1252,7 @@ def test_missing_secrets_root_fails_closed(monkeypatch: pytest.MonkeyPatch) -> N
 def test_missing_account_secret_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    (tmp_path / "paper").mkdir(parents=True)
+    (tmp_path / Environment.PAPER.value).mkdir(parents=True)
     monkeypatch.setenv("SECRETS_ROOT", str(tmp_path))
     _install_stub(monkeypatch)
     with pytest.raises(harness.LifecycleRefused):
@@ -1289,3 +1292,23 @@ def test_account_id_never_appears_in_argv_help() -> None:
     assert "--account-secret" in text
     assert "SECRETS_ROOT" in text
     assert "--account-id" not in text
+
+
+def test_documented_secret_path_matches_the_canonical_environment_name() -> None:
+    """Guards the casing bug that only fails on a case-sensitive filesystem.
+
+    ``FileSecretStore`` joins ``Environment.PAPER.value`` ("PAPER"), so any
+    doc or help text promising a lowercase directory sends the owner to a
+    path that works on Windows and fails on the Linux host.
+    """
+    env_dir = Environment.PAPER.value
+    assert env_dir == "PAPER"
+
+    help_text = harness.build_parser().format_help()
+    assert f"$SECRETS_ROOT/{env_dir}" in help_text
+
+    runbook = (REPO_ROOT / "docs/runbooks/POI_IBKR_001_OWNER_RUN.md").read_text(encoding="utf-8")
+    assert f"$SECRETS_ROOT/{env_dir}/ibkr/paper-account-id" in runbook
+    # No lowercase variant may survive anywhere in the owner-facing surface.
+    assert "$SECRETS_ROOT/paper/" not in runbook
+    assert "$SECRETS_ROOT/paper/" not in help_text

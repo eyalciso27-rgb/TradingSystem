@@ -116,7 +116,8 @@ CANCEL_PATH_MIN_DISCOUNT = Decimal("0.20")
 #: Protective stop distance below (BUY) the observed average fill price.
 PROTECTION_STOP_FRACTION = Decimal("0.02")
 
-#: Secret name (under $SECRETS_ROOT/paper) holding the DU paper account id.
+#: Secret name (under $SECRETS_ROOT/<ENVIRONMENT>, i.e. .../PAPER) holding
+#: the DU paper account id. The directory is Environment.PAPER.value.
 DEFAULT_ACCOUNT_SECRET = "ibkr/paper-account-id"
 
 CLIENT_ORDER_PREFIX = "poi-ibkr-001"
@@ -1362,7 +1363,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--account-secret",
         default=DEFAULT_ACCOUNT_SECRET,
         help=(
-            "name of the secret under $SECRETS_ROOT/paper holding the DU paper"
+            "name of the secret under $SECRETS_ROOT/PAPER holding the DU paper"
             f" account id (default: {DEFAULT_ACCOUNT_SECRET})"
         ),
     )
