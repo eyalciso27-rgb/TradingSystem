@@ -31,7 +31,8 @@
 
 | ID | Title | Class | Component | Fix now w/o IBKR? |
 |---|---|---|---|---|
-| D-01 | Reconnect protection check is a global boolean, masking a naked position in another symbol | **P1** | `scripts/poi_ibkr_lifecycle.py` `_run_reconnect` | ✅ **fixed in this PR** |
+| D-01 | Reconnect protection check is a global boolean, masking a naked position in another symbol | **P1** | `scripts/poi_ibkr_lifecycle.py` `_run_reconnect` | ✅ fixed (PR #45) |
+| D-01b | Per-symbol fix still let any stale/foreign/malformed `:stop:` order mark the symbol protected | **P1** | `scripts/poi_ibkr_lifecycle.py` `_run_reconnect` | ✅ **fixed in this PR** (exact canonical current-run match) |
 | D-02 | Owner-run `--client-id` default (7) diverges from adapter `DEFAULT_CLIENT_ID` (1); stale-connection recovery undocumented | P2 | lifecycle CLI + runbook | ✅ (doc) — not done here (P2, out of P0/P1 scope) |
 | B-01 | POI-IBKR-001 Paper lifecycle (cancel-path/fill-path/protection/reconnect/reconciliation) not run | BLOCKED | owner-run | ❌ owner + host |
 | B-02 | Owner-run chaos/recovery host drills not run | BLOCKED | `CHAOS_RECOVERY_DRILLS.md` §4 | ❌ blocked on B-01 |
@@ -67,17 +68,50 @@
   silently protected; (c) any naked position triggers the loud
   `>>> OWNER ACTION REQUIRED <<<` abort and a reconciliation mismatch; (d) a
   single correctly-protected position in the run's own symbol still passes.
-- **Resolution:** protection is now per-symbol. A protective stop covers only
-  the run's own symbol; positions in any other symbol are reported via a new
-  `no_unexpected_symbol_position` check and, together with any naked position,
-  raise `_unprotected_position_abort` and are excluded from the `protected`
-  set fed to reconciliation (so they surface as `PROTECTION_MISMATCH`). The
-  `":stop:"` delimiter is matched instead of a bare `"stop"` substring.
-  Regression tests:
-  `test_reconnect_does_not_mask_a_naked_position_in_another_symbol` and
-  `test_reconnect_with_only_the_run_symbol_protected_still_passes` in
-  `tests/poi/test_poi_ibkr_lifecycle_cli.py`. The two pre-existing reconnect
-  tests remain green.
+- **Resolution (two stages):**
+  - *First fix (PR #45)* made coverage per-symbol but was **incomplete**: it
+    still did `protected_symbols = {envelope.symbol} if protective else set()`
+    on any `:stop:` order, so a **stale, cross-run, cross-scenario, or
+    malformed** harness-looking stop could still mark `envelope.symbol`
+    protected. This was caught in review and re-opened as **D-01b**.
+  - *Corrective fix (this PR)* binds the match to the **exact canonical
+    current-run stop identity**. A resting order protects `envelope.symbol`
+    only when its `client_order_id` is precisely
+    `<entry_id>-protection:<entry_id>:stop:<positive-int>` with
+    `entry_id = poi-ibkr-001-<run_date>-fill-path-<symbol>`, and it is in a
+    working state (`SUBMITTING`/`ACKNOWLEDGED`/`PARTIALLY_FILLED`). This binds
+    run_date + the fill-path scenario + the symbol + the exact spec_ref shape
+    (`scripts/poi_ibkr_lifecycle.py::_current_run_stop_prefix` /
+    `_is_current_run_stop`).
+- **Matching / fail-closed rule (corrective fix):**
+  - protection requires **exactly one** canonical current-run stop for the
+    symbol — zero ⇒ naked, more than one ⇒ ambiguous; both **fail closed**;
+  - a stale prior-run stop (different `run_date`), a cross-symbol stop, a
+    cross-scenario/cross-run order, or a malformed protective-looking id
+    **never** counts;
+  - **every non-zero** position is considered (long **and** short); a short in
+    any symbol, or any cross-symbol position, is an anomaly that **fails
+    closed** — the repository contract does not prove shorts impossible, so
+    they are surfaced, never ignored;
+  - the resting stop's **quantity cannot be read from `BrokerOrderReceipt`**,
+    so full-coverage is **not asserted from the receipt**; the run records an
+    explicit owner note to confirm the stop quantity covers the full position
+    in the Gateway UI;
+  - only the matched canonical stops are fed to reconciliation as internally
+    expected, so a foreign/stale resting order surfaces as
+    `UNEXPECTED_BROKER_ORDER`, and only a uniquely-protected run-symbol
+    position is fed as `protected` (otherwise `POSITION_MISMATCH` /
+    `PROTECTION_MISMATCH`).
+- **Regression tests** (`tests/poi/test_poi_ibkr_lifecycle_cli.py`):
+  `test_reconnect_matcher_rule_is_exact`,
+  `test_reconnect_protected_f_but_naked_g_fails`,
+  `test_reconnect_naked_f_with_unrelated_symbol_stop_fails`,
+  `test_reconnect_naked_f_with_stale_prior_run_stop_fails`,
+  `test_reconnect_malformed_protective_looking_order_fails`,
+  `test_reconnect_exact_current_run_stop_passes`,
+  `test_reconnect_short_position_fails_closed`,
+  `test_reconnect_ambiguous_multiple_canonical_stops_fails_closed`. The
+  pre-existing end-to-end reconnect tests remain green.
 
 No **P0** defect was found.
 
