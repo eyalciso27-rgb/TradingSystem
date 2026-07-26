@@ -1044,22 +1044,57 @@ def _run_reconnect(
     positions = {p.symbol: p for p in broker.get_positions(envelope.account_alias)}
     live = {symbol: position for symbol, position in positions.items() if position.quantity > 0}
     open_orders = broker.get_open_orders(envelope.account_alias)
+    # A protective STOP this harness placed. The ``:stop:`` marker comes from
+    # the ProtectionManager spec_ref (``protection:<ref>:stop:N``); a bare
+    # "stop" substring could match unrelated text, so match the delimiter.
     protective = tuple(
         o
         for o in open_orders
-        if o.client_order_id.startswith(CLIENT_ORDER_PREFIX) and "stop" in o.client_order_id
+        if o.client_order_id.startswith(CLIENT_ORDER_PREFIX) and ":stop:" in o.client_order_id
     )
+    # A protective stop this run placed only ever covers this run's own
+    # allowlisted symbol. Coverage is therefore PER SYMBOL, never a global
+    # boolean: a resting stop for symbol A must NEVER be counted as
+    # protecting a naked position in symbol B.
+    protected_symbols = {envelope.symbol} if protective else set()
+    unexpected = {
+        symbol: position for symbol, position in live.items() if symbol != envelope.symbol
+    }
+    naked = {
+        symbol: position
+        for symbol, position in live.items()
+        if symbol not in protected_symbols
+    }
     report.record(
         "positions_survived_reconnect",
         True,
         f"{len(live)} open position(s) reported after reconnect",
     )
-    # The invariant that matters after a restart: no naked position.
+    # Any live position outside this run's symbol is unexpected on a
+    # single-symbol PoI account and must never be silently treated as
+    # protected — it is an anomaly for the owner to resolve.
+    report.record(
+        "no_unexpected_symbol_position",
+        not unexpected,
+        "none"
+        if not unexpected
+        else f"live position(s) outside {envelope.symbol}: {sorted(unexpected)}",
+    )
+    # The invariant that matters after a restart: no naked position. It holds
+    # only if EVERY live position is covered by a protective stop for that
+    # same symbol.
     report.record(
         "protection_survived_reconnect",
-        not live or bool(protective),
-        f"{len(protective)} protective order(s) still resting for {len(live)} position(s)",
+        not naked,
+        f"{len(live) - len(naked)} of {len(live)} live position(s) protected"
+        f" ({len(protective)} protective stop(s) resting)",
     )
+    if naked:
+        _unprotected_position_abort(
+            report,
+            f"reconnect found {len(naked)} live position(s) without a matching"
+            f" protective stop: {sorted(naked)}",
+        )
     _reconcile(
         broker,
         envelope,
@@ -1073,7 +1108,14 @@ def _run_reconnect(
             for o in open_orders
         ),
         positions={symbol: position.quantity for symbol, position in live.items()},
-        protected={symbol: position.quantity for symbol, position in live.items() if protective},
+        # Only a position whose OWN symbol has a resting protective stop is
+        # reported protected to reconciliation; everything else surfaces as a
+        # PROTECTION_MISMATCH rather than being masked.
+        protected={
+            symbol: position.quantity
+            for symbol, position in live.items()
+            if symbol in protected_symbols
+        },
         processed_event_ids=frozenset(_event_id(e) for e in broker.order_events()),
         now=now,
         trigger=ReconciliationTrigger.STARTUP,
