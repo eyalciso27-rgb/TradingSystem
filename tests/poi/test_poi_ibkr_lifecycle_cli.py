@@ -683,9 +683,14 @@ def test_reconnect_reports_surviving_position_and_protection() -> None:
     assert filled.passed
 
     # A restart does not change what the broker reports; the harness must
-    # re-read it without submitting or cancelling anything.
+    # re-read it without submitting or cancelling anything. The reconnect is
+    # bound to the fill-path run via its run reference (the fill-path token).
     before = len(list(broker.order_events()))
-    report = _run(broker, _envelope(scenario="reconnect", symbol="F"))
+    report = _run(
+        broker,
+        _envelope(scenario="reconnect", symbol="F"),
+        run_ref=harness.confirmation_token(envelope),
+    )
     names = {name: ok for name, ok, _ in report.checks}
     assert names["positions_survived_reconnect"]
     assert names["protection_survived_reconnect"]
@@ -699,7 +704,13 @@ def test_reconnect_flags_a_position_left_without_protection() -> None:
     broker._positions[ALIAS] = (
         BrokerPosition(symbol="F", quantity=Decimal("1"), average_price=Decimal("10")),
     )
-    report = _run(broker, _envelope(scenario="reconnect", symbol="F"))
+    report = _run(
+        broker,
+        _envelope(scenario="reconnect", symbol="F"),
+        run_ref=harness.confirmation_token(
+            _envelope(scenario="fill-path", symbol="F", limit_price=Decimal("12"))
+        ),
+    )
     assert not report.passed
     assert any(name == "protection_survived_reconnect" and not ok for name, ok, _ in report.checks)
 
@@ -1317,11 +1328,36 @@ def test_documented_secret_path_matches_the_canonical_environment_name() -> None
 # -- 13. reconnect protection binds to the canonical current-run stop -------
 
 
-def _canonical_stop_id(symbol: str, *, run_date: str = RUN_DATE, seq: int = 1) -> str:
-    """The exact client_order_id the harness gives this run's protective stop:
-    ``<entry_id>-protection:<entry_id>:stop:<seq>`` with
-    ``entry_id = poi-ibkr-001-<run_date>-fill-path-<symbol>``."""
-    entry_id = f"{harness.CLIENT_ORDER_PREFIX}-{run_date}-fill-path-{symbol}"
+def _fill_path_run_ref(
+    *,
+    symbol: str = "F",
+    run_date: str = RUN_DATE,
+    quantity: str = "1",
+    limit_price: str = "12",
+    reference_price: str = "10",
+) -> str:
+    """The canonical run reference (confirmation token) of a fill-path run —
+    the exact identity the harness embeds in that run's order ids."""
+    env = _envelope(
+        scenario="fill-path",
+        symbol=symbol,
+        run_date=run_date,
+        quantity=Decimal(quantity),
+        limit_price=Decimal(limit_price),
+        reference_price=Decimal(reference_price),
+    )
+    token: str = harness.confirmation_token(env)
+    return token
+
+
+def _canonical_stop_id(
+    symbol: str = "F", *, run_date: str = RUN_DATE, run_ref: str | None = None, seq: int = 1
+) -> str:
+    """The exact client_order_id the harness gives a fill-path run's protective
+    stop: ``<entry_id>-protection:<entry_id>:stop:<seq>`` with
+    ``entry_id = poi-ibkr-001-<run_date>-fill-path-<symbol>-<run_ref>``."""
+    ref = run_ref if run_ref is not None else _fill_path_run_ref(symbol=symbol, run_date=run_date)
+    entry_id = f"{harness.CLIENT_ORDER_PREFIX}-{run_date}-fill-path-{symbol}-{ref}"
     return f"{entry_id}-protection:{entry_id}:stop:{seq}"
 
 
@@ -1336,8 +1372,13 @@ def _place_order(broker: FakeBroker, client_order_id: str) -> None:
     )
 
 
-def _reconnect(broker: FakeBroker, *, symbol: str = "F") -> Any:
-    return _run(broker, _envelope(scenario="reconnect", symbol=symbol))
+def _reconnect(
+    broker: FakeBroker, *, symbol: str = "F", run_ref: str | None = "__default__"
+) -> Any:
+    """Run the reconnect scenario, defaulting --run-ref to this run's fill-path
+    reference. Pass ``run_ref=None`` to exercise the missing-reference path."""
+    ref = _fill_path_run_ref(symbol=symbol) if run_ref == "__default__" else run_ref
+    return _run(broker, _envelope(scenario="reconnect", symbol=symbol), run_ref=ref)
 
 
 def _assert_fails_closed(report: Any) -> None:
@@ -1347,21 +1388,38 @@ def _assert_fails_closed(report: Any) -> None:
 
 
 def test_reconnect_matcher_rule_is_exact() -> None:
-    """The matcher accepts only ``<entry>-protection:<entry>:stop:<int>``."""
-    env = _envelope(scenario="reconnect", symbol="F")
-    prefix = harness._current_run_stop_prefix(env)
-    assert harness._is_current_run_stop(_canonical_stop_id("F"), prefix)
-    assert harness._is_current_run_stop(_canonical_stop_id("F", seq=42), prefix)
-    # rejected: other symbol, other date, other scenario, non-canonical ref,
-    # empty/non-numeric/zero suffix
-    assert not harness._is_current_run_stop(_canonical_stop_id("AAPL"), prefix)
+    """The matcher accepts only ``<entry>-protection:<entry>:stop:<int>`` for
+    the exact run reference, and rejects everything else."""
+    run_ref = _fill_path_run_ref(symbol="F")
+    prefix = harness._current_run_stop_prefix(run_date=RUN_DATE, symbol="F", run_ref=run_ref)
+    assert harness._is_current_run_stop(_canonical_stop_id("F", run_ref=run_ref), prefix)
+    assert harness._is_current_run_stop(_canonical_stop_id("F", run_ref=run_ref, seq=42), prefix)
+    # rejected: other symbol, other date, DIFFERENT run reference, non-canonical
+    # position_ref, empty/non-numeric/zero suffix
+    assert not harness._is_current_run_stop(_canonical_stop_id("T"), prefix)
     assert not harness._is_current_run_stop(_canonical_stop_id("F", run_date="2026-07-20"), prefix)
+    assert not harness._is_current_run_stop(_canonical_stop_id("F", run_ref="DEADBEEF0000"), prefix)
     assert not harness._is_current_run_stop(
         f"{harness.CLIENT_ORDER_PREFIX}-{RUN_DATE}-fill-path-F-protection:x:stop:1", prefix
     )
     assert not harness._is_current_run_stop(prefix, prefix)  # empty suffix
     assert not harness._is_current_run_stop(prefix + "abc", prefix)  # non-numeric
     assert not harness._is_current_run_stop(prefix + "0", prefix)  # zero seq
+
+
+def test_reconnect_without_run_reference_fails_closed() -> None:
+    """No --run-ref => same-run ownership is unprovable => fail closed, even
+    though a genuinely-canonical current-run stop is resting."""
+    broker = _broker()
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="F", quantity=Decimal("1"), average_price=Decimal("10")),
+    )
+    _place_order(broker, _canonical_stop_id("F"))
+    report = _reconnect(broker, run_ref=None)
+    names = {name: ok for name, ok, _ in report.checks}
+    assert names["run_reference_provided"] is False
+    assert names["protection_survived_reconnect"] is False
+    _assert_fails_closed(report)
 
 
 def test_reconnect_protected_f_but_naked_g_fails() -> None:
@@ -1375,33 +1433,68 @@ def test_reconnect_protected_f_but_naked_g_fails() -> None:
     _place_order(broker, _canonical_stop_id("F"))
     report = _reconnect(broker)
     names = {name: ok for name, ok, _ in report.checks}
+    assert names["run_reference_provided"] is True
     assert names["no_unexpected_position"] is False  # G is cross-symbol
     assert names["reconciliation"] is False
     _assert_fails_closed(report)
 
 
 def test_reconnect_naked_f_with_unrelated_symbol_stop_fails() -> None:
-    """A canonical stop for another symbol (AAPL) must not protect F."""
+    """A canonical stop for another symbol (T) must not protect F."""
     broker = _broker()
     broker._positions[ALIAS] = (
         BrokerPosition(symbol="F", quantity=Decimal("1"), average_price=Decimal("10")),
     )
-    _place_order(broker, _canonical_stop_id("AAPL"))  # stop for a different symbol
+    _place_order(broker, _canonical_stop_id("T"))  # stop for a different symbol
     report = _reconnect(broker)
     names = {name: ok for name, ok, _ in report.checks}
     assert names["protection_survived_reconnect"] is False
     _assert_fails_closed(report)
 
 
-def test_reconnect_naked_f_with_stale_prior_run_stop_fails() -> None:
-    """A canonical F stop from a PRIOR run (different run_date) must not
-    protect this run's F position."""
+def test_reconnect_naked_f_with_stale_prior_day_stop_fails() -> None:
+    """A canonical F stop from a PRIOR day (different run_date) must not protect
+    this run's F position."""
     broker = _broker()
     broker._positions[ALIAS] = (
         BrokerPosition(symbol="F", quantity=Decimal("1"), average_price=Decimal("10")),
     )
-    _place_order(broker, _canonical_stop_id("F", run_date="2026-07-20"))  # stale
+    _place_order(broker, _canonical_stop_id("F", run_date="2026-07-20"))  # prior day
     report = _reconnect(broker)  # current run_date is 2026-07-21
+    names = {name: ok for name, ok, _ in report.checks}
+    assert names["protection_survived_reconnect"] is False
+    _assert_fails_closed(report)
+
+
+def test_reconnect_naked_f_with_stale_same_day_different_run_stop_fails() -> None:
+    """A canonical F stop from a DIFFERENT same-day run (a run with different
+    parameters, hence a different run reference) must not protect this run's F
+    position — the core gap the run-instance binding closes."""
+    broker = _broker()
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="F", quantity=Decimal("1"), average_price=Decimal("10")),
+    )
+    # Same date + symbol, but an earlier same-day run at a different limit price
+    # => a different confirmation token => a different run reference.
+    other_ref = _fill_path_run_ref(symbol="F", limit_price="13")
+    current_ref = _fill_path_run_ref(symbol="F", limit_price="12")
+    assert other_ref != current_ref
+    _place_order(broker, _canonical_stop_id("F", run_ref=other_ref))
+    report = _run(broker, _envelope(scenario="reconnect", symbol="F"), run_ref=current_ref)
+    names = {name: ok for name, ok, _ in report.checks}
+    assert names["protection_survived_reconnect"] is False
+    _assert_fails_closed(report)
+
+
+def test_reconnect_same_date_symbol_different_run_reference_fails() -> None:
+    """Explicit: same date/symbol but a different run reference passed to the
+    reconnect than the stop was created under => no match => fail closed."""
+    broker = _broker()
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="F", quantity=Decimal("1"), average_price=Decimal("10")),
+    )
+    _place_order(broker, _canonical_stop_id("F", run_ref="AAAAAAAAAAAA"))
+    report = _run(broker, _envelope(scenario="reconnect", symbol="F"), run_ref="BBBBBBBBBBBB")
     names = {name: ok for name, ok, _ in report.checks}
     assert names["protection_survived_reconnect"] is False
     _assert_fails_closed(report)
@@ -1422,16 +1515,18 @@ def test_reconnect_malformed_protective_looking_order_fails() -> None:
     _assert_fails_closed(report)
 
 
-def test_reconnect_exact_current_run_stop_passes() -> None:
+def test_reconnect_exact_same_run_stop_passes() -> None:
     """Control: a single non-zero long in the run's symbol backed by exactly
-    one canonical current-run stop reconciles clean and passes."""
+    one canonical stop FOR THE SAME RUN REFERENCE reconciles clean and passes."""
     broker = _broker()
     broker._positions[ALIAS] = (
         BrokerPosition(symbol="F", quantity=Decimal("1"), average_price=Decimal("10")),
     )
-    _place_order(broker, _canonical_stop_id("F"))
-    report = _reconnect(broker)
+    run_ref = _fill_path_run_ref(symbol="F")
+    _place_order(broker, _canonical_stop_id("F", run_ref=run_ref))
+    report = _reconnect(broker, run_ref=run_ref)
     names = {name: ok for name, ok, _ in report.checks}
+    assert names["run_reference_provided"] is True
     assert names["no_unexpected_position"] is True
     assert names["protection_stop_unambiguous"] is True
     assert names["protection_survived_reconnect"] is True
@@ -1457,15 +1552,16 @@ def test_reconnect_short_position_fails_closed() -> None:
 
 
 def test_reconnect_ambiguous_multiple_canonical_stops_fails_closed() -> None:
-    """More than one canonical current-run stop for the position is ambiguous
+    """More than one canonical same-run stop for the position is ambiguous
     and cannot be certified as protection."""
     broker = _broker()
     broker._positions[ALIAS] = (
         BrokerPosition(symbol="F", quantity=Decimal("1"), average_price=Decimal("10")),
     )
-    _place_order(broker, _canonical_stop_id("F", seq=1))
-    _place_order(broker, _canonical_stop_id("F", seq=2))
-    report = _reconnect(broker)
+    run_ref = _fill_path_run_ref(symbol="F")
+    _place_order(broker, _canonical_stop_id("F", run_ref=run_ref, seq=1))
+    _place_order(broker, _canonical_stop_id("F", run_ref=run_ref, seq=2))
+    report = _reconnect(broker, run_ref=run_ref)
     names = {name: ok for name, ok, _ in report.checks}
     assert names["protection_stop_unambiguous"] is False
     assert names["protection_survived_reconnect"] is False

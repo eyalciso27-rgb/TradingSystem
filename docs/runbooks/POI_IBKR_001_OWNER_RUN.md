@@ -176,18 +176,28 @@ merely planned, so this failure shows up as a real `PROTECTION_MISMATCH`.
 ### Step 6 — reconnect / restart evidence
 
 With the position and its stop still open, restart the Gateway
-(`sudo systemctl restart ibgateway`), wait for login, then:
+(`sudo systemctl restart ibgateway`), wait for login, then run `reconnect`
+bound to the **exact fill-path run** via `--run-ref`. The fill-path evidence
+(step 5) printed a line `run reference (pass to reconnect as --run-ref): …`;
+`<RUN_REF>` below is that value (it is the fill-path confirmation token).
 
 ```bash
 uv run python scripts/poi_ibkr_lifecycle.py \
   --scenario reconnect --account-alias <ALIAS> --broker-module "$BM" \
+  --symbol F --run-ref <RUN_REF> \
   --evidence-out /tmp/poi-ibkr-001-step6-reconnect.md
 ```
 
 `reconnect` is read-only — it submits and cancels nothing. It asserts the
-invariant that matters after a restart: **no naked position**. The position
-must still be reported and a protective order must still be resting;
-reconciliation must come back clean. Record what the Gateway did with the
+invariant that matters after a restart: **no naked position**. `--run-ref`
+binds the check to this specific fill-path run's protective stop, so a stale
+stop from a different run (even the same day and symbol) can never mask a
+naked position; **without `--run-ref` the scenario fails closed** because
+same-run ownership cannot be proven. The position must still be reported and
+this run's protective stop must still be resting; reconciliation must come
+back clean. The resting stop's **quantity is not exposed by the API**, so the
+scenario notes that you must **confirm in the Gateway/TWS UI that the stop
+quantity covers the full position**. Record what the Gateway did with the
 resting stop across the restart — this is the "deterministic recovery"
 criterion.
 
