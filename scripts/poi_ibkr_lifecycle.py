@@ -1027,6 +1027,48 @@ def _run_fill_path(
         )
 
 
+#: Order states in which a resting protective stop is actually protecting.
+#: A CANCEL_PENDING / CANCELLED / FILLED / REJECTED stop protects nothing, so
+#: it must never count as coverage (fail closed).
+_WORKING_ORDER_STATES: frozenset[OrderState] = frozenset(
+    {OrderState.SUBMITTING, OrderState.ACKNOWLEDGED, OrderState.PARTIALLY_FILLED}
+)
+
+
+def _current_run_stop_prefix(envelope: LifecycleEnvelope) -> str:
+    """The exact ``client_order_id`` prefix of THIS run's protective stop.
+
+    A protective stop is created only by the ``fill-path`` scenario, whose
+    entry ``client_order_id`` is ``poi-ibkr-001-<run_date>-fill-path-<symbol>``.
+    The ProtectionManager builds ``spec_ref`` as
+    ``protection:<entry_id>:stop:<n>`` and the harness submits it as
+    ``<entry_id>-<spec_ref>``. So an order belongs to THIS run's protective
+    stop for THIS symbol iff its id is exactly::
+
+        <entry_id>-protection:<entry_id>:stop:<positive-int>
+
+    Binding run_date + the fill-path scenario + the allowlisted symbol + the
+    exact spec_ref shape rejects a stale prior-run stop (different date), a
+    cross-symbol stop, a cross-scenario / cross-run order, and a malformed
+    protective-looking id — none of which may ever mark this symbol protected.
+    """
+    entry_id = f"{CLIENT_ORDER_PREFIX}-{envelope.run_date}-fill-path-{envelope.symbol}"
+    return f"{entry_id}-protection:{entry_id}:stop:"
+
+
+def _is_current_run_stop(client_order_id: str, prefix: str) -> bool:
+    """True iff the id is exactly this run's canonical protective-stop id.
+
+    The suffix after ``:stop:`` must be a positive ASCII integer sequence;
+    anything else (empty, non-numeric, another run/symbol/scenario) is
+    rejected, so a malformed or foreign protective-looking order never counts.
+    """
+    if not client_order_id.startswith(prefix):
+        return False
+    suffix = client_order_id[len(prefix) :]
+    return bool(suffix) and suffix.isascii() and suffix.isdigit() and int(suffix) >= 1
+
+
 def _run_reconnect(
     broker: BrokerPort,
     envelope: LifecycleEnvelope,
@@ -1040,82 +1082,115 @@ def _run_reconnect(
     and reconciles. It submits nothing and cancels nothing — if protection
     were missing, the correct response is an owner decision, not an
     automatic order.
+
+    Protection is matched to EXACTLY this run's canonical fill-path stop for
+    this symbol (see ``_current_run_stop_prefix``). Mere presence of any
+    harness-looking stop never counts: a stale, foreign, cross-symbol,
+    cross-run, ambiguous, or malformed stop leaves the position naked and the
+    run fails closed. Quantity of the resting stop cannot be read from a
+    ``BrokerOrderReceipt``, so full-coverage is required to be owner-confirmed
+    in the UI and is never asserted from the receipt surface alone.
     """
-    positions = {p.symbol: p for p in broker.get_positions(envelope.account_alias)}
-    live = {symbol: position for symbol, position in positions.items() if position.quantity > 0}
+    positions = tuple(broker.get_positions(envelope.account_alias))
+    # Every NON-ZERO position (long OR short). A short is itself an anomaly
+    # this scenario must surface, so we never restrict to quantity > 0.
+    nonzero = tuple(p for p in positions if p.quantity != 0)
     open_orders = broker.get_open_orders(envelope.account_alias)
-    # A protective STOP this harness placed. The ``:stop:`` marker comes from
-    # the ProtectionManager spec_ref (``protection:<ref>:stop:N``); a bare
-    # "stop" substring could match unrelated text, so match the delimiter.
-    protective = tuple(
+
+    stop_prefix = _current_run_stop_prefix(envelope)
+    current_run_stops = tuple(
         o
         for o in open_orders
-        if o.client_order_id.startswith(CLIENT_ORDER_PREFIX) and ":stop:" in o.client_order_id
+        if _is_current_run_stop(o.client_order_id, stop_prefix) and o.state in _WORKING_ORDER_STATES
     )
-    # A protective stop this run placed only ever covers this run's own
-    # allowlisted symbol. Coverage is therefore PER SYMBOL, never a global
-    # boolean: a resting stop for symbol A must NEVER be counted as
-    # protecting a naked position in symbol B.
-    protected_symbols = {envelope.symbol} if protective else set()
-    unexpected = {
-        symbol: position for symbol, position in live.items() if symbol != envelope.symbol
-    }
-    naked = {
-        symbol: position
-        for symbol, position in live.items()
-        if symbol not in protected_symbols
-    }
+
+    # The harness only ever opens a single LONG in its own allowlisted symbol.
+    # Anything else — a different symbol, or a SHORT in any symbol including
+    # this one — is an anomaly that must fail closed.
+    expected_long = tuple(p for p in nonzero if p.symbol == envelope.symbol and p.quantity > 0)
+    anomalous = tuple(p for p in nonzero if p not in expected_long)
+
     report.record(
         "positions_survived_reconnect",
         True,
-        f"{len(live)} open position(s) reported after reconnect",
+        f"{len(nonzero)} non-zero position(s) reported after reconnect",
     )
-    # Any live position outside this run's symbol is unexpected on a
-    # single-symbol PoI account and must never be silently treated as
-    # protected — it is an anomaly for the owner to resolve.
     report.record(
-        "no_unexpected_symbol_position",
-        not unexpected,
+        "no_unexpected_position",
+        not anomalous,
         "none"
-        if not unexpected
-        else f"live position(s) outside {envelope.symbol}: {sorted(unexpected)}",
+        if not anomalous
+        else "unexpected (cross-symbol or short): "
+        + ", ".join(f"{p.symbol}:{p.quantity}" for p in anomalous),
     )
-    # The invariant that matters after a restart: no naked position. It holds
-    # only if EVERY live position is covered by a protective stop for that
-    # same symbol.
+    # Ambiguity fails closed: more than one canonical stop for the position is
+    # not a clean, verifiable protection state.
+    ambiguous = bool(expected_long) and len(current_run_stops) > 1
+    report.record(
+        "protection_stop_unambiguous",
+        not ambiguous,
+        "one canonical stop"
+        if len(current_run_stops) == 1
+        else f"{len(current_run_stops)} canonical stop(s) matched",
+    )
+
+    # The run symbol is protected ONLY when exactly one canonical current-run
+    # stop is resting for it. Zero => naked; >1 => ambiguous. Both fail closed.
+    symbol_protected = bool(expected_long) and len(current_run_stops) == 1
+    naked = tuple(p for p in expected_long if not symbol_protected)
+
     report.record(
         "protection_survived_reconnect",
         not naked,
-        f"{len(live) - len(naked)} of {len(live)} live position(s) protected"
-        f" ({len(protective)} protective stop(s) resting)",
+        f"{len(expected_long) - len(naked)} of {len(expected_long)} run-symbol"
+        f" position(s) protected by a canonical current-run stop"
+        f" ({len(current_run_stops)} matched, {len(open_orders)} open order(s))",
     )
+    if symbol_protected:
+        report.note(
+            "A resting protective stop cannot expose its quantity through"
+            " BrokerOrderReceipt: confirm in the Gateway/TWS UI that the stop"
+            " quantity covers the FULL position before relying on it."
+        )
     if naked:
         _unprotected_position_abort(
             report,
-            f"reconnect found {len(naked)} live position(s) without a matching"
-            f" protective stop: {sorted(naked)}",
+            f"reconnect found {len(naked)} run-symbol position(s) with no unique"
+            f" canonical current-run protective stop: "
+            + ", ".join(f"{p.symbol}:{p.quantity}" for p in naked),
+        )
+    if ambiguous:
+        _unprotected_position_abort(
+            report,
+            f"{len(current_run_stops)} canonical stops matched the position;"
+            " protection is ambiguous and cannot be verified",
+        )
+    if anomalous:
+        _unprotected_position_abort(
+            report,
+            "unexpected position(s) on the account (cross-symbol or short): "
+            + ", ".join(f"{p.symbol}:{p.quantity}" for p in anomalous),
         )
     _reconcile(
         broker,
         envelope,
         report,
+        # Only the matched canonical current-run stops are internally expected;
+        # any other resting order surfaces as an UNEXPECTED_BROKER_ORDER rather
+        # than being silently accepted.
         open_orders=tuple(
             InternalOrderExpectation(
                 client_order_id=o.client_order_id,
                 expected_state=o.state,
                 is_protective=True,
             )
-            for o in open_orders
+            for o in current_run_stops
         ),
-        positions={symbol: position.quantity for symbol, position in live.items()},
-        # Only a position whose OWN symbol has a resting protective stop is
-        # reported protected to reconciliation; everything else surfaces as a
-        # PROTECTION_MISMATCH rather than being masked.
-        protected={
-            symbol: position.quantity
-            for symbol, position in live.items()
-            if symbol in protected_symbols
-        },
+        positions={p.symbol: p.quantity for p in nonzero},
+        # Report protected ONLY for a run-symbol position backed by a unique
+        # canonical stop; everything else surfaces as a PROTECTION_MISMATCH /
+        # POSITION_MISMATCH rather than being masked.
+        protected=({p.symbol: p.quantity for p in expected_long} if symbol_protected else {}),
         processed_event_ids=frozenset(_event_id(e) for e in broker.order_events()),
         now=now,
         trigger=ReconciliationTrigger.STARTUP,
