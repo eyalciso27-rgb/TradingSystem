@@ -1312,3 +1312,61 @@ def test_documented_secret_path_matches_the_canonical_environment_name() -> None
     # No lowercase variant may survive anywhere in the owner-facing surface.
     assert "$SECRETS_ROOT/paper/" not in runbook
     assert "$SECRETS_ROOT/paper/" not in help_text
+
+
+# -- 13. reconnect protection is per-symbol (IMP-1304 fail-open fix) ---------
+
+
+def test_reconnect_does_not_mask_a_naked_position_in_another_symbol() -> None:
+    """A resting protective stop for the run's symbol must NEVER be counted as
+    protecting a naked position in a different symbol. Regression for the
+    global-boolean fail-open closed under IMP-1304."""
+    broker = _broker()
+    # F is properly protected; G is a naked leftover position on the account.
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="F", quantity=Decimal("1"), average_price=Decimal("10")),
+        BrokerPosition(symbol="G", quantity=Decimal("1"), average_price=Decimal("20")),
+    )
+    stop_id = f"{harness.CLIENT_ORDER_PREFIX}-2026-07-21-fill-path-F-protection:x:stop:1"
+    broker._orders[stop_id] = BrokerOrderReceipt(
+        client_order_id=stop_id,
+        broker_order_ref="FAKE-stop-F",
+        state=OrderState.ACKNOWLEDGED,
+        authorization_ref="auth",
+        correlation_id="corr",
+        received_at=AS_OF,
+    )
+    report = _run(broker, _envelope(scenario="reconnect", symbol="F"))
+    names = {name: ok for name, ok, _ in report.checks}
+
+    assert not report.passed  # the naked G position must fail the run
+    # G is outside the run's symbol -> flagged, not silently protected.
+    assert names["no_unexpected_symbol_position"] is False
+    # The naked position invariant catches G despite F's stop existing.
+    assert names["protection_survived_reconnect"] is False
+    assert any(name == "owner_action_required" and not ok for name, ok, _ in report.checks)
+    # Reconciliation must see G as a mismatch, not a clean protected book.
+    assert names["reconciliation"] is False
+    assert harness.OWNER_ACTION_BANNER in report.render()
+
+
+def test_reconnect_with_only_the_run_symbol_protected_still_passes() -> None:
+    """Control: a single protected position in the run's own symbol is clean."""
+    broker = _broker()
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="F", quantity=Decimal("1"), average_price=Decimal("10")),
+    )
+    stop_id = f"{harness.CLIENT_ORDER_PREFIX}-2026-07-21-fill-path-F-protection:x:stop:1"
+    broker._orders[stop_id] = BrokerOrderReceipt(
+        client_order_id=stop_id,
+        broker_order_ref="FAKE-stop-F",
+        state=OrderState.ACKNOWLEDGED,
+        authorization_ref="auth",
+        correlation_id="corr",
+        received_at=AS_OF,
+    )
+    report = _run(broker, _envelope(scenario="reconnect", symbol="F"))
+    names = {name: ok for name, ok, _ in report.checks}
+    assert names["no_unexpected_symbol_position"] is True
+    assert names["protection_survived_reconnect"] is True
+    assert report.passed
