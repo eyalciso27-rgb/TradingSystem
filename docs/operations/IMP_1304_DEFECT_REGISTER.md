@@ -35,6 +35,8 @@
 | D-01b | Per-symbol fix still let any stale/foreign/malformed `:stop:` order mark the symbol protected | **P1** | `scripts/poi_ibkr_lifecycle.py` `_run_reconnect` | ✅ fixed (PR #46) (canonical date+scenario+symbol match) |
 | D-01c | The match bound date+scenario+symbol only: two same-parameter same-day runs share `entry_id`, so a stale same-day stop from a run with **different** parameters could still match | **P1** | `scripts/poi_ibkr_lifecycle.py` identity + `_run_reconnect` | ✅ **fixed in this PR** (bind order ids to a deterministic operation reference) |
 | D-01d | The operation reference initially reused the **confirmation token**, embedding a reusable execution-authorization value in `client_order_id`, broker-visible order metadata, and evidence | **P1 (security)** | `scripts/poi_ibkr_lifecycle.py` identity | ✅ **fixed in this PR** (separate, domain-separated, non-authorizing operation reference) |
+| D-01e | Evidence artifact lacked broker order identity, fill identity and intended-parameters fields, so an owner could not correlate the artifact with the real order | P2 | `scripts/poi_ibkr_lifecycle.py` fill/cancel path | ✅ **fixed in this bundle** (records `intended_parameters`, `entry_broker_order`, `fill_identity`) |
+| D-ADAPTER-01 | Reconnect owner-run cannot recover the harness order id / operation reference from a real Gateway after a restart: the paper adapter never sets `order.orderRef` on `placeOrder`, and `get_open_orders` returns only in-memory orders (not a live `reqAllOpenOrders`). A fresh reconnect invocation therefore sees the live position but no matching stop → would report naked (fail closed) even though protection is resting | **P1** | `broker-ibkr/paper_adapter.py` (host-only `# pragma: no cover` transport) | ⛔ **BLOCKED** — the fix (persist `orderRef`, bounded to the IBKR length limit, + live open-order query + reconstruct id) must be implemented AND verified against a real Gateway; cannot be done or proven in a no-broker bundle. Documented as a prerequisite for DEF-07 |
 | D-02 | Owner-run `--client-id` default (7) diverges from adapter `DEFAULT_CLIENT_ID` (1); stale-connection recovery undocumented | P2 | lifecycle CLI + runbook | ✅ (doc) — not done here (P2, out of P0/P1 scope) |
 | B-01 | POI-IBKR-001 Paper lifecycle (cancel-path/fill-path/protection/reconnect/reconciliation) not run | BLOCKED | owner-run | ❌ owner + host |
 | B-02 | Owner-run chaos/recovery host drills not run | BLOCKED | `CHAOS_RECOVERY_DRILLS.md` §4 | ❌ blocked on B-01 |
@@ -205,11 +207,42 @@ dependencies and are tracked, not resolved here.
   all **already fixed** in those PRs and re-verified here; they are closed, not
   open.
 
-## 6. Effect on IMP-1304 `done_criteria`
+## 6. Integrated audit (Phase-13 non-market bundle, Section A)
 
-`done_criteria` = *"No open critical/high safety defect."* After closing D-01,
-the audit finds **no open P0/P1 safety defect in committed code**. This does
-**not** complete IMP-1304 or Phase 13: the register's blocked items (B-01…B-04)
-are owner-run/host dependencies that must still be discharged, and IMP-1302 /
-the POI-IBKR-001 owner-run remain outstanding. IMP-1304 stays open pending
-those.
+Re-verified after the PR #39–#48 sequence — not assumed correct because CI was
+green.
+
+| Audit item | Result |
+|---|---|
+| confirmation token is authorization-only | ✅ used only for `--confirm` (`run_lifecycle` compares `confirmation_token(envelope)`); never embedded in ids/evidence |
+| operation reference non-authorizing + domain-separated | ✅ `operation_reference` under `OPERATION_REF_NAMESPACE="poi-ibkr-run-ref-v1"`; ≠ token; rejected by `--confirm` (test) |
+| no authorization token leak to ids/logs/reports/evidence | ✅ test `test_confirmation_token_never_appears_in_order_ids_or_evidence` |
+| operation identity deterministic, not overclaimed as unique instance | ✅ terminology corrected (PR #48); identical-parameter runs share it by design |
+| client_order_id length/charset valid for the adapter | ✅ the adapter uses it only as an internal dict key; **it is never sent to IBKR** (transport uses the integer orderId; `order.orderRef` is not set — see D-ADAPTER-01) |
+| stop identity parseable after adding the operation reference | ✅ `_is_current_run_stop` parses `<entry_id>-protection:<entry_id>:stop:<int>` |
+| reconnect matches only one working stop | ✅ exactly-one rule; zero→naked, >1→ambiguous, both fail closed |
+| stale/malformed/foreign/cross-symbol/ambiguous stops fail closed | ✅ dedicated tests |
+| all non-zero positions incl. shorts fail closed | ✅ `test_reconnect_short_position_fails_closed` |
+| reconciliation receives correct expected orders/positions/protected | ✅ only matched working stops fed as expected; only uniquely-protected symbol fed as protected |
+| cleanup cannot flatten | ✅ `_run_cleanup` cancels orders only; never reads/closes positions |
+| partial + surprise fills remain protected | ✅ remainder cancelled before protection; surprise-fill abort |
+| no retry can duplicate an order | ✅ agent idempotency + broker idempotency; duplicate-delivery tests |
+| authorization/reference changes preserve crash-safe resumption | ✅ deterministic id for identical parameters |
+| evidence redaction keeps fields needed for reconnect | ✅ operation reference is printed (non-secret) so `--run-ref` is recoverable |
+| evidence has no secrets or executable authorization values | ✅ account masked; token never in the executed-run artifact |
+| all runbook commands use `uv run --no-sync` | ✅ verified across all host runbooks |
+
+**New finding:** **D-ADAPTER-01 (P1, BLOCKED)** — the reconnect owner-run
+cannot recover the harness order id from a real Gateway after a restart (no
+`order.orderRef`; in-memory-only `get_open_orders`). It is BLOCKED on broker
+connectivity to implement+verify and is recorded as a prerequisite for DEF-07.
+
+## 7. Effect on IMP-1304 `done_criteria`
+
+`done_criteria` = *"No open critical/high safety defect."* The audit finds **no
+open P0/P1 safety defect in committed code**. One P1, **D-ADAPTER-01**, is
+**BLOCKED** on broker connectivity (host-only transport, unverifiable without a
+real Gateway) and is documented rather than shipped untested. This does **not**
+complete IMP-1304 or Phase 13: the blocked items (B-01…B-04, D-ADAPTER-01) are
+owner-run/host dependencies, and IMP-1302 / the POI-IBKR-001 owner-run remain
+outstanding. IMP-1304 stays open.

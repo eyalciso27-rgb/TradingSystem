@@ -69,6 +69,7 @@ from trading_application.pre_submit_check import (
 from trading_broker_core.port import (
     BrokerCapabilityMode,
     BrokerOrderEvent,
+    BrokerOrderReceipt,
     BrokerPort,
     BrokerPortError,
     CancelOrderRequest,
@@ -546,6 +547,41 @@ def _unprotected_position_abort(report: LifecycleReport, reason: str) -> None:
     )
 
 
+def _record_intended_parameters(report: LifecycleReport, envelope: LifecycleEnvelope) -> None:
+    """Record the exact intended parameters into the evidence artifact.
+
+    Proves *what was intended* independently of what the broker returned:
+    symbol, side, quantity, limit price, run date, the (non-authorizing)
+    operation reference and the masked account alias. The confirmation token
+    is deliberately NOT recorded — it is an execution-authorization value.
+    """
+    report.record(
+        "intended_parameters",
+        True,
+        f"symbol={envelope.symbol} side={envelope.side.value}"
+        f" quantity={envelope.quantity} limit_price={envelope.limit_price}"
+        f" run_date={envelope.run_date} operation_reference={envelope.run_ref}"
+        f" account={mask_account(envelope.account_alias)}",
+    )
+
+
+def _record_broker_order_identity(
+    report: LifecycleReport, name: str, receipt: BrokerOrderReceipt | None
+) -> None:
+    """Record a broker order's identity so the owner can correlate the
+    artifact with the actual order at the broker. ``broker_order_ref`` is the
+    broker's own opaque reference; it is not an account id or a secret."""
+    if receipt is None:
+        report.record(name, False, "no broker receipt returned")
+        return
+    report.record(
+        name,
+        True,
+        f"client_order_id={receipt.client_order_id}"
+        f" broker_order_ref={receipt.broker_order_ref} state={receipt.state.value}",
+    )
+
+
 def _event_id(event: BrokerOrderEvent) -> str:
     """The engine's canonical id for one normalized broker event."""
     return f"{event.sequence}:{event.client_order_id}:{event.state.value}"
@@ -735,6 +771,7 @@ def _run_cancel_path(
     timeout_seconds: float,
 ) -> None:
     """Submit a far-from-market resting LIMIT, acknowledge, then cancel."""
+    _record_intended_parameters(report, envelope)
     # LifecycleEnvelope already refused to construct without a reference
     # price and a limit far enough below it; this records the proof.
     reference = envelope.reference_price or Decimal(0)
@@ -767,6 +804,7 @@ def _run_cancel_path(
     if outcome.status is not ExecutionStatus.SUBMITTED:
         _submit_failure_abort(report, outcome.status)
         return
+    _record_broker_order_identity(report, "entry_broker_order", outcome.receipt)
 
     # Idempotency proof: the identical queue item must NOT create a second
     # order (the DoD's "zero duplicate orders").
@@ -866,6 +904,7 @@ def _run_fill_path(
     timeout_seconds: float,
 ) -> None:
     """Submit a marketable LIMIT, then protect the resulting position."""
+    _record_intended_parameters(report, envelope)
     correlation_id = f"{CLIENT_ORDER_PREFIX}-fill-{int(now.timestamp())}"
     request = _authorized_request(
         envelope,
@@ -887,6 +926,8 @@ def _run_fill_path(
     if outcome.status is not ExecutionStatus.SUBMITTED:
         _submit_failure_abort(report, outcome.status)
         return
+    # Broker order identity of the entry: proves which order was created.
+    _record_broker_order_identity(report, "entry_broker_order", outcome.receipt)
 
     fill, seen = _await_state(
         broker,
@@ -900,6 +941,16 @@ def _run_fill_path(
         fill is not None,
         f"observed states: {[e.state.value for e in seen] or 'none'}",
     )
+    if fill is not None:
+        # Fill identity: broker order ref + sequence + filled quantity, so the
+        # artifact ties the fill to the entry order.
+        report.record(
+            "fill_identity",
+            True,
+            f"client_order_id={fill.client_order_id}"
+            f" broker_order_ref={fill.broker_order_ref} sequence={fill.sequence}"
+            f" state={fill.state.value} filled_quantity={fill.filled_quantity}",
+        )
     if fill is None:
         # Fail closed: an unfilled entry must not be left resting.
         cancel_outcome = agent.cancel(envelope.client_order_id, correlation_id=correlation_id)

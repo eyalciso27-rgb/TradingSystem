@@ -645,3 +645,70 @@ def test_no_ibkr_sdk_or_network_import_in_this_module() -> None:
         if stripped.startswith(("import ", "from ")):
             for forbidden in ("ib" + "api", "trading_broker_ibkr", "httpx", "requests", "socket"):
                 assert forbidden not in stripped, f"forbidden import: {stripped}"
+
+
+# -- callback loss / delayed / disconnect-after-accept (IMP-1303 gaps) ------
+
+
+def test_lost_fill_callback_surfaces_as_missing_fill_event() -> None:
+    """A broker fill event that the internal inbox never processed (a lost or
+    dropped callback) must surface at reconciliation as MISSING_FILL_EVENT —
+    it is detected, never silently ignored."""
+    drill = ExecutionDrill()
+    drill.agent.process(drill.request("ord-lost"))  # broker emits an ACK event
+    # Reconcile with an EMPTY processed set: the internal side never saw the
+    # broker's event (the callback was lost).
+    report = drill.reconcile(
+        open_orders=(
+            InternalOrderExpectation(
+                client_order_id="ord-lost", expected_state=OrderState.ACKNOWLEDGED
+            ),
+        ),
+        processed_event_ids=frozenset(),
+    )
+    kinds = {f.kind for f in report.findings}  # type: ignore[attr-defined]
+    assert FindingKind.MISSING_FILL_EVENT in kinds
+    assert report.reconciled is False  # type: ignore[attr-defined]
+
+
+def test_duplicate_callback_is_detected_not_double_counted() -> None:
+    """A redelivered broker event (duplicate callback) is a no-op for order
+    state — the broker's idempotency means no second order and the event
+    stream still resolves to one logical order."""
+    drill = ExecutionDrill()
+    request = drill.request("ord-dupcb")
+    drill.agent.process(request)
+    drill.agent.process(request)  # duplicate delivery
+    acks = [
+        e
+        for e in drill.broker.order_events()
+        if e.client_order_id == "ord-dupcb" and e.state is OrderState.ACKNOWLEDGED
+    ]
+    assert len(acks) == 1
+    assert len(drill.broker.get_open_orders("paper-main")) == 1
+
+
+def test_disconnect_after_accepted_order_blocks_until_reconciled() -> None:
+    """An order is accepted, then the broker disconnects. A new submit while
+    disconnected fails closed (no blind retry), and recovery is a
+    reconciliation over the still-open accepted order — never a resend."""
+    drill = ExecutionDrill()
+    first = drill.agent.process(drill.request("ord-acc"))
+    assert first.status is ExecutionStatus.SUBMITTED
+
+    drill.broker.disconnect()  # disconnect AFTER the order was accepted
+    blocked = drill.agent.process(drill.request("ord-after"))
+    assert blocked.status in (ExecutionStatus.FAILED, ExecutionStatus.NEEDS_REVIEW)
+    assert blocked.receipt is None
+
+    drill.broker.connect()  # reconnect; recover via reconciliation
+    report = drill.reconcile(
+        open_orders=(
+            InternalOrderExpectation(
+                client_order_id="ord-acc", expected_state=OrderState.ACKNOWLEDGED
+            ),
+        ),
+        trigger=ReconciliationTrigger.STARTUP,
+    )
+    assert report.reconciled is True  # type: ignore[attr-defined]
+    assert len(drill.broker.get_open_orders("paper-main")) == 1  # nothing re-sent
