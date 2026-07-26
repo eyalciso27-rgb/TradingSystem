@@ -689,7 +689,7 @@ def test_reconnect_reports_surviving_position_and_protection() -> None:
     report = _run(
         broker,
         _envelope(scenario="reconnect", symbol="F"),
-        run_ref=harness.confirmation_token(envelope),
+        run_ref=harness.operation_reference(envelope),
     )
     names = {name: ok for name, ok, _ in report.checks}
     assert names["positions_survived_reconnect"]
@@ -707,7 +707,7 @@ def test_reconnect_flags_a_position_left_without_protection() -> None:
     report = _run(
         broker,
         _envelope(scenario="reconnect", symbol="F"),
-        run_ref=harness.confirmation_token(
+        run_ref=harness.operation_reference(
             _envelope(scenario="fill-path", symbol="F", limit_price=Decimal("12"))
         ),
     )
@@ -1325,7 +1325,77 @@ def test_documented_secret_path_matches_the_canonical_environment_name() -> None
     assert "$SECRETS_ROOT/paper/" not in help_text
 
 
-# -- 13. reconnect protection binds to the canonical current-run stop -------
+# -- 12b. the operation reference is NOT the execution confirmation token ---
+
+
+def _security_env(**kwargs: Any) -> Any:
+    defaults: dict[str, Any] = {
+        "scenario": "fill-path",
+        "symbol": "F",
+        "limit_price": Decimal("12"),
+    }
+    defaults.update(kwargs)
+    return _envelope(**defaults)
+
+
+def test_operation_reference_is_not_the_confirmation_token() -> None:
+    """The order-embedded reference must never equal the execution token."""
+    env = _security_env()
+    assert env.run_ref == harness.operation_reference(env)
+    assert env.run_ref != harness.confirmation_token(env)
+    # domain separation: different prefix, different length
+    assert harness.OPERATION_REF_NAMESPACE != harness.OWNER_CONFIRM_NAMESPACE
+    assert len(env.run_ref) == harness.OPERATION_REF_LENGTH
+
+
+def test_operation_reference_cannot_satisfy_confirm() -> None:
+    """Passing the operation reference as --confirm must be refused (it is not
+    an execution authorization value)."""
+    broker = _broker()
+    env = _security_env(scenario="fill-path", symbol="F", reference_price=None)
+    with pytest.raises(harness.LifecycleRefused):
+        _run(broker, env, execute=True, confirm_token=harness.operation_reference(env))
+
+
+def test_operation_reference_changes_with_parameters() -> None:
+    assert harness.operation_reference(_security_env(limit_price=Decimal("12"))) != (
+        harness.operation_reference(_security_env(limit_price=Decimal("13")))
+    )
+    assert harness.operation_reference(_security_env(quantity=Decimal("1"))) != (
+        harness.operation_reference(_security_env(symbol="T"))
+    )
+    assert harness.operation_reference(_security_env(run_date="2026-07-21")) != (
+        harness.operation_reference(_security_env(run_date="2026-07-22"))
+    )
+
+
+def test_operation_reference_is_deterministic_for_identical_parameters() -> None:
+    """The crash-safe resumption identity: identical parameters => same ref."""
+    assert harness.operation_reference(_security_env()) == harness.operation_reference(
+        _security_env()
+    )
+
+
+def test_confirmation_token_never_appears_in_order_ids_or_evidence() -> None:
+    """A full fill-path run: the execution token must not leak into any order
+    id or into the executed run's evidence artifact."""
+    broker = _filling_broker()
+    env = _envelope(scenario="fill-path", symbol="F", limit_price=Decimal("12"))
+    token = harness.confirmation_token(env)
+    report = _run(broker, env, execute=True, confirm_token=token)
+    assert report.passed
+
+    assert token not in env.client_order_id  # entry id
+    broker.connect()
+    for receipt in broker.get_open_orders(ALIAS):  # every broker-visible order id
+        assert token not in receipt.client_order_id
+    rendered = report.render()
+    assert token not in rendered  # executed-run evidence artifact
+    # the operation reference IS present (it is the safe, non-authorizing id)
+    assert env.run_ref in rendered
+
+
+# -- 13. reconnect protection binds to the operation reference --------------
 
 
 def _fill_path_run_ref(
@@ -1336,8 +1406,8 @@ def _fill_path_run_ref(
     limit_price: str = "12",
     reference_price: str = "10",
 ) -> str:
-    """The canonical run reference (confirmation token) of a fill-path run —
-    the exact identity the harness embeds in that run's order ids."""
+    """The operation reference of a fill-path run — the non-authorizing
+    identity the harness embeds in that run's order ids (NOT the token)."""
     env = _envelope(
         scenario="fill-path",
         symbol=symbol,
@@ -1346,8 +1416,8 @@ def _fill_path_run_ref(
         limit_price=Decimal(limit_price),
         reference_price=Decimal(reference_price),
     )
-    token: str = harness.confirmation_token(env)
-    return token
+    ref: str = harness.operation_reference(env)
+    return ref
 
 
 def _canonical_stop_id(
@@ -1409,7 +1479,7 @@ def test_reconnect_matcher_rule_is_exact() -> None:
 
 def test_reconnect_without_run_reference_fails_closed() -> None:
     """No --run-ref => same-run ownership is unprovable => fail closed, even
-    though a genuinely-canonical current-run stop is resting."""
+    though a genuinely-canonical stop for this operation is resting."""
     broker = _broker()
     broker._positions[ALIAS] = (
         BrokerPosition(symbol="F", quantity=Decimal("1"), average_price=Decimal("10")),
