@@ -61,9 +61,16 @@
 ### Defect closure (IMP-1304)
 - The reconnect protection identity chain (D-01 → D-01d) is closed in code:
   per-operation matching bound to the non-authorizing operation reference, with
-  the confirmation token kept authorization-only. No **open code P0/P1**
-  remains after this bundle (see the defect register). One P1 finding
-  (**D-ADAPTER-01**) is BLOCKED on broker connectivity — see §2.
+  the confirmation token kept authorization-only.
+- **D-ADAPTER-01 code fix (this bundle):** the IBKR paper adapter now persists
+  each lifecycle order's canonical, non-authorizing `client_order_id` in
+  `Order.orderRef` (versioned `poi1:` prefix, reversible, `ORDER_REF_MAX_LEN`
+  fail-closed), and `get_open_orders` recovers open orders from a **read-only
+  `reqAllOpenOrders` snapshot** — restart-safe, with no process-local
+  dependency. Foreign/malformed/cancelled/duplicate orders never count as
+  protection; the read path never mutates the broker. 17 new contract tests.
+- No **open code P0/P1** remains after this bundle. The only outstanding piece
+  of D-ADAPTER-01 is **owner-host empirical verification** (§2).
 
 ## 2. NOT COMPLETED — REQUIRES MARKET OR OWNER HOST
 
@@ -74,12 +81,13 @@ Each maps to a record in `PHASE_13_DEFERRED_OWNER_RUNS.{md,yaml}`.
   market open).
 - **Actual protection placement** — DEF-05.
 - **Actual Gateway restart** — DEF-06 (`IB_GATEWAY_RESTART_REQUIRED`).
-- **Actual reconnect / reconciliation** — DEF-07 / DEF-08. **Blocked twice:**
-  by the host requirement **and** by **D-ADAPTER-01** (the paper adapter does
-  not set `order.orderRef` and `get_open_orders` returns only in-memory orders,
-  so after a real Gateway restart a fresh reconnect invocation cannot recover
-  the harness order id / operation reference from the live Gateway; that fix
-  needs a broker-connected environment to implement and verify).
+- **Actual reconnect / reconciliation** — DEF-07 / DEF-08. The D-ADAPTER-01
+  code fix (orderRef persistence + `reqAllOpenOrders` recovery) is **done and
+  contract-tested**; what remains is the **owner-host empirical verification**
+  (DEF-15): that a real IB Gateway preserves `orderRef` and round-trips the
+  official Paper `openOrder`/`openOrderEnd` callbacks, recovered from a fresh
+  process after a restart, and that the broker-specific `orderRef` size limit
+  holds.
 - **Actual cleanup** — DEF-09.
 - **Market-hours quote evidence** — DEF-10 (`MARKET_DATA_WINDOW_REQUIRED`).
 - **Host chaos drills** — DEF-11.

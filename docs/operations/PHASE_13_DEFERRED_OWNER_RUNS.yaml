@@ -199,8 +199,8 @@ records:
     evidence_path_template: /tmp/poi-ibkr-001-reconnect-<YYYYMMDD>.md
     prerequisites:
       - <RUN_REF> is the operation reference printed in the DEF-04 fill-path evidence
-      - PREREQUISITE ADAPTER FIX (see register D-ADAPTER-01) may be required before this
-        works against the real Gateway
+      - the adapter orderRef persistence + open-order recovery fix (D-ADAPTER-01) is
+        implemented and contract-tested; its empirical round-trip is DEF-15
     pass_criteria: exactly one matching working stop for the operation; no naked position; clean reconciliation
     abort_criteria: missing/wrong --run-ref; naked position; ambiguous or foreign stop; a short position
     current_status: NOT_RUN
@@ -344,6 +344,34 @@ records:
     current_status: NOT_RUN
     status_after_pass: DEEP_PROBE_ACTIVATED
     cleanup: none (read-only status)
+    never_flattens: true
+
+  - id: DEF-15-orderref-roundtrip-verification
+    task_id: IMP-1304
+    poi_id: POI-IBKR-001
+    blocker: IB_GATEWAY_RESTART_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: false
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario reconnect --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --symbol F --run-ref <RUN_REF>
+      --evidence-out /tmp/poi-ibkr-001-orderref-roundtrip-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-orderref-roundtrip-<YYYYMMDD>.md
+    prerequisites:
+      - the D-ADAPTER-01 code fix (orderRef persistence + reqAllOpenOrders recovery)
+      - a resting protective stop from DEF-04 and a real Gateway restart (DEF-06)
+    pass_criteria: >-
+      the real Gateway preserves orderRef; a fresh process recovers the stop from
+      reqAllOpenOrders; the operation reference round-trips; broker-specific orderRef
+      size is confirmed within ORDER_REF_MAX_LEN
+    abort_criteria: orderRef not preserved/truncated by the Gateway; recovery misses the stop
+    current_status: NOT_RUN
+    status_after_pass: ORDERREF_ROUNDTRIP_VERIFIED
+    cleanup: DEF-09 cleanup then manual position close
     never_flattens: true
 
   - id: DEF-14-external-provider-benchmark

@@ -35,6 +35,7 @@ the separately-approved POI-IBKR-001 experiment, not part of this task.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol, TypeVar, cast
@@ -107,6 +108,87 @@ IBKR_STATUS_MAP: Mapping[str, OrderState] = {
     "Inactive": OrderState.REJECTED,
 }
 
+#: Order states in which an order is genuinely still working at the broker.
+_WORKING_ORDER_STATES: frozenset[OrderState] = frozenset(
+    {
+        OrderState.SUBMITTING,
+        OrderState.ACKNOWLEDGED,
+        OrderState.PARTIALLY_FILLED,
+        OrderState.CANCEL_PENDING,
+    }
+)
+
+# -- Order-ref identity codec (IMP-1304 D-ADAPTER-01) -----------------------
+#
+# Every lifecycle-owned order carries its canonical, NON-AUTHORIZING
+# client_order_id in IBKR ``Order.orderRef`` under a versioned prefix, so that
+# a fresh adapter (after a process or Gateway restart) can recover the order's
+# identity from ``reqAllOpenOrders`` alone — with no process-local state.
+#
+# The client_order_id embeds the operation reference, never the confirmation
+# token, an account secret or an authorization value (enforced by the lifecycle
+# harness and asserted by tests), so persisting it is safe. The encoding is a
+# plain, fully reversible prefix + verbatim id; ``ORDER_REF_MAX_LEN`` is a
+# conservative, documented budget comfortably within what the installed TWS
+# API accepts. If a future id ever exceeds the budget, submission fails closed
+# rather than silently truncating into a colliding ref (a "poi2:" compact
+# encoding would then be introduced under a new version prefix).
+LIFECYCLE_ORDER_REF_PREFIX = "poi1:"
+ORDER_REF_MAX_LEN = 200
+
+
+class OrderRefTooLongError(BrokerPortError):
+    """A client_order_id will not fit in orderRef; never truncate — fail closed."""
+
+
+def encode_order_ref(client_order_id: str) -> str:
+    """Encode a canonical client_order_id into a lifecycle orderRef (v1)."""
+    ref = f"{LIFECYCLE_ORDER_REF_PREFIX}{client_order_id}"
+    if len(ref) > ORDER_REF_MAX_LEN:
+        raise OrderRefTooLongError(
+            BrokerErrorCode.VALIDATION_FAILED,
+            f"client_order_id too long to persist in orderRef "
+            f"({len(ref)} > {ORDER_REF_MAX_LEN}); refusing to submit rather than truncate",
+        )
+    return ref
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveredIdentity:
+    """The identity recovered from an order's orderRef.
+
+    ``lifecycle_owned`` is True only for an order this harness placed (a
+    ``poi1:`` prefix with a non-empty body). Everything else — a missing ref, a
+    foreign/manual order, or a malformed lifecycle-looking ref — is NOT
+    lifecycle-owned and carries a clearly-marked, non-canonical id so it can
+    never be silently matched as this run's protection.
+    """
+
+    client_order_id: str
+    lifecycle_owned: bool
+
+
+def decode_order_ref(order_ref: str | None, broker_order_id: int) -> RecoveredIdentity:
+    """Recover a canonical client_order_id from an orderRef (fail-closed)."""
+    if not order_ref or not order_ref.startswith(LIFECYCLE_ORDER_REF_PREFIX):
+        # missing ref, or a foreign / manual order — never lifecycle-owned.
+        return RecoveredIdentity(f"foreign:ibkr-paper:{broker_order_id}", False)
+    body = order_ref[len(LIFECYCLE_ORDER_REF_PREFIX) :]
+    if not body.strip():
+        # a lifecycle-looking but malformed ref — surfaced, never claimed.
+        return RecoveredIdentity(f"malformed:ibkr-paper:{broker_order_id}", False)
+    return RecoveredIdentity(body, True)
+
+
+@dataclass(frozen=True, slots=True)
+class RawOpenOrder:
+    """One order from a read-only ``reqAllOpenOrders`` snapshot (never mutated)."""
+
+    broker_order_id: int
+    order_ref: str
+    status: str
+    symbol: str
+
 
 def mask_account_id(account_id: str) -> str:
     """``DU1234567`` -> ``DU*****67``; the full id never leaves the adapter."""
@@ -154,6 +236,16 @@ class PaperTransport(Protocol):
     def account_summary(self, account_id: str) -> Mapping[str, Decimal]: ...
 
     def positions(self, account_id: str) -> tuple[BrokerPosition, ...]: ...
+
+    def open_order_snapshot(self, account_id: str) -> tuple[RawOpenOrder, ...]:
+        """Read-only snapshot of live open orders (``reqAllOpenOrders``).
+
+        Must never send, cancel, replace or modify an order. Blocks until the
+        canonical end-of-snapshot callback, then returns every open order with
+        its ``orderRef`` so the adapter can recover lifecycle identity after a
+        restart with no process-local state.
+        """
+        ...
 
     def next_order_id(self) -> int: ...
 
@@ -288,15 +380,42 @@ class IbkrPaperAdapter:
         return self._guarded(lambda: transport.positions(account_id))
 
     def get_open_orders(self, account_alias: str) -> tuple[BrokerOrderReceipt, ...]:
-        self._require_connected()
-        self._account_id(account_alias)
-        open_states = (
-            OrderState.SUBMITTING,
-            OrderState.ACKNOWLEDGED,
-            OrderState.PARTIALLY_FILLED,
-            OrderState.CANCEL_PENDING,
-        )
-        return tuple(r for r in self._orders.values() if r.state in open_states)
+        """Recover open orders from the broker, not from process-local memory.
+
+        Queries a read-only ``reqAllOpenOrders`` snapshot and normalizes it into
+        ``BrokerOrderReceipt``s, recovering each order's canonical identity from
+        its ``orderRef``. This is what makes reconnect restart-safe: a fresh
+        adapter with empty memory still sees the resting protective stop.
+
+        Only genuinely-working orders are returned; a cancelled / filled /
+        rejected order is never reported as working protection. Duplicate
+        ``openOrder`` callbacks for the same broker order id collapse to one.
+        Foreign / manual / malformed / missing-ref orders are returned with a
+        clearly non-canonical id so they can never be claimed as lifecycle
+        protection (the lifecycle matcher rejects them, fail-closed).
+        """
+        transport = self._require_connected()
+        account_id = self._account_id(account_alias)
+        raws = self._guarded(lambda: transport.open_order_snapshot(account_id))
+        receipts: dict[int, BrokerOrderReceipt] = {}
+        for raw in raws:
+            if raw.broker_order_id in receipts:
+                continue  # duplicate openOrder callback: collapse to one
+            state = IBKR_STATUS_MAP.get(raw.status)
+            if state is None or state not in _WORKING_ORDER_STATES:
+                # unmapped/UNKNOWN or a non-working (cancelled/filled/rejected)
+                # order is never reported as working protection.
+                continue
+            identity = decode_order_ref(raw.order_ref, raw.broker_order_id)
+            receipts[raw.broker_order_id] = BrokerOrderReceipt(
+                client_order_id=identity.client_order_id,
+                broker_order_ref=f"ibkr-paper:{raw.broker_order_id}",
+                state=state,
+                authorization_ref="recovered:open-order-snapshot",
+                correlation_id="recovered:open-order-snapshot",
+                received_at=self._now(),
+            )
+        return tuple(receipts.values())
 
     def preview_order(self, intent: OrderIntent) -> OrderPreview:
         self._require_connected()
@@ -317,9 +436,7 @@ class IbkrPaperAdapter:
             return existing
         account_id = self._account_id(intent.account_alias)
         broker_order_id = self._guarded(transport.next_order_id)
-        status = self._guarded(
-            lambda: transport.submit(broker_order_id, account_id, intent)
-        )
+        status = self._guarded(lambda: transport.submit(broker_order_id, account_id, intent))
         state = self._map_status(status, intent.client_order_id, intent.correlation_id)
         receipt = BrokerOrderReceipt(
             client_order_id=intent.client_order_id,
@@ -442,9 +559,7 @@ class IbkrPaperAdapter:
                 correlation_id=intent.correlation_id,
             )
 
-    def _map_status(
-        self, status: str, client_order_id: str, correlation_id: str
-    ) -> OrderState:
+    def _map_status(self, status: str, client_order_id: str, correlation_id: str) -> OrderState:
         state = IBKR_STATUS_MAP.get(status)
         if state is None:
             # Unknown broker state: record UNKNOWN (resolvable only by
@@ -548,6 +663,14 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
 
         def positionEnd(self) -> None:  # noqa: N802
             self.responses.put(("position_end", None))
+
+        def openOrder(  # noqa: N802
+            self, order_id: int, contract: object, order: object, order_state: object
+        ) -> None:
+            self.responses.put(("open_order", (order_id, contract, order, order_state)))
+
+        def openOrderEnd(self) -> None:  # noqa: N802
+            self.responses.put(("open_order_end", None))
 
     class _IbApiPaperTransport:
         """Blocking, single-threaded-request transport over the SDK."""
@@ -677,8 +800,33 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             order.outsideRth = False
             order.eTradeOnly = False
             order.firmQuoteOnly = False
+            # Persist the canonical (non-authorizing) client_order_id so a
+            # restart can recover this order's identity from the Gateway.
+            order.orderRef = encode_order_ref(intent.client_order_id)
             self._app.placeOrder(broker_order_id, contract, order)
             return self._await_status(broker_order_id)
+
+        def open_order_snapshot(self, account_id: str) -> tuple[RawOpenOrder, ...]:
+            # Read-only: reqAllOpenOrders never sends/cancels/modifies an order.
+            self._app.reqAllOpenOrders()
+            rows = self._drain("open_order_end", "open_order")
+            snapshot: dict[int, RawOpenOrder] = {}
+            for row in rows:
+                order_id, contract, order, order_state = cast(
+                    "tuple[int, object, object, object]", row
+                )
+                if order_id in snapshot:
+                    continue  # duplicate openOrder callback for the same order
+                order_account = str(getattr(order, "account", "") or account_id)
+                if order_account != account_id:
+                    continue
+                snapshot[order_id] = RawOpenOrder(
+                    broker_order_id=order_id,
+                    order_ref=str(getattr(order, "orderRef", "") or ""),
+                    status=str(getattr(order_state, "status", "") or ""),
+                    symbol=str(getattr(contract, "symbol", "") or ""),
+                )
+            return tuple(snapshot.values())
 
         def cancel(self, broker_order_id: int) -> str:
             self._app.cancelOrder(broker_order_id, "")
@@ -723,11 +871,18 @@ __all__ = [
     "ALLOWED_HOSTS",
     "IBKR_PAPER_CAPABILITIES",
     "IBKR_STATUS_MAP",
+    "LIFECYCLE_ORDER_REF_PREFIX",
     "LIVE_API_PORT",
+    "ORDER_REF_MAX_LEN",
     "PAPER_ACCOUNT_PREFIX",
     "PAPER_API_PORT",
     "IbkrPaperAdapter",
+    "OrderRefTooLongError",
     "PaperTransport",
+    "RawOpenOrder",
+    "RecoveredIdentity",
     "build_paper_adapter",
+    "decode_order_ref",
+    "encode_order_ref",
     "mask_account_id",
 ]

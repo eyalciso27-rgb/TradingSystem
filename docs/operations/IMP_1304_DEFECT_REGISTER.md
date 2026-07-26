@@ -36,7 +36,7 @@
 | D-01c | The match bound date+scenario+symbol only: two same-parameter same-day runs share `entry_id`, so a stale same-day stop from a run with **different** parameters could still match | **P1** | `scripts/poi_ibkr_lifecycle.py` identity + `_run_reconnect` | ✅ **fixed in this PR** (bind order ids to a deterministic operation reference) |
 | D-01d | The operation reference initially reused the **confirmation token**, embedding a reusable execution-authorization value in `client_order_id`, broker-visible order metadata, and evidence | **P1 (security)** | `scripts/poi_ibkr_lifecycle.py` identity | ✅ **fixed in this PR** (separate, domain-separated, non-authorizing operation reference) |
 | D-01e | Evidence artifact lacked broker order identity, fill identity and intended-parameters fields, so an owner could not correlate the artifact with the real order | P2 | `scripts/poi_ibkr_lifecycle.py` fill/cancel path | ✅ **fixed in this bundle** (records `intended_parameters`, `entry_broker_order`, `fill_identity`) |
-| D-ADAPTER-01 | Reconnect owner-run cannot recover the harness order id / operation reference from a real Gateway after a restart: the paper adapter never sets `order.orderRef` on `placeOrder`, and `get_open_orders` returns only in-memory orders (not a live `reqAllOpenOrders`). A fresh reconnect invocation therefore sees the live position but no matching stop → would report naked (fail closed) even though protection is resting | **P1** | `broker-ibkr/paper_adapter.py` (host-only `# pragma: no cover` transport) | ⛔ **BLOCKED** — the fix (persist `orderRef`, bounded to the IBKR length limit, + live open-order query + reconstruct id) must be implemented AND verified against a real Gateway; cannot be done or proven in a no-broker bundle. Documented as a prerequisite for DEF-07 |
+| D-ADAPTER-01 | Reconnect owner-run cannot recover the harness order id / operation reference from a real Gateway after a restart: the paper adapter never set `order.orderRef` on `placeOrder`, and `get_open_orders` returned only in-memory orders (not a live `reqAllOpenOrders`) | **P1** | `broker-ibkr/paper_adapter.py` | ✅ **code fix implemented + contract-tested in this bundle**; **owner-host empirical verification BLOCKED / NOT RUN** (see below) |
 | D-02 | Owner-run `--client-id` default (7) diverges from adapter `DEFAULT_CLIENT_ID` (1); stale-connection recovery undocumented | P2 | lifecycle CLI + runbook | ✅ (doc) — not done here (P2, out of P0/P1 scope) |
 | B-01 | POI-IBKR-001 Paper lifecycle (cancel-path/fill-path/protection/reconnect/reconciliation) not run | BLOCKED | owner-run | ❌ owner + host |
 | B-02 | Owner-run chaos/recovery host drills not run | BLOCKED | `CHAOS_RECOVERY_DRILLS.md` §4 | ❌ blocked on B-01 |
@@ -232,10 +232,47 @@ green.
 | evidence has no secrets or executable authorization values | ✅ account masked; token never in the executed-run artifact |
 | all runbook commands use `uv run --no-sync` | ✅ verified across all host runbooks |
 
-**New finding:** **D-ADAPTER-01 (P1, BLOCKED)** — the reconnect owner-run
-cannot recover the harness order id from a real Gateway after a restart (no
-`order.orderRef`; in-memory-only `get_open_orders`). It is BLOCKED on broker
-connectivity to implement+verify and is recorded as a prerequisite for DEF-07.
+### D-ADAPTER-01 resolution — orderRef persistence + open-order recovery
+
+The **code fix is implemented and contract-tested** in this bundle
+(`packages/py/broker-ibkr/src/trading_broker_ibkr/paper_adapter.py`); only the
+**owner-host empirical verification** remains BLOCKED.
+
+- **Outbound identity persistence:** every lifecycle order now carries its
+  canonical, **non-authorizing** `client_order_id` in IBKR `Order.orderRef`
+  under a versioned prefix. **orderRef encoding rule:** `orderRef =
+  "poi1:" + client_order_id`, fully reversible; bounded by a documented
+  `ORDER_REF_MAX_LEN = 200`; if an id ever exceeds the budget the submit
+  **fails closed** (`OrderRefTooLongError`) — never truncates into a colliding
+  ref. The ref carries no confirmation token, account secret or authorization
+  value (asserted by tests).
+- **Open-order recovery:** `get_open_orders` now takes a **read-only**
+  `reqAllOpenOrders` snapshot (`open_order_snapshot` on the transport seam,
+  ending on the canonical `openOrderEnd`) and normalizes it into
+  `BrokerOrderReceipt`s, recovering the lifecycle identity from `orderRef` via
+  `decode_order_ref`. **Recovery rule:** a `poi1:`-prefixed non-empty ref →
+  lifecycle-owned (id recovered verbatim); a missing/foreign ref →
+  `foreign:…`; a `poi1:`-prefixed empty/blank ref → `malformed:…`. Foreign,
+  malformed, cancelled/filled/rejected, unmapped-status and duplicate-callback
+  orders are never claimed as this run's protection; the lifecycle reconnect
+  matcher does the finer stale/cross-symbol/ambiguous rejection, fail-closed.
+- **Restart-safe:** a fresh adapter with empty memory recovers the resting
+  stop from the snapshot alone (no process-local dependency) — tested.
+- **Read-only:** the recovery path never calls `placeOrder` / `cancelOrder` /
+  any mutation (static + behavioural tests).
+
+Tests: 17 new in `tests/broker/test_ibkr_paper_adapter.py` — codec
+reversibility, too-long fail-closed, token-absence, submit-sets-ref +
+restart recovery, missing/malformed/foreign refs, duplicate callback,
+cancelled/filled/rejected not working, unknown status dropped, snapshot API
+error fail-closed, reconcile-uses-snapshot, read-path-never-mutates, ambiguity
+surfaced, no-secret-in-ref.
+
+**Still BLOCKED (owner host + market execution):** empirically verifying that a
+real IB Gateway preserves `orderRef` and round-trips the official Paper
+`openOrder`/`openOrderEnd` callbacks; restarting a real Gateway with a resting
+stop and recovering it from a fresh process; and confirming the broker-specific
+`orderRef` size limit against the installed API. Recorded as DEF-07 / DEF-15.
 
 ## 7. Effect on IMP-1304 `done_criteria`
 

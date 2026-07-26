@@ -170,9 +170,9 @@ Blocker vocabulary: `MARKET_CLOSED`, `OWNER_HOST_REQUIRED`,
 - **Blocker:** `IB_GATEWAY_RESTART_REQUIRED`
 - **Sends / cancels / modifies an order:** no · **owner confirmation:** yes
 - **Prerequisites:** `<RUN_REF>` is the operation reference printed in the
-  DEF-04 evidence. **See adapter prerequisite D-ADAPTER-01 in the defect
-  register** — the reconnect scenario needs the adapter to recover the harness
-  order id from the live Gateway, which requires a broker-connected fix first.
+  DEF-04 evidence. The adapter **orderRef persistence + open-order recovery fix
+  (D-ADAPTER-01) is implemented and contract-tested**; its empirical round-trip
+  against a real Gateway is **DEF-15** below.
 - **Command:**
   ```bash
   uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
@@ -296,6 +296,29 @@ Blocker vocabulary: `MARKET_CLOSED`, `OWNER_HOST_REQUIRED`,
 - **Evidence:** `/tmp/ib-gateway-watchdog-deepprobe-<YYYYMMDD>.md`
 - **Status before → after PASS:** `NOT_RUN` → `DEEP_PROBE_ACTIVATED`
 - **Cleanup:** none (read-only status). **Never flattens.**
+
+## DEF-15-orderref-roundtrip-verification — IMP-1304 / POI-IBKR-001
+- **Blocker:** `IB_GATEWAY_RESTART_REQUIRED`
+- **Sends / cancels / modifies an order:** no · **owner confirmation:** yes
+- **Prerequisites:** the D-ADAPTER-01 code fix (orderRef persistence +
+  `reqAllOpenOrders` recovery, implemented + contract-tested in this bundle); a
+  resting stop from DEF-04 and a real Gateway restart (DEF-06).
+- **Command:**
+  ```bash
+  uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
+    --scenario reconnect --account-alias <ALIAS> --broker-module <BROKER_MODULE> \
+    --symbol F --run-ref <RUN_REF> \
+    --evidence-out /tmp/poi-ibkr-001-orderref-roundtrip-<YYYYMMDD>.md
+  ```
+- **Expected safe result:** the **real Gateway preserves `orderRef`**; a fresh
+  process recovers the stop from `reqAllOpenOrders`; the operation reference
+  round-trips; the broker-specific `orderRef` size is confirmed within
+  `ORDER_REF_MAX_LEN`.
+- **Abort criteria:** `orderRef` not preserved/truncated by the Gateway;
+  recovery misses the stop.
+- **Evidence:** `/tmp/poi-ibkr-001-orderref-roundtrip-<YYYYMMDD>.md`
+- **Status before → after PASS:** `NOT_RUN` → `ORDERREF_ROUNDTRIP_VERIFIED`
+- **Cleanup:** DEF-09 cleanup then manual position close. **Never flattens.**
 
 ## DEF-14-external-provider-benchmark — IMP-1303 / POI-MD-001
 - **Blocker:** `EXTERNAL_PROVIDER_DEFERRED`
