@@ -251,8 +251,26 @@ class LifecycleEnvelope:
                 )
 
     @property
+    def run_ref(self) -> str:
+        """Canonical unique reference for THIS run.
+
+        It is the confirmation token — a digest over run_date + scenario +
+        symbol + side + quantity + limit + reference + account + port. Two
+        runs that differ in ANY of those get distinct references; an
+        identical-parameter same-day re-run shares one (the crash-safe
+        resumption identity). Binding order ids to it means a stale stop from
+        a different run — including a same-day, same-symbol run with different
+        parameters — carries a different reference and cannot be mistaken for
+        this run's protection.
+        """
+        return confirmation_token(self)
+
+    @property
     def client_order_id(self) -> str:
-        return f"{CLIENT_ORDER_PREFIX}-{self.run_date}-{self.scenario}-{self.symbol}"
+        # The run reference is part of the id, so the entry order id and the
+        # protective stop id derived from it both carry this run's unique
+        # identity (see _current_run_stop_prefix).
+        return f"{CLIENT_ORDER_PREFIX}-{self.run_date}-{self.scenario}-{self.symbol}-{self.run_ref}"
 
 
 def confirmation_token(envelope: LifecycleEnvelope) -> str:
@@ -1025,6 +1043,10 @@ def _run_fill_path(
             " account: close them manually in the Gateway/TWS UI (this harness"
             " never flattens — flatten stays hard-disabled)."
         )
+    # Record this run's unique reference so the owner can bind the reconnect
+    # scenario to exactly this fill-path run: reconnect must be given it via
+    # --run-ref (see _run_reconnect).
+    report.note(f"run reference (pass to reconnect as --run-ref): {envelope.run_ref}")
 
 
 #: Order states in which a resting protective stop is actually protecting.
@@ -1035,24 +1057,34 @@ _WORKING_ORDER_STATES: frozenset[OrderState] = frozenset(
 )
 
 
-def _current_run_stop_prefix(envelope: LifecycleEnvelope) -> str:
-    """The exact ``client_order_id`` prefix of THIS run's protective stop.
+def _fill_path_entry_id(*, run_date: str, symbol: str, run_ref: str) -> str:
+    """The fill-path entry ``client_order_id`` for a specific run reference.
 
-    A protective stop is created only by the ``fill-path`` scenario, whose
-    entry ``client_order_id`` is ``poi-ibkr-001-<run_date>-fill-path-<symbol>``.
-    The ProtectionManager builds ``spec_ref`` as
-    ``protection:<entry_id>:stop:<n>`` and the harness submits it as
-    ``<entry_id>-<spec_ref>``. So an order belongs to THIS run's protective
-    stop for THIS symbol iff its id is exactly::
+    Mirrors ``LifecycleEnvelope.client_order_id`` for ``scenario='fill-path'``:
+    ``poi-ibkr-001-<run_date>-fill-path-<symbol>-<run_ref>``.
+    """
+    return f"{CLIENT_ORDER_PREFIX}-{run_date}-fill-path-{symbol}-{run_ref}"
+
+
+def _current_run_stop_prefix(*, run_date: str, symbol: str, run_ref: str) -> str:
+    """The exact ``client_order_id`` prefix of a specific run's protective stop.
+
+    A protective stop is created only by the ``fill-path`` scenario. The
+    ProtectionManager builds ``spec_ref`` as ``protection:<entry_id>:stop:<n>``
+    and the harness submits it as ``<entry_id>-<spec_ref>``. So an order
+    belongs to the run identified by ``run_ref`` for ``symbol`` iff its id is
+    exactly::
 
         <entry_id>-protection:<entry_id>:stop:<positive-int>
 
-    Binding run_date + the fill-path scenario + the allowlisted symbol + the
-    exact spec_ref shape rejects a stale prior-run stop (different date), a
-    cross-symbol stop, a cross-scenario / cross-run order, and a malformed
-    protective-looking id — none of which may ever mark this symbol protected.
+    where ``entry_id = poi-ibkr-001-<run_date>-fill-path-<symbol>-<run_ref>``.
+    Binding run_date + the fill-path scenario + the symbol + **the unique run
+    reference** + the exact spec_ref shape rejects a stale prior-day stop
+    (different date), a stale same-day stop from a DIFFERENT run (different
+    reference), a cross-symbol stop, a cross-scenario order, and a malformed
+    protective-looking id — none may ever mark this symbol protected.
     """
-    entry_id = f"{CLIENT_ORDER_PREFIX}-{envelope.run_date}-fill-path-{envelope.symbol}"
+    entry_id = _fill_path_entry_id(run_date=run_date, symbol=symbol, run_ref=run_ref)
     return f"{entry_id}-protection:{entry_id}:stop:"
 
 
@@ -1075,6 +1107,7 @@ def _run_reconnect(
     report: LifecycleReport,
     *,
     now: datetime,
+    run_ref: str | None,
 ) -> None:
     """Prove state survives a Gateway restart: position + protection intact.
 
@@ -1083,13 +1116,16 @@ def _run_reconnect(
     were missing, the correct response is an owner decision, not an
     automatic order.
 
-    Protection is matched to EXACTLY this run's canonical fill-path stop for
+    Protection is matched to EXACTLY the fill-path run identified by
+    ``run_ref`` (the fill-path confirmation token the owner recorded), for
     this symbol (see ``_current_run_stop_prefix``). Mere presence of any
     harness-looking stop never counts: a stale, foreign, cross-symbol,
     cross-run, ambiguous, or malformed stop leaves the position naked and the
-    run fails closed. Quantity of the resting stop cannot be read from a
-    ``BrokerOrderReceipt``, so full-coverage is required to be owner-confirmed
-    in the UI and is never asserted from the receipt surface alone.
+    run fails closed. Without ``run_ref`` same-run ownership cannot be proven
+    from the ``BrokerOrderReceipt`` surface, so the scenario fails closed
+    rather than claiming protection. The resting stop's QUANTITY cannot be
+    read from a receipt either, so full coverage is never asserted from the
+    receipt — it must be owner-confirmed in the Gateway UI.
     """
     positions = tuple(broker.get_positions(envelope.account_alias))
     # Every NON-ZERO position (long OR short). A short is itself an anomaly
@@ -1097,12 +1133,28 @@ def _run_reconnect(
     nonzero = tuple(p for p in positions if p.quantity != 0)
     open_orders = broker.get_open_orders(envelope.account_alias)
 
-    stop_prefix = _current_run_stop_prefix(envelope)
-    current_run_stops = tuple(
-        o
-        for o in open_orders
-        if _is_current_run_stop(o.client_order_id, stop_prefix) and o.state in _WORKING_ORDER_STATES
+    # Same-run ownership requires the fill-path run reference. Without it we
+    # cannot bind a resting stop to THIS run, so no stop may count as coverage.
+    normalized_ref = run_ref.strip() if run_ref else ""
+    report.record(
+        "run_reference_provided",
+        bool(normalized_ref),
+        "given"
+        if normalized_ref
+        else "missing --run-ref (the fill-path token): same-run ownership unprovable",
     )
+    if normalized_ref:
+        stop_prefix = _current_run_stop_prefix(
+            run_date=envelope.run_date, symbol=envelope.symbol, run_ref=normalized_ref
+        )
+        current_run_stops = tuple(
+            o
+            for o in open_orders
+            if _is_current_run_stop(o.client_order_id, stop_prefix)
+            and o.state in _WORKING_ORDER_STATES
+        )
+    else:
+        current_run_stops = ()
 
     # The harness only ever opens a single LONG in its own allowlisted symbol.
     # Anything else — a different symbol, or a SHORT in any symbol including
@@ -1170,6 +1222,14 @@ def _run_reconnect(
             report,
             "unexpected position(s) on the account (cross-symbol or short): "
             + ", ".join(f"{p.symbol}:{p.quantity}" for p in anomalous),
+        )
+    if not normalized_ref:
+        _owner_action_required(
+            report,
+            "reconnect cannot verify protection without the fill-path run reference",
+            "re-run with --run-ref <the fill-path confirmation token you recorded>",
+            "until then, treat every open position as UNVERIFIED and confirm its"
+            " protective stop by hand in the Gateway/TWS UI",
         )
     _reconcile(
         broker,
@@ -1246,6 +1306,7 @@ def run_lifecycle(
     *,
     execute: bool,
     confirm_token: str | None,
+    run_ref: str | None = None,
     clock: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
     timeout_seconds: float = 30.0,
@@ -1283,7 +1344,7 @@ def run_lifecycle(
         if envelope.scenario == "cleanup":
             _run_cleanup(broker, envelope, report, now=now)
         elif envelope.scenario == "reconnect":
-            _run_reconnect(broker, envelope, report, now=now)
+            _run_reconnect(broker, envelope, report, now=now, run_ref=run_ref)
         elif envelope.scenario == "preflight":
             # Read-only by definition: no what-if, no intent, nothing built.
             report.note("preflight is read-only; no order intent was constructed")
@@ -1515,6 +1576,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="ACTUALLY SEND to the paper broker (requires --confirm)",
     )
     parser.add_argument("--confirm", default=None, help="token printed by the dry run")
+    parser.add_argument(
+        "--run-ref",
+        default=None,
+        help=(
+            "reconnect only: the fill-path run reference (its confirmation"
+            " token, printed in the fill-path evidence) that binds this"
+            " reconnect to that specific run's protective stop; without it the"
+            " reconnect fails closed"
+        ),
+    )
     parser.add_argument("--evidence-out", default=None, help="write the sanitized artifact here")
     return parser
 
@@ -1568,6 +1639,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         envelope,
         execute=args.execute,
         confirm_token=args.confirm,
+        run_ref=args.run_ref,
         timeout_seconds=args.timeout_seconds,
     )
     rendered = report.render()

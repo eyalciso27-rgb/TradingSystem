@@ -32,7 +32,8 @@
 | ID | Title | Class | Component | Fix now w/o IBKR? |
 |---|---|---|---|---|
 | D-01 | Reconnect protection check is a global boolean, masking a naked position in another symbol | **P1** | `scripts/poi_ibkr_lifecycle.py` `_run_reconnect` | ✅ fixed (PR #45) |
-| D-01b | Per-symbol fix still let any stale/foreign/malformed `:stop:` order mark the symbol protected | **P1** | `scripts/poi_ibkr_lifecycle.py` `_run_reconnect` | ✅ **fixed in this PR** (exact canonical current-run match) |
+| D-01b | Per-symbol fix still let any stale/foreign/malformed `:stop:` order mark the symbol protected | **P1** | `scripts/poi_ibkr_lifecycle.py` `_run_reconnect` | ✅ fixed (PR #46) (canonical date+scenario+symbol match) |
+| D-01c | The canonical match bound date+scenario+symbol but **not a unique run instance**: two same-day same-symbol runs share `entry_id`, so a stale same-day stop could still match | **P1** | `scripts/poi_ibkr_lifecycle.py` identity + `_run_reconnect` | ✅ **fixed in this PR** (bind to the run reference / confirmation token) |
 | D-02 | Owner-run `--client-id` default (7) diverges from adapter `DEFAULT_CLIENT_ID` (1); stale-connection recovery undocumented | P2 | lifecycle CLI + runbook | ✅ (doc) — not done here (P2, out of P0/P1 scope) |
 | B-01 | POI-IBKR-001 Paper lifecycle (cancel-path/fill-path/protection/reconnect/reconciliation) not run | BLOCKED | owner-run | ❌ owner + host |
 | B-02 | Owner-run chaos/recovery host drills not run | BLOCKED | `CHAOS_RECOVERY_DRILLS.md` §4 | ❌ blocked on B-01 |
@@ -74,21 +75,40 @@
     on any `:stop:` order, so a **stale, cross-run, cross-scenario, or
     malformed** harness-looking stop could still mark `envelope.symbol`
     protected. This was caught in review and re-opened as **D-01b**.
-  - *Corrective fix (this PR)* binds the match to the **exact canonical
-    current-run stop identity**. A resting order protects `envelope.symbol`
-    only when its `client_order_id` is precisely
-    `<entry_id>-protection:<entry_id>:stop:<positive-int>` with
-    `entry_id = poi-ibkr-001-<run_date>-fill-path-<symbol>`, and it is in a
-    working state (`SUBMITTING`/`ACKNOWLEDGED`/`PARTIALLY_FILLED`). This binds
-    run_date + the fill-path scenario + the symbol + the exact spec_ref shape
-    (`scripts/poi_ibkr_lifecycle.py::_current_run_stop_prefix` /
-    `_is_current_run_stop`).
-- **Matching / fail-closed rule (corrective fix):**
-  - protection requires **exactly one** canonical current-run stop for the
+  - *Second fix (PR #46)* bound the match to `entry_id =
+    poi-ibkr-001-<run_date>-fill-path-<symbol>`. Review found this still binds
+    only date + scenario + symbol, **not a unique run instance**: two
+    fill-path runs for the same symbol on the same day share the same
+    `entry_id`, so a stale same-day stop could still match. Re-opened as
+    **D-01c**.
+  - *Corrective fix (this PR)* binds the identity to a **unique run
+    reference** — the existing **confirmation token** (a digest over run_date,
+    scenario, symbol, side, quantity, limit, reference, account, port). The
+    token is embedded in `LifecycleEnvelope.client_order_id`
+    (`…-fill-path-<symbol>-<run_ref>`), so the entry order id and the derived
+    protective stop id both carry it. The reconnect scenario must be given the
+    fill-path run reference via `--run-ref` (printed in the fill-path
+    evidence); it reconstructs the exact expected stop id and matches only
+    that. No random id is invented — the canonical token identity is reused
+    (`_current_run_stop_prefix` / `_is_current_run_stop` /
+    `LifecycleEnvelope.run_ref`).
+- **Unique run-identity rule (corrective fix):** a resting order protects
+  `envelope.symbol` only when its `client_order_id` is exactly
+  `<entry_id>-protection:<entry_id>:stop:<positive-int>` with
+  `entry_id = poi-ibkr-001-<run_date>-fill-path-<symbol>-<run_ref>`, it is in a
+  working state (`SUBMITTING`/`ACKNOWLEDGED`/`PARTIALLY_FILLED`), and
+  `run_ref` equals the fill-path token supplied to `--run-ref`. The same
+  identity is used consistently by the entry order id, the protective stop id,
+  the reconnect matcher, and the fill-path evidence artifact.
+- **Fail-closed rules:**
+  - **`--run-ref` is required** for the reconnect scenario; without it same-run
+    ownership cannot be proven from `BrokerOrderReceipt`, so the run **fails
+    closed** (`run_reference_provided` = False) and never claims protection;
+  - protection requires **exactly one** canonical same-run stop for the
     symbol — zero ⇒ naked, more than one ⇒ ambiguous; both **fail closed**;
-  - a stale prior-run stop (different `run_date`), a cross-symbol stop, a
-    cross-scenario/cross-run order, or a malformed protective-looking id
-    **never** counts;
+  - a stale prior-day stop (different `run_date`), a stale **same-day stop from
+    a different run** (different run reference), a cross-symbol stop, a
+    cross-scenario order, or a malformed protective-looking id **never** counts;
   - **every non-zero** position is considered (long **and** short); a short in
     any symbol, or any cross-symbol position, is an anomaly that **fails
     closed** — the repository contract does not prove shorts impossible, so
@@ -104,14 +124,26 @@
     `PROTECTION_MISMATCH`).
 - **Regression tests** (`tests/poi/test_poi_ibkr_lifecycle_cli.py`):
   `test_reconnect_matcher_rule_is_exact`,
+  `test_reconnect_without_run_reference_fails_closed`,
   `test_reconnect_protected_f_but_naked_g_fails`,
   `test_reconnect_naked_f_with_unrelated_symbol_stop_fails`,
-  `test_reconnect_naked_f_with_stale_prior_run_stop_fails`,
+  `test_reconnect_naked_f_with_stale_prior_day_stop_fails`,
+  `test_reconnect_naked_f_with_stale_same_day_different_run_stop_fails`,
+  `test_reconnect_same_date_symbol_different_run_reference_fails`,
   `test_reconnect_malformed_protective_looking_order_fails`,
-  `test_reconnect_exact_current_run_stop_passes`,
+  `test_reconnect_exact_same_run_stop_passes`,
   `test_reconnect_short_position_fails_closed`,
   `test_reconnect_ambiguous_multiple_canonical_stops_fails_closed`. The
-  pre-existing end-to-end reconnect tests remain green.
+  pre-existing end-to-end reconnect tests remain green (now passing the
+  fill-path run reference to reconnect).
+- **Quantity limitation (documented):** a resting stop's quantity is not
+  exposed by `BrokerOrderReceipt`, so full coverage is never asserted from the
+  receipt — the run records an explicit owner note to confirm the stop
+  quantity covers the full position in the Gateway UI. A residual identity
+  limitation is also acknowledged: two runs with *identical* parameters on the
+  same day share a run reference (by the crash-safe resumption design);
+  preflight's pre-existing-position gate keeps the account flat before each
+  fill-path run, so this cannot leave two distinct same-parameter positions.
 
 No **P0** defect was found.
 
