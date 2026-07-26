@@ -33,7 +33,8 @@
 |---|---|---|---|---|
 | D-01 | Reconnect protection check is a global boolean, masking a naked position in another symbol | **P1** | `scripts/poi_ibkr_lifecycle.py` `_run_reconnect` | ✅ fixed (PR #45) |
 | D-01b | Per-symbol fix still let any stale/foreign/malformed `:stop:` order mark the symbol protected | **P1** | `scripts/poi_ibkr_lifecycle.py` `_run_reconnect` | ✅ fixed (PR #46) (canonical date+scenario+symbol match) |
-| D-01c | The canonical match bound date+scenario+symbol but **not a unique run instance**: two same-day same-symbol runs share `entry_id`, so a stale same-day stop could still match | **P1** | `scripts/poi_ibkr_lifecycle.py` identity + `_run_reconnect` | ✅ **fixed in this PR** (bind to the run reference / confirmation token) |
+| D-01c | The match bound date+scenario+symbol only: two same-parameter same-day runs share `entry_id`, so a stale same-day stop from a run with **different** parameters could still match | **P1** | `scripts/poi_ibkr_lifecycle.py` identity + `_run_reconnect` | ✅ **fixed in this PR** (bind order ids to a deterministic operation reference) |
+| D-01d | The operation reference initially reused the **confirmation token**, embedding a reusable execution-authorization value in `client_order_id`, broker-visible order metadata, and evidence | **P1 (security)** | `scripts/poi_ibkr_lifecycle.py` identity | ✅ **fixed in this PR** (separate, domain-separated, non-authorizing operation reference) |
 | D-02 | Owner-run `--client-id` default (7) diverges from adapter `DEFAULT_CLIENT_ID` (1); stale-connection recovery undocumented | P2 | lifecycle CLI + runbook | ✅ (doc) — not done here (P2, out of P0/P1 scope) |
 | B-01 | POI-IBKR-001 Paper lifecycle (cancel-path/fill-path/protection/reconnect/reconciliation) not run | BLOCKED | owner-run | ❌ owner + host |
 | B-02 | Owner-run chaos/recovery host drills not run | BLOCKED | `CHAOS_RECOVERY_DRILLS.md` §4 | ❌ blocked on B-01 |
@@ -76,39 +77,57 @@
     malformed** harness-looking stop could still mark `envelope.symbol`
     protected. This was caught in review and re-opened as **D-01b**.
   - *Second fix (PR #46)* bound the match to `entry_id =
-    poi-ibkr-001-<run_date>-fill-path-<symbol>`. Review found this still binds
-    only date + scenario + symbol, **not a unique run instance**: two
-    fill-path runs for the same symbol on the same day share the same
-    `entry_id`, so a stale same-day stop could still match. Re-opened as
-    **D-01c**.
-  - *Corrective fix (this PR)* binds the identity to a **unique run
-    reference** — the existing **confirmation token** (a digest over run_date,
-    scenario, symbol, side, quantity, limit, reference, account, port). The
-    token is embedded in `LifecycleEnvelope.client_order_id`
-    (`…-fill-path-<symbol>-<run_ref>`), so the entry order id and the derived
-    protective stop id both carry it. The reconnect scenario must be given the
-    fill-path run reference via `--run-ref` (printed in the fill-path
-    evidence); it reconstructs the exact expected stop id and matches only
-    that. No random id is invented — the canonical token identity is reused
-    (`_current_run_stop_prefix` / `_is_current_run_stop` /
-    `LifecycleEnvelope.run_ref`).
-- **Unique run-identity rule (corrective fix):** a resting order protects
-  `envelope.symbol` only when its `client_order_id` is exactly
+    poi-ibkr-001-<run_date>-fill-path-<symbol>`. Review found this binds only
+    date + scenario + symbol: two same-parameter same-day runs share the same
+    `entry_id`, and a stale same-day stop from a run with different parameters
+    could still match. Re-opened as **D-01c**.
+  - *Corrective fix (this PR, D-01c + D-01d)* binds order identity to a
+    **deterministic operation reference** and — critically — makes that
+    reference a **separate, non-authorizing** value:
+    - **D-01d (security):** the operation reference must **not** be the
+      confirmation token. The token is accepted by `--execute --confirm`, so
+      embedding it in `client_order_id`, broker-visible order metadata, and
+      evidence would expose a reusable execution-authorization value. The
+      reference is now `operation_reference(envelope)` — a SHA-256 digest over
+      the same canonical fields but under a **distinct domain prefix**
+      (`OPERATION_REF_NAMESPACE = "poi-ibkr-run-ref-v1"`, length
+      `OPERATION_REF_LENGTH = 16`). It cannot equal a confirmation token and is
+      never accepted by `--confirm`. `confirmation_token` stays exclusively for
+      `--confirm` authorization.
+    - The operation reference is embedded in
+      `LifecycleEnvelope.client_order_id`
+      (`…-fill-path-<symbol>-<run_ref>`), so the entry order id and the derived
+      protective stop id both carry it. The reconnect scenario is given the
+      fill-path **operation reference** via `--run-ref` (printed in the
+      fill-path evidence); it reconstructs the expected stop id and matches
+      only that. No random id is invented.
+- **Deterministic operation-identity rule (corrective fix):** a resting order
+  protects `envelope.symbol` only when its `client_order_id` is exactly
   `<entry_id>-protection:<entry_id>:stop:<positive-int>` with
   `entry_id = poi-ibkr-001-<run_date>-fill-path-<symbol>-<run_ref>`, it is in a
-  working state (`SUBMITTING`/`ACKNOWLEDGED`/`PARTIALLY_FILLED`), and
-  `run_ref` equals the fill-path token supplied to `--run-ref`. The same
-  identity is used consistently by the entry order id, the protective stop id,
-  the reconnect matcher, and the fill-path evidence artifact.
+  working state (`SUBMITTING`/`ACKNOWLEDGED`/`PARTIALLY_FILLED`), and `run_ref`
+  equals the fill-path **operation reference** supplied to `--run-ref`. The
+  same reference is used consistently by the entry order id, the protective
+  stop id, the reconnect matcher, and the fill-path evidence artifact. The
+  reference is a **deterministic operation identity / crash-safe resumption
+  identity / scenario-bound operation reference**; it is **not** a unique
+  execution-instance id and does **not** distinguish two identical-parameter
+  runs (that reliance is on the gates below).
 - **Fail-closed rules:**
-  - **`--run-ref` is required** for the reconnect scenario; without it same-run
-    ownership cannot be proven from `BrokerOrderReceipt`, so the run **fails
-    closed** (`run_reference_provided` = False) and never claims protection;
-  - protection requires **exactly one** canonical same-run stop for the
-    symbol — zero ⇒ naked, more than one ⇒ ambiguous; both **fail closed**;
+  - **`--run-ref` is required** for the reconnect scenario; without it a
+    resting stop cannot be bound to this fill-path operation from
+    `BrokerOrderReceipt`, so the run **fails closed**
+    (`run_reference_provided` = False) and never claims protection;
+  - protection requires **exactly one** matching working stop for the operation
+    — zero ⇒ naked, more than one ⇒ ambiguous; both **fail closed**;
   - a stale prior-day stop (different `run_date`), a stale **same-day stop from
-    a different run** (different run reference), a cross-symbol stop, a
-    cross-scenario order, or a malformed protective-looking id **never** counts;
+    a run with different parameters** (different operation reference), a
+    cross-symbol stop, a cross-scenario order, or a malformed protective-looking
+    id **never** counts;
+  - identical-parameter same-day runs share the operation reference by design;
+    the **preflight no-stale-order gate** and **pre-existing-position gate**
+    keep the account clean before each fill-path run, so this cannot leave two
+    distinct same-parameter positions;
   - **every non-zero** position is considered (long **and** short); a short in
     any symbol, or any cross-symbol position, is an anomaly that **fails
     closed** — the repository contract does not prove shorts impossible, so
@@ -117,13 +136,18 @@
     so full-coverage is **not asserted from the receipt**; the run records an
     explicit owner note to confirm the stop quantity covers the full position
     in the Gateway UI;
-  - only the matched canonical stops are fed to reconciliation as internally
-    expected, so a foreign/stale resting order surfaces as
+  - only the matched working stops for the operation are fed to reconciliation
+    as internally expected, so a foreign/stale resting order surfaces as
     `UNEXPECTED_BROKER_ORDER`, and only a uniquely-protected run-symbol
     position is fed as `protected` (otherwise `POSITION_MISMATCH` /
     `PROTECTION_MISMATCH`).
-- **Regression tests** (`tests/poi/test_poi_ibkr_lifecycle_cli.py`):
-  `test_reconnect_matcher_rule_is_exact`,
+- **Regression tests** (`tests/poi/test_poi_ibkr_lifecycle_cli.py`) — identity
+  security: `test_operation_reference_is_not_the_confirmation_token`,
+  `test_operation_reference_cannot_satisfy_confirm`,
+  `test_operation_reference_changes_with_parameters`,
+  `test_operation_reference_is_deterministic_for_identical_parameters`,
+  `test_confirmation_token_never_appears_in_order_ids_or_evidence`; reconnect
+  matching: `test_reconnect_matcher_rule_is_exact`,
   `test_reconnect_without_run_reference_fails_closed`,
   `test_reconnect_protected_f_but_naked_g_fails`,
   `test_reconnect_naked_f_with_unrelated_symbol_stop_fails`,
@@ -135,15 +159,17 @@
   `test_reconnect_short_position_fails_closed`,
   `test_reconnect_ambiguous_multiple_canonical_stops_fails_closed`. The
   pre-existing end-to-end reconnect tests remain green (now passing the
-  fill-path run reference to reconnect).
+  fill-path operation reference to reconnect).
 - **Quantity limitation (documented):** a resting stop's quantity is not
   exposed by `BrokerOrderReceipt`, so full coverage is never asserted from the
   receipt — the run records an explicit owner note to confirm the stop
   quantity covers the full position in the Gateway UI. A residual identity
-  limitation is also acknowledged: two runs with *identical* parameters on the
-  same day share a run reference (by the crash-safe resumption design);
-  preflight's pre-existing-position gate keeps the account flat before each
-  fill-path run, so this cannot leave two distinct same-parameter positions.
+  limitation is also documented: the operation reference is a **deterministic
+  operation identity**, so two runs with *identical* parameters on the same day
+  share it (the crash-safe resumption identity) — it does **not** distinguish
+  two identical-parameter runs. The **preflight no-stale-order and
+  pre-existing-position gates**, **exactly one matching working stop**, and
+  **fail-closed ambiguity handling** are what keep that safe.
 
 No **P0** defect was found.
 

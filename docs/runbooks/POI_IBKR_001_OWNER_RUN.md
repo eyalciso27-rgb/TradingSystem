@@ -73,7 +73,7 @@ export SECRETS_ROOT=/path/to/runtime/secrets   # no default; never in the repo
 ### Step 1 — preflight (read-only; nothing is built)
 
 ```bash
-uv run python scripts/poi_ibkr_lifecycle.py \
+uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
   --scenario preflight --account-alias <ALIAS> --broker-module "$BM" \
   --evidence-out /tmp/poi-ibkr-001-step1-preflight.md
 ```
@@ -91,7 +91,7 @@ to execute**, simply without `--execute`. A token produced by
 `--scenario dry-run` is rejected by `--scenario cancel-path --execute`.
 
 ```bash
-uv run python scripts/poi_ibkr_lifecycle.py \
+uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
   --scenario cancel-path --account-alias <ALIAS> --broker-module "$BM" \
   --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET> \
   --reference-price <CURRENT_PRICE> \
@@ -109,7 +109,7 @@ scenario — without them the envelope refuses to build, and a limit closer than
 20 % is refused before any connection is made.
 
 ```bash
-uv run python scripts/poi_ibkr_lifecycle.py \
+uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
   --scenario cancel-path --account-alias <ALIAS> --broker-module "$BM" \
   --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET> \
   --reference-price <CURRENT_PRICE> \
@@ -130,10 +130,10 @@ cancel path has no protection machinery. Follow the printed steps by hand.
 ### Step 4 — verify flat, then re-dry-run the fill path
 
 ```bash
-uv run python scripts/poi_ibkr_lifecycle.py \
+uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
   --scenario preflight --account-alias <ALIAS> --broker-module "$BM"
 
-uv run python scripts/poi_ibkr_lifecycle.py \
+uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
   --scenario fill-path --account-alias <ALIAS> --broker-module "$BM" \
   --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT>
 ```
@@ -146,7 +146,7 @@ price changed.
 ### Step 5 — fill path (**one share; a real position is opened**)
 
 ```bash
-uv run python scripts/poi_ibkr_lifecycle.py \
+uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
   --scenario fill-path --account-alias <ALIAS> --broker-module "$BM" \
   --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT> \
   --execute --confirm <TOKEN> \
@@ -178,11 +178,10 @@ merely planned, so this failure shows up as a real `PROTECTION_MISMATCH`.
 With the position and its stop still open, restart the Gateway
 (`sudo systemctl restart ibgateway`), wait for login, then run `reconnect`
 bound to the **exact fill-path run** via `--run-ref`. The fill-path evidence
-(step 5) printed a line `run reference (pass to reconnect as --run-ref): …`;
-`<RUN_REF>` below is that value (it is the fill-path confirmation token).
+(step 5) printed a line `operation reference (pass to reconnect as --run-ref): …`; `<RUN_REF>` below is that value. It is a **non-authorizing** operation reference — **not** the confirmation token — so it is safe to place on the command line and in evidence.
 
 ```bash
-uv run python scripts/poi_ibkr_lifecycle.py \
+uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
   --scenario reconnect --account-alias <ALIAS> --broker-module "$BM" \
   --symbol F --run-ref <RUN_REF> \
   --evidence-out /tmp/poi-ibkr-001-step6-reconnect.md
@@ -190,12 +189,16 @@ uv run python scripts/poi_ibkr_lifecycle.py \
 
 `reconnect` is read-only — it submits and cancels nothing. It asserts the
 invariant that matters after a restart: **no naked position**. `--run-ref`
-binds the check to this specific fill-path run's protective stop, so a stale
-stop from a different run (even the same day and symbol) can never mask a
-naked position; **without `--run-ref` the scenario fails closed** because
-same-run ownership cannot be proven. The position must still be reported and
-this run's protective stop must still be resting; reconciliation must come
-back clean. The resting stop's **quantity is not exposed by the API**, so the
+binds the check to this fill-path operation's protective stop, so a stale stop
+from a run with different parameters (a different operation reference, even the
+same day and symbol) can never mask a naked position; **without `--run-ref`
+the scenario fails closed** because the stop cannot be bound to this fill-path
+operation. The operation reference is a deterministic operation identity — two
+runs with identical parameters share it, which is why the preflight
+no-stale-order and pre-existing-position gates, exactly one matching working
+stop, and fail-closed ambiguity handling remain the safeguards. The position
+must still be reported and this operation's protective stop must still be
+resting; reconciliation must come back clean. The resting stop's **quantity is not exposed by the API**, so the
 scenario notes that you must **confirm in the Gateway/TWS UI that the stop
 quantity covers the full position**. Record what the Gateway did with the
 resting stop across the restart — this is the "deterministic recovery"
@@ -208,7 +211,7 @@ inspects.
 ### Step 7 — cleanup and close-out
 
 ```bash
-uv run python scripts/poi_ibkr_lifecycle.py \
+uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
   --scenario cleanup --account-alias <ALIAS> --broker-module "$BM" \
   --evidence-out /tmp/poi-ibkr-001-step7-cleanup.md
 ```
