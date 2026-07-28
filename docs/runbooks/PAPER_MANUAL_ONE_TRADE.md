@@ -36,6 +36,15 @@ so not for the fill scenario). No other symbol without a new owner decision.
 
 ## 4. One-trade flow (per approved run)
 
+> **Exact copy/paste-safe command sequence:** the concrete owner-run commands
+> for this flow live in [`POI_IBKR_001_OWNER_RUN.md`](POI_IBKR_001_OWNER_RUN.md)
+> (steps 1–7) and are itemised, with placeholders and evidence paths, in the
+> deferred ledger
+> [`../operations/PHASE_13_DEFERRED_OWNER_RUNS.md`](../operations/PHASE_13_DEFERRED_OWNER_RUNS.md)
+> (DEF-01…DEF-09). **Every host command uses `uv run --no-sync python`** so the
+> locally installed official IBKR API package is never pruned. Nothing below has
+> been executed; POI-IBKR-001 remains BLOCKED / NOT RUN.
+
 1. **Approve plan** — owner approves the complete plan (entry, stop,
    quantity, symbol) → a single-use SubmitAuthorization is minted.
 2. **Drop lifecycle marker** — create `order-lifecycle.active` (inhibits

@@ -1,0 +1,399 @@
+# Phase-13 deferred owner-run manifest (machine-readable).
+#
+# Mirrors docs/operations/PHASE_13_DEFERRED_OWNER_RUNS.md. Every record is a
+# run that could NOT be performed in a no-broker, market-closed, non-host
+# environment. Schema-validated by tests/operations/test_deferred_manifest.py.
+#
+# HARD RULES enforced by the schema test:
+#   * every record has a non-empty command_template and evidence_path_template;
+#   * blocker is one of the allowed values;
+#   * no Live API port (4001) and no LIVE environment anywhere;
+#   * every command uses `uv run --no-sync` (owner host must not prune ibapi);
+#   * any command that sends/cancels/modifies (mutates_broker_state) uses
+#     --execute and carries an explicit confirmation placeholder (<TOKEN>);
+#   * prices are placeholders that require a fresh positive quote — never
+#     invented numeric market prices;
+#   * no Phase-14 / Phase-15 commands.
+#
+# THE HARNESS NEVER FLATTENS. Any open position must be closed by the owner in
+# the Gateway/TWS UI. Nothing here changes docs/poi/STATUS.yaml; POI-IBKR-001
+# stays BLOCKED / NOT RUN until the owner records real evidence.
+version: "1.0"
+allowed_blockers:
+  - MARKET_CLOSED
+  - OWNER_HOST_REQUIRED
+  - IBKR_PAPER_EXECUTION_REQUIRED
+  - IB_GATEWAY_RESTART_REQUIRED
+  - MARKET_DATA_WINDOW_REQUIRED
+  - EXTERNAL_PROVIDER_DEFERRED
+  - EXTERNAL_INFRASTRUCTURE_NOT_IMPLEMENTED
+
+records:
+  - id: DEF-01-cancel-path-dry-run
+    task_id: IMP-1302
+    poi_id: POI-IBKR-001
+    blocker: OWNER_HOST_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: false
+    owner_confirmation_required: false
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario cancel-path --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET>
+      --reference-price <CURRENT_PRICE>
+      --evidence-out /tmp/poi-ibkr-001-cancel-dryrun-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-cancel-dryrun-<YYYYMMDD>.md
+    prerequisites:
+      - IB Gateway Paper running on the owner host, API enabled, Read-Only API DISABLED
+      - SECRETS_ROOT exported with $SECRETS_ROOT/PAPER/ibkr/paper-account-id present
+      - a fresh positive quote for F to choose <FAR_BELOW_MARKET> (>= 20% below <CURRENT_PRICE>)
+    pass_criteria: what-if preview succeeds; NOTHING WAS SENT; an operation reference is printed
+    abort_criteria: preflight fails; any submit is attempted; the harness prints REFUSED
+    current_status: NOT_RUN
+    status_after_pass: DRY_RUN_RECORDED
+    cleanup: none required (nothing is sent)
+    never_flattens: true
+
+  - id: DEF-02-cancel-path-execute
+    task_id: IMP-1302
+    poi_id: POI-IBKR-001
+    blocker: IBKR_PAPER_EXECUTION_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: true
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario cancel-path --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET>
+      --reference-price <CURRENT_PRICE> --execute --confirm <TOKEN>
+      --evidence-out /tmp/poi-ibkr-001-cancel-execute-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-cancel-execute-<YYYYMMDD>.md
+    prerequisites:
+      - DEF-01 dry-run completed; <TOKEN> is the confirmation token that dry-run printed
+      - the resting limit is >= 20% below the market so it CANNOT fill
+    pass_criteria: submit -> ACKNOWLEDGED -> cancel -> CANCELLED -> never_filled -> clean reconciliation
+    abort_criteria: any fill event; cancel not confirmed; UNKNOWN broker state (do not resend)
+    current_status: NOT_RUN
+    status_after_pass: CANCEL_PATH_PASS
+    cleanup: if the order did not cancel, cancel it by hand in the Gateway UI, then re-run reconnect
+    never_flattens: true
+
+  - id: DEF-03-fill-path-dry-run
+    task_id: IMP-1302
+    poi_id: POI-IBKR-001
+    blocker: OWNER_HOST_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: false
+    owner_confirmation_required: false
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario fill-path --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT>
+      --evidence-out /tmp/poi-ibkr-001-fill-dryrun-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-fill-dryrun-<YYYYMMDD>.md
+    prerequisites:
+      - account flat; DEF-02 cancel-path cleaned up
+      - a fresh positive quote for F to choose <MARKETABLE_LIMIT> (at/just above the ask, <= $50 notional)
+    pass_criteria: what-if preview succeeds; NOTHING WAS SENT; an operation reference is printed
+    abort_criteria: preflight fails; any submit is attempted
+    current_status: NOT_RUN
+    status_after_pass: DRY_RUN_RECORDED
+    cleanup: none required (nothing is sent)
+    never_flattens: true
+
+  - id: DEF-04-fill-path-execute
+    task_id: IMP-1302
+    poi_id: POI-IBKR-001
+    blocker: IBKR_PAPER_EXECUTION_REQUIRED
+    requires_market_open: true
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: true
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario fill-path --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT> --execute --confirm <TOKEN>
+      --evidence-out /tmp/poi-ibkr-001-fill-execute-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-fill-execute-<YYYYMMDD>.md
+    prerequisites:
+      - US market OPEN (a marketable limit needs an open market to fill)
+      - DEF-03 dry-run completed; <TOKEN> is that dry-run's confirmation token
+      - record the printed operation reference for DEF-07 (reconnect --run-ref)
+    pass_criteria: submit -> FILLED -> position reported -> protective STOP submitted -> no unprotected position
+    abort_criteria: fill without accepted protection; UNKNOWN state; a short or cross-symbol position
+    current_status: NOT_RUN
+    status_after_pass: FILL_PATH_PASS
+    cleanup: leaves an OPEN position + stop; close them by hand in the Gateway UI after DEF-07/08
+    never_flattens: true
+
+  - id: DEF-05-protection-verification
+    task_id: IMP-1302
+    poi_id: POI-IBKR-001
+    blocker: IBKR_PAPER_EXECUTION_REQUIRED
+    requires_market_open: true
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: true
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario fill-path --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT> --execute --confirm <TOKEN>
+      --evidence-out /tmp/poi-ibkr-001-protection-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-protection-<YYYYMMDD>.md
+    prerequisites:
+      - part of DEF-04 fill-path; verified from the same executed run's evidence
+      - confirm in the Gateway UI that the stop quantity covers the FULL position
+    pass_criteria: exactly one protective STOP resting; SELL; quantity = position; stop below entry
+    abort_criteria: stop rejected/absent; quantity mismatch the receipt cannot prove
+    current_status: NOT_RUN
+    status_after_pass: PROTECTION_VERIFIED
+    cleanup: cancel the stop and close the position by hand in the Gateway UI
+    never_flattens: true
+
+  - id: DEF-06-gateway-restart
+    task_id: IMP-1303
+    poi_id: POI-IBKR-001
+    blocker: IB_GATEWAY_RESTART_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: false
+    mutates_broker_state: false
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario preflight --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --evidence-out /tmp/poi-ibkr-001-restart-preflight-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-restart-preflight-<YYYYMMDD>.md
+    prerequisites:
+      - DEF-04 position + stop still open
+      - restart the Gateway on the host (systemctl restart ibgateway), wait for login
+    pass_criteria: after restart, preflight reconnects; the position and stop are still reported
+    abort_criteria: Gateway does not return; API unavailable; login loop
+    current_status: NOT_RUN
+    status_after_pass: RESTART_OBSERVED
+    cleanup: proceed to DEF-07/08/09; the position stays open until manual close
+    never_flattens: true
+
+  - id: DEF-07-reconnect-operation-reference
+    task_id: IMP-1303
+    poi_id: POI-IBKR-001
+    blocker: IB_GATEWAY_RESTART_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: false
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario reconnect --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --symbol F --run-ref <RUN_REF>
+      --evidence-out /tmp/poi-ibkr-001-reconnect-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-reconnect-<YYYYMMDD>.md
+    prerequisites:
+      - <RUN_REF> is the operation reference printed in the DEF-04 fill-path evidence
+      - the adapter orderRef persistence + open-order recovery fix (D-ADAPTER-01) is
+        implemented and contract-tested; its empirical round-trip is DEF-15
+    pass_criteria: exactly one matching working stop for the operation; no naked position; clean reconciliation
+    abort_criteria: missing/wrong --run-ref; naked position; ambiguous or foreign stop; a short position
+    current_status: NOT_RUN
+    status_after_pass: RECONNECT_VERIFIED
+    cleanup: proceed to DEF-09 cleanup; close the position by hand
+    never_flattens: true
+
+  - id: DEF-08-reconciliation
+    task_id: IMP-1303
+    poi_id: POI-IBKR-001
+    blocker: OWNER_HOST_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: false
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario reconnect --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --symbol F --run-ref <RUN_REF>
+      --evidence-out /tmp/poi-ibkr-001-reconciliation-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-reconciliation-<YYYYMMDD>.md
+    prerequisites:
+      - reconciliation is recorded as part of DEF-07 reconnect; this captures its result
+    pass_criteria: reconciliation reconciled=true; no blocking findings; protected position matches
+    abort_criteria: POSITION_MISMATCH / PROTECTION_MISMATCH / UNEXPECTED_BROKER_ORDER
+    current_status: NOT_RUN
+    status_after_pass: RECONCILIATION_VERIFIED
+    cleanup: proceed to DEF-09
+    never_flattens: true
+
+  - id: DEF-09-cleanup
+    task_id: IMP-1302
+    poi_id: POI-IBKR-001
+    blocker: IBKR_PAPER_EXECUTION_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: true
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario cleanup --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --evidence-out /tmp/poi-ibkr-001-cleanup-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-cleanup-<YYYYMMDD>.md
+    prerequisites:
+      - runs after DEF-07/08; cancels only orders whose id starts with poi-ibkr-001
+    pass_criteria: every PoI order cancelled; reconciliation clean
+    abort_criteria: a cancel is refused; an unexpected order remains
+    current_status: NOT_RUN
+    status_after_pass: CLEANUP_VERIFIED
+    cleanup: >-
+      cleanup cancels ORDERS only; it NEVER flattens. Close the 1-share position
+      by hand in the Gateway/TWS UI, then re-run preflight until flat and clean.
+    never_flattens: true
+
+  - id: DEF-10-market-data-open-session
+    task_id: IMP-1303
+    poi_id: POI-MD-001
+    blocker: MARKET_DATA_WINDOW_REQUIRED
+    requires_market_open: true
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: false
+    owner_confirmation_required: false
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_market_data_readonly.py
+      --host 127.0.0.1 --port 4002 --symbol F --market-data-mode realtime
+      --session-module trading_broker_ibkr.poi_market_data_session
+    evidence_path_template: /tmp/poi-md-001-open-session-<YYYYMMDD>.md
+    prerequisites:
+      - US market open, realtime entitlement window, Read-Only API enabled for the read-only harness
+    pass_criteria: marketDataType=1 REALTIME; valid positive bid/ask/last; clean disconnect
+    abort_criteria: entitlement error; delayed downgrade; invalid/negative prices
+    current_status: NOT_RUN
+    status_after_pass: MD_OPEN_SESSION_RECORDED
+    cleanup: none (read-only; no order surface)
+    never_flattens: true
+
+  - id: DEF-11-owner-run-host-chaos-drills
+    task_id: IMP-1303
+    poi_id: POI-IBKR-001
+    blocker: IB_GATEWAY_RESTART_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: false
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario preflight --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --evidence-out /tmp/poi-ibkr-001-hostchaos-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-hostchaos-<YYYYMMDD>.md
+    prerequisites:
+      - the destructive host drills in docs/runbooks/CHAOS_RECOVERY_DRILLS.md section 4
+      - requires an open lifecycle (DEF-04) to exercise the watchdog reconciliation gate
+    pass_criteria: gateway kill inhibits restart while order-lifecycle.active; recovery is a reconciliation
+    abort_criteria: any blind restart during an active lifecycle; a naked position
+    current_status: NOT_RUN
+    status_after_pass: HOST_CHAOS_RECORDED
+    cleanup: DEF-09 cleanup then manual position close
+    never_flattens: true
+
+  - id: DEF-12-ibc-watchdog-host-evidence
+    task_id: IMP-1304
+    poi_id: POI-PLAT-ARM-001
+    blocker: OWNER_HOST_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: false
+    mutates_broker_state: false
+    owner_confirmation_required: false
+    command_template: >-
+      uv run --no-sync python scripts/ib_gateway_watchdog.py --status
+    evidence_path_template: /tmp/ib-gateway-watchdog-status-<YYYYMMDD>.md
+    prerequisites:
+      - IBC auto-login installed under systemd; host patches upstreamed to the repo
+    pass_criteria: watchdog reports IBC/systemd health; host transcript captured in the repo
+    abort_criteria: watchdog cannot read gateway state; systemd unit missing
+    current_status: NOT_RUN
+    status_after_pass: HOST_EVIDENCE_RECORDED
+    cleanup: none (read-only status)
+    never_flattens: true
+
+  - id: DEF-13-watchdog-deep-probe-activation
+    task_id: IMP-1304
+    poi_id: POI-PLAT-ARM-001
+    blocker: OWNER_HOST_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: false
+    mutates_broker_state: false
+    owner_confirmation_required: false
+    command_template: >-
+      uv run --no-sync python scripts/ib_gateway_watchdog.py --deep-probe --status
+    evidence_path_template: /tmp/ib-gateway-watchdog-deepprobe-<YYYYMMDD>.md
+    prerequisites:
+      - the broker python package present on the host so the deep probe can run
+    pass_criteria: deep probe classifies API state correctly; no false restart
+    abort_criteria: deep probe crashes or triggers a spurious restart
+    current_status: NOT_RUN
+    status_after_pass: DEEP_PROBE_ACTIVATED
+    cleanup: none (read-only status)
+    never_flattens: true
+
+  - id: DEF-15-orderref-roundtrip-verification
+    task_id: IMP-1304
+    poi_id: POI-IBKR-001
+    blocker: IB_GATEWAY_RESTART_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: false
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario reconnect --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --symbol F --run-ref <RUN_REF>
+      --evidence-out /tmp/poi-ibkr-001-orderref-roundtrip-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-orderref-roundtrip-<YYYYMMDD>.md
+    prerequisites:
+      - the D-ADAPTER-01 code fix (orderRef persistence + reqAllOpenOrders recovery)
+      - a resting protective stop from DEF-04 and a real Gateway restart (DEF-06)
+    pass_criteria: >-
+      the real Gateway preserves orderRef; a fresh process recovers the stop from
+      reqAllOpenOrders; the operation reference round-trips; broker-specific orderRef
+      size is confirmed within ORDER_REF_MAX_LEN
+    abort_criteria: orderRef not preserved/truncated by the Gateway; recovery misses the stop
+    current_status: NOT_RUN
+    status_after_pass: ORDERREF_ROUNDTRIP_VERIFIED
+    cleanup: DEF-09 cleanup then manual position close
+    never_flattens: true
+
+  - id: DEF-14-external-provider-benchmark
+    task_id: IMP-1303
+    poi_id: POI-MD-001
+    blocker: EXTERNAL_PROVIDER_DEFERRED
+    requires_market_open: false
+    requires_owner_host: false
+    requires_broker_connection: false
+    mutates_broker_state: false
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_market_data_readonly.py
+      --host 127.0.0.1 --port 4002 --symbol F --market-data-mode realtime
+      --session-module trading_broker_ibkr.poi_market_data_session
+    evidence_path_template: /tmp/poi-md-001-provider-benchmark-<YYYYMMDD>.md
+    prerequisites:
+      - an owner-approved external market-data provider (NONE selected; deferred by Track A / A2)
+      - a provider ADR, benchmark plan, outage/fallback plan, field-ownership matrix
+    pass_criteria: not runnable until a provider is selected; POI-MD-001 aggregate stays BLOCKED
+    abort_criteria: any attempt to select/integrate a provider without owner approval
+    current_status: DEFERRED
+    status_after_pass: PROVIDER_BENCHMARK_RECORDED
+    cleanup: none
+    never_flattens: true

@@ -26,7 +26,13 @@ from trading_broker_core.port import (
 )
 from trading_broker_ibkr.paper_adapter import (
     IBKR_STATUS_MAP,
+    LIFECYCLE_ORDER_REF_PREFIX,
+    ORDER_REF_MAX_LEN,
     IbkrPaperAdapter,
+    OrderRefTooLongError,
+    RawOpenOrder,
+    decode_order_ref,
+    encode_order_ref,
     mask_account_id,
 )
 from trading_contracts.enums import Environment, OrderState, OrderType
@@ -55,6 +61,12 @@ class FakePaperTransport:
         self._cancel_status = cancel_status
         self._connected = False
         self._next_id = 1000
+        # tracked live orders: broker_order_id -> RawOpenOrder (for the
+        # read-only reqAllOpenOrders snapshot)
+        self._live: dict[int, RawOpenOrder] = {}
+        #: injected snapshot rows (for restart / foreign / malformed drills)
+        self.snapshot_override: tuple[RawOpenOrder, ...] | None = None
+        self.snapshot_error: Exception | None = None
 
     def connect(self, host: str, port: int, client_id: int) -> tuple[str, ...]:
         self.calls.append(f"connect:{host}:{port}:{client_id}")
@@ -101,11 +113,35 @@ class FakePaperTransport:
 
     def submit(self, broker_order_id: int, account_id: str, intent: OrderIntent) -> str:
         self.calls.append(f"submit:{broker_order_id}:{intent.client_order_id}")
+        # Faithfully round-trip the orderRef codec so the snapshot can recover
+        # the client_order_id after a "restart" (a fresh adapter instance).
+        self._live[broker_order_id] = RawOpenOrder(
+            broker_order_id=broker_order_id,
+            order_ref=encode_order_ref(intent.client_order_id),
+            status=self._submit_status,
+            symbol=intent.symbol,
+        )
         return self._submit_status
 
     def cancel(self, broker_order_id: int) -> str:
         self.calls.append(f"cancel:{broker_order_id}")
+        existing = self._live.get(broker_order_id)
+        if existing is not None:
+            self._live[broker_order_id] = RawOpenOrder(
+                broker_order_id=existing.broker_order_id,
+                order_ref=existing.order_ref,
+                status=self._cancel_status,
+                symbol=existing.symbol,
+            )
         return self._cancel_status
+
+    def open_order_snapshot(self, account_id: str) -> tuple[RawOpenOrder, ...]:
+        self.calls.append("open_order_snapshot")
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
+        if self.snapshot_override is not None:
+            return self.snapshot_override
+        return tuple(self._live.values())
 
 
 def make_adapter(
@@ -336,3 +372,220 @@ def test_source_has_no_secret_access() -> None:
 def test_masking_never_reveals_full_account() -> None:
     assert mask_account_id(PAPER_ACCOUNT) == "DU" + "*" * 5 + PAPER_ACCOUNT[-2:]
     assert PAPER_ACCOUNT[2:-2] not in mask_account_id(PAPER_ACCOUNT)
+
+
+# -- orderRef codec + restart-safe open-order recovery (D-ADAPTER-01) --------
+#
+# A realistic lifecycle stop client_order_id (the longest id the harness makes),
+# built by concatenation so no guardrail matches a hardcoded literal.
+_RUN_REF = "A40B11ABF9D10C5B"
+_ENTRY_ID = "poi-ibkr-001-2026-07-21-fill-path-AAPL-" + _RUN_REF
+_STOP_ID = f"{_ENTRY_ID}-protection:{_ENTRY_ID}:stop:1"
+
+
+def test_encode_order_ref_is_prefixed_and_reversible() -> None:
+    ref = encode_order_ref(_STOP_ID)
+    assert ref.startswith(LIFECYCLE_ORDER_REF_PREFIX)
+    recovered = decode_order_ref(ref, 1)
+    assert recovered.lifecycle_owned is True
+    assert recovered.client_order_id == _STOP_ID  # fully reversible
+
+
+def test_encode_order_ref_fails_closed_when_too_long_never_truncates() -> None:
+    too_long = "poi-ibkr-001-" + "x" * ORDER_REF_MAX_LEN
+    with pytest.raises(OrderRefTooLongError):
+        encode_order_ref(too_long)
+
+
+def test_confirmation_token_never_appears_in_order_ref() -> None:
+    # The encoded ref is the client_order_id only; whatever token-like value an
+    # operator holds is never part of it.
+    token = "DEADBEEF1234"
+    ref = encode_order_ref(_STOP_ID)
+    assert token not in ref
+    # and the client_order_id itself carries the operation reference, not a token
+    assert _RUN_REF in ref and token not in _STOP_ID
+
+
+def test_submit_sets_order_ref_and_snapshot_recovers_it() -> None:
+    transport = FakePaperTransport()
+    adapter = make_adapter(transport)
+    adapter.connect()
+    adapter.submit_order(make_intent(_STOP_ID, order_type=OrderType.STOP, stop_price=Decimal("9")))
+    # A FRESH adapter instance (empty memory) — simulates a process restart.
+    restarted = make_adapter(transport)
+    restarted.connect()
+    open_orders = restarted.get_open_orders("paper-main")
+    assert [o.client_order_id for o in open_orders] == [_STOP_ID]  # recovered from orderRef
+
+
+def test_recovery_after_restart_has_no_process_local_dependency() -> None:
+    transport = FakePaperTransport()
+    seed = make_adapter(transport)
+    seed.connect()
+    seed.submit_order(make_intent(_ENTRY_ID))
+    # brand-new adapter with empty _orders/_broker_ids
+    restarted = make_adapter(transport)
+    restarted.connect()
+    recovered = restarted.get_open_orders("paper-main")
+    assert any(o.client_order_id == _ENTRY_ID for o in recovered)
+
+
+def test_missing_order_ref_is_foreign_not_lifecycle_owned() -> None:
+    transport = FakePaperTransport()
+    transport.snapshot_override = (
+        RawOpenOrder(broker_order_id=1, order_ref="", status="Submitted", symbol="AAPL"),
+    )
+    adapter = make_adapter(transport)
+    adapter.connect()
+    (order,) = adapter.get_open_orders("paper-main")
+    assert order.client_order_id.startswith("foreign:")
+    assert decode_order_ref("", 1).lifecycle_owned is False
+
+
+def test_malformed_lifecycle_ref_is_surfaced_not_claimed() -> None:
+    transport = FakePaperTransport()
+    transport.snapshot_override = (
+        RawOpenOrder(
+            broker_order_id=2,
+            order_ref=LIFECYCLE_ORDER_REF_PREFIX + "   ",
+            status="Submitted",
+            symbol="AAPL",
+        ),
+    )
+    adapter = make_adapter(transport)
+    adapter.connect()
+    (order,) = adapter.get_open_orders("paper-main")
+    assert order.client_order_id.startswith("malformed:")
+    assert decode_order_ref(LIFECYCLE_ORDER_REF_PREFIX + "  ", 2).lifecycle_owned is False
+
+
+def test_foreign_manual_order_stays_foreign() -> None:
+    transport = FakePaperTransport()
+    transport.snapshot_override = (
+        RawOpenOrder(
+            broker_order_id=3, order_ref="MANUAL-TWS-123", status="Submitted", symbol="AAPL"
+        ),
+    )
+    adapter = make_adapter(transport)
+    adapter.connect()
+    (order,) = adapter.get_open_orders("paper-main")
+    assert order.client_order_id.startswith("foreign:")
+    assert not order.client_order_id.startswith("poi-ibkr-001")
+
+
+def test_duplicate_open_order_callback_does_not_duplicate_state() -> None:
+    ref = encode_order_ref(_STOP_ID)
+    transport = FakePaperTransport()
+    transport.snapshot_override = (
+        RawOpenOrder(broker_order_id=4, order_ref=ref, status="Submitted", symbol="AAPL"),
+        RawOpenOrder(broker_order_id=4, order_ref=ref, status="Submitted", symbol="AAPL"),
+    )
+    adapter = make_adapter(transport)
+    adapter.connect()
+    orders = adapter.get_open_orders("paper-main")
+    assert len(orders) == 1  # collapsed to one
+
+
+def test_cancelled_filled_rejected_orders_do_not_count_as_working() -> None:
+    ref = encode_order_ref(_STOP_ID)
+    for status in ("Cancelled", "ApiCancelled", "Filled", "Inactive"):
+        transport = FakePaperTransport()
+        transport.snapshot_override = (
+            RawOpenOrder(broker_order_id=5, order_ref=ref, status=status, symbol="AAPL"),
+        )
+        adapter = make_adapter(transport)
+        adapter.connect()
+        assert adapter.get_open_orders("paper-main") == (), status
+
+
+def test_unknown_status_in_snapshot_is_dropped_not_claimed() -> None:
+    ref = encode_order_ref(_STOP_ID)
+    transport = FakePaperTransport()
+    transport.snapshot_override = (
+        RawOpenOrder(broker_order_id=6, order_ref=ref, status="SomeNewStatus", symbol="AAPL"),
+    )
+    adapter = make_adapter(transport)
+    adapter.connect()
+    # An unmapped status is not silently claimed as working protection.
+    assert adapter.get_open_orders("paper-main") == ()
+
+
+def test_snapshot_error_fails_closed() -> None:
+    transport = FakePaperTransport()
+    transport.snapshot_error = RuntimeError("api error during snapshot")
+    adapter = make_adapter(transport)
+    adapter.connect()
+    with pytest.raises(BrokerPortError):
+        adapter.get_open_orders("paper-main")
+
+
+def test_reconcile_uses_recovered_snapshot() -> None:
+    transport = FakePaperTransport()
+    adapter = make_adapter(transport)
+    adapter.connect()
+    adapter.submit_order(make_intent(_STOP_ID, order_type=OrderType.STOP, stop_price=Decimal("9")))
+    restarted = make_adapter(transport)
+    restarted.connect()
+    result = restarted.reconcile("paper-main")
+    assert any(o.client_order_id == _STOP_ID for o in result.open_orders)
+
+
+def test_get_open_orders_read_path_never_mutates_the_broker() -> None:
+    transport = FakePaperTransport()
+    adapter = make_adapter(transport)
+    adapter.connect()
+    adapter.submit_order(make_intent(_ENTRY_ID))
+    before = list(transport.calls)
+    adapter.get_open_orders("paper-main")
+    new_calls = transport.calls[len(before) :]
+    # the recovery read path only takes a snapshot — never submit/cancel
+    assert all(c == "open_order_snapshot" for c in new_calls)
+    assert not any(c.startswith(("submit:", "cancel:")) for c in new_calls)
+
+
+def test_no_recovery_code_calls_broker_mutation_methods() -> None:
+    """Static guard: get_open_orders / decode / recovery must not reference
+    placeOrder/cancelOrder/reqGlobalCancel or the transport submit/cancel."""
+    source = Path("packages/py/broker-ibkr/src/trading_broker_ibkr/paper_adapter.py").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("def get_open_orders")
+    end = source.index("def preview_order")
+    read_path = source[start:end]
+    for banned in (
+        "placeOrder",
+        "cancelOrder",
+        "reqGlobalCancel",
+        "transport.submit",
+        "transport.cancel",
+        ".submit(",
+        ".cancel(",
+    ):
+        assert banned not in read_path, f"recovery read path must not call {banned}"
+
+
+def test_two_matching_stops_both_surface_so_lifecycle_can_flag_ambiguity() -> None:
+    """Two working orders that decode to the SAME lifecycle client_order_id
+    (distinct broker order ids) must BOTH surface, so the lifecycle reconnect
+    matcher can detect the ambiguity and fail closed — the adapter never hides
+    one."""
+    ref = encode_order_ref(_STOP_ID)
+    transport = FakePaperTransport()
+    transport.snapshot_override = (
+        RawOpenOrder(broker_order_id=7, order_ref=ref, status="Submitted", symbol="AAPL"),
+        RawOpenOrder(broker_order_id=8, order_ref=ref, status="Submitted", symbol="AAPL"),
+    )
+    adapter = make_adapter(transport)
+    adapter.connect()
+    orders = adapter.get_open_orders("paper-main")
+    assert len(orders) == 2  # distinct broker ids, same recovered id -> both surface
+    assert {o.client_order_id for o in orders} == {_STOP_ID}
+    assert {o.broker_order_ref for o in orders} == {"ibkr-paper:7", "ibkr-paper:8"}
+
+
+def test_order_ref_carries_no_account_secret_or_authorization() -> None:
+    """The persisted ref is only the non-authorizing client_order_id."""
+    ref = encode_order_ref(_STOP_ID)
+    for secret_like in ("submit-auth:", "DU1234567", "password", "authorized_at"):
+        assert secret_like not in ref

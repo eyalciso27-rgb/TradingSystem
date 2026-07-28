@@ -1636,3 +1636,62 @@ def test_reconnect_ambiguous_multiple_canonical_stops_fails_closed() -> None:
     assert names["protection_stop_unambiguous"] is False
     assert names["protection_survived_reconnect"] is False
     _assert_fails_closed(report)
+
+
+# -- 14. evidence-artifact completeness (IMP-1302 B.3) ----------------------
+
+
+def test_fill_path_evidence_records_every_required_identity_field() -> None:
+    """The executed fill-path artifact must carry enough to prove intended
+    parameters, authorization, broker order identity, fill identity and
+    protection identity — the fields an owner needs to correlate the run."""
+    broker = _filling_broker()
+    env = _envelope(scenario="fill-path", symbol="F", limit_price=Decimal("12"))
+    report = _run(broker, env, execute=True, confirm_token=harness.confirmation_token(env))
+    assert report.passed
+    names = {name for name, _, _ in report.checks}
+    details = {name: detail for name, _, detail in report.checks}
+
+    assert "intended_parameters" in names
+    for token in ("symbol=F", "side=BUY", "quantity=1", "limit_price=12", "operation_reference="):
+        assert token in details["intended_parameters"]
+    # authorization result
+    assert "OWNER_CONFIRMED_POI_RUN" in details["submit"] or "SUBMITTED" in details["submit"]
+    # broker + fill identity
+    assert "broker_order_ref=" in details["entry_broker_order"]
+    assert "broker_order_ref=" in details["fill_identity"]
+    assert "filled_quantity=" in details["fill_identity"]
+    # protection identity (spec_ref-keyed check name)
+    assert any(name.startswith("protection_submitted[") for name in names)
+
+    rendered = report.render()
+    assert "intended_parameters" in rendered
+    assert "entry_broker_order" in rendered
+    assert "fill_identity" in rendered
+    # the executed artifact must not leak the confirmation token
+    assert harness.confirmation_token(env) not in rendered
+
+
+def test_reconnect_evidence_records_reconciliation_and_run_reference() -> None:
+    broker = _broker()
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="F", quantity=Decimal("1"), average_price=Decimal("10")),
+    )
+    run_ref = _fill_path_run_ref(symbol="F")
+    _place_order(broker, _canonical_stop_id("F", run_ref=run_ref))
+    report = _reconnect(broker, run_ref=run_ref)
+    names = {name for name, _, _ in report.checks}
+    assert "run_reference_provided" in names
+    assert "positions_survived_reconnect" in names
+    assert "protection_survived_reconnect" in names
+    assert "reconciliation" in names
+
+
+def test_cleanup_evidence_records_a_cleanup_result() -> None:
+    broker = _broker()
+    order_id = f"{harness.CLIENT_ORDER_PREFIX}-cleanup-leftover"
+    _place_order(broker, order_id)
+    report = _run(broker, _envelope(scenario="cleanup"))
+    names = {name for name, _, _ in report.checks}
+    assert "cleanup_scope" in names
+    assert "reconciliation" in names
