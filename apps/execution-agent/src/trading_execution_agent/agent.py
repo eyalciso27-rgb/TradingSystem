@@ -57,6 +57,7 @@ from trading_broker_core.port import (
     CancelOrderRequest,
     OrderIntent,
     OrderSide,
+    TimeInForce,
 )
 from trading_contracts.enums import Environment, OrderType
 
@@ -95,6 +96,10 @@ class ExecutionRequest:
     stop_price: Decimal | None
     strategy_id: str
     source_id: str
+    #: Time-in-force for the order. Defaults to DAY; a protective exit that must
+    #: outlive the session (so it cannot expire while the position is open)
+    #: is submitted GTC by its caller — never left to a session-bound default.
+    time_in_force: TimeInForce = TimeInForce.DAY
 
     def __post_init__(self) -> None:
         if not self.client_order_id.strip():
@@ -167,9 +172,7 @@ class ExecutionAgent:
             )
         try:
             receipt = self._broker.cancel_order(
-                CancelOrderRequest(
-                    client_order_id=client_order_id, correlation_id=correlation_id
-                )
+                CancelOrderRequest(client_order_id=client_order_id, correlation_id=correlation_id)
             )
         except BrokerPortError as error:
             status = (
@@ -291,6 +294,7 @@ class ExecutionAgent:
             quantity=authorization.authorized_quantity,  # exactly as authorized
             limit_price=request.limit_price,
             stop_price=request.stop_price,
+            time_in_force=request.time_in_force,
         )
         try:
             receipt = self._broker.submit_order(intent)
@@ -303,9 +307,7 @@ class ExecutionAgent:
                     "RECONCILE_BEFORE_ANY_RETRY",
                 )
             return refuse(ExecutionStatus.FAILED, f"SUBMIT_{error.code.value}", "NO_AUTO_RETRY")
-        return self._outcome(
-            request, ExecutionStatus.SUBMITTED, ("SUBMITTED",), receipt=receipt
-        )
+        return self._outcome(request, ExecutionStatus.SUBMITTED, ("SUBMITTED",), receipt=receipt)
 
     def _outcome(
         self,

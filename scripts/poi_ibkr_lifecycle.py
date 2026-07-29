@@ -76,6 +76,7 @@ from trading_broker_core.port import (
     InstrumentQuery,
     OrderIntent,
     OrderSide,
+    TimeInForce,
 )
 from trading_contracts.enums import Environment, OrderState, OrderType
 from trading_execution_agent.agent import ExecutionAgent, ExecutionRequest, ExecutionStatus
@@ -408,6 +409,7 @@ def _authorized_request(
     stop_price: Decimal | None,
     correlation_id: str,
     now: datetime,
+    time_in_force: TimeInForce = TimeInForce.DAY,
 ) -> ExecutionRequest:
     """Build the queue item the ExecutionAgent consumes.
 
@@ -470,6 +472,7 @@ def _authorized_request(
         stop_price=stop_price,
         strategy_id="poi-ibkr-001-manual",
         source_id="owner-manual",
+        time_in_force=time_in_force,
     )
 
 
@@ -1077,6 +1080,11 @@ def _run_fill_path(
             stop_price=spec.stop_price,
             correlation_id=correlation_id,
             now=now,
+            # A protective stop MUST outlive the trading session: a DAY stop
+            # would expire at the close and leave the open position naked
+            # overnight. Submit protection GTC so it rests until the position
+            # is closed (the harness never flattens; the owner closes by hand).
+            time_in_force=TimeInForce.GTC,
         )
         protective_outcome = agent.process(protective)
         accepted = protective_outcome.status is ExecutionStatus.SUBMITTED

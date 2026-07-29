@@ -1738,7 +1738,9 @@ def test_cancel_path_entry_intent_uses_day_time_in_force() -> None:
     assert all(i.time_in_force is TimeInForce.DAY for i in broker.intents)
 
 
-def test_fill_path_entry_and_protective_stop_use_day_time_in_force() -> None:
+def test_fill_path_entry_is_day_and_protective_stop_is_gtc() -> None:
+    """The marketable LIMIT entry is DAY; the protective STOP is GTC so it
+    cannot expire at the session close and leave the position naked overnight."""
     from trading_broker_core.port import TimeInForce
     from trading_contracts.enums import OrderType as _OrderType
 
@@ -1746,6 +1748,7 @@ def test_fill_path_entry_and_protective_stop_use_day_time_in_force() -> None:
     env = _envelope(scenario="fill-path", symbol="F", limit_price=Decimal("12"))
     report = _run(broker, env, execute=True, confirm_token=harness.confirmation_token(env))
     assert report.passed
-    kinds = {i.order_type for i in broker.intents}
-    assert _OrderType.LIMIT in kinds and _OrderType.STOP in kinds  # entry + protective stop
-    assert all(i.time_in_force is TimeInForce.DAY for i in broker.intents)
+    by_type = {i.order_type: i for i in broker.intents}
+    assert _OrderType.LIMIT in by_type and _OrderType.STOP in by_type  # entry + protective stop
+    assert by_type[_OrderType.LIMIT].time_in_force is TimeInForce.DAY  # entry
+    assert by_type[_OrderType.STOP].time_in_force is TimeInForce.GTC  # protection survives session

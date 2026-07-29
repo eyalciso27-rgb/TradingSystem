@@ -69,13 +69,23 @@
   `reqAllOpenOrders` snapshot** — restart-safe, with no process-local
   dependency. Foreign/malformed/cancelled/duplicate orders never count as
   protection; the read path never mutates the broker. 17 new contract tests.
-- **D-TIF-01 fix (this bundle):** a real Paper owner-run surfaced IBKR error
-  **10052 "Invalid time in force:Empty"** — the transport built the order with
-  no `tif`. Fixed with a canonical `TimeInForce` enum (default `DAY`), validated
+- **D-TIF-01 fix:** a real Paper owner-run surfaced IBKR error **10052
+  "Invalid time in force:Empty"** — the transport built the order with no
+  `tif`. Fixed with a canonical `TimeInForce` enum (default `DAY`), validated
   and translated before `placeOrder` (via `build_outgoing_order`), with
-  `order.transmit` set explicitly; 15 new tests including a 10052 regression.
-  The harness had already failed closed correctly on the rejection
-  (`UNKNOWN_BROKER_STATE`, no retry).
+  `order.transmit` set explicitly. The harness had already failed closed
+  correctly on the rejection (`UNKNOWN_BROKER_STATE`, no retry).
+- **D-TIF-02 fix (pre-merge review):** the protective STOP is now **GTC** (not
+  DAY) so it cannot expire at the session close and leave the position naked
+  overnight; the entry LIMIT stays DAY. `transmit=True` is safe (entry and stop
+  are separate orders; bracket/OCA remain UNSUPPORTED). 17 TIF tests in total,
+  including a 10052 regression, a GTC protective field matrix, and a lifecycle
+  test asserting entry=DAY / protection=GTC.
+- **D-TIF-03 (documented, P2):** deterministic broker validation rejects
+  (10052/321) currently time out into `UNKNOWN` rather than a definite
+  `REJECTED`. Conservative-safe today; a host-verified follow-up (DEF-17) will
+  map a confirmed allowlist to `REJECTED` to avoid unnecessary reconciliation.
+  Not implemented offline (host-only, unverifiable without a real Gateway).
 - No **open code P0/P1** remains after this bundle. The only outstanding piece
   of D-ADAPTER-01 is **owner-host empirical verification** (§2).
 
