@@ -719,3 +719,29 @@ def test_outgoing_order_ref_carries_no_confirmation_token_or_secret() -> None:
     ref = build_outgoing_order(intent, PAPER_ACCOUNT).order_ref
     for secret_like in ("submit-auth:", PAPER_ACCOUNT, "DEADBEEF"):
         assert secret_like not in ref
+
+
+def test_protective_stop_gtc_outgoing_fields() -> None:
+    """A GTC protective STOP: aux_price set, no lmt_price, tif=GTC (survives the
+    session), transmit=True — verified independently of the entry."""
+    intent = make_intent(
+        "poi-stp-gtc",
+        side=OrderSide.SELL,
+        order_type=OrderType.STOP,
+        quantity=Decimal("1"),
+        limit_price=None,
+        stop_price=Decimal("9"),
+        time_in_force=TimeInForce.GTC,
+    )
+    fields = build_outgoing_order(intent, PAPER_ACCOUNT)
+    assert fields.action == "SELL"
+    assert fields.order_type == "STP"
+    assert fields.tif == "GTC"
+    assert fields.aux_price == 9.0
+    assert fields.limit_price is None  # no stale/irrelevant price field
+    assert fields.transmit is True
+
+
+def test_day_and_gtc_are_both_supported_and_distinct() -> None:
+    assert ibkr_time_in_force(TimeInForce.DAY) == "DAY"
+    assert ibkr_time_in_force(TimeInForce.GTC) == "GTC"

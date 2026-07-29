@@ -33,6 +33,7 @@
 | fail-closed + cleanup | any error aborts, attempts to cancel what was sent, and reports FAIL |
 | no flatten | not implemented; positions are closed by the owner in the Gateway UI |
 | protective leg checked too | the generated STOP is re-validated before sending: SELL only, STOP only, positive stop price, quantity > 0 and never more than the position held (a larger SELL would open a short) |
+| protective stop is GTC | the entry LIMIT is **DAY**; the protective STOP is **GTC** so it does not expire at the session close and leave the position naked overnight (the harness never flattens — the owner still closes the position by hand) |
 | loud abort | any state that may leave real exposure records a FAILED `owner_action_required` check plus `>>> OWNER ACTION REQUIRED <<<` steps; the artifact can then never read `RESULT: PASS` |
 | crash-safe | a re-run after a crash reuses the same day's `client_order_id`, so the broker returns the original receipt; preflight separately refuses to start on top of a leftover PoI order or a pre-existing position in the traded symbol |
 | sanitized output | account ids masked (`DU*****xx`); no credential is read, prompted for or printed |
