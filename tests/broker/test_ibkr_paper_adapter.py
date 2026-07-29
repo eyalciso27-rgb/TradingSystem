@@ -23,16 +23,20 @@ from trading_broker_core.port import (
     InstrumentQuery,
     OrderIntent,
     OrderSide,
+    TimeInForce,
 )
 from trading_broker_ibkr.paper_adapter import (
     IBKR_STATUS_MAP,
+    IBKR_TIME_IN_FORCE_MAP,
     LIFECYCLE_ORDER_REF_PREFIX,
     ORDER_REF_MAX_LEN,
     IbkrPaperAdapter,
     OrderRefTooLongError,
     RawOpenOrder,
+    build_outgoing_order,
     decode_order_ref,
     encode_order_ref,
+    ibkr_time_in_force,
     mask_account_id,
 )
 from trading_contracts.enums import Environment, OrderState, OrderType
@@ -588,4 +592,130 @@ def test_order_ref_carries_no_account_secret_or_authorization() -> None:
     """The persisted ref is only the non-authorizing client_order_id."""
     ref = encode_order_ref(_STOP_ID)
     for secret_like in ("submit-auth:", "DU1234567", "password", "authorized_at"):
+        assert secret_like not in ref
+
+
+# -- outgoing IBKR order-field matrix + TIF hardening (10052 regression) -----
+
+
+def test_buy_limit_outgoing_fields_include_explicit_day_tif() -> None:
+    intent = make_intent(
+        "poi-lmt",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=Decimal("1"),
+        limit_price=Decimal("5"),
+    )
+    fields = build_outgoing_order(intent, PAPER_ACCOUNT)
+    assert fields.account == PAPER_ACCOUNT
+    assert fields.action == "BUY"
+    assert fields.order_type == "LMT"
+    assert fields.total_quantity == 1
+    assert fields.limit_price == 5.0
+    assert fields.aux_price is None
+    assert fields.tif == "DAY"
+    assert fields.transmit is True
+    assert fields.order_ref.startswith(LIFECYCLE_ORDER_REF_PREFIX)
+
+
+def test_protective_stop_outgoing_fields_are_verified_independently() -> None:
+    intent = make_intent(
+        "poi-stp",
+        side=OrderSide.SELL,
+        order_type=OrderType.STOP,
+        quantity=Decimal("1"),
+        limit_price=None,
+        stop_price=Decimal("9"),
+    )
+    fields = build_outgoing_order(intent, PAPER_ACCOUNT)
+    assert fields.action == "SELL"
+    assert fields.order_type == "STP"
+    assert fields.total_quantity == 1
+    assert fields.aux_price == 9.0
+    assert fields.limit_price is None
+    assert fields.tif == "DAY"
+    assert fields.transmit is True
+
+
+def test_no_outgoing_required_field_is_ever_empty() -> None:
+    for intent in (
+        make_intent("m1", order_type=OrderType.LIMIT, limit_price=Decimal("5")),
+        make_intent("m2", side=OrderSide.SELL, order_type=OrderType.STOP, stop_price=Decimal("9")),
+        make_intent("m3", order_type=OrderType.MARKET, limit_price=None),
+    ):
+        f = build_outgoing_order(intent, PAPER_ACCOUNT)
+        assert f.account and f.action and f.order_type and f.tif and f.order_ref
+        assert f.total_quantity > 0
+        assert f.transmit is True
+
+
+def test_time_in_force_default_is_day() -> None:
+    assert make_intent("d1").time_in_force is TimeInForce.DAY
+
+
+def test_ibkr_time_in_force_maps_supported_values() -> None:
+    assert ibkr_time_in_force(TimeInForce.DAY) == "DAY"
+    assert ibkr_time_in_force(TimeInForce.GTC) == "GTC"
+    assert set(IBKR_TIME_IN_FORCE_MAP) == set(TimeInForce)  # every enum member mapped
+
+
+def test_ibkr_time_in_force_absent_or_non_canonical_fails_closed() -> None:
+    with pytest.raises(BrokerPortError) as e:
+        ibkr_time_in_force("DAY")  # type: ignore[arg-type]  # bare str, not the enum
+    assert e.value.code is BrokerErrorCode.VALIDATION_FAILED
+
+
+def test_ibkr_time_in_force_unsupported_fails_closed(monkeypatch: Any) -> None:
+    import trading_broker_ibkr.paper_adapter as adapter_mod
+
+    monkeypatch.setattr(adapter_mod, "IBKR_TIME_IN_FORCE_MAP", {})
+    with pytest.raises(BrokerPortError) as e:
+        adapter_mod.ibkr_time_in_force(TimeInForce.DAY)
+    assert e.value.code is BrokerErrorCode.CAPABILITY_UNSUPPORTED
+
+
+def test_ibkr_order_type_unsupported_fails_closed(monkeypatch: Any) -> None:
+    import trading_broker_ibkr.paper_adapter as adapter_mod
+
+    monkeypatch.setattr(adapter_mod, "IBKR_ORDER_TYPE_MAP", {})
+    with pytest.raises(BrokerPortError):
+        adapter_mod.ibkr_order_type(OrderType.LIMIT)
+
+
+def test_10052_regression_empty_tif_never_reaches_placeorder(monkeypatch: Any) -> None:
+    """Reproduces IBKR error 10052: an order whose TIF cannot be translated to
+    a non-empty value MUST fail closed in the adapter BEFORE placeOrder — the
+    transport (and thus placeOrder) is never reached."""
+    import trading_broker_ibkr.paper_adapter as adapter_mod
+
+    monkeypatch.setattr(adapter_mod, "IBKR_TIME_IN_FORCE_MAP", {})  # nothing maps
+    transport = FakePaperTransport()
+    adapter = make_adapter(transport)
+    adapter.connect()
+    before = list(transport.calls)
+    with pytest.raises(BrokerPortError):
+        adapter.submit_order(
+            make_intent("poi-10052", order_type=OrderType.LIMIT, limit_price=Decimal("5"))
+        )
+    # fail-closed BEFORE any submit -> placeOrder was never called
+    assert not any(c.startswith("submit:") for c in transport.calls[len(before) :])
+
+
+def test_outgoing_order_never_produces_empty_tif() -> None:
+    """The exact defect: the old path left order.tif empty. The builder can
+    never emit an empty TIF for any supported intent."""
+    for tif in TimeInForce:
+        intent = make_intent(
+            "t-" + tif.value,
+            order_type=OrderType.LIMIT,
+            limit_price=Decimal("5"),
+            time_in_force=tif,
+        )
+        assert build_outgoing_order(intent, PAPER_ACCOUNT).tif != ""
+
+
+def test_outgoing_order_ref_carries_no_confirmation_token_or_secret() -> None:
+    intent = make_intent("poi-lmt", order_type=OrderType.LIMIT, limit_price=Decimal("5"))
+    ref = build_outgoing_order(intent, PAPER_ACCOUNT).order_ref
+    for secret_like in ("submit-auth:", PAPER_ACCOUNT, "DEADBEEF"):
         assert secret_like not in ref

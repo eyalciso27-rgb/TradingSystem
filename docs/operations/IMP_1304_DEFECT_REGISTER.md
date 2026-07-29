@@ -37,6 +37,7 @@
 | D-01d | The operation reference initially reused the **confirmation token**, embedding a reusable execution-authorization value in `client_order_id`, broker-visible order metadata, and evidence | **P1 (security)** | `scripts/poi_ibkr_lifecycle.py` identity | ✅ **fixed in this PR** (separate, domain-separated, non-authorizing operation reference) |
 | D-01e | Evidence artifact lacked broker order identity, fill identity and intended-parameters fields, so an owner could not correlate the artifact with the real order | P2 | `scripts/poi_ibkr_lifecycle.py` fill/cancel path | ✅ **fixed in this bundle** (records `intended_parameters`, `entry_broker_order`, `fill_identity`) |
 | D-ADAPTER-01 | Reconnect owner-run cannot recover the harness order id / operation reference from a real Gateway after a restart: the paper adapter never set `order.orderRef` on `placeOrder`, and `get_open_orders` returned only in-memory orders (not a live `reqAllOpenOrders`) | **P1** | `broker-ibkr/paper_adapter.py` | ✅ **code fix implemented + contract-tested in this bundle**; **owner-host empirical verification BLOCKED / NOT RUN** (see below) |
+| D-TIF-01 | The IBKR transport built the `Order` with **no `tif`** (and no explicit `transmit`), so a real Paper submit reached the API with an empty TIF and was rejected: `ERROR 1 … 10052 Invalid time in force:Empty`. Observed on a real cancel-path owner-run (BUY LIMIT F qty 1). The harness then failed closed correctly (`UNKNOWN_BROKER_STATE`, `RECONCILE_BEFORE_ANY_RETRY`) — no unsafe outcome | **P1** | `broker-ibkr/paper_adapter.py` transport | ✅ **fixed in this bundle** — canonical `TimeInForce` (default `DAY`), validated + translated before `placeOrder`; regression-proofed |
 | D-02 | Owner-run `--client-id` default (7) diverges from adapter `DEFAULT_CLIENT_ID` (1); stale-connection recovery undocumented | P2 | lifecycle CLI + runbook | ✅ (doc) — not done here (P2, out of P0/P1 scope) |
 | B-01 | POI-IBKR-001 Paper lifecycle (cancel-path/fill-path/protection/reconnect/reconciliation) not run | BLOCKED | owner-run | ❌ owner + host |
 | B-02 | Owner-run chaos/recovery host drills not run | BLOCKED | `CHAOS_RECOVERY_DRILLS.md` §4 | ❌ blocked on B-01 |
@@ -231,6 +232,43 @@ green.
 | evidence redaction keeps fields needed for reconnect | ✅ operation reference is printed (non-secret) so `--run-ref` is recoverable |
 | evidence has no secrets or executable authorization values | ✅ account masked; token never in the executed-run artifact |
 | all runbook commands use `uv run --no-sync` | ✅ verified across all host runbooks |
+
+### D-TIF-01 resolution — explicit, validated time-in-force
+
+**Root cause:** the host transport constructed `ibapi.order.Order` and set
+action/orderType/quantity/prices/orderRef but **never set `order.tif`**, so
+IBKR received an empty TIF and rejected the order with error **10052**. There
+was no canonical TIF concept at the broker boundary (the frozen contracts
+model `time_in_force` as a token string — documented gap).
+
+**Fix (code, contract-tested — no IBKR connection):**
+- Added a typed **`TimeInForce`** enum at the broker-port boundary
+  (`trading_broker_core.port`) with the broker-supported values `DAY`, `GTC`;
+  `OrderIntent.time_in_force` defaults to **`DAY`** (the canonical MVP value for
+  the BUY LIMIT entry and protective STOP). It is a required enum, never
+  implicitly empty.
+- The adapter translates every outbound field through pure, fail-closed helpers
+  (`ibkr_order_type`, `ibkr_time_in_force`) and a single
+  **`build_outgoing_order`** projection. An absent / empty / unknown /
+  unsupported order type or TIF **raises before `placeOrder`** — validated both
+  in `_validate_intent` and at order-build time.
+- The transport now sets `order.tif` from the validated map and sets
+  `order.transmit = True` explicitly (never left implicit).
+- **Outgoing IBKR field matrix (after):** `account` = DU alias · `action` =
+  BUY/SELL · `orderType` ∈ {LMT, STP, STP LMT, MKT} · **`tif` = "DAY"** ·
+  `totalQuantity` = whole shares · `lmtPrice`/`auxPrice` only when applicable ·
+  `orderRef` = `poi1:<client_order_id>` (non-authorizing) · `transmit` = True.
+  **Before:** `tif` was empty; `transmit` implicit.
+- **UNKNOWN handling and no-blind-retry are unchanged** — the harness still
+  fails closed on UNKNOWN and never resends.
+
+Tests: 13 new in `tests/broker/test_ibkr_paper_adapter.py` (BUY-LIMIT and
+protective-STOP field matrices independently; DAY default; supported-TIF map is
+exhaustive; absent/non-canonical and unsupported TIF fail closed; unsupported
+order type fails closed; **10052 regression — an unmappable TIF fails closed
+before `placeOrder`**; the builder never emits an empty TIF; the ref carries no
+token/secret) + 2 in `tests/poi/test_poi_ibkr_lifecycle_cli.py` (cancel-path
+entry and fill-path entry + protective stop all carry `DAY`).
 
 ### D-ADAPTER-01 resolution — orderRef persistence + open-order recovery
 

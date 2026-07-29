@@ -69,8 +69,23 @@
   `reqAllOpenOrders` snapshot** — restart-safe, with no process-local
   dependency. Foreign/malformed/cancelled/duplicate orders never count as
   protection; the read path never mutates the broker. 17 new contract tests.
+- **D-TIF-01 fix (this bundle):** a real Paper owner-run surfaced IBKR error
+  **10052 "Invalid time in force:Empty"** — the transport built the order with
+  no `tif`. Fixed with a canonical `TimeInForce` enum (default `DAY`), validated
+  and translated before `placeOrder` (via `build_outgoing_order`), with
+  `order.transmit` set explicitly; 15 new tests including a 10052 regression.
+  The harness had already failed closed correctly on the rejection
+  (`UNKNOWN_BROKER_STATE`, no retry).
 - No **open code P0/P1** remains after this bundle. The only outstanding piece
   of D-ADAPTER-01 is **owner-host empirical verification** (§2).
+
+### Two failed owner-run attempts (recorded as FAILURES)
+- Read-Only API enabled during a submit scenario → blocked (must be disabled
+  for submitting scenarios).
+- Empty-TIF rejection (10052) → the harness failed closed. Both are FAILED
+  owner-run evidence; **a mandatory read-only reconciliation (DEF-16, operation
+  reference `DCCA3A59ED4FBE87`) must pass before any next execution.** See the
+  deferred ledger.
 
 ## 2. NOT COMPLETED — REQUIRES MARKET OR OWNER HOST
 

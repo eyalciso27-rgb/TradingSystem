@@ -57,6 +57,7 @@ from trading_broker_core.port import (
     OrderIntent,
     OrderPreview,
     ReconciliationResult,
+    TimeInForce,
 )
 from trading_contracts.enums import Environment, OrderState, OrderType
 
@@ -107,6 +108,98 @@ IBKR_STATUS_MAP: Mapping[str, OrderState] = {
     "Cancelled": OrderState.CANCELLED,
     "Inactive": OrderState.REJECTED,
 }
+
+#: Canonical OrderType -> IBKR order-type string. The only order types this
+#: adapter supports; anything else fails closed (never a silent default).
+IBKR_ORDER_TYPE_MAP: Mapping[OrderType, str] = {
+    OrderType.LIMIT: "LMT",
+    OrderType.STOP: "STP",
+    OrderType.STOP_LIMIT: "STP LMT",
+    OrderType.MARKET: "MKT",
+}
+
+#: Canonical TimeInForce -> IBKR TIF string. IBKR rejects an empty TIF with
+#: error 10052 ("Invalid time in force:Empty"), so every outgoing order MUST
+#: carry an explicit, supported TIF. Only broker-supported values appear here.
+IBKR_TIME_IN_FORCE_MAP: Mapping[TimeInForce, str] = {
+    TimeInForce.DAY: "DAY",
+    TimeInForce.GTC: "GTC",
+}
+
+
+def ibkr_order_type(order_type: OrderType) -> str:
+    """Translate a canonical order type to IBKR's string, fail-closed."""
+    mapped = IBKR_ORDER_TYPE_MAP.get(order_type)
+    if not mapped:
+        raise BrokerPortError(
+            BrokerErrorCode.CAPABILITY_UNSUPPORTED,
+            f"order type {order_type.value!r} is not supported by this adapter",
+        )
+    return mapped
+
+
+def ibkr_time_in_force(time_in_force: TimeInForce) -> str:
+    """Translate a canonical TIF to IBKR's string, fail-closed.
+
+    Refuses an absent / empty / unknown / unsupported TIF *before* the order
+    is ever built — this is the guard that makes IBKR error 10052 impossible.
+    """
+    if not isinstance(time_in_force, TimeInForce):
+        raise BrokerPortError(
+            BrokerErrorCode.VALIDATION_FAILED,
+            "time_in_force is absent or not a canonical TimeInForce",
+        )
+    mapped = IBKR_TIME_IN_FORCE_MAP.get(time_in_force)
+    if not mapped:  # unknown/unsupported enum member, or an empty mapping value
+        raise BrokerPortError(
+            BrokerErrorCode.CAPABILITY_UNSUPPORTED,
+            f"time-in-force {time_in_force.value!r} is not supported by this adapter",
+        )
+    return mapped
+
+
+@dataclass(frozen=True, slots=True)
+class OutgoingOrder:
+    """The exact broker fields an ``OrderIntent`` translates to.
+
+    A pure, deterministic projection of the intent onto the concrete IBKR
+    ``Order`` fields, so the outgoing wire shape can be asserted in a contract
+    test without importing ``ibapi``. The host transport copies these onto a
+    real ``ibapi.order.Order``; nothing here is empty or implicit.
+    """
+
+    account: str
+    action: str
+    order_type: str
+    tif: str
+    total_quantity: int
+    limit_price: float | None
+    aux_price: float | None
+    order_ref: str
+    transmit: bool
+    outside_rth: bool = False
+    e_trade_only: bool = False
+    firm_quote_only: bool = False
+
+
+def build_outgoing_order(intent: OrderIntent, account_id: str) -> OutgoingOrder:
+    """Translate a validated intent into the exact outgoing IBKR order fields.
+
+    Fails closed (via ``ibkr_order_type`` / ``ibkr_time_in_force``) if the order
+    type or TIF is absent/unknown/unsupported — before any order is placed.
+    """
+    return OutgoingOrder(
+        account=account_id,
+        action=intent.side.value,
+        order_type=ibkr_order_type(intent.order_type),
+        tif=ibkr_time_in_force(intent.time_in_force),
+        total_quantity=int(intent.quantity),
+        limit_price=float(intent.limit_price) if intent.limit_price is not None else None,
+        aux_price=float(intent.stop_price) if intent.stop_price is not None else None,
+        order_ref=encode_order_ref(intent.client_order_id),
+        transmit=True,
+    )
+
 
 #: Order states in which an order is genuinely still working at the broker.
 _WORKING_ORDER_STATES: frozenset[OrderState] = frozenset(
@@ -551,6 +644,16 @@ class IbkrPaperAdapter:
                 "fractional quantities are DISABLED in the MVP",
                 correlation_id=intent.correlation_id,
             )
+        # Translate the outbound broker fields NOW, before any placeOrder, so
+        # an absent/empty/unknown/unsupported order type or TIF fails closed
+        # here — never reaching the wire with an empty value (IBKR 10052).
+        try:
+            ibkr_order_type(intent.order_type)
+            ibkr_time_in_force(intent.time_in_force)
+        except BrokerPortError as error:
+            raise BrokerPortError(
+                error.code, str(error), correlation_id=intent.correlation_id
+            ) from error
         existing = self._orders.get(intent.client_order_id)
         if existing is not None and existing.authorization_ref != intent.authorization_ref:
             raise BrokerPortError(
@@ -783,26 +886,28 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             contract.secType = "STK"
             contract.exchange = "SMART"
             contract.currency = "USD"
+            # Translate + validate every outbound field BEFORE placeOrder. A
+            # missing/empty order type or TIF raises here, so nothing with an
+            # empty value ever reaches the wire (IBKR 10052 becomes impossible).
+            fields = build_outgoing_order(intent, account_id)
             order = Order()
-            order.account = account_id
-            order.action = intent.side.value
-            order.orderType = {
-                OrderType.LIMIT: "LMT",
-                OrderType.STOP: "STP",
-                OrderType.STOP_LIMIT: "STP LMT",
-                OrderType.MARKET: "MKT",
-            }[intent.order_type]
-            order.totalQuantity = int(intent.quantity)
-            if intent.limit_price is not None:
-                order.lmtPrice = float(intent.limit_price)
-            if intent.stop_price is not None:
-                order.auxPrice = float(intent.stop_price)
-            order.outsideRth = False
-            order.eTradeOnly = False
-            order.firmQuoteOnly = False
+            order.account = fields.account
+            order.action = fields.action
+            order.orderType = fields.order_type
+            order.tif = fields.tif
+            order.totalQuantity = fields.total_quantity
+            if fields.limit_price is not None:
+                order.lmtPrice = fields.limit_price
+            if fields.aux_price is not None:
+                order.auxPrice = fields.aux_price
+            order.outsideRth = fields.outside_rth
+            order.eTradeOnly = fields.e_trade_only
+            order.firmQuoteOnly = fields.firm_quote_only
+            # Explicit: submit as a live order (never leave transmit implicit).
+            order.transmit = fields.transmit
             # Persist the canonical (non-authorizing) client_order_id so a
             # restart can recover this order's identity from the Gateway.
-            order.orderRef = encode_order_ref(intent.client_order_id)
+            order.orderRef = fields.order_ref
             self._app.placeOrder(broker_order_id, contract, order)
             return self._await_status(broker_order_id)
 
@@ -869,8 +974,10 @@ def build_paper_adapter(
 __all__ = [
     "ADAPTER_VERSION",
     "ALLOWED_HOSTS",
+    "IBKR_ORDER_TYPE_MAP",
     "IBKR_PAPER_CAPABILITIES",
     "IBKR_STATUS_MAP",
+    "IBKR_TIME_IN_FORCE_MAP",
     "LIFECYCLE_ORDER_REF_PREFIX",
     "LIVE_API_PORT",
     "ORDER_REF_MAX_LEN",
@@ -878,11 +985,15 @@ __all__ = [
     "PAPER_API_PORT",
     "IbkrPaperAdapter",
     "OrderRefTooLongError",
+    "OutgoingOrder",
     "PaperTransport",
     "RawOpenOrder",
     "RecoveredIdentity",
+    "build_outgoing_order",
     "build_paper_adapter",
     "decode_order_ref",
     "encode_order_ref",
+    "ibkr_order_type",
+    "ibkr_time_in_force",
     "mask_account_id",
 ]

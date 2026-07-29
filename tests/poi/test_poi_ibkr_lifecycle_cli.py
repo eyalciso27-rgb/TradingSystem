@@ -1695,3 +1695,57 @@ def test_cleanup_evidence_records_a_cleanup_result() -> None:
     names = {name for name, _, _ in report.checks}
     assert "cleanup_scope" in names
     assert "reconciliation" in names
+
+
+# -- 15. every submitted intent carries an explicit DAY TIF (10052 guard) ----
+
+
+class _CapturingBroker(FillingBroker):
+    """Records every OrderIntent the harness submits."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.intents: list[OrderIntent] = []
+
+    def submit_order(self, intent: OrderIntent) -> BrokerOrderReceipt:
+        self.intents.append(intent)
+        return super().submit_order(intent)
+
+
+def _capturing(**kwargs: Any) -> _CapturingBroker:
+    defaults: dict[str, Any] = {
+        "accounts": {ALIAS: _snapshot()},
+        "instruments": {
+            "F": BrokerInstrument(
+                broker_instrument_ref="ref-F", symbol="F", exchange="SMART", currency="USD"
+            )
+        },
+        "clock": _frozen_clock,
+    }
+    defaults.update(kwargs)
+    return _CapturingBroker(**defaults)
+
+
+def test_cancel_path_entry_intent_uses_day_time_in_force() -> None:
+    from trading_broker_core.port import TimeInForce
+
+    broker = _capturing()
+    env = _envelope(
+        scenario="cancel-path", symbol="F", limit_price=Decimal("5"), reference_price=Decimal("10")
+    )
+    _run(broker, env, execute=True, confirm_token=harness.confirmation_token(env))
+    assert broker.intents, "the cancel-path must submit an entry order"
+    assert all(i.time_in_force is TimeInForce.DAY for i in broker.intents)
+
+
+def test_fill_path_entry_and_protective_stop_use_day_time_in_force() -> None:
+    from trading_broker_core.port import TimeInForce
+    from trading_contracts.enums import OrderType as _OrderType
+
+    broker = _capturing()
+    env = _envelope(scenario="fill-path", symbol="F", limit_price=Decimal("12"))
+    report = _run(broker, env, execute=True, confirm_token=harness.confirmation_token(env))
+    assert report.passed
+    kinds = {i.order_type for i in broker.intents}
+    assert _OrderType.LIMIT in kinds and _OrderType.STOP in kinds  # entry + protective stop
+    assert all(i.time_in_force is TimeInForce.DAY for i in broker.intents)
