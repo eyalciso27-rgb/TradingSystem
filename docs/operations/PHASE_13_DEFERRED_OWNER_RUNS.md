@@ -18,6 +18,22 @@
 > `<MARKETABLE_LIMIT>` must each be taken from a **fresh positive quote** at run
 > time — never an invented or stale number.
 
+## Failed owner-run attempts (recorded evidence — both are FAILURES)
+
+Two real owner-run cancel-path attempts were made on the Paper Gateway and
+**both failed**. Neither is a PASS; POI-IBKR-001 stays BLOCKED / NOT RUN.
+
+| Attempt | Result | Classification |
+|---|---|---|
+| Read-Only API enabled during a submit scenario | The Gateway's Read-Only API blocked the order path | **FAILED owner-run evidence** — Read-Only API must be **disabled** for submitting scenarios (it is only enabled for the read-only market-data harness) |
+| Read-Only API disabled, cancel-path execute | `ERROR 1 … 10052 Invalid time in force:Empty` — the IBKR `Order` reached the API with an **empty TIF**. The harness then correctly failed closed: `UNKNOWN_BROKER_STATE`, `RECONCILE_BEFORE_ANY_RETRY` | **FAILED owner-run evidence** — root cause was the adapter never setting `order.tif`; fixed in code (D-TIF-01). **No retry/resend was performed and none is permitted after UNKNOWN state.** |
+
+**MANDATORY before any next execution:** run the read-only reconciliation
+**DEF-16** below (operation reference `DCCA3A59ED4FBE87`) and confirm the
+account is clean (no open POI order, no F position, no unexpected working F
+order, clean disconnect). Do **not** re-run any `--execute` scenario until that
+reconciliation passes.
+
 ## Legend
 
 | Placeholder | Meaning |
@@ -319,6 +335,29 @@ Blocker vocabulary: `MARKET_CLOSED`, `OWNER_HOST_REQUIRED`,
 - **Evidence:** `/tmp/poi-ibkr-001-orderref-roundtrip-<YYYYMMDD>.md`
 - **Status before → after PASS:** `NOT_RUN` → `ORDERREF_ROUNDTRIP_VERIFIED`
 - **Cleanup:** DEF-09 cleanup then manual position close. **Never flattens.**
+
+## DEF-16-readonly-reconciliation-after-failed-run — IMP-1304 / POI-IBKR-001
+- **Blocker:** `OWNER_HOST_REQUIRED`
+- **Sends / cancels / modifies an order:** no (read-only reconnect) ·
+  **owner confirmation:** no
+- **Prerequisites:** **MANDATORY** after the two failed cancel-path attempts
+  (Read-Only API reject + empty-TIF reject) and **before ANY next execution**.
+- **Command:**
+  ```bash
+  uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
+    --scenario reconnect --account-alias <ALIAS> --broker-module <BROKER_MODULE> \
+    --symbol F --run-ref DCCA3A59ED4FBE87 \
+    --evidence-out /tmp/poi-ibkr-001-reconcile-after-failure-<YYYYMMDD>.md
+  ```
+- **Expected safe result:** **no open POI order for operation reference
+  `DCCA3A59ED4FBE87`**; **no F position**; **no unexpected working F order**;
+  clean reconciliation; **clean disconnect**.
+- **Abort criteria:** any open POI/F order, any F position, or an unclean
+  reconciliation → resolve before proceeding.
+- **Evidence:** `/tmp/poi-ibkr-001-reconcile-after-failure-<YYYYMMDD>.md`
+- **Status before → after PASS:** `NOT_RUN` → `ACCOUNT_CONFIRMED_CLEAN`
+- **Cleanup:** if any POI order remains → DEF-09 cleanup; if any F position
+  exists → close it by hand in the Gateway UI. **The harness never flattens.**
 
 ## DEF-14-external-provider-benchmark — IMP-1303 / POI-MD-001
 - **Blocker:** `EXTERNAL_PROVIDER_DEFERRED`

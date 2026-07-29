@@ -52,6 +52,22 @@ class OrderSide(StrEnum):
     SELL = "SELL"
 
 
+class TimeInForce(StrEnum):
+    """Canonical time-in-force at the broker boundary.
+
+    The frozen ``trading_contracts`` baseline deliberately leaves
+    ``time_in_force`` as an uppercase token string (documented gap: the MVP is
+    whole-share/day). This enum is the typed, closed value list at the ADAPTER
+    boundary, where a broker adapter MUST translate it to a concrete broker
+    value — an empty/absent TIF is what IBKR rejects with error 10052. Only
+    values an adapter is expected to support belong here; anything else fails
+    closed at the adapter, never a silent default.
+    """
+
+    DAY = "DAY"
+    GTC = "GTC"
+
+
 class BrokerErrorCode(StrEnum):
     """Canonical broker error taxonomy (all failures are fail-closed)."""
 
@@ -142,12 +158,19 @@ class OrderIntent:
     quantity: Decimal
     limit_price: Decimal | None = None
     stop_price: Decimal | None = None
+    #: Explicit, typed time-in-force. Defaults to DAY — the canonical MVP
+    #: value for the POI BUY LIMIT entry and protective STOP. It is NEVER
+    #: implicitly empty here; the adapter still validates it is a broker-
+    #: supported TIF before ``placeOrder`` (IBKR rejects an empty TIF: 10052).
+    time_in_force: TimeInForce = TimeInForce.DAY
 
     def __post_init__(self) -> None:
         if not self.client_order_id.strip():
             raise ValueError("client_order_id is mandatory")
         if not self.correlation_id.strip():
             raise ValueError("correlation_id is mandatory")
+        if not isinstance(self.time_in_force, TimeInForce):
+            raise ValueError("time_in_force must be a TimeInForce")
         if self.quantity <= 0:
             raise ValueError("quantity must be positive")
         if self.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT) and (
@@ -336,5 +359,6 @@ __all__ = [
     "OrderIntent",
     "OrderPreview",
     "OrderSide",
+    "TimeInForce",
     "ReconciliationResult",
 ]

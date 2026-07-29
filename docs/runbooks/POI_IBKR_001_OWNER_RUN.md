@@ -59,10 +59,42 @@
    missing secret file, or a non-`DU` value all fail closed before the
    adapter is constructed.
 
+## Two prior failed attempts — reconcile before retrying
+
+Two real cancel-path attempts on the Paper Gateway **failed** and are recorded
+as FAILED owner-run evidence (POI-IBKR-001 stays BLOCKED / NOT RUN):
+
+1. **Read-Only API enabled** during a submit scenario — the Gateway blocked the
+   order path. Read-Only API must be **disabled** for submitting scenarios (it
+   is only enabled for the read-only market-data harness).
+2. **Empty TIF** — `ERROR 1 … 10052 Invalid time in force:Empty`. The order
+   reached the API with an empty time-in-force. **Root cause fixed** (D-TIF-01:
+   the adapter now sends an explicit, validated `DAY` TIF). The harness failed
+   closed correctly: `UNKNOWN_BROKER_STATE`, `RECONCILE_BEFORE_ANY_RETRY` — **no
+   retry was or may be performed after UNKNOWN state.**
+
+> **MANDATORY first step now — read-only reconciliation.** Before any
+> `--execute`, confirm the account is clean for the failed operation reference
+> `DCCA3A59ED4FBE87` (read-only; submits/cancels nothing):
+>
+> ```bash
+> uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
+>   --scenario reconnect --account-alias <ALIAS> --broker-module "$BM" \
+>   --symbol F --run-ref DCCA3A59ED4FBE87 \
+>   --evidence-out /tmp/poi-ibkr-001-reconcile-after-failure-$(date -u +%Y%m%d).md
+> ```
+>
+> Require: **no open POI order for `DCCA3A59ED4FBE87`, no F position, no
+> unexpected working F order, clean reconciliation, clean disconnect.** If any
+> leftover order exists run `--scenario cleanup`; if any F position exists close
+> it by hand in the Gateway UI (the harness never flattens). Only when this
+> passes may you proceed to Step 1.
+
 ## The seven steps
 
 Replace `<ALIAS>` with the configured account **alias** (never a `DU` id) and
-`<TOKEN>` with the token the preceding dry run printed.
+`<TOKEN>` with the token the preceding dry run printed. **Every command uses
+`uv run --no-sync python`** so the host's installed `ibapi` is never pruned.
 
 ```bash
 cd ~/TradingSystem

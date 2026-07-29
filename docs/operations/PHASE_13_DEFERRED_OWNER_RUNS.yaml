@@ -374,6 +374,36 @@ records:
     cleanup: DEF-09 cleanup then manual position close
     never_flattens: true
 
+  - id: DEF-16-readonly-reconciliation-after-failed-run
+    task_id: IMP-1304
+    poi_id: POI-IBKR-001
+    blocker: OWNER_HOST_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: false
+    owner_confirmation_required: false
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario reconnect --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --symbol F --run-ref DCCA3A59ED4FBE87
+      --evidence-out /tmp/poi-ibkr-001-reconcile-after-failure-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-reconcile-after-failure-<YYYYMMDD>.md
+    prerequisites:
+      - MANDATORY after the two failed cancel-path attempts (Read-Only API reject +
+        empty-TIF reject) and before ANY next execution
+      - read-only: reconnect submits nothing, cancels nothing
+    pass_criteria: >-
+      no open POI order for operation reference DCCA3A59ED4FBE87; no F position; no
+      unexpected working F order; clean reconciliation; clean disconnect
+    abort_criteria: any open POI/F order, any F position, or an unclean reconciliation
+    current_status: NOT_RUN
+    status_after_pass: ACCOUNT_CONFIRMED_CLEAN
+    cleanup: >-
+      if any POI order remains, run DEF-09 cleanup; if any F position exists, close it
+      by hand in the Gateway UI (the harness never flattens)
+    never_flattens: true
+
   - id: DEF-14-external-provider-benchmark
     task_id: IMP-1303
     poi_id: POI-MD-001
