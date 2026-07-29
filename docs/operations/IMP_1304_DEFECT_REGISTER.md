@@ -37,7 +37,9 @@
 | D-01d | The operation reference initially reused the **confirmation token**, embedding a reusable execution-authorization value in `client_order_id`, broker-visible order metadata, and evidence | **P1 (security)** | `scripts/poi_ibkr_lifecycle.py` identity | ✅ **fixed in this PR** (separate, domain-separated, non-authorizing operation reference) |
 | D-01e | Evidence artifact lacked broker order identity, fill identity and intended-parameters fields, so an owner could not correlate the artifact with the real order | P2 | `scripts/poi_ibkr_lifecycle.py` fill/cancel path | ✅ **fixed in this bundle** (records `intended_parameters`, `entry_broker_order`, `fill_identity`) |
 | D-ADAPTER-01 | Reconnect owner-run cannot recover the harness order id / operation reference from a real Gateway after a restart: the paper adapter never set `order.orderRef` on `placeOrder`, and `get_open_orders` returned only in-memory orders (not a live `reqAllOpenOrders`) | **P1** | `broker-ibkr/paper_adapter.py` | ✅ **code fix implemented + contract-tested in this bundle**; **owner-host empirical verification BLOCKED / NOT RUN** (see below) |
-| D-TIF-01 | The IBKR transport built the `Order` with **no `tif`** (and no explicit `transmit`), so a real Paper submit reached the API with an empty TIF and was rejected: `ERROR 1 … 10052 Invalid time in force:Empty`. Observed on a real cancel-path owner-run (BUY LIMIT F qty 1). The harness then failed closed correctly (`UNKNOWN_BROKER_STATE`, `RECONCILE_BEFORE_ANY_RETRY`) — no unsafe outcome | **P1** | `broker-ibkr/paper_adapter.py` transport | ✅ **fixed in this bundle** — canonical `TimeInForce` (default `DAY`), validated + translated before `placeOrder`; regression-proofed |
+| D-TIF-01 | The IBKR transport built the `Order` with **no `tif`** (and no explicit `transmit`), so a real Paper submit reached the API with an empty TIF and was rejected: `ERROR 1 … 10052 Invalid time in force:Empty`. Observed on a real cancel-path owner-run (BUY LIMIT F qty 1). The harness then failed closed correctly (`UNKNOWN_BROKER_STATE`, `RECONCILE_BEFORE_ANY_RETRY`) — no unsafe outcome | **P1** | `broker-ibkr/paper_adapter.py` transport | ✅ **fixed** — canonical `TimeInForce` (default `DAY`), validated + translated before `placeOrder`; regression-proofed |
+| D-TIF-02 | The TIF fix defaulted **every** order to `DAY`, including the protective STOP — a DAY protective stop expires at session close and leaves the real position **naked overnight** | **P1** | `agent.py` / `poi_ibkr_lifecycle.py` | ✅ **fixed in pre-merge review** — protective STOP is now **GTC**; entry LIMIT stays DAY |
+| D-TIF-03 | Deterministic broker validation rejects (10052/321) time out into `UNKNOWN` (not a definite `REJECTED`), forcing unnecessary reconciliation | P2 | `broker-ibkr` host transport `_await_status`/`error()` | 📝 **documented** — determination + DEF-17 owner-host follow-up; not implemented (host-only, unverifiable offline; conservative-safe today) |
 | D-02 | Owner-run `--client-id` default (7) diverges from adapter `DEFAULT_CLIENT_ID` (1); stale-connection recovery undocumented | P2 | lifecycle CLI + runbook | ✅ (doc) — not done here (P2, out of P0/P1 scope) |
 | B-01 | POI-IBKR-001 Paper lifecycle (cancel-path/fill-path/protection/reconnect/reconciliation) not run | BLOCKED | owner-run | ❌ owner + host |
 | B-02 | Owner-run chaos/recovery host drills not run | BLOCKED | `CHAOS_RECOVERY_DRILLS.md` §4 | ❌ blocked on B-01 |
@@ -255,10 +257,54 @@ model `time_in_force` as a token string — documented gap).
 - The transport now sets `order.tif` from the validated map and sets
   `order.transmit = True` explicitly (never left implicit).
 - **Outgoing IBKR field matrix (after):** `account` = DU alias · `action` =
-  BUY/SELL · `orderType` ∈ {LMT, STP, STP LMT, MKT} · **`tif` = "DAY"** ·
+  BUY/SELL · `orderType` ∈ {LMT, STP, STP LMT, MKT} · **`tif` = "DAY" for the
+  entry LIMIT, "GTC" for the protective STOP** (see D-TIF-02 below) ·
   `totalQuantity` = whole shares · `lmtPrice`/`auxPrice` only when applicable ·
   `orderRef` = `poi1:<client_order_id>` (non-authorizing) · `transmit` = True.
   **Before:** `tif` was empty; `transmit` implicit.
+
+### D-TIF-02 resolution — protective STOP is GTC, not DAY (pre-merge review)
+
+**Finding (P1, merge-blocking):** the first D-TIF-01 fix gave **every** order —
+including the protective STOP — the default `DAY` TIF. A **DAY protective stop
+expires at the session close** while the real 1-share position remains open,
+leaving it **naked overnight** until the owner closes it by hand. This defeats
+the "protection follows fills / no unprotected position" invariant.
+
+**Fix:** the protective STOP is now submitted **GTC** so it rests until the
+position is closed; the marketable entry LIMIT stays **DAY** (it is cancelled or
+filled within the session). `ExecutionRequest.time_in_force` (default `DAY`) is
+threaded through the Execution Agent into `OrderIntent`; the lifecycle harness
+sets `TimeInForce.GTC` on the protective order only. `transmit = True` is safe
+because the entry and the stop are **separate** orders (bracket/OCA are declared
+`UNSUPPORTED` and unused) — there is no parent-child group an early transmit
+could release incomplete.
+
+Tests: `test_fill_path_entry_is_day_and_protective_stop_is_gtc` (lifecycle),
+`test_protective_stop_gtc_outgoing_fields` + `test_day_and_gtc_are_both_supported_and_distinct`
+(adapter field matrix).
+
+### D-TIF-03 — deterministic broker rejects classified UNKNOWN (P2, documented)
+
+**Finding (P2, operability — not a safety defect):** the host transport's
+`_await_status` reacts only to `orderStatus`; a deterministic pre-acceptance
+**validation reject** (e.g. `10052` empty-TIF, `321` Read-Only/validation)
+arrives via the `error()` callback and produces **no** `orderStatus`, so
+`_await_status` times out into `UNKNOWN_BROKER_RESPONSE`. That is *conservative
+and safe* (UNKNOWN → mandatory reconciliation, never an unsafe action), but it
+forces an **unnecessary reconciliation** for an order that was definitely never
+submitted.
+
+**Determination:** a deterministic broker validation reject *should* map to a
+definite `REJECTED` / not-submitted state (distinct from pre-submit local
+validation, an acknowledged order, and genuine transport ambiguity). **Not
+implemented in this PR:** the fix lives entirely in the host-only
+(`# pragma: no cover`) transport error-callback wiring and **cannot be verified
+without a real Gateway**; a mis-scoped reject-code allowlist could hide a truly
+working order (a safety regression worse than an extra reconciliation). It is
+recorded as an owner-host-verified follow-up (DEF-17). The primary observed
+reject (10052) is now impossible via the TIF fix, and Read-Only (321) is
+prevented by the runbook precondition.
 - **UNKNOWN handling and no-blind-retry are unchanged** — the harness still
   fails closed on UNKNOWN and never resends.
 

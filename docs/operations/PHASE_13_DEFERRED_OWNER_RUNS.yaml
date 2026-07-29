@@ -404,6 +404,37 @@ records:
       by hand in the Gateway UI (the harness never flattens)
     never_flattens: true
 
+  - id: DEF-17-broker-reject-classification-verification
+    task_id: IMP-1304
+    poi_id: POI-IBKR-001
+    blocker: IBKR_PAPER_EXECUTION_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: false
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario preflight --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --evidence-out /tmp/poi-ibkr-001-reject-classification-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-reject-classification-<YYYYMMDD>.md
+    prerequisites:
+      - >-
+        D-TIF-03 follow-up - verify against a real Gateway which IBKR error codes are
+        deterministic pre-acceptance rejects (10052, 321, ...) before mapping any to
+        a definite REJECTED state in the host transport error() handler
+      - >-
+        until verified, deterministic rejects remain UNKNOWN (mandatory reconciliation,
+        conservative-safe)
+    pass_criteria: >-
+      the allowlist of pre-acceptance reject codes is empirically confirmed; UNKNOWN
+      stays the default for ambiguous/unknown codes; no working order is ever hidden
+    abort_criteria: any code that could correspond to an accepted/working order is proposed for REJECTED
+    current_status: NOT_RUN
+    status_after_pass: REJECT_CLASSIFICATION_VERIFIED
+    cleanup: none (read-only preflight)
+    never_flattens: true
+
   - id: DEF-14-external-provider-benchmark
     task_id: IMP-1303
     poi_id: POI-MD-001

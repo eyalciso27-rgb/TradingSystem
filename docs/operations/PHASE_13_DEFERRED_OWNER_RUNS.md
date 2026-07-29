@@ -359,6 +359,29 @@ Blocker vocabulary: `MARKET_CLOSED`, `OWNER_HOST_REQUIRED`,
 - **Cleanup:** if any POI order remains → DEF-09 cleanup; if any F position
   exists → close it by hand in the Gateway UI. **The harness never flattens.**
 
+## DEF-17-broker-reject-classification-verification — IMP-1304 / POI-IBKR-001
+- **Blocker:** `IBKR_PAPER_EXECUTION_REQUIRED`
+- **Sends / cancels / modifies an order:** no · **owner confirmation:** yes
+- **Prerequisites (D-TIF-03 follow-up):** verify against a real Gateway which
+  IBKR error codes are **deterministic pre-acceptance rejects** (10052, 321, …)
+  before any of them is mapped to a definite `REJECTED` state in the host
+  transport's `error()` handler. Until verified, deterministic rejects remain
+  `UNKNOWN` → mandatory reconciliation (conservative-safe).
+- **Command:**
+  ```bash
+  uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
+    --scenario preflight --account-alias <ALIAS> --broker-module <BROKER_MODULE> \
+    --evidence-out /tmp/poi-ibkr-001-reject-classification-<YYYYMMDD>.md
+  ```
+- **Expected safe result:** the allowlist of pre-acceptance reject codes is
+  empirically confirmed; `UNKNOWN` stays the default for ambiguous/unknown
+  codes; **no working order is ever hidden**.
+- **Abort criteria:** any code that could correspond to an accepted/working
+  order is proposed for `REJECTED`.
+- **Evidence:** `/tmp/poi-ibkr-001-reject-classification-<YYYYMMDD>.md`
+- **Status before → after PASS:** `NOT_RUN` → `REJECT_CLASSIFICATION_VERIFIED`
+- **Cleanup:** none (read-only preflight). **The harness never flattens.**
+
 ## DEF-14-external-provider-benchmark — IMP-1303 / POI-MD-001
 - **Blocker:** `EXTERNAL_PROVIDER_DEFERRED`
 - **Sends an order:** no · **owner confirmation:** yes
