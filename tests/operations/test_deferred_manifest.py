@@ -62,7 +62,7 @@ ALLOWED_BLOCKERS = frozenset(
 )
 
 #: price-bearing flags whose value must be a `<...>` placeholder, never a number
-PRICE_FLAGS = ("--limit-price", "--reference-price")
+PRICE_FLAGS = ("--limit-price", "--reference-price", "--quote-bid", "--quote-ask")
 
 
 @pytest.fixture(scope="module")
@@ -206,3 +206,56 @@ def test_the_fourteen_mandated_items_are_present(records: list[dict[str, Any]]) 
     joined = " ".join(tasks)
     for fragment in needed:
         assert fragment in joined, f"mandated deferred item missing: {fragment}"
+
+
+def test_cancel_path_commands_carry_a_fresh_two_sided_quote(
+    records: list[dict[str, Any]],
+) -> None:
+    """D-CANCEL-08: an old hand-copied reference price authorizes nothing.
+
+    A limit below the market is NON-MARKETABLE at the observed quote — it
+    reduces fill risk, it does not remove it — so the cancel path must be bound
+    to a fresh, two-sided, session-classified observation.
+    """
+    for record in records:
+        command = record["command_template"]
+        if "--scenario cancel-path" not in command:
+            continue
+        for flag in ("--quote-bid", "--quote-ask", "--quote-at", "--quote-session"):
+            assert flag in command, f"{record['id']}: cancel path needs {flag}"
+
+
+def test_execute_commands_carry_a_durable_owner_run_journal(
+    records: list[dict[str, Any]],
+) -> None:
+    """D-CANCEL-05: the confirmation token alone is replayable across processes."""
+    for record in records:
+        command = record["command_template"]
+        if "--execute" not in command:
+            continue
+        assert "--journal-dir <" in command, (
+            f"{record['id']}: an execute command needs a durable --journal-dir"
+            " placeholder so the attempt cannot be replayed"
+        )
+
+
+def test_no_manifest_command_uses_a_global_cancel(records: list[dict[str, Any]]) -> None:
+    """There is no global-cancel path anywhere, and there must never be one."""
+    for record in records:
+        assert "reqGlobalCancel" not in record["command_template"]
+        assert "--flatten" not in record["command_template"]
+
+
+def test_the_post_fix_cancellation_verification_is_recorded(
+    records: list[dict[str, Any]],
+) -> None:
+    """The failed real cancellation must leave a visible, unrun follow-up."""
+    by_id = {r["id"]: r for r in records}
+    for required in (
+        "DEF-18-post-fix-cancellation-verification",
+        "DEF-19-verify-clean-readonly",
+        "DEF-20-restart-recovery-cancellation",
+    ):
+        assert required in by_id, f"{required} missing from the manifest"
+        # Claude did not and cannot run these: they must stay NOT_RUN.
+        assert by_id[required]["current_status"] == "NOT_RUN", required

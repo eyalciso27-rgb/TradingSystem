@@ -8,6 +8,7 @@ BrokerPort (same suite as the fake broker) plus IBKR/paper-specific gates.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from trading_broker_core.port import (
     TimeInForce,
 )
 from trading_broker_ibkr.paper_adapter import (
+    DEFAULT_CLIENT_ID,
     IBKR_STATUS_MAP,
     IBKR_TIME_IN_FORCE_MAP,
     LIFECYCLE_ORDER_REF_PREFIX,
@@ -65,18 +67,25 @@ class FakePaperTransport:
         self._cancel_status = cancel_status
         self._connected = False
         self._next_id = 1000
+        #: the client id the adapter connected with; recovered rows carry it
+        self.client_id = DEFAULT_CLIENT_ID
         # tracked live orders: broker_order_id -> RawOpenOrder (for the
         # read-only reqAllOpenOrders snapshot)
         self._live: dict[int, RawOpenOrder] = {}
         #: injected snapshot rows (for restart / foreign / malformed drills)
         self.snapshot_override: tuple[RawOpenOrder, ...] | None = None
         self.snapshot_error: Exception | None = None
+        #: injected SAME-CLIENT rows; when None the same-client feed is derived
+        #: from the global snapshot by filtering on the connected client id,
+        #: exactly as the real reqOpenOrders feed behaves.
+        self.same_client_override: tuple[RawOpenOrder, ...] | None = None
 
     def connect(self, host: str, port: int, client_id: int) -> tuple[str, ...]:
         self.calls.append(f"connect:{host}:{port}:{client_id}")
         if not self._healthy:
             raise RuntimeError("gateway down")
         self._connected = True
+        self.client_id = client_id
         return self._managed
 
     def disconnect(self) -> None:
@@ -124,6 +133,13 @@ class FakePaperTransport:
             order_ref=encode_order_ref(intent.client_order_id),
             status=self._submit_status,
             symbol=intent.symbol,
+            client_id=self.client_id,
+            perm_id=900000 + broker_order_id,
+            account=account_id,
+            action=intent.side.value,
+            quantity=intent.quantity,
+            order_type=intent.order_type.value,
+            limit_price=intent.limit_price,
         )
         return self._submit_status
 
@@ -131,12 +147,7 @@ class FakePaperTransport:
         self.calls.append(f"cancel:{broker_order_id}")
         existing = self._live.get(broker_order_id)
         if existing is not None:
-            self._live[broker_order_id] = RawOpenOrder(
-                broker_order_id=existing.broker_order_id,
-                order_ref=existing.order_ref,
-                status=self._cancel_status,
-                symbol=existing.symbol,
-            )
+            self._live[broker_order_id] = replace(existing, status=self._cancel_status)
         return self._cancel_status
 
     def open_order_snapshot(self, account_id: str) -> tuple[RawOpenOrder, ...]:
@@ -146,6 +157,18 @@ class FakePaperTransport:
         if self.snapshot_override is not None:
             return self.snapshot_override
         return tuple(self._live.values())
+
+    def same_client_open_orders(self, account_id: str) -> tuple[RawOpenOrder, ...]:
+        self.calls.append("same_client_open_orders")
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
+        if self.same_client_override is not None:
+            return self.same_client_override
+        # The real reqOpenOrders feed only reports THIS client's orders.
+        rows = self.snapshot_override if self.snapshot_override is not None else tuple(
+            self._live.values()
+        )
+        return tuple(row for row in rows if row.client_id == self.client_id)
 
 
 def make_adapter(

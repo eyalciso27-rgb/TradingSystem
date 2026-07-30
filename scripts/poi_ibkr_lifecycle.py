@@ -58,7 +58,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
+from trading_application.owner_run_journal import (
+    OwnerRunJournal,
+    OwnerRunJournalError,
+    OwnerRunReplayRefused,
+)
 from trading_application.pre_submit_check import (
     PreSubmitAction,
     PreSubmitCheck,
@@ -72,6 +78,7 @@ from trading_broker_core.port import (
     BrokerOrderReceipt,
     BrokerPort,
     BrokerPortError,
+    BrokerPosition,
     CancelOrderRequest,
     InstrumentQuery,
     OrderIntent,
@@ -94,6 +101,7 @@ from trading_execution_agent.reconciliation import (
     InternalState,
     ReconciliationEngine,
     ReconciliationPolicy,
+    ReconciliationReport,
     ReconciliationTrigger,
 )
 
@@ -112,9 +120,29 @@ CANCEL_PATH_ONLY_SYMBOLS: frozenset[str] = frozenset({"AAPL"})
 
 MAX_QUANTITY = Decimal("1")
 MAX_NOTIONAL = Decimal("50")
-#: Entry limit must sit at least this far from the reference price on the
-#: cancel path, so the resting order cannot fill by accident.
+#: Entry limit must sit at least this far below the observed bid on the cancel
+#: path. This makes the resting order NON-MARKETABLE at the observed quote — it
+#: materially reduces fill risk, it does NOT make a fill impossible (a gap, a
+#: halt-and-reopen or a fast move can still trade through it).
 CANCEL_PATH_MIN_DISCOUNT = Decimal("0.20")
+
+#: A market quote older than this may not authorize a submission. An old,
+#: manually copied price is not evidence about the CURRENT market.
+MAX_QUOTE_AGE_SECONDS = 120
+#: Widest bid/ask spread (as a fraction of the mid) that still counts as a
+#: sane, two-sided, tradeable market.
+MAX_QUOTE_SPREAD_FRACTION = Decimal("0.02")
+#: A mid that moved more than this between owner approval and submission
+#: invalidates the approval: the owner must re-observe and re-approve.
+MAX_QUOTE_DRIFT_FRACTION = Decimal("0.005")
+
+#: Market-session classifications recorded with a quote.
+QUOTE_SESSIONS: tuple[str, ...] = ("regular", "pre-market", "after-hours", "closed")
+#: Sessions in which a submission may be authorized. A closed market has no
+#: live two-sided quote, so nothing may be justified against one.
+SUBMITTABLE_QUOTE_SESSIONS: frozenset[str] = frozenset(
+    {"regular", "pre-market", "after-hours"}
+)
 #: Protective stop distance below (BUY) the observed average fill price.
 PROTECTION_STOP_FRACTION = Decimal("0.02")
 
@@ -150,12 +178,25 @@ SCENARIOS: tuple[str, ...] = (
     "fill-path",
     "reconnect",
     "cleanup",
+    "verify-clean",
 )
 #: Scenarios that may send anything at all.
 SUBMITTING_SCENARIOS: frozenset[str] = frozenset({"cancel-path", "fill-path"})
 #: Scenarios that legitimately run while a PoI order is still open, so the
 #: "no leftover order" gate must not block them.
-LEFTOVER_TOLERANT_SCENARIOS: frozenset[str] = frozenset({"reconnect", "cleanup"})
+LEFTOVER_TOLERANT_SCENARIOS: frozenset[str] = frozenset(
+    {"reconnect", "cleanup", "verify-clean"}
+)
+#: Scenarios that never construct an order intent (no symbol/price envelope).
+NON_ORDER_SCENARIOS: frozenset[str] = frozenset(
+    {"preflight", "cleanup", "reconnect", "verify-clean"}
+)
+#: Scenarios that make no broker call capable of changing state. ``cleanup`` is
+#: NOT here: it cancels (an exposure-REDUCING call), which is why its evidence
+#: header says CANCEL-ONLY rather than DRY-RUN.
+READ_ONLY_SCENARIOS: frozenset[str] = frozenset(
+    {"preflight", "reconnect", "verify-clean"}
+)
 
 POLICY_REF = "poi-ibkr-001-lifecycle-policy-1"
 
@@ -164,8 +205,37 @@ POLICY_REF = "poi-ibkr-001-lifecycle-policy-1"
 OWNER_ACTION_BANNER = ">>> OWNER ACTION REQUIRED <<<"
 
 
+#: Evidence header for cleanup. Cleanup submits nothing, but it DOES send
+#: exposure-reducing cancellation requests, so calling it a dry run would be a
+#: dangerous lie about what the run did.
+CLEANUP_MODE_LABEL = "CANCEL-ONLY (no order submission; existing POI orders may be cancelled)"
+#: Evidence header for the scenarios that make no state-changing broker call.
+READ_ONLY_MODE_LABEL = "READ-ONLY (nothing submitted, cancelled or flattened)"
+
+#: Domain-separation prefix for the durable journal's canonical parameters
+#: hash. Distinct from both the confirmation-token and operation-reference
+#: namespaces, so a journal digest can never be mistaken for either.
+PARAMETERS_HASH_NAMESPACE = "poi-ibkr-params-v1"
+
+
 class LifecycleRefused(Exception):
     """The safety envelope refused the run (always before any broker call)."""
+
+
+@runtime_checkable
+class SupportsCancellableRecovery(Protocol):
+    """Optional adapter capability: which orders may THIS client cancel.
+
+    Deliberately not part of ``BrokerPort``. Global open-order visibility is a
+    port-level concern; "may this API client cancel that order after a
+    restart" is broker-specific and strictly narrower. An adapter without this
+    capability simply has no restart recovery and cleanup falls back to
+    process-local state — it never gains authority it cannot prove.
+    """
+
+    def recover_cancellable_orders(
+        self, account_alias: str
+    ) -> tuple[BrokerOrderReceipt, ...]: ...
 
 
 def mask_account(value: str) -> str:
@@ -174,6 +244,95 @@ def mask_account(value: str) -> str:
     if len(text) <= 4:
         return "*" * len(text)
     return f"{text[:2]}*****{text[-2:]}"
+
+
+@dataclass(frozen=True, slots=True)
+class QuoteObservation:
+    """One timestamped, two-sided market observation.
+
+    The cancel path's safety argument is that the entry limit is
+    NON-MARKETABLE. That is a claim about a LIVE market, so it must be bound to
+    a fresh, valid, two-sided quote rather than to an old number copied by
+    hand. It is evidence about fill RISK, never a guarantee about fills.
+    """
+
+    bid: Decimal
+    ask: Decimal
+    observed_at: datetime
+    session: str
+
+    def __post_init__(self) -> None:
+        if self.session not in QUOTE_SESSIONS:
+            raise LifecycleRefused(
+                f"quote session {self.session!r} is not one of {list(QUOTE_SESSIONS)}"
+            )
+        if self.observed_at.tzinfo is None:
+            raise LifecycleRefused("quote observed_at must be timezone-aware (UTC)")
+
+    @property
+    def mid(self) -> Decimal:
+        return (self.bid + self.ask) / Decimal(2)
+
+    @property
+    def spread(self) -> Decimal:
+        return self.ask - self.bid
+
+    def describe(self) -> str:
+        """Sanitized one-line description for the evidence artifact."""
+        return (
+            f"bid={self.bid} ask={self.ask} mid={self.mid}"
+            f" session={self.session} observed_at={self.observed_at.isoformat()}"
+        )
+
+
+def quote_refusal(
+    quote: QuoteObservation,
+    *,
+    now: datetime,
+    max_age_seconds: int = MAX_QUOTE_AGE_SECONDS,
+) -> str | None:
+    """Why this quote may not authorize a submission; ``None`` if it may."""
+    if quote.bid <= 0 or quote.ask <= 0:
+        return f"quote needs a positive bid and ask (bid={quote.bid} ask={quote.ask})"
+    if quote.ask <= quote.bid:
+        return f"crossed or locked quote (bid={quote.bid} >= ask={quote.ask})"
+    if quote.session not in SUBMITTABLE_QUOTE_SESSIONS:
+        return (
+            f"market session {quote.session!r} has no live two-sided quote;"
+            " nothing may be authorized against it"
+        )
+    age = (now - quote.observed_at).total_seconds()
+    if age < 0:
+        return f"quote is timestamped {abs(age):.0f}s in the future"
+    if age > max_age_seconds:
+        return (
+            f"quote is {age:.0f}s old (maximum {max_age_seconds}s);"
+            " re-observe the market and re-run"
+        )
+    spread_fraction = quote.spread / quote.mid
+    if spread_fraction > MAX_QUOTE_SPREAD_FRACTION:
+        return (
+            f"spread {spread_fraction:.2%} exceeds the"
+            f" {MAX_QUOTE_SPREAD_FRACTION:.2%} sanity cap; the market is not"
+            " orderly enough to justify a submission"
+        )
+    return None
+
+
+def quote_drift_refusal(
+    approved: QuoteObservation, current: QuoteObservation
+) -> str | None:
+    """Whether the market moved materially since the approval observation."""
+    if approved.mid <= 0:
+        return "the approved quote has no usable mid"
+    drift = abs(current.mid - approved.mid) / approved.mid
+    if drift > MAX_QUOTE_DRIFT_FRACTION:
+        return (
+            f"the mid moved {drift:.2%} (from {approved.mid} to {current.mid}),"
+            f" beyond the {MAX_QUOTE_DRIFT_FRACTION:.2%} limit; the owner's"
+            " approval no longer describes this market"
+        )
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +360,12 @@ class LifecycleEnvelope:
     #: crash-safe resumption identity).
     run_date: str
     reference_price: Decimal | None = None
+    #: The owner's fresh two-sided market observation. Mandatory for the cancel
+    #: path. Deliberately NOT part of the confirmation-token material: the
+    #: token binds the owner-chosen parameters, while the quote must be re-
+    #: observed and re-validated at execution time (a token bound to a live
+    #: quote could never be carried from a dry run to an execute).
+    quote: QuoteObservation | None = None
 
     def __post_init__(self) -> None:
         if self.scenario not in SCENARIOS:
@@ -224,7 +389,7 @@ class LifecycleEnvelope:
             )
         if not self.account_alias.strip():
             raise LifecycleRefused("account_alias is mandatory")
-        if self.scenario in ("preflight", "cleanup", "reconnect"):
+        if self.scenario in NON_ORDER_SCENARIOS:
             return
         if self.symbol not in ALLOWED_SYMBOLS:
             raise LifecycleRefused(
@@ -247,20 +412,41 @@ class LifecycleEnvelope:
         if notional > MAX_NOTIONAL:
             raise LifecycleRefused(f"estimated notional {notional} exceeds the {MAX_NOTIONAL} cap")
         if self.scenario == "cancel-path":
-            # The whole point of the cancel path is an order that CANNOT
-            # fill. Without a reference price that is unprovable, so the
-            # guard is mandatory rather than best-effort.
+            # The cancel path needs an order that is NON-MARKETABLE at the
+            # observed market — fill risk reduced, never eliminated. Both
+            # guards are mandatory: the owner's stated reference (which the
+            # confirmation token binds) and a fresh two-sided quote.
             if self.reference_price is None or self.reference_price <= 0:
                 raise LifecycleRefused(
                     "--reference-price (current market price) is mandatory for the"
-                    " cancel path: it is what proves the limit cannot fill"
+                    " cancel path: it bounds how far the limit sits from the market"
                 )
             floor = self.reference_price * (Decimal("1") - CANCEL_PATH_MIN_DISCOUNT)
             if self.limit_price > floor:
                 raise LifecycleRefused(
                     f"limit {self.limit_price} is too close to the market"
                     f" ({self.reference_price}); it must be <= {floor}"
-                    f" ({CANCEL_PATH_MIN_DISCOUNT:%} below) so it cannot fill"
+                    f" ({CANCEL_PATH_MIN_DISCOUNT:%} below) to be non-marketable"
+                    " at the observed quote"
+                )
+            if self.quote is None:
+                raise LifecycleRefused(
+                    "the cancel path requires a fresh two-sided quote"
+                    " (--quote-bid, --quote-ask, --quote-at, --quote-session):"
+                    " an old manually copied reference price must never"
+                    " authorize a submission"
+                )
+            # Structural check only. Whether the quote is USABLE (positive,
+            # two-sided, fresh, orderly, open session) is decided at run time
+            # by ``quote_refusal`` so the owner sees the real reason in the
+            # evidence rather than a derived price comparison.
+            bid_floor = self.quote.bid * (Decimal("1") - CANCEL_PATH_MIN_DISCOUNT)
+            if self.quote.bid > 0 and self.limit_price > bid_floor:
+                raise LifecycleRefused(
+                    f"limit {self.limit_price} is not far enough below the observed"
+                    f" bid {self.quote.bid}; it must be <= {bid_floor}"
+                    f" ({CANCEL_PATH_MIN_DISCOUNT:%} below the bid) to be"
+                    " non-marketable at the observed quote"
                 )
 
     @property
@@ -316,6 +502,32 @@ def confirmation_token(envelope: LifecycleEnvelope) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:CONFIRM_DIGEST_LENGTH].upper()
 
 
+def parameters_hash(envelope: LifecycleEnvelope) -> str:
+    """Full digest of the canonical owner-run parameters (authorizes nothing).
+
+    Binds a durable journal entry to the exact parameters it was created for,
+    so a journalled operation reference can never be reused for a different
+    order. It is NOT the confirmation token: a different domain prefix and the
+    full digest length, and ``--confirm`` will never accept it.
+    """
+    material = "|".join(
+        (
+            PARAMETERS_HASH_NAMESPACE,
+            HARNESS_VERSION,
+            envelope.run_date,
+            envelope.scenario,
+            envelope.symbol,
+            envelope.side.value,
+            str(envelope.quantity),
+            str(envelope.limit_price),
+            str(envelope.reference_price),
+            envelope.account_alias,
+            str(envelope.port),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
 def operation_reference(envelope: LifecycleEnvelope) -> str:
     """A deterministic, NON-AUTHORIZING operation reference for a run.
 
@@ -357,6 +569,10 @@ class LifecycleReport:
     executed: bool
     checks: list[tuple[str, bool, str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: Overrides the default EXECUTED/DRY-RUN header. Cleanup is neither: it
+    #: submits nothing yet may cancel existing POI orders, so "DRY-RUN (nothing
+    #: sent)" would be a dangerous lie about what the run did.
+    mode_label: str | None = None
 
     def record(self, name: str, ok: bool, detail: str) -> None:
         self.checks.append((name, ok, detail))
@@ -369,7 +585,12 @@ class LifecycleReport:
         return bool(self.checks) and all(ok for _, ok, _ in self.checks)
 
     def render(self) -> str:
-        mode = "EXECUTED (real broker order path)" if self.executed else "DRY-RUN (nothing sent)"
+        if self.mode_label is not None:
+            mode = self.mode_label
+        elif self.executed:
+            mode = "EXECUTED (real broker order path)"
+        else:
+            mode = "DRY-RUN (nothing sent)"
         lines = [
             f"# POI-IBKR-001 lifecycle harness — {self.scenario}",
             "",
@@ -513,6 +734,36 @@ def _submit_failure_abort(report: LifecycleReport, status: ExecutionStatus) -> N
         )
 
 
+def _cancel_unconfirmed_abort(
+    report: LifecycleReport,
+    *,
+    operation_reference: str,
+    broker_order_ref: str,
+    detail: str,
+) -> None:
+    """The cancel was sent but the broker never confirmed it as cancelled.
+
+    The order may still be working. This is not a fill (that is handled by
+    ``_unprotected_position_abort``) — it is an UNKNOWN cancellation outcome,
+    so the only safe response is owner reconciliation, never a blind re-run of
+    the scenario or a reuse of the confirmation token. Both references are
+    non-authorizing broker/operation correlators — never account ids, tokens
+    or secrets.
+    """
+    _owner_action_required(
+        report,
+        "CANCELLATION NOT CONFIRMED — the order MAY STILL BE WORKING at the broker"
+        f" ({detail})",
+        f"correlate operation_reference={operation_reference}"
+        f" broker_order_ref={broker_order_ref} in the IB Gateway/TWS UI (VNC)",
+        "do NOT blindly re-run this scenario and do NOT reuse the confirmation"
+        " token — a fresh submit could double the exposure",
+        "cancel the order by hand if it is still working",
+        "re-run --scenario reconnect and confirm reconciliation reports the"
+        " account clean (open_poi_orders=0) before anything else",
+    )
+
+
 def _protective_spec_refusal(spec: ProtectionOrderSpec, position_quantity: Decimal) -> str | None:
     """Envelope check for the protective leg; ``None`` means acceptable.
 
@@ -585,6 +836,33 @@ def _record_broker_order_identity(
     )
 
 
+def _record_position_breakdown(
+    report: LifecycleReport,
+    positions: Sequence[BrokerPosition],
+    *,
+    symbol: str,
+    label: str,
+) -> tuple[BrokerPosition, ...]:
+    """Report raw rows, NON-ZERO positions and run-symbol positions separately.
+
+    IBKR reports a closed holding as a row with quantity 0. Counting raw rows
+    as "positions" makes a flat account read as ``1 position(s)``, which an
+    owner can easily misread as live exposure. Returns the non-zero positions.
+    """
+    nonzero = tuple(p for p in positions if p.quantity != 0)
+    in_symbol = tuple(p for p in nonzero if p.symbol == symbol)
+    zero_rows = len(positions) - len(nonzero)
+    report.record(
+        label,
+        True,
+        f"raw_rows={len(positions)} (of which zero-quantity={zero_rows});"
+        f" non_zero_positions={len(nonzero)}"
+        f" [{', '.join(f'{p.symbol}:{p.quantity}' for p in nonzero) or 'none'}];"
+        f" {symbol}_positions={len(in_symbol)}",
+    )
+    return nonzero
+
+
 def _event_id(event: BrokerOrderEvent) -> str:
     """The engine's canonical id for one normalized broker event."""
     return f"{event.sequence}:{event.client_order_id}:{event.state.value}"
@@ -651,7 +929,7 @@ def _reconcile(
     processed_event_ids: frozenset[str],
     now: datetime,
     trigger: ReconciliationTrigger,
-) -> None:
+) -> ReconciliationReport:
     engine = ReconciliationEngine(
         ReconciliationPolicy(
             policy_version=POLICY_REF,
@@ -688,6 +966,7 @@ def _reconcile(
             f" expected={finding.expected} observed={finding.observed}"
             f" -> {finding.recommendation.value}"
         )
+    return result
 
 
 def _preflight(broker: BrokerPort, envelope: LifecycleEnvelope, report: LifecycleReport) -> None:
@@ -719,7 +998,7 @@ def _preflight(broker: BrokerPort, envelope: LifecycleEnvelope, report: Lifecycl
         f"; oca={capabilities.oco.value}",
     )
 
-    if envelope.scenario not in ("preflight", "cleanup", "reconnect"):
+    if envelope.scenario not in NON_ORDER_SCENARIOS:
         instrument = broker.resolve_instrument(InstrumentQuery(symbol=envelope.symbol))
         report.record(
             "instrument_resolved",
@@ -756,11 +1035,59 @@ def _preflight(broker: BrokerPort, envelope: LifecycleEnvelope, report: Lifecycl
             else f"{envelope.symbol} already held ({existing[0].quantity}); close it"
             " first — this run must own the whole position it protects",
         )
-    report.record(
-        "position_snapshot",
-        True,
-        f"{len(positions)} position(s) reported before the run",
+    _record_position_breakdown(
+        report, positions, symbol=envelope.symbol, label="position_snapshot"
     )
+
+
+def _revalidate_quote(
+    report: LifecycleReport,
+    envelope: LifecycleEnvelope,
+    *,
+    now: datetime,
+    quote_provider: Callable[[], QuoteObservation] | None,
+) -> QuoteObservation:
+    """Re-check the approving quote immediately before submission.
+
+    The owner's observation authorized a NON-MARKETABLE limit. That claim
+    decays: it must still be fresh, still two-sided, still an open session,
+    and the market must not have moved materially since the approval. Any
+    failure refuses the run BEFORE anything is sent — an old, manually copied
+    reference price never authorizes a submission on its own.
+    """
+    approved = envelope.quote
+    if approved is None:  # unreachable: the envelope enforces this
+        raise LifecycleRefused("the cancel path requires an approving quote")
+    refusal = quote_refusal(approved, now=now)
+    report.record(
+        "approval_quote_valid",
+        refusal is None,
+        approved.describe() if refusal is None else refusal,
+    )
+    if refusal is not None:
+        raise LifecycleRefused(f"the approving quote is not usable: {refusal}")
+
+    current = approved if quote_provider is None else quote_provider()
+    source = "owner-observed (no live quote provider wired)" if quote_provider is None else "live"
+    fresh_refusal = quote_refusal(current, now=now)
+    if fresh_refusal is not None:
+        raise LifecycleRefused(f"pre-submit quote check failed: {fresh_refusal}")
+    drift = quote_drift_refusal(approved, current)
+    if drift is not None:
+        raise LifecycleRefused(f"pre-submit quote check failed: {drift}")
+    bid_floor = current.bid * (Decimal("1") - CANCEL_PATH_MIN_DISCOUNT)
+    if envelope.limit_price > bid_floor:
+        raise LifecycleRefused(
+            f"pre-submit quote check failed: limit {envelope.limit_price} is no"
+            f" longer {CANCEL_PATH_MIN_DISCOUNT:%} below the bid {current.bid}"
+        )
+    report.record(
+        "pre_submit_quote_revalidated",
+        True,
+        f"{current.describe()} source={source}; limit {envelope.limit_price} <="
+        f" {bid_floor} at submission time",
+    )
+    return current
 
 
 def _run_cancel_path(
@@ -772,18 +1099,35 @@ def _run_cancel_path(
     now: datetime,
     sleep: Callable[[float], None],
     timeout_seconds: float,
+    quote_provider: Callable[[], QuoteObservation] | None = None,
 ) -> None:
-    """Submit a far-from-market resting LIMIT, acknowledge, then cancel."""
+    """Submit a non-marketable resting LIMIT, acknowledge, then cancel."""
     _record_intended_parameters(report, envelope)
     # LifecycleEnvelope already refused to construct without a reference
-    # price and a limit far enough below it; this records the proof.
+    # price and a limit far enough below it; this records the proof. Note the
+    # claim: NON-MARKETABLE at the observed quote. A limit below the market
+    # materially reduces fill risk; it does not make a fill impossible (a gap,
+    # a halt-and-reopen or a fast move can still trade through it).
     reference = envelope.reference_price or Decimal(0)
     floor = reference * (Decimal("1") - CANCEL_PATH_MIN_DISCOUNT)
     report.record(
-        "cancel_path_price_safe",
+        "cancel_path_non_marketable",
         reference > 0 and envelope.limit_price <= floor,
         f"limit {envelope.limit_price} <= {floor}"
-        f" ({CANCEL_PATH_MIN_DISCOUNT:%} below reference {reference}) so it cannot fill",
+        f" ({CANCEL_PATH_MIN_DISCOUNT:%} below reference {reference}):"
+        " non-marketable at the observed quote; fill risk reduced but NOT"
+        " eliminated",
+    )
+    # Bind the approval to a fresh, valid, two-sided observation and
+    # revalidate it IMMEDIATELY before submission.
+    quote = _revalidate_quote(
+        report, envelope, now=now, quote_provider=quote_provider
+    )
+    report.record(
+        "quote_session_recorded",
+        True,
+        f"session={quote.session} (regular / pre-market / after-hours"
+        " classification is recorded with the approving quote)",
     )
 
     correlation_id = f"{CLIENT_ORDER_PREFIX}-cancel-{int(now.timestamp())}"
@@ -871,10 +1215,26 @@ def _run_cancel_path(
     )
     # Last look: a fill that landed while the cancel was in flight.
     late_fill = _first_fill(seen_after)
+    if cancelled is None and late_fill is None:
+        # Cancel was sent but neither a CANCELLED nor a fill was observed: the
+        # order may still be working. Fail closed with an owner reconciliation
+        # instruction — never reconcile-as-clean and never a blind re-run.
+        _cancel_unconfirmed_abort(
+            report,
+            operation_reference=envelope.run_ref or operation_reference(envelope),
+            broker_order_ref=outcome.receipt.broker_order_ref
+            if outcome.receipt is not None
+            else "unknown",
+            detail=f"observed states: {[e.state.value for e in seen_after] or 'none'}",
+        )
+        return
     report.record(
         "never_filled",
         late_fill is None,
-        "no fill event on the cancel path"
+        # An OBSERVED post-run fact, never a pre-submit guarantee: the order
+        # was non-marketable at the observed quote, and in this window it did
+        # not fill.
+        "observed: no fill event on the cancel path during this run"
         if late_fill is None
         else f"a fill arrived during cancellation: {late_fill.state.value}",
     )
@@ -1237,8 +1597,12 @@ def _run_reconnect(
     """
     positions = tuple(broker.get_positions(envelope.account_alias))
     # Every NON-ZERO position (long OR short). A short is itself an anomaly
-    # this scenario must surface, so we never restrict to quantity > 0.
-    nonzero = tuple(p for p in positions if p.quantity != 0)
+    # this scenario must surface, so we never restrict to quantity > 0. Zero-
+    # quantity rows are reported separately so a flat account cannot read as
+    # though it still held something.
+    nonzero = _record_position_breakdown(
+        report, positions, symbol=envelope.symbol, label="position_breakdown"
+    )
     open_orders = broker.get_open_orders(envelope.account_alias)
 
     # Binding a resting stop to this fill-path operation requires the
@@ -1274,7 +1638,8 @@ def _run_reconnect(
     report.record(
         "positions_survived_reconnect",
         True,
-        f"{len(nonzero)} non-zero position(s) reported after reconnect",
+        f"{len(nonzero)} non-zero position(s) reported after reconnect"
+        f" (from {len(positions)} raw row(s))",
     )
     report.record(
         "no_unexpected_position",
@@ -1366,40 +1731,208 @@ def _run_reconnect(
     )
 
 
+def _cancellable_lifecycle_orders(
+    broker: BrokerPort, envelope: LifecycleEnvelope, report: LifecycleReport
+) -> tuple[tuple[BrokerOrderReceipt, ...], str | None]:
+    """The lifecycle orders this API client may actually cancel.
+
+    Global open-order VISIBILITY is not cancellation AUTHORITY: a
+    ``reqAllOpenOrders`` row may belong to another API client or to the
+    Gateway UI. Only the adapter's same-client recovery may make an order
+    cancellable, and it fails closed on any ambiguity. The canonical PoI
+    prefix is then applied on top — it is a narrowing filter, never proof of
+    ownership on its own.
+
+    Returns ``(orders, refusal)``; a non-``None`` refusal means recovery
+    itself was ambiguous and NOTHING may be cancelled.
+    """
+    if not isinstance(broker, SupportsCancellableRecovery):
+        # No restart recovery: fall back to the visible PoI orders. This grants
+        # no authority — the port itself refuses to cancel an order it has no
+        # mapping for, so in practice only orders THIS process submitted can be
+        # cancelled, and a foreign/manual order is refused by the adapter.
+        visible = tuple(
+            o
+            for o in broker.get_open_orders(envelope.account_alias)
+            if o.client_order_id.startswith(CLIENT_ORDER_PREFIX)
+        )
+        report.record(
+            "cancellable_recovery",
+            True,
+            "adapter exposes no same-client recovery; only orders this process"
+            f" submitted can be cancelled ({len(visible)} PoI order(s) visible)",
+        )
+        return visible, None
+    try:
+        recovered = broker.recover_cancellable_orders(envelope.account_alias)
+    except BrokerPortError as error:
+        report.record(
+            "cancellable_recovery",
+            False,
+            f"same-client recovery refused ({error.code.value}); nothing may be"
+            " cancelled while the recovered identity is ambiguous",
+        )
+        return (), error.code.value
+    owned = tuple(
+        o for o in recovered if o.client_order_id.startswith(CLIENT_ORDER_PREFIX)
+    )
+    report.record(
+        "cancellable_recovery",
+        True,
+        f"{len(owned)} lifecycle-owned same-client order(s) cancellable"
+        f" (of {len(recovered)} recovered for this client id)",
+    )
+    return owned, None
+
+
 def _run_cleanup(
     broker: BrokerPort,
     envelope: LifecycleEnvelope,
     report: LifecycleReport,
     *,
     now: datetime,
+    sleep: Callable[[float], None],
+    timeout_seconds: float,
 ) -> None:
-    """Cancel every still-open order this harness created. Never flattens.
+    """Cancel every lifecycle-owned order this client may cancel. Never flattens.
 
-    Cleanup goes straight to the port: cancelling is the one broker call
-    that reduces exposure, so it must not depend on minting a new
-    authorization (which would be a submit permission).
+    Cleanup goes straight to the port: cancelling is the one broker call that
+    REDUCES exposure, so it must not depend on minting a new authorization
+    (which would be a submit permission). It is CANCEL-ONLY, not a dry run.
+
+    Every eligible order gets exactly ONE cancellation attempt, and a failure
+    on one order never prevents the attempt on the next — leaving a second
+    order working because the first one failed would be the worst outcome.
+    There is still no automatic retry. Cleanup reads clean only when a FRESH
+    broker snapshot shows no targeted working order left.
     """
-    open_orders = broker.get_open_orders(envelope.account_alias)
-    mine = tuple(o for o in open_orders if o.client_order_id.startswith(CLIENT_ORDER_PREFIX))
-    report.record("cleanup_scope", True, f"{len(mine)} PoI order(s) to cancel")
-    for receipt in mine:
-        cancel = broker.cancel_order(
-            CancelOrderRequest(
-                client_order_id=receipt.client_order_id,
-                correlation_id=f"{CLIENT_ORDER_PREFIX}-cleanup",
+    report.mode_label = CLEANUP_MODE_LABEL
+    observed = broker.get_open_orders(envelope.account_alias)
+    observed_mine = tuple(
+        o for o in observed if o.client_order_id.startswith(CLIENT_ORDER_PREFIX)
+    )
+    report.record(
+        "cleanup_observed_orders",
+        True,
+        f"{len(observed)} order(s) visible at the broker;"
+        f" {len(observed_mine)} carry the PoI prefix",
+    )
+    targets, recovery_refusal = _cancellable_lifecycle_orders(broker, envelope, report)
+    report.record(
+        "cleanup_scope",
+        True,
+        f"{len(targets)} lifecycle order(s) eligible for cancellation by this client",
+    )
+
+    attempted: list[str] = []
+    confirmed: list[str] = []
+    unresolved: list[str] = []
+    for receipt in targets:
+        client_order_id = receipt.client_order_id
+        attempted.append(client_order_id)
+        try:
+            cancel = broker.cancel_order(
+                CancelOrderRequest(
+                    client_order_id=client_order_id,
+                    correlation_id=f"{CLIENT_ORDER_PREFIX}-cleanup",
+                )
             )
-        )
+        except BrokerPortError as error:
+            # One order failing must not abort the sweep: keep making the
+            # exposure-reducing attempt for every other eligible order.
+            report.record(
+                f"cleanup_cancel[{client_order_id}]",
+                False,
+                f"cancel failed: {error.code.value} (no retry; continuing with"
+                " the remaining eligible orders)",
+            )
+            unresolved.append(client_order_id)
+            continue
         report.record(
-            f"cleanup_cancel[{receipt.client_order_id}]",
+            f"cleanup_cancel[{client_order_id}]",
             cancel.state in (OrderState.CANCELLED, OrderState.CANCEL_PENDING),
             f"state={cancel.state.value}",
         )
+        # CANCEL_PENDING is accepted-but-not-final: wait for the terminal
+        # CANCELLED before claiming this order is gone.
+        if cancel.state is OrderState.CANCELLED:
+            confirmed.append(client_order_id)
+            continue
+        settled, _seen = _await_state(
+            broker,
+            client_order_id,
+            frozenset({OrderState.CANCELLED}),
+            timeout_seconds=timeout_seconds,
+            sleep=sleep,
+        )
+        report.record(
+            f"cleanup_cancel_confirmed[{client_order_id}]",
+            settled is not None,
+            "cancellation confirmed by the broker"
+            if settled is not None
+            else "no CANCELLED confirmation before timeout",
+        )
+        (confirmed if settled is not None else unresolved).append(client_order_id)
+
+    report.record(
+        "cleanup_attempts",
+        True,
+        f"attempted={attempted or 'none'} confirmed={confirmed or 'none'}"
+        f" unresolved={unresolved or 'none'}",
+    )
+
+    # Fresh snapshot: PASS only when NO targeted working order remains.
+    remaining = broker.get_open_orders(envelope.account_alias)
+    remaining_mine = tuple(
+        o for o in remaining if o.client_order_id.startswith(CLIENT_ORDER_PREFIX)
+    )
+    report.record(
+        "cleanup_no_working_order_remains",
+        not remaining_mine,
+        "no PoI working order remains after cleanup"
+        if not remaining_mine
+        else f"{len(remaining_mine)} PoI order(s) still working:"
+        f" {[o.client_order_id for o in remaining_mine]}",
+    )
+    positions = tuple(broker.get_positions(envelope.account_alias))
+    nonzero = _record_position_breakdown(
+        report, positions, symbol=envelope.symbol, label="cleanup_position_breakdown"
+    )
+    if nonzero:
+        # Cleanup cancels orders; it NEVER flattens. A surviving position is
+        # the owner's to resolve and must be impossible to miss.
+        _owner_action_required(
+            report,
+            "cleanup does not flatten and a position is still open: "
+            + ", ".join(f"{p.symbol}:{p.quantity}" for p in nonzero),
+            "inspect the position in the IB Gateway/TWS UI (VNC)",
+            "close it or place a protective stop by hand",
+        )
+    if recovery_refusal or unresolved or remaining_mine:
+        stuck = sorted({*unresolved, *(o.client_order_id for o in remaining_mine)})
+        _owner_action_required(
+            report,
+            "CLEANUP DID NOT PROVE THE ACCOUNT IS CLEAR — "
+            + (
+                f"same-client recovery was refused ({recovery_refusal})"
+                if recovery_refusal
+                else f"one or more PoI orders may still be working: {stuck}"
+            ),
+            "open the IB Gateway/TWS UI (VNC) and cancel any remaining PoI order"
+            " by hand",
+            "do NOT re-run a submitting scenario until cleanup reads clean",
+            "re-run --scenario cleanup, then --scenario verify-clean, to re-inspect",
+        )
+        return
     _reconcile(
         broker,
         envelope,
         report,
         open_orders=(),
-        positions={},
+        # Reconciliation reflects the ACTUAL post-cancel snapshot: a surviving
+        # position is reported as held (and flagged above) rather than being
+        # asserted away as zero.
+        positions={p.symbol: p.quantity for p in nonzero},
         protected={},
         # Cleanup reads the whole event stream, so it has genuinely seen
         # every event it reports as processed.
@@ -1407,6 +1940,84 @@ def _run_cleanup(
         now=now,
         trigger=ReconciliationTrigger.EVENT_DRIVEN,
     )
+
+
+def _run_verify_clean(
+    broker: BrokerPort,
+    envelope: LifecycleEnvelope,
+    report: LifecycleReport,
+    *,
+    now: datetime,
+) -> None:
+    """Read-only proof that this account has nothing outstanding.
+
+    The scenario-correct verifier for a CANCEL-PATH operation. ``reconnect``
+    is the FILL-PATH verifier: it proves that a position and its exact
+    protective stop survived a restart, which is why it requires a fill-path
+    operation reference. Using it to check a cancel-path run conflates two
+    different questions, so cancel-path cleanliness gets its own check here.
+
+    Makes no submission, no cancellation and no flatten call — it only reads.
+    """
+    report.mode_label = READ_ONLY_MODE_LABEL
+    open_orders = broker.get_open_orders(envelope.account_alias)
+    lifecycle = tuple(
+        o for o in open_orders if o.client_order_id.startswith(CLIENT_ORDER_PREFIX)
+    )
+    working = tuple(o for o in lifecycle if o.state in _WORKING_ORDER_STATES)
+    report.record(
+        "verify_no_working_lifecycle_order",
+        not working,
+        "no PoI lifecycle order is working"
+        if not working
+        else f"{len(working)} still working: "
+        + ", ".join(f"{o.client_order_id}:{o.state.value}" for o in working),
+    )
+    foreign = len(open_orders) - len(lifecycle)
+    report.record(
+        "verify_foreign_orders_untouched",
+        True,
+        f"{foreign} non-PoI order(s) visible; reported for the owner, never"
+        " cancelled or modified by this harness",
+    )
+    positions = tuple(broker.get_positions(envelope.account_alias))
+    nonzero = _record_position_breakdown(
+        report, positions, symbol=envelope.symbol, label="verify_position_breakdown"
+    )
+    report.record(
+        "verify_no_open_position",
+        not nonzero,
+        "flat"
+        if not nonzero
+        else "open: " + ", ".join(f"{p.symbol}:{p.quantity}" for p in nonzero),
+    )
+    result = _reconcile(
+        broker,
+        envelope,
+        report,
+        open_orders=(),
+        positions={},
+        protected={},
+        processed_event_ids=frozenset(_event_id(e) for e in broker.order_events()),
+        now=now,
+        trigger=ReconciliationTrigger.PERIODIC,
+    )
+    report.record(
+        "verify_no_unresolved_broker_state",
+        not result.findings,
+        "no unresolved broker operation state"
+        if not result.findings
+        else f"{len(result.findings)} unresolved finding(s): "
+        + ", ".join(sorted({f.kind.value for f in result.findings})),
+    )
+    if working or nonzero:
+        _owner_action_required(
+            report,
+            "verify-clean found the account is NOT clean",
+            "inspect open orders and positions in the IB Gateway/TWS UI (VNC)",
+            "run --scenario cleanup to cancel any remaining PoI order",
+            "close or protect any open position by hand — this harness never flattens",
+        )
 
 
 def run_lifecycle(
@@ -1419,11 +2030,14 @@ def run_lifecycle(
     clock: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
     timeout_seconds: float = 30.0,
+    journal: OwnerRunJournal | None = None,
+    quote_provider: Callable[[], QuoteObservation] | None = None,
 ) -> LifecycleReport:
     """Run one scenario end to end, fail-closed, with cleanup on error."""
     now_fn = clock or (lambda: datetime.now(tz=UTC))
     sleep_fn = sleep or time.sleep
     expected_token = confirmation_token(envelope)
+    params_hash = parameters_hash(envelope)
 
     if execute and envelope.scenario in SUBMITTING_SCENARIOS:
         if confirm_token is None or confirm_token.strip().upper() != expected_token:
@@ -1435,8 +2049,45 @@ def run_lifecycle(
         raise LifecycleRefused(
             f"scenario {envelope.scenario!r} never submits; --execute is refused"
         )
+    if execute and journal is None:
+        # The confirmation token is deterministic, so on its own it is NOT
+        # single-use across processes. The durable journal is what makes an
+        # execute attempt unrepeatable; without it, refuse to execute.
+        raise LifecycleRefused(
+            "--execute requires a durable owner-run journal (--journal-dir): the"
+            " confirmation token alone can be replayed in a new process"
+        )
 
     report = LifecycleReport(scenario=envelope.scenario, executed=execute)
+    if journal is not None and envelope.scenario in SUBMITTING_SCENARIOS:
+        # BEFORE any broker call: atomically claim the single execute attempt
+        # (or record the dry-run approval). A crash never resets this.
+        try:
+            if execute:
+                record = journal.begin_execute(
+                    operation_reference=envelope.run_ref,
+                    parameters_hash=params_hash,
+                    started_at=now_fn(),
+                    harness_version=HARNESS_VERSION,
+                )
+                report.record(
+                    "execute_attempt_claimed",
+                    True,
+                    f"durable state={record.state.value} for operation"
+                    f" {envelope.run_ref}; a second --execute is now refused",
+                )
+            else:
+                journal.record_dry_run(
+                    operation_reference=envelope.run_ref,
+                    parameters_hash=params_hash,
+                    approved_at=now_fn(),
+                    harness_version=HARNESS_VERSION,
+                )
+        except OwnerRunReplayRefused as refusal:
+            raise LifecycleRefused(str(refusal)) from refusal
+        except OwnerRunJournalError as error:
+            raise LifecycleRefused(f"owner-run journal unusable: {error}") from error
+
     broker = broker_factory()
     connected = False
     agent = ExecutionAgent(broker, clock=now_fn)
@@ -1451,7 +2102,16 @@ def run_lifecycle(
 
         now = now_fn()
         if envelope.scenario == "cleanup":
-            _run_cleanup(broker, envelope, report, now=now)
+            _run_cleanup(
+                broker,
+                envelope,
+                report,
+                now=now,
+                sleep=sleep_fn,
+                timeout_seconds=timeout_seconds,
+            )
+        elif envelope.scenario == "verify-clean":
+            _run_verify_clean(broker, envelope, report, now=now)
         elif envelope.scenario == "reconnect":
             _run_reconnect(broker, envelope, report, now=now, run_ref=run_ref)
         elif envelope.scenario == "preflight":
@@ -1494,6 +2154,7 @@ def run_lifecycle(
                 now=now,
                 sleep=sleep_fn,
                 timeout_seconds=timeout_seconds,
+                quote_provider=quote_provider,
             )
         elif envelope.scenario == "fill-path":
             _run_fill_path(
@@ -1522,7 +2183,46 @@ def run_lifecycle(
                 report.record("disconnect", True, "clean disconnect")
             except Exception:  # noqa: BLE001
                 report.record("disconnect", False, "disconnect failed")
+        if journal is not None and execute:
+            _journal_outcome(journal, envelope, report, broker, now=now_fn())
     return report
+
+
+def _journal_outcome(
+    journal: OwnerRunJournal,
+    envelope: LifecycleEnvelope,
+    report: LifecycleReport,
+    broker: BrokerPort,
+    *,
+    now: datetime,
+) -> None:
+    """Persist the last known canonical state of an execute attempt.
+
+    Best-effort and never fatal: the exclusivity marker is already durable, so
+    a journal write failure here can only lose detail, never re-open the
+    operation. Records no token, account id or authorization material.
+    """
+    try:
+        broker_ref: str | None = None
+        last_state: str | None = None
+        for event in broker.order_events():
+            if event.client_order_id == envelope.client_order_id:
+                broker_ref = event.broker_order_ref
+                last_state = event.state.value
+        journal.record_progress(
+            operation_reference=envelope.run_ref,
+            observed_at=now,
+            broker_order_ref=broker_ref,
+            last_known_state=last_state,
+            # Anything short of a fully passing run leaves the operation
+            # requiring reconciliation before it can be considered closed.
+            reconciliation_required=not report.passed,
+        )
+    except (OwnerRunJournalError, Exception):  # noqa: BLE001 - never fatal
+        report.note(
+            "the owner-run journal could not record the final state; the durable"
+            " execute-attempt guard is unaffected and still blocks a replay"
+        )
 
 
 def _emergency_cleanup(
@@ -1661,8 +2361,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--reference-price",
         default=None,
         help=(
-            "current market price. MANDATORY for the cancel path: it is what"
-            " proves the resting limit cannot fill"
+            "current market price. MANDATORY for the cancel path: it bounds how"
+            " far the resting limit sits from the market"
+        ),
+    )
+    parser.add_argument(
+        "--quote-bid",
+        default=None,
+        help="observed BID. Mandatory for the cancel path (with --quote-ask/-at/-session)",
+    )
+    parser.add_argument("--quote-ask", default=None, help="observed ASK")
+    parser.add_argument(
+        "--quote-at",
+        default=None,
+        help=(
+            "ISO-8601 UTC timestamp of the quote observation; a quote older than"
+            f" {MAX_QUOTE_AGE_SECONDS}s may not authorize a submission"
+        ),
+    )
+    parser.add_argument(
+        "--quote-session",
+        default=None,
+        choices=QUOTE_SESSIONS,
+        help="market session the quote was observed in; 'closed' never authorizes a submit",
+    )
+    parser.add_argument(
+        "--journal-dir",
+        default=None,
+        help=(
+            "directory holding the DURABLE owner-run attempt journal. Required"
+            " for --execute: it makes an execute attempt single-use across"
+            " processes and crashes. Never store it in the repository"
         ),
     )
     parser.add_argument(
@@ -1708,6 +2437,37 @@ def _decimal(value: str | None, *, default: Decimal) -> Decimal:
         raise LifecycleRefused(f"not a valid decimal: {value!r}") from error
 
 
+def _build_quote(args: argparse.Namespace) -> QuoteObservation | None:
+    """Build the owner's market observation from the CLI, or ``None``.
+
+    All four quote flags travel together: a partial quote is refused rather
+    than silently defaulted, so nothing can be authorized against a half-
+    specified market.
+    """
+    supplied = [args.quote_bid, args.quote_ask, args.quote_at, args.quote_session]
+    if all(value is None for value in supplied):
+        return None
+    if any(value is None for value in supplied):
+        raise LifecycleRefused(
+            "--quote-bid, --quote-ask, --quote-at and --quote-session must all be"
+            " supplied together (a partial quote authorizes nothing)"
+        )
+    try:
+        observed_at = datetime.fromisoformat(str(args.quote_at))
+    except ValueError as error:
+        raise LifecycleRefused(
+            f"--quote-at must be an ISO-8601 timestamp: {args.quote_at!r}"
+        ) from error
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=UTC)
+    return QuoteObservation(
+        bid=_decimal(args.quote_bid, default=Decimal("0")),
+        ask=_decimal(args.quote_ask, default=Decimal("0")),
+        observed_at=observed_at,
+        session=str(args.quote_session),
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -1730,7 +2490,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             port=args.port,
             run_date=args.run_date or datetime.now(tz=UTC).strftime("%Y-%m-%d"),
             reference_price=reference,
+            quote=_build_quote(args),
         )
+        journal = OwnerRunJournal(Path(args.journal_dir)) if args.journal_dir else None
         factory = _load_broker_factory(
             args.broker_module,
             account_alias=args.account_alias,
@@ -1739,18 +2501,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             port=args.port,
             client_id=args.client_id,
         )
-    except (LifecycleRefused, ImportError) as error:
+    except (LifecycleRefused, ImportError, OwnerRunJournalError) as error:
         print(f"REFUSED: {error}")
         return 2
 
-    report = run_lifecycle(
-        factory,
-        envelope,
-        execute=args.execute,
-        confirm_token=args.confirm,
-        run_ref=args.run_ref,
-        timeout_seconds=args.timeout_seconds,
-    )
+    try:
+        report = run_lifecycle(
+            factory,
+            envelope,
+            execute=args.execute,
+            confirm_token=args.confirm,
+            run_ref=args.run_ref,
+            timeout_seconds=args.timeout_seconds,
+            journal=journal,
+        )
+    except LifecycleRefused as error:
+        # Refusals raised before any broker call (token mismatch, replayed
+        # execute attempt, missing journal) must not look like a broker result.
+        print(f"REFUSED: {error}")
+        return 2
     rendered = report.render()
     print(rendered)
     if args.evidence_out is not None:

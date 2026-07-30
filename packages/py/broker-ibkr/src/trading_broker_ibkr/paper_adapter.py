@@ -34,10 +34,11 @@ the separately-approved POI-IBKR-001 experiment, not part of this task.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from typing import Protocol, TypeVar, cast
 
 from trading_broker_core.port import (
@@ -60,6 +61,21 @@ from trading_broker_core.port import (
     TimeInForce,
 )
 from trading_contracts.enums import Environment, OrderState, OrderType
+
+from trading_broker_ibkr.callback_router import (
+    DIAGNOSTICS_STREAM,
+    OPEN_ORDERS_STREAM,
+    POSITIONS_STREAM,
+    CallbackRouter,
+    classify_error_stream,
+    order_stream,
+    request_stream,
+)
+from trading_broker_ibkr.ibkr_error_callback import (
+    ErrorCallbackShapeError,
+    normalize_error_callback,
+    normalize_message,
+)
 
 _T = TypeVar("_T")
 
@@ -211,6 +227,182 @@ _WORKING_ORDER_STATES: frozenset[OrderState] = frozenset(
     }
 )
 
+# -- IBKR error-callback classification (D-CANCEL-01 / D-TIF-03) -------------
+#
+# System/connectivity notices IBKR delivers via ``error()`` that must NEVER
+# fail an order operation. They arrive with reqId == -1 (already excluded by
+# order-id correlation), but this allowlist is a documented belt-and-braces so
+# a farm-status code sharing an order id still cannot fail a submit/cancel.
+INFORMATIONAL_IBKR_ERROR_CODES: frozenset[int] = frozenset(
+    {2104, 2106, 2107, 2108, 2119, 2158}
+)
+
+#: IBKR delivers "Order Cancelled - <reason>" as error code 202 — a cancel
+#: CONFIRMATION, not a failure.
+CANCEL_CONFIRMED_ERROR_CODES: frozenset[int] = frozenset({202})
+
+#: Deterministic, pre-acceptance order rejects: the order was definitely NOT
+#: accepted, so they are TERMINAL (no retry) rather than UNKNOWN. Kept small and
+#: conservative — anything not listed here stays UNKNOWN (reconcile-required),
+#: which never hides a working order. (10052 is prevented upstream by the TIF
+#: validation but is included for completeness / defence in depth.)
+DETERMINISTIC_ORDER_REJECT_CODES: frozenset[int] = frozenset({103, 201, 321, 10052})
+
+
+def is_informational_ibkr_error(code: int) -> bool:
+    """True for a connectivity/farm-status notice that must not fail an order."""
+    return code in INFORMATIONAL_IBKR_ERROR_CODES
+
+
+#: IBKR reports an unset double field as a huge sentinel (``UNSET_DOUBLE``);
+#: anything at or beyond this magnitude means "not reported", not a price.
+_UNSET_DOUBLE_THRESHOLD = Decimal("1e307")
+
+
+def format_ibkr_error(
+    code: int, text: str, advanced_reject: str = "", *, context: str
+) -> str:
+    """Sanitized, bounded description of an order-scoped IBKR error.
+
+    Preserves the ORIGINAL numeric code (the owner correlates on it) and the
+    broker's text, both length-bounded and sanitized by ``normalize_message``.
+    Never includes an account id, credential, secret path or authorization
+    material — the adapter never puts any of those into a broker error.
+    """
+    detail = normalize_message(text)
+    if advanced_reject:
+        detail = f"{detail} [advanced-rejection: {normalize_message(advanced_reject)}]"
+    return f"IBKR {code} on {context}: {detail}"
+
+
+def classify_ibkr_order_error(code: int) -> BrokerErrorCode:
+    """Map an order-scoped IBKR error code to the canonical broker error.
+
+    Deterministic pre-acceptance rejects are TERMINAL (``BROKER_REJECTED``, no
+    retry); everything else — including ambiguous codes — stays
+    ``UNKNOWN_BROKER_RESPONSE`` (reconcile-required), never hiding a live order.
+    """
+    if code in DETERMINISTIC_ORDER_REJECT_CODES:
+        return BrokerErrorCode.BROKER_REJECTED
+    return BrokerErrorCode.UNKNOWN_BROKER_RESPONSE
+
+
+class CancelDisposition(StrEnum):
+    """What one order-status callback means while awaiting a cancellation."""
+
+    STALE = "STALE"  # a leftover Submitted/PreSubmitted/ACK — ignore, keep waiting
+    PENDING = "PENDING"  # PendingCancel — accepted, not yet final — keep waiting
+    CONFIRMED = "CONFIRMED"  # Cancelled/ApiCancelled — terminal success
+    EXPOSED = "EXPOSED"  # Filled/PartiallyFilled — exposure, NOT a cancellation
+    REJECTED = "REJECTED"  # Inactive/rejected — terminal deterministic failure
+
+
+def classify_cancel_status(status: str) -> CancelDisposition:
+    """Classify an IBKR order-status string encountered while cancelling.
+
+    A stale acknowledgement is NEVER treated as cancellation confirmation; a
+    fill is an exposure event, never success. An unmapped status is treated as
+    stale (keep waiting → eventual UNKNOWN), never as success.
+    """
+    state = IBKR_STATUS_MAP.get(status)
+    if state is OrderState.CANCELLED:
+        return CancelDisposition.CONFIRMED
+    if state is OrderState.CANCEL_PENDING:
+        return CancelDisposition.PENDING
+    if state in (OrderState.FILLED, OrderState.PARTIALLY_FILLED):
+        return CancelDisposition.EXPOSED
+    if state is OrderState.REJECTED:
+        return CancelDisposition.REJECTED
+    # SUBMITTING / ACKNOWLEDGED / unmapped -> stale: keep waiting, never confirm.
+    return CancelDisposition.STALE
+
+
+@dataclass(frozen=True, slots=True)
+class CancelCallbackEvent:
+    """One correlated broker callback observed while awaiting a cancellation."""
+
+    kind: str  # "status" | "error"
+    order_id: int
+    status: str | None = None
+    error_code: int | None = None
+    error_text: str = ""
+    advanced_reject: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CancelResolution:
+    """The terminal disposition of a cancellation wait (pure decision)."""
+
+    outcome: str  # "CONFIRMED" | "EXPOSED" | "REJECTED" | "ERROR" | "TIMEOUT"
+    status: str | None = None
+    error_code: int | None = None
+    detail: str = ""
+
+
+def resolve_cancel(
+    events: Iterable[CancelCallbackEvent], broker_order_id: int
+) -> CancelResolution:
+    """Reduce correlated cancel callbacks to a single terminal resolution.
+
+    Pure and deterministic: the caller supplies the correlated event stream
+    (statuses + errors for this order id). Stale acks and PendingCancel keep the
+    wait open; a fill is EXPOSED (never success); an Inactive/reject is REJECTED;
+    an order error 202 is a cancel CONFIRMATION; other order errors are ERROR;
+    an exhausted stream (queue timeout) is TIMEOUT. Never retries.
+    """
+    for event in events:
+        if event.order_id != broker_order_id:
+            continue  # correlate strictly by broker order id
+        if event.kind == "error":
+            code = event.error_code or 0
+            if is_informational_ibkr_error(code):
+                continue  # farm-status notice — observable, never a failure
+            if code in CANCEL_CONFIRMED_ERROR_CODES:
+                return CancelResolution("CONFIRMED", status="Cancelled", error_code=code)
+            return CancelResolution(
+                "ERROR",
+                error_code=code,
+                detail=format_ibkr_error(
+                    code, event.error_text, event.advanced_reject, context="cancellation"
+                ),
+            )
+        disposition = classify_cancel_status(event.status or "")
+        if disposition in (CancelDisposition.STALE, CancelDisposition.PENDING):
+            continue
+        return CancelResolution(disposition.value, status=event.status)
+    return CancelResolution("TIMEOUT")
+
+
+def cancel_resolution_to_status(resolution: CancelResolution) -> str:
+    """Turn a cancel resolution into a confirming status, or fail closed.
+
+    CONFIRMED returns the status string. EXPOSED and TIMEOUT raise
+    UNKNOWN_BROKER_RESPONSE (reconcile-required, never a blind retry). REJECTED
+    and deterministic order errors raise BROKER_REJECTED (terminal). Ambiguous
+    order errors stay UNKNOWN.
+    """
+    if resolution.outcome == "CONFIRMED":
+        return resolution.status or "Cancelled"
+    if resolution.outcome == "EXPOSED":
+        raise BrokerPortError(
+            BrokerErrorCode.UNKNOWN_BROKER_RESPONSE,
+            "order filled during cancellation — position exposure, not cancelled;"
+            " reconcile required",
+        )
+    if resolution.outcome == "REJECTED":
+        raise BrokerPortError(
+            BrokerErrorCode.BROKER_REJECTED,
+            f"cancel rejected — order {resolution.status or 'inactive'} (terminal)",
+        )
+    if resolution.outcome == "ERROR":
+        raise BrokerPortError(
+            classify_ibkr_order_error(resolution.error_code or 0), resolution.detail
+        )
+    raise BrokerPortError(
+        BrokerErrorCode.UNKNOWN_BROKER_RESPONSE,
+        "no cancellation confirmation before timeout; reconcile required",
+    )
+
 # -- Order-ref identity codec (IMP-1304 D-ADAPTER-01) -----------------------
 #
 # Every lifecycle-owned order carries its canonical, NON-AUTHORIZING
@@ -273,14 +465,41 @@ def decode_order_ref(order_ref: str | None, broker_order_id: int) -> RecoveredId
     return RecoveredIdentity(body, True)
 
 
+#: Client id recorded for an order whose owning API client is unknown or was
+#: not reported. It can never equal a configured adapter client id (those are
+#: non-negative), so an unattributed order is NEVER cancellable — fail closed.
+FOREIGN_CLIENT_ID = -1
+
+
 @dataclass(frozen=True, slots=True)
 class RawOpenOrder:
-    """One order from a read-only ``reqAllOpenOrders`` snapshot (never mutated)."""
+    """One order observed in a read-only open-order snapshot (never mutated).
+
+    Two provenances produce these rows and they are NOT interchangeable:
+
+    - ``reqAllOpenOrders`` — GLOBAL VISIBILITY across every API client and the
+      TWS/Gateway UI. Seeing an order here proves it exists; it proves nothing
+      about whether this API client may cancel it.
+    - ``reqOpenOrders`` — orders bound to THIS API client id, which is the only
+      provenance that can support cancellation authority.
+
+    ``client_id`` therefore defaults to ``FOREIGN_CLIENT_ID``: a transport that
+    does not report the owning client leaves the order visible-but-never-
+    cancellable rather than silently cancellable.
+    """
 
     broker_order_id: int
     order_ref: str
     status: str
     symbol: str
+    client_id: int = FOREIGN_CLIENT_ID
+    perm_id: int = 0
+    account: str = ""
+    action: str = ""
+    quantity: Decimal = Decimal(0)
+    order_type: str = ""
+    limit_price: Decimal | None = None
+    aux_price: Decimal | None = None
 
 
 def mask_account_id(account_id: str) -> str:
@@ -331,12 +550,25 @@ class PaperTransport(Protocol):
     def positions(self, account_id: str) -> tuple[BrokerPosition, ...]: ...
 
     def open_order_snapshot(self, account_id: str) -> tuple[RawOpenOrder, ...]:
-        """Read-only snapshot of live open orders (``reqAllOpenOrders``).
+        """GLOBAL read-only snapshot of live open orders (``reqAllOpenOrders``).
 
         Must never send, cancel, replace or modify an order. Blocks until the
-        canonical end-of-snapshot callback, then returns every open order with
-        its ``orderRef`` so the adapter can recover lifecycle identity after a
-        restart with no process-local state.
+        canonical end-of-snapshot callback, then returns every open order the
+        gateway can see — including orders placed by other API clients and by
+        the TWS/Gateway UI.
+
+        This is a VISIBILITY/reconciliation feed. It must never, on its own,
+        make an order cancellable (see ``same_client_open_orders``).
+        """
+        ...
+
+    def same_client_open_orders(self, account_id: str) -> tuple[RawOpenOrder, ...]:
+        """Read-only snapshot of orders bound to THIS API client (``reqOpenOrders``).
+
+        Must never send, cancel, replace or modify an order. Every returned row
+        must carry the owning ``client_id`` so the adapter can verify that the
+        order really belongs to the configured client before treating it as
+        cancellable after a restart.
         """
         ...
 
@@ -473,12 +705,19 @@ class IbkrPaperAdapter:
         return self._guarded(lambda: transport.positions(account_id))
 
     def get_open_orders(self, account_alias: str) -> tuple[BrokerOrderReceipt, ...]:
-        """Recover open orders from the broker, not from process-local memory.
+        """GLOBAL visibility of live open orders — never cancellation authority.
 
-        Queries a read-only ``reqAllOpenOrders`` snapshot and normalizes it into
-        ``BrokerOrderReceipt``s, recovering each order's canonical identity from
-        its ``orderRef``. This is what makes reconnect restart-safe: a fresh
-        adapter with empty memory still sees the resting protective stop.
+        Queries the read-only ``reqAllOpenOrders`` snapshot and normalizes it
+        into ``BrokerOrderReceipt``s, recovering each order's canonical identity
+        from its ``orderRef``. This is what makes reconnect restart-safe: a
+        fresh adapter with empty memory still SEES the resting protective stop,
+        and reconciliation can flag anything unexpected.
+
+        It deliberately hydrates NOTHING. ``reqAllOpenOrders`` also reports
+        orders belonging to other API clients and to the TWS/Gateway UI, so an
+        order appearing here does not prove this client may cancel it. Making
+        an order cancellable is the separate, stricter
+        ``recover_cancellable_orders`` path.
 
         Only genuinely-working orders are returned; a cancelled / filled /
         rejected order is never reported as working protection. Duplicate
@@ -509,6 +748,115 @@ class IbkrPaperAdapter:
                 received_at=self._now(),
             )
         return tuple(receipts.values())
+
+    def recover_cancellable_orders(
+        self, account_alias: str
+    ) -> tuple[BrokerOrderReceipt, ...]:
+        """Recover the orders this client may cancel after a restart.
+
+        Distinct from ``get_open_orders`` on purpose. Visibility is global;
+        cancellation authority is not. A recovered order becomes cancellable
+        ONLY when every one of these holds:
+
+        - it came from the SAME-CLIENT (``reqOpenOrders``) feed;
+        - its ``client_id`` equals this adapter's configured API client id;
+        - its account equals the configured paper account for the alias;
+        - it is genuinely working (not cancelled/filled/rejected/unmapped);
+        - its ``orderRef`` is a valid canonical ``poi1:`` lifecycle reference —
+          the prefix alone is NOT proof of ownership, it is one of several
+          required conditions;
+        - its broker order id is a valid, non-zero id;
+        - its canonical identity is unambiguous.
+
+        Ambiguity fails closed with ``UNKNOWN_BROKER_RESPONSE`` and NOTHING is
+        hydrated: cancelling the wrong order is far worse than cancelling
+        nothing. Repeated snapshots are idempotent and can never overwrite an
+        existing canonical mapping.
+        """
+        transport = self._require_connected()
+        account_id = self._account_id(account_alias)
+        raws = self._guarded(lambda: transport.same_client_open_orders(account_id))
+        eligible = self._eligible_recovered_orders(raws, account_id)
+        # Validate the WHOLE snapshot before mutating anything, so a conflict
+        # never leaves the adapter half-hydrated.
+        for client_order_id, raw in eligible.items():
+            known = self._broker_ids.get(client_order_id)
+            if known is not None and known != raw.broker_order_id:
+                raise BrokerPortError(
+                    BrokerErrorCode.UNKNOWN_BROKER_RESPONSE,
+                    f"recovered order {client_order_id} maps to broker order"
+                    f" {raw.broker_order_id} but this process already knows it as"
+                    f" {known}; refusing to act on an ambiguous identity",
+                )
+        recovered: list[BrokerOrderReceipt] = []
+        for client_order_id, raw in eligible.items():
+            state = IBKR_STATUS_MAP[raw.status]
+            receipt = BrokerOrderReceipt(
+                client_order_id=client_order_id,
+                broker_order_ref=f"ibkr-paper:{raw.broker_order_id}",
+                state=state,
+                authorization_ref="recovered:same-client-open-orders",
+                correlation_id="recovered:same-client-open-orders",
+                received_at=self._now(),
+            )
+            # Idempotent and non-destructive: an existing in-process mapping
+            # (verified identical above) is never rewritten.
+            self._orders.setdefault(client_order_id, receipt)
+            self._broker_ids.setdefault(client_order_id, raw.broker_order_id)
+            recovered.append(receipt)
+        return tuple(recovered)
+
+    def _eligible_recovered_orders(
+        self, raws: Iterable[RawOpenOrder], account_id: str
+    ) -> dict[str, RawOpenOrder]:
+        """Filter a same-client snapshot down to unambiguous, owned orders."""
+        by_broker_id: dict[int, RawOpenOrder] = {}
+        for raw in raws:
+            if raw.broker_order_id <= 0:
+                # A zero/negative broker order id cannot address a cancellation.
+                continue
+            if raw.client_id != self._client_id:
+                # Visible, but owned by another API client or unattributed.
+                continue
+            if raw.account and raw.account != account_id:
+                continue  # cross-account row: never this alias's order
+            state = IBKR_STATUS_MAP.get(raw.status)
+            if state is None or state not in _WORKING_ORDER_STATES:
+                continue
+            identity = decode_order_ref(raw.order_ref, raw.broker_order_id)
+            if not identity.lifecycle_owned:
+                continue  # foreign / manual / malformed ref: never cancellable
+            seen = by_broker_id.get(raw.broker_order_id)
+            if seen is None:
+                by_broker_id[raw.broker_order_id] = raw
+                continue
+            # Duplicate callback for the same broker order id: identical rows
+            # collapse, contradictory ones fail closed.
+            if seen.order_ref != raw.order_ref:
+                raise BrokerPortError(
+                    BrokerErrorCode.UNKNOWN_BROKER_RESPONSE,
+                    f"broker order {raw.broker_order_id} was reported with two"
+                    " different canonical identities; refusing to act on it",
+                )
+            if seen.perm_id and raw.perm_id and seen.perm_id != raw.perm_id:
+                raise BrokerPortError(
+                    BrokerErrorCode.UNKNOWN_BROKER_RESPONSE,
+                    f"broker order {raw.broker_order_id} was reported with"
+                    " conflicting permIds; refusing to act on it",
+                )
+        eligible: dict[str, RawOpenOrder] = {}
+        for raw in by_broker_id.values():
+            client_order_id = decode_order_ref(raw.order_ref, raw.broker_order_id).client_order_id
+            duplicate = eligible.get(client_order_id)
+            if duplicate is not None:
+                raise BrokerPortError(
+                    BrokerErrorCode.UNKNOWN_BROKER_RESPONSE,
+                    f"two working broker orders ({duplicate.broker_order_id} and"
+                    f" {raw.broker_order_id}) claim the canonical identity"
+                    f" {client_order_id}; refusing to act on an ambiguous identity",
+                )
+            eligible[client_order_id] = raw
+        return eligible
 
     def preview_order(self, intent: OrderIntent) -> OrderPreview:
         self._require_connected()
@@ -701,6 +1049,32 @@ class IbkrPaperAdapter:
             ) from error
 
 
+def _coerce_int(value: object, default: int) -> int:
+    """Read an integer broker field, falling back to a fail-closed default."""
+    try:
+        return int(cast("int", value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_decimal(value: object) -> Decimal | None:
+    """Read an optional numeric broker field.
+
+    IBKR reports an unset double as a huge sentinel (``UNSET_DOUBLE``); treat
+    that — and anything unparseable — as "not reported" rather than inventing
+    a price.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        number = Decimal(str(value))
+    except (ValueError, ArithmeticError):
+        return None
+    if abs(number) >= _UNSET_DOUBLE_THRESHOLD:
+        return None
+    return number
+
+
 def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-IBKR-001
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> PaperTransport:
@@ -709,20 +1083,29 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
     ``ibapi`` is imported here, lazily, keeping the SDK confined to this
     package. Actually running this against the paper gateway is the
     separately-approved POI-IBKR-001 experiment — never CI.
+
+    Every callback is demultiplexed through a :class:`CallbackRouter` instead
+    of one shared queue, so an in-flight request can never consume (and
+    discard) the callback another operation is waiting for — the defect that
+    turned a real cancellation into a false timeout.
     """
-    import queue
     import threading
 
     try:
         from ibapi.client import EClient  # type: ignore[import-not-found]
         from ibapi.contract import Contract  # type: ignore[import-not-found]
         from ibapi.order import Order  # type: ignore[import-not-found]
+        from ibapi.order_cancel import OrderCancel  # type: ignore[import-not-found]
         from ibapi.wrapper import EWrapper  # type: ignore[import-not-found]
     except ImportError as error:
+        # Fail closed if the installed API lacks the expected surface (e.g. an
+        # older API without ibapi.order_cancel.OrderCancel) — never guess a
+        # compatibility shim that could send an invalid cancellation request.
         raise BrokerPortError(
             BrokerErrorCode.BROKER_UNHEALTHY,
-            "ibapi is not installed on this host; install it inside the broker-ibkr"
-            " environment before the paper PoI",
+            "ibapi (with ibapi.order_cancel.OrderCancel) is not available on this"
+            " host; install the expected API inside the broker-ibkr environment"
+            " before the paper PoI",
         ) from error
 
     class _PaperApp(EWrapper, EClient):  # type: ignore[misc]
@@ -731,8 +1114,28 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             self.managed: tuple[str, ...] = ()
             self.ready = threading.Event()
             self.next_id: int = 0
-            self.responses: queue.Queue[tuple[str, object]] = queue.Queue()
+            self.router = CallbackRouter()
+            #: The configured API client id, recorded so recovered orders can
+            #: be checked against it. Set at connect time.
+            self.api_client_id: int = FOREIGN_CLIENT_ID
+            self._issued = threading.Lock()
+            self._order_ids: set[int] = set()
+            self._request_ids: set[int] = set()
 
+        # -- id bookkeeping (order ids and request ids share a numeric space) --
+        def issue_order_id(self, order_id: int) -> None:
+            with self._issued:
+                self._order_ids.add(order_id)
+
+        def issue_request_id(self, request_id: int) -> None:
+            with self._issued:
+                self._request_ids.add(request_id)
+
+        def _issued_ids(self) -> tuple[set[int], set[int]]:
+            with self._issued:
+                return set(self._order_ids), set(self._request_ids)
+
+        # -- EWrapper callbacks ------------------------------------------------
         def managedAccounts(self, accounts: str) -> None:  # noqa: N802
             self.managed = tuple(a for a in accounts.split(",") if a)
 
@@ -743,40 +1146,71 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
         def orderStatus(  # noqa: N802
             self, order_id: int, status: str, *args: object, **kwargs: object
         ) -> None:
-            self.responses.put(("status", (order_id, status)))
+            self.issue_order_id(order_id)
+            self.router.publish(order_stream(order_id), "status", (order_id, status))
 
         def contractDetails(self, req_id: int, details: object) -> None:  # noqa: N802
-            self.responses.put(("contract", details))
+            self.router.publish(request_stream(req_id), "contract", details)
 
         def contractDetailsEnd(self, req_id: int) -> None:  # noqa: N802
-            self.responses.put(("contract_end", req_id))
+            self.router.publish(request_stream(req_id), "contract_end", req_id)
 
         def accountSummary(  # noqa: N802
             self, req_id: int, account: str, tag: str, value: str, currency: str
         ) -> None:
-            self.responses.put(("account", (account, tag, value)))
+            self.router.publish(request_stream(req_id), "account", (account, tag, value))
 
         def accountSummaryEnd(self, req_id: int) -> None:  # noqa: N802
-            self.responses.put(("account_end", req_id))
+            self.router.publish(request_stream(req_id), "account_end", req_id)
 
         def position(  # noqa: N802
             self, account: str, contract: object, position: object, avg_cost: float
         ) -> None:
-            self.responses.put(("position", (account, contract, position, avg_cost)))
+            self.router.publish(
+                POSITIONS_STREAM, "position", (account, contract, position, avg_cost)
+            )
 
         def positionEnd(self) -> None:  # noqa: N802
-            self.responses.put(("position_end", None))
+            self.router.publish(POSITIONS_STREAM, "position_end", None)
 
         def openOrder(  # noqa: N802
             self, order_id: int, contract: object, order: object, order_state: object
         ) -> None:
-            self.responses.put(("open_order", (order_id, contract, order, order_state)))
+            self.router.publish(
+                OPEN_ORDERS_STREAM, "open_order", (order_id, contract, order, order_state)
+            )
 
         def openOrderEnd(self) -> None:  # noqa: N802
-            self.responses.put(("open_order_end", None))
+            self.router.publish(OPEN_ORDERS_STREAM, "open_order_end", None)
+
+        def error(self, *args: object, **kwargs: object) -> None:  # noqa: N802
+            # The error() signature varies across API versions (10.48 inserts
+            # errorTime), so normalize defensively rather than assuming one
+            # shape. An unrecognised shape is dropped instead of crashing the
+            # reader thread — losing a diagnostic can never fail an order open.
+            try:
+                normalized = normalize_error_callback(*args, **kwargs)
+            except ErrorCallbackShapeError:
+                return
+            order_ids, request_ids = self._issued_ids()
+            stream = classify_error_stream(
+                normalized.request_id, order_ids=order_ids, request_ids=request_ids
+            )
+            payload = (
+                normalized.request_id,
+                normalized.code,
+                normalized.message,
+                normalized.advanced_reject,
+            )
+            self.router.publish(stream, "error", payload)
+            if stream != DIAGNOSTICS_STREAM:
+                # Also keep an observable copy: the diagnostics stream is never
+                # consumed by an operation waiter, so this duplicates nothing
+                # that a waiter depends on.
+                self.router.publish(DIAGNOSTICS_STREAM, "error", payload)
 
     class _IbApiPaperTransport:
-        """Blocking, single-threaded-request transport over the SDK."""
+        """Blocking, one-request-at-a-time transport over the SDK."""
 
         def __init__(self) -> None:
             self._app = _PaperApp()
@@ -784,6 +1218,7 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             self._req_id = 100
 
         def connect(self, host: str, port: int, client_id: int) -> tuple[str, ...]:
+            self._app.api_client_id = client_id
             self._app.connect(host, port, client_id)
             self._thread = threading.Thread(target=self._app.run, daemon=True)
             self._thread.start()
@@ -799,25 +1234,51 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                 if self._app.isConnected():
                     self._app.disconnect()
             finally:
+                self._app.router.close()
                 if self._thread is not None:
                     self._thread.join(timeout=5)
 
         def is_connected(self) -> bool:
             return bool(self._app.isConnected())
 
-        def _drain(self, end_kind: str, want: str) -> list[object]:
+        def _next_request_id(self) -> int:
+            self._req_id += 1
+            self._app.issue_request_id(self._req_id)
+            return self._req_id
+
+        def _collect(self, stream: str, *, end_kind: str, want: str, what: str) -> list[object]:
+            """Drain ONE stream up to its end marker; other streams untouched.
+
+            An order-scoped error can never appear here (errors are routed by
+            issued id), but a request-scoped error is surfaced rather than
+            waited out into a misleading timeout.
+            """
             collected: list[object] = []
-            while True:
-                try:
-                    kind, payload = self._app.responses.get(timeout=timeout_seconds)
-                except queue.Empty as error:
-                    raise BrokerPortError(
-                        BrokerErrorCode.BROKER_REJECTED, f"timed out waiting for {want}"
-                    ) from error
-                if kind == end_kind:
-                    return collected
-                if kind == want:
-                    collected.append(payload)
+            try:
+                while True:
+                    envelope = self._app.router.take(stream, timeout=timeout_seconds)
+                    if envelope is None:
+                        raise BrokerPortError(
+                            BrokerErrorCode.BROKER_REJECTED, f"timed out waiting for {what}"
+                        )
+                    if envelope.kind == "error":
+                        _req, code, text, advanced = cast(
+                            "tuple[int | None, int, str, str]", envelope.payload
+                        )
+                        if is_informational_ibkr_error(code):
+                            continue  # farm status: observable, never fatal
+                        raise BrokerPortError(
+                            classify_ibkr_order_error(code),
+                            format_ibkr_error(code, text, advanced, context=what),
+                        )
+                    if envelope.kind == end_kind:
+                        return collected
+                    if envelope.kind == want:
+                        collected.append(envelope.payload)
+            finally:
+                # Deterministic waiter cleanup. Anything that arrived late is
+                # archived by the router, never silently discarded.
+                self._app.router.release(stream)
 
         def resolve_instrument(self, query: InstrumentQuery) -> BrokerInstrument | None:
             contract = Contract()
@@ -825,9 +1286,14 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             contract.secType = "STK"
             contract.exchange = query.exchange or "SMART"
             contract.currency = query.currency or "USD"
-            self._req_id += 1
-            self._app.reqContractDetails(self._req_id, contract)
-            details = self._drain("contract_end", "contract")
+            req_id = self._next_request_id()
+            self._app.reqContractDetails(req_id, contract)
+            details = self._collect(
+                request_stream(req_id),
+                end_kind="contract_end",
+                want="contract",
+                what="contract details",
+            )
             if not details:
                 return None
             first = details[0]
@@ -842,12 +1308,17 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             )
 
         def account_summary(self, account_id: str) -> Mapping[str, Decimal]:
-            self._req_id += 1
+            req_id = self._next_request_id()
             self._app.reqAccountSummary(
-                self._req_id, "All", "NetLiquidation,TotalCashValue,BuyingPower"
+                req_id, "All", "NetLiquidation,TotalCashValue,BuyingPower"
             )
-            rows = self._drain("account_end", "account")
-            self._app.cancelAccountSummary(self._req_id)
+            rows = self._collect(
+                request_stream(req_id),
+                end_kind="account_end",
+                want="account",
+                what="account summary",
+            )
+            self._app.cancelAccountSummary(req_id)
             values: dict[str, Decimal] = {}
             for row in rows:
                 account, tag, value = cast("tuple[str, str, str]", row)
@@ -857,7 +1328,9 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
 
         def positions(self, account_id: str) -> tuple[BrokerPosition, ...]:
             self._app.reqPositions()
-            rows = self._drain("position_end", "position")
+            rows = self._collect(
+                POSITIONS_STREAM, end_kind="position_end", want="position", what="positions"
+            )
             self._app.cancelPositions()
             result: list[BrokerPosition] = []
             for row in rows:
@@ -878,6 +1351,7 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
         def next_order_id(self) -> int:
             order_id = self._app.next_id
             self._app.next_id += 1
+            self._app.issue_order_id(order_id)
             return order_id
 
         def submit(self, broker_order_id: int, account_id: str, intent: OrderIntent) -> str:
@@ -908,13 +1382,14 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             # Persist the canonical (non-authorizing) client_order_id so a
             # restart can recover this order's identity from the Gateway.
             order.orderRef = fields.order_ref
+            self._app.issue_order_id(broker_order_id)
             self._app.placeOrder(broker_order_id, contract, order)
             return self._await_status(broker_order_id)
 
-        def open_order_snapshot(self, account_id: str) -> tuple[RawOpenOrder, ...]:
-            # Read-only: reqAllOpenOrders never sends/cancels/modifies an order.
-            self._app.reqAllOpenOrders()
-            rows = self._drain("open_order_end", "open_order")
+        def _open_order_rows(
+            self, account_id: str, rows: list[object]
+        ) -> tuple[RawOpenOrder, ...]:
+            """Normalize openOrder callbacks into the recovered-order model."""
             snapshot: dict[int, RawOpenOrder] = {}
             for row in rows:
                 order_id, contract, order, order_state = cast(
@@ -930,26 +1405,109 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                     order_ref=str(getattr(order, "orderRef", "") or ""),
                     status=str(getattr(order_state, "status", "") or ""),
                     symbol=str(getattr(contract, "symbol", "") or ""),
+                    # Absent clientId => FOREIGN_CLIENT_ID => never cancellable.
+                    client_id=_coerce_int(getattr(order, "clientId", None), FOREIGN_CLIENT_ID),
+                    perm_id=_coerce_int(getattr(order, "permId", None), 0),
+                    account=order_account,
+                    action=str(getattr(order, "action", "") or ""),
+                    quantity=_coerce_decimal(getattr(order, "totalQuantity", None)) or Decimal(0),
+                    order_type=str(getattr(order, "orderType", "") or ""),
+                    limit_price=_coerce_decimal(getattr(order, "lmtPrice", None)),
+                    aux_price=_coerce_decimal(getattr(order, "auxPrice", None)),
                 )
             return tuple(snapshot.values())
 
+        def open_order_snapshot(self, account_id: str) -> tuple[RawOpenOrder, ...]:
+            # Read-only GLOBAL visibility: reqAllOpenOrders never sends,
+            # cancels, replaces or modifies an order. It reports orders from
+            # every API client and from the TWS/Gateway UI, so the adapter
+            # treats it as evidence only, never as cancellation authority.
+            self._app.reqAllOpenOrders()
+            rows = self._collect(
+                OPEN_ORDERS_STREAM,
+                end_kind="open_order_end",
+                want="open_order",
+                what="open orders",
+            )
+            return self._open_order_rows(account_id, rows)
+
+        def same_client_open_orders(self, account_id: str) -> tuple[RawOpenOrder, ...]:
+            # Read-only SAME-CLIENT feed: reqOpenOrders returns the orders bound
+            # to this API client id, which is the only basis on which a
+            # recovered order may become cancellable. Rows are additionally
+            # filtered on the reported clientId (belt and braces).
+            self._app.reqOpenOrders()
+            rows = self._collect(
+                OPEN_ORDERS_STREAM,
+                end_kind="open_order_end",
+                want="open_order",
+                what="same-client open orders",
+            )
+            return tuple(
+                row
+                for row in self._open_order_rows(account_id, rows)
+                if row.client_id == self._app.api_client_id
+            )
+
         def cancel(self, broker_order_id: int) -> str:
-            self._app.cancelOrder(broker_order_id, "")
-            return self._await_status(broker_order_id)
+            # Modern IB API: cancelOrder(orderId, OrderCancel()). The previous
+            # empty-string argument raised inside ibapi (it reads OrderCancel
+            # attributes), so no cancellation request ever reached the wire.
+            self._app.issue_order_id(broker_order_id)
+            self._app.cancelOrder(broker_order_id, OrderCancel())
+            resolution = resolve_cancel(self._cancel_events(broker_order_id), broker_order_id)
+            # Fails closed: EXPOSED/TIMEOUT -> UNKNOWN (reconcile required),
+            # REJECTED / deterministic errors -> BROKER_REJECTED (terminal).
+            # Never retries, and never accepts a stale ack as confirmation.
+            return cancel_resolution_to_status(resolution)
+
+        def _cancel_events(self, broker_order_id: int) -> Iterator[CancelCallbackEvent]:
+            """Correlated callbacks for one cancellation, in arrival order."""
+            stream = order_stream(broker_order_id)
+            while True:
+                envelope = self._app.router.take(stream, timeout=timeout_seconds)
+                if envelope is None:
+                    return  # exhausted -> resolve_cancel yields TIMEOUT
+                if envelope.kind == "status":
+                    order_id, status = cast("tuple[int, str]", envelope.payload)
+                    yield CancelCallbackEvent(
+                        kind="status", order_id=order_id, status=status
+                    )
+                elif envelope.kind == "error":
+                    request_id, code, text, advanced = cast(
+                        "tuple[int | None, int, str, str]", envelope.payload
+                    )
+                    yield CancelCallbackEvent(
+                        kind="error",
+                        order_id=request_id if request_id is not None else broker_order_id,
+                        error_code=code,
+                        error_text=text,
+                        advanced_reject=advanced,
+                    )
 
         def _await_status(self, broker_order_id: int) -> str:
+            stream = order_stream(broker_order_id)
             while True:
-                try:
-                    kind, payload = self._app.responses.get(timeout=timeout_seconds)
-                except queue.Empty as error:
+                envelope = self._app.router.take(stream, timeout=timeout_seconds)
+                if envelope is None:
                     raise BrokerPortError(
                         BrokerErrorCode.UNKNOWN_BROKER_RESPONSE,
                         f"no status for order {broker_order_id}; reconcile required",
-                    ) from error
-                if kind == "status":
-                    order_id, status = cast("tuple[int, str]", payload)
+                    )
+                if envelope.kind == "status":
+                    order_id, status = cast("tuple[int, str]", envelope.payload)
                     if order_id == broker_order_id:
                         return status
+                elif envelope.kind == "error":
+                    _req, code, text, advanced = cast(
+                        "tuple[int | None, int, str, str]", envelope.payload
+                    )
+                    if is_informational_ibkr_error(code):
+                        continue  # farm status: never fails a submit
+                    raise BrokerPortError(
+                        classify_ibkr_order_error(code),
+                        format_ibkr_error(code, text, advanced, context="submit"),
+                    )
 
     return _IbApiPaperTransport()
 
@@ -974,15 +1532,23 @@ def build_paper_adapter(
 __all__ = [
     "ADAPTER_VERSION",
     "ALLOWED_HOSTS",
+    "CANCEL_CONFIRMED_ERROR_CODES",
+    "DEFAULT_CLIENT_ID",
+    "DETERMINISTIC_ORDER_REJECT_CODES",
+    "FOREIGN_CLIENT_ID",
     "IBKR_ORDER_TYPE_MAP",
     "IBKR_PAPER_CAPABILITIES",
     "IBKR_STATUS_MAP",
     "IBKR_TIME_IN_FORCE_MAP",
+    "INFORMATIONAL_IBKR_ERROR_CODES",
     "LIFECYCLE_ORDER_REF_PREFIX",
     "LIVE_API_PORT",
     "ORDER_REF_MAX_LEN",
     "PAPER_ACCOUNT_PREFIX",
     "PAPER_API_PORT",
+    "CancelCallbackEvent",
+    "CancelDisposition",
+    "CancelResolution",
     "IbkrPaperAdapter",
     "OrderRefTooLongError",
     "OutgoingOrder",
@@ -991,9 +1557,15 @@ __all__ = [
     "RecoveredIdentity",
     "build_outgoing_order",
     "build_paper_adapter",
+    "cancel_resolution_to_status",
+    "classify_cancel_status",
+    "classify_ibkr_order_error",
     "decode_order_ref",
     "encode_order_ref",
+    "format_ibkr_error",
     "ibkr_order_type",
     "ibkr_time_in_force",
+    "is_informational_ibkr_error",
     "mask_account_id",
+    "resolve_cancel",
 ]
