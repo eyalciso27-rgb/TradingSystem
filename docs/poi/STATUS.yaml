@@ -120,6 +120,37 @@ items:
         evidence: evidence/POI-IBKR-001-CANCEL-DEFECT.md
         defects: D-CANCEL-01..D-CANCEL-08
         post_fix_verification: NOT_RUN  # DEF-18, DEF-19, DEF-20
+    # Read-only owner-host findings. No order was submitted, cancelled or
+    # modified to produce these; recording them never changes status.
+    owner_host_findings:
+      - date: "2026-07-30"
+        method: read-only inspection (no order path exercised)
+        result: DEFECT
+        summary: >-
+          the real adapter shipped a deterministic TEST clock as its production
+          default, so a host at 2026-07-30T17:05:22Z produced adapter timestamps
+          starting at 2026-07-10T12:00:01Z and incrementing one second per call;
+          every snapshot, receipt, broker event, reconciliation result and health
+          check carried a fabricated ~20-day-stale time. verify-clean separately
+          collapsed to "broker error BROKER_UNHEALTHY; no retry", hiding the
+          actual account state
+        evidence: evidence/POI-IBKR-001-CLOCK-DEFECT.md
+        defects: D-CLOCK-01, D-CLOCK-02
+        post_fix_verification: NOT_RUN  # DEF-19, DEF-18, DEF-20
+        # Consequence: any evidence artifact produced by a real owner-run BEFORE
+        # this fix carries fabricated adapter timestamps and must be regenerated
+        # rather than trusted. It cannot support a PASS.
+        prior_artifacts: MUST_BE_REGENERATED
+      - date: "2026-07-30"
+        method: read-only inspection
+        result: OBSERVATION
+        summary: >-
+          zero open orders and one non-zero unrelated Paper position, DVLT
+          quantity 1352. It is unrelated to any PoI operation. The harness never
+          flattens and nothing acts on it; verify-clean correctly continues to
+          FAIL while any non-zero position exists, and now names it explicitly.
+          Closing it is an owner decision, by hand, in the Gateway/TWS UI
+        owner_action: OWNER_DECISION_ONLY
     # Market-data dependency (ADR-0016, 2026-07-21): the proven
     # POI-MD-001.realtime_subgate satisfies the market-data dependency for
     # THIS PoI only. The POI-MD-001 aggregate stays BLOCKED (external

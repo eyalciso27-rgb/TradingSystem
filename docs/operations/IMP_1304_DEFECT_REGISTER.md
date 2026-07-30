@@ -48,6 +48,8 @@
 | D-CANCEL-06 | Hydrating cancellable state from `reqAllOpenOrders` would conflate **visibility** with **authority**: that feed reports orders from every API client and from the TWS/Gateway UI, so a foreign or manual order could have become cancellable through this adapter | **P1 (safety)** | `broker-ibkr/paper_adapter.py` | ✅ **fixed in this bundle** — global feed grants nothing; authority requires the same-client feed + matching `clientId` + account + canonical `orderRef` + valid non-zero id + unambiguous identity. No `reqGlobalCancel` anywhere |
 | D-CANCEL-07 | Cleanup evidence read `mode: DRY-RUN (nothing sent)` although cleanup sends cancellations; it did not wait for confirmation or re-read the broker; one failing cancel aborted the whole sweep; and `reconnect` (a fill-path protection verifier) was the only "is it clean" check available to a cancel-path run | **P1** | `scripts/poi_ibkr_lifecycle.py` | ✅ **fixed in this bundle** — `CANCEL-ONLY` header, wait + fresh re-read, one attempt per eligible order with no early abort and no retry, plus a dedicated read-only `--scenario verify-clean` |
 | D-CANCEL-08 | The cancel path asserted the resting limit "cannot fill", bound that claim to a possibly-stale hand-copied `--reference-price`, and reported zero-quantity broker rows as positions (a flat account could read as `1 position(s)`) | P2 | `scripts/poi_ibkr_lifecycle.py` | ✅ **fixed in this bundle** — "non-marketable at the observed quote; fill risk reduced but not eliminated", mandatory fresh two-sided quote (age/spread/session/drift, revalidated immediately before submit), and raw / non-zero / run-symbol position rows reported separately |
+| D-CLOCK-01 | `IbkrPaperAdapter.__init__` defaulted to a **deterministic TEST clock** frozen at `2026-07-10T12:00Z` (`clock or _deterministic_clock(...)`, +1s per call). On a real owner-run at host time `2026-07-30T17:05:22Z` the adapter stamped every account snapshot, receipt, broker event, reconciliation result and health check with a fabricated timestamp ~20 days stale — evidence that could not be correlated with the Gateway log, with the harness's own real-UTC timestamps, or with reality | **P1 (evidence integrity)** | `broker-ibkr/paper_adapter.py` | ✅ **fixed in this bundle** — production default is real tz-aware UTC (`utc_now`); injected clocks still honoured; naive clocks fail closed; non-UTC normalized; durations measured monotonically |
+| D-CLOCK-02 | A real `verify-clean` owner-run reported only `broker error BROKER_UNHEALTHY; no retry`. The first failing read aborted the whole scenario, so the owner could not distinguish a dead Gateway from a reachable account that merely held an unrelated position (`DVLT` 1352, zero open orders), and got no code detail or root cause | **P1 (diagnosability)** | `scripts/poi_ibkr_lifecycle.py` | ✅ **fixed in this bundle** — sanitized bounded message + chained root-cause TYPE + correlation id; every read-only probe recorded independently; read-only scenarios continue past a failed preflight; open positions named explicitly. Fail-closed behaviour unchanged |
 | D-02 | Owner-run `--client-id` default (7) diverges from adapter `DEFAULT_CLIENT_ID` (1); stale-connection recovery undocumented | P2 | lifecycle CLI + runbook | ✅ (doc) — not done here (P2, out of P0/P1 scope) |
 | B-01 | POI-IBKR-001 Paper lifecycle (cancel-path/fill-path/protection/reconnect/reconciliation) not run | BLOCKED | owner-run | ❌ owner + host |
 | B-02 | Owner-run chaos/recovery host drills not run | BLOCKED | `CHAOS_RECOVERY_DRILLS.md` §4 | ❌ blocked on B-01 |
@@ -550,3 +552,165 @@ Live order was sent while implementing it. The following remain **NOT RUN**:
 fresh post-merge Paper owner-run, in `docs/poi/STATUS.yaml`. The post-merge
 validation sequence is recorded as DEF-18 … DEF-20 in
 `docs/operations/PHASE_13_DEFERRED_OWNER_RUNS.yaml`.
+
+## 9. Adapter clock and diagnosability (D-CLOCK-01, D-CLOCK-02)
+
+### 9.1 What the owner host observed
+
+A read-only owner-host inspection after PR #52 produced two findings.
+
+| Observation | Value |
+|---|---|
+| host system time (UTC) | `2026-07-30T17:05:22Z` |
+| first adapter timestamp | `2026-07-10T12:00:01Z` |
+| subsequent adapter timestamps | `...12:00:02Z`, `...12:00:03Z`, `...12:00:04Z` |
+| open orders | 0 |
+| non-zero positions | 1 — `DVLT` quantity `1352` (unrelated to any PoI run) |
+| `verify-clean` output | `broker error BROKER_UNHEALTHY; no retry` (nothing else) |
+
+The timestamps advance by exactly one second per call and start ~20 days
+before the real host time. That is not clock drift — it is a synthetic tick
+sequence.
+
+### 9.2 D-CLOCK-01 — a test clock shipped in the production adapter
+
+`IbkrPaperAdapter.__init__` contained:
+
+```python
+self._now = clock or _deterministic_clock(datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
+```
+
+`_deterministic_clock` returns `start + N seconds` on the Nth call. It exists so
+tests can compare receipts and events for equality. As the **default** it meant
+that any adapter constructed without an explicit clock — i.e. every real
+owner-run — fabricated its timestamps.
+
+**Every** evidence timestamp the adapter produces went through `self._now()`:
+
+| Timestamp | Where |
+|---|---|
+| `AccountSnapshot.observed_at` | `get_account_snapshot` |
+| `BrokerOrderReceipt.received_at` | `submit_order`, `cancel_order` |
+| `BrokerOrderEvent.observed_at` | `_append_event` (the append-only stream) |
+| `ReconciliationResult.reconciled_at` | `reconcile` |
+| `IntegrationHealth.checked_at` | `health_check` |
+| recovered open-order receipts | `get_open_orders`, `recover_cancellable_orders` |
+| UNKNOWN / reconciliation evidence | `reconcile` + the unresolved set |
+
+**Safety and evidence impact.**
+
+- *Evidence integrity (realised).* Artifacts from a real owner-run cannot be
+  correlated with the IB Gateway log, with wall-clock reality, or with the
+  harness's own timestamps. Since the harness clock (`run_lifecycle`) was
+  already real UTC, a single artifact mixed real and fabricated times ~20 days
+  apart.
+- *Event ordering (realised).* Adapter-stamped `BrokerOrderEvent`s and
+  agent-stamped records sat in two unrelated time bases, so "what happened
+  first" was not answerable across that boundary.
+- *Reconciliation age (latent).* Any age-based judgement over broker
+  timestamps would have measured against a fixed past instant.
+- *Not affected — checked explicitly:*
+  - **quote freshness** uses the harness clock (`now_fn`, already real UTC) and
+    the owner-supplied `--quote-at`, never the adapter clock;
+  - **authorization / confirmation tokens** are digests of parameters plus the
+    `--run-date`, with no adapter timestamp in the material;
+  - **journal timestamps** come from `run_lifecycle`'s `now_fn`;
+  - **operation timeouts** never used adapter time — `CallbackRouter` and
+    `threading.Event.wait` are monotonic (see 9.3).
+
+**Fix.** The default is now the real clock:
+
+```python
+self._now = _validated_clock(clock or utc_now)
+```
+
+- `utc_now()` returns `datetime.now(tz=UTC)` — timezone-aware, no import-time
+  constant, no dependence on the host's local timezone;
+- `_validated_clock` **fails closed** (`VALIDATION_FAILED`) if a clock returns
+  a naive timestamp, and normalizes any aware reading to UTC;
+- injected clocks still work, so deterministic tests keep full control of time;
+- `_deterministic_clock` was **deleted** from the adapter — that helper belongs
+  to tests, and it now lives in `tests/broker/test_ibkr_paper_adapter.py`;
+- the **fake broker keeps its own deterministic default** (unchanged): it is a
+  test double, its reproducibility is the point, and the conformance suite's
+  "same inputs ⇒ same result" assertion depends on it. The IBKR conformance
+  test now injects that deterministic clock explicitly instead of relying on a
+  frozen production default.
+
+A guardrail test fails the build if any `datetime(20…)` literal reappears in
+`broker-ibkr` production code.
+
+### 9.3 Wall-clock vs monotonic
+
+Evidence timestamps are UTC **wall-clock** — that is what an owner correlates
+against. Elapsed-duration measurement must not be, because the system clock can
+step (NTP correction, tz database update, manual change): a backwards jump
+could extend a bounded wait indefinitely, and a forwards jump could abandon a
+live order early.
+
+| Purpose | Source |
+|---|---|
+| evidence timestamps | `utc_now()` / `run_lifecycle`'s `now_fn` — UTC wall-clock |
+| callback waits | `CallbackRouter` — `time.monotonic` |
+| gateway-ready wait | `threading.Event.wait` — monotonic internally |
+| harness order polling | `_await_state` — `time.monotonic` (**changed here**) |
+
+`_await_state` previously accumulated `poll_seconds` per iteration, which
+measured sleeps rather than elapsed time. It now takes an explicit `monotonic`
+source and computes a real deadline. The two bases are never mixed: monotonic
+values are durations only and never reach an artifact.
+
+### 9.4 D-CLOCK-02 — a fail-closed abort that hid the account state
+
+`verify-clean` reported only `broker error BROKER_UNHEALTHY; no retry`. Two
+things were wrong with that.
+
+1. **No detail.** The code alone cannot distinguish a dead Gateway from a
+   refused preflight. Broker errors now render as
+   `broker error <CODE>; <bounded sanitized message>; cause=<RootCauseType>;
+   correlation_id=<id>; no retry`. The root cause's TYPE is included but never
+   its text (a third-party exception's text is not ours to trust). Messages are
+   collapsed, truncated to 200 characters, re-masked for anything shaped like a
+   broker account, and stripped of anything path-like so a secret-store
+   location can never surface.
+
+2. **One failure erased everything else.** The first failing read raised out of
+   the whole run. Now each read-only probe is recorded independently, and a
+   read-only scenario continues past a failed preflight — it can send nothing,
+   and the owner needs the whole picture. A failed probe still records a FAILED
+   check, so the run still fails closed and still refuses to submit; only the
+   surviving evidence improves.
+
+So the `DVLT` position is now named explicitly
+(`verify_no_open_position … open: DVLT:1352`, plus the raw/non-zero/run-symbol
+breakdown) instead of vanishing behind a generic broker error.
+
+### 9.5 The unrelated Paper position
+
+The owner host holds `DVLT` quantity `1352` with zero open orders. It is
+unrelated to any PoI operation.
+
+**Nothing in this bundle modifies, closes, protects or otherwise acts on it,**
+and the harness still never flattens. `verify-clean` continues to FAIL while any
+non-zero position exists — that is correct — but it now names the position and
+prints the owner-action banner instead of hiding it. Closing it is the owner's
+decision, by hand, in the Gateway/TWS UI.
+
+### 9.6 NOT EXECUTED
+
+The defect was found by read-only host inspection. Since discovery, **no real
+IBKR order and no real cancellation have been executed**, and nothing in this
+bundle was validated against a live Gateway:
+
+- ❌ no cancel-path execute;
+- ❌ no real cancellation after this change;
+- ❌ no fill-path owner-run;
+- ❌ no Gateway restart recovery owner-run;
+- ❌ no Live connection and no Live order;
+- ❌ no PAPER_AUTO activation.
+
+**POI-IBKR-001 remains non-PASS.** The post-merge validation sequence is
+DEF-19 → DEF-18 → DEF-20 in
+`docs/operations/PHASE_13_DEFERRED_OWNER_RUNS.yaml`; every evidence artifact
+produced before this fix carries fabricated adapter timestamps and must be
+re-generated rather than trusted.

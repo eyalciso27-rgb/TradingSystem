@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import tempfile
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -176,12 +177,32 @@ def _open_orders(broker: FakeBroker) -> tuple[BrokerOrderReceipt, ...]:
     return broker.get_open_orders(ALIAS)
 
 
+def _fake_duration_clock() -> tuple[Callable[[float], None], Callable[[], float]]:
+    """A paired fake sleep + MONOTONIC source that advance together.
+
+    Elapsed time is measured monotonically (D-CLOCK-01), so a test that fakes
+    ``sleep`` must also fake the duration source — otherwise the polling loop
+    would spin against real time. Returns ``(sleep, monotonic)``.
+    """
+    elapsed = [0.0]
+
+    def sleep(seconds: float) -> None:
+        elapsed[0] += seconds
+
+    def monotonic() -> float:
+        return elapsed[0]
+
+    return sleep, monotonic
+
+
 def _run(broker: FakeBroker, envelope: Any, **kwargs: Any) -> Any:
+    fake_sleep, fake_monotonic = _fake_duration_clock()
     defaults: dict[str, Any] = {
         "execute": False,
         "confirm_token": None,
         "clock": _frozen_clock,
-        "sleep": lambda _seconds: None,
+        "sleep": fake_sleep,
+        "monotonic": fake_monotonic,
         "timeout_seconds": 0.0,
     }
     defaults.update(kwargs)
@@ -833,6 +854,14 @@ def test_crash_restart_never_creates_a_second_order() -> None:
 def test_polling_is_bounded_by_the_timeout() -> None:
     """A missing fill must never poll forever."""
     calls: list[float] = []
+    elapsed = [0.0]
+
+    def sleep(seconds: float) -> None:
+        # The fake sleep drives the fake MONOTONIC source, so the bound is
+        # measured exactly as production measures it — without real waiting.
+        calls.append(seconds)
+        elapsed[0] += seconds
+
     broker = _broker()
     envelope = _envelope(scenario="fill-path", symbol="F", limit_price=Decimal("12"))
     report = _run(
@@ -840,7 +869,8 @@ def test_polling_is_bounded_by_the_timeout() -> None:
         envelope,
         execute=True,
         confirm_token=harness.confirmation_token(envelope),
-        sleep=calls.append,
+        sleep=sleep,
+        monotonic=lambda: elapsed[0],
         timeout_seconds=3.0,
     )
     assert len(calls) <= 4, "polling must stop at the timeout"
@@ -2106,7 +2136,7 @@ def test_verify_clean_fails_when_a_lifecycle_order_is_still_working() -> None:
     report = _run(broker, _envelope(scenario="verify-clean"))
 
     assert not report.passed
-    assert "verify-clean found the account is NOT clean" in report.render()
+    assert "verify-clean could not prove the account is clean" in report.render()
 
 
 def test_verify_clean_needs_no_fill_path_run_reference() -> None:
@@ -2158,3 +2188,213 @@ def test_the_position_breakdown_separates_raw_nonzero_and_symbol_rows() -> None:
     assert "non_zero_positions=1" in detail
     assert "MSFT:3" in detail
     assert "F_positions=0" in detail
+
+
+# -- D-CLOCK-01/02: real UTC evidence, monotonic durations, real diagnostics --
+
+
+def test_timeouts_are_measured_monotonically_not_on_the_wall_clock() -> None:
+    """A wall-clock jump must not abandon a live order or hang the run.
+
+    The evidence clock is frozen here while the MONOTONIC source advances; the
+    poll must still terminate at the timeout. If the loop used wall-clock
+    subtraction it would never reach its deadline.
+    """
+    elapsed = [0.0]
+
+    def sleep(seconds: float) -> None:
+        elapsed[0] += seconds
+
+    broker = _broker()
+    envelope = _envelope(scenario="fill-path", symbol="F", limit_price=Decimal("12"))
+    report = _run(
+        broker,
+        envelope,
+        execute=True,
+        confirm_token=harness.confirmation_token(envelope),
+        clock=_frozen_clock,  # wall clock never moves
+        sleep=sleep,
+        monotonic=lambda: elapsed[0],
+        timeout_seconds=3.0,
+    )
+    assert elapsed[0] >= 3.0, "the poll must actually reach its deadline"
+    assert any(name == "unfilled_entry_cancelled" and ok for name, ok, _ in report.checks)
+
+
+def test_a_backwards_wall_clock_jump_does_not_extend_the_timeout() -> None:
+    """An NTP step backwards must not turn a bounded wait into a hang."""
+    elapsed = [0.0]
+    stamps = iter(
+        [AS_OF, AS_OF - timedelta(hours=1), AS_OF - timedelta(hours=2)] * 200
+    )
+
+    def sleep(seconds: float) -> None:
+        elapsed[0] += seconds
+
+    broker = _broker()
+    envelope = _envelope(scenario="fill-path", symbol="F", limit_price=Decimal("12"))
+    _run(
+        broker,
+        envelope,
+        execute=True,
+        confirm_token=harness.confirmation_token(envelope),
+        clock=lambda: next(stamps),
+        sleep=sleep,
+        monotonic=lambda: elapsed[0],
+        timeout_seconds=2.0,
+    )
+    # Bounded by the monotonic deadline regardless of the wall clock going back.
+    assert 2.0 <= elapsed[0] <= 4.0
+
+
+def test_await_state_uses_the_injected_monotonic_source() -> None:
+    """Direct proof that the deadline comes from the duration source."""
+    readings = [0.0, 0.0, 5.0]
+    broker = _broker()
+    broker.connect()
+    found, seen = harness._await_state(
+        broker,
+        "no-such-order",
+        frozenset({OrderState.CANCELLED}),
+        timeout_seconds=1.0,
+        sleep=lambda _s: None,
+        monotonic=lambda: readings.pop(0) if readings else 99.0,
+    )
+    assert found is None
+    assert seen == []
+
+
+# -- diagnostics -------------------------------------------------------------
+
+
+def test_broker_error_evidence_carries_code_message_and_root_cause() -> None:
+    """`broker error BROKER_UNHEALTHY; no retry` alone was not actionable."""
+
+    class _UnhealthyBroker(FakeBroker):
+        def connect(self) -> None:
+            try:
+                raise ConnectionRefusedError("gateway socket closed")
+            except ConnectionRefusedError as cause:
+                raise BrokerPortError(
+                    BrokerErrorCode.BROKER_UNHEALTHY,
+                    "gateway did not become ready",
+                ) from cause
+
+    broker = _UnhealthyBroker(accounts={ALIAS: _snapshot()}, clock=_frozen_clock)
+    report = _run(broker, _envelope(scenario="verify-clean"))
+    detail = {name: d for name, _ok, d in report.checks}["fail_closed"]
+
+    assert "BROKER_UNHEALTHY" in detail
+    assert "gateway did not become ready" in detail
+    assert "cause=ConnectionRefusedError" in detail
+    assert "no retry" in detail  # fail-closed wording preserved
+    assert not report.passed
+
+
+def test_broker_error_evidence_is_bounded_and_sanitized() -> None:
+    account = "DU" + "1234567"
+    noisy = (
+        f"account {account} at /etc/secrets/paper/token failed " + "x" * 500
+    )
+    error = BrokerPortError(BrokerErrorCode.NOT_CONNECTED, noisy)
+    detail = harness.describe_broker_error(error)
+
+    assert account not in detail
+    assert "DU*****" in detail
+    assert "/etc/secrets" not in detail
+    assert len(detail) <= harness.BROKER_DETAIL_MAX_LENGTH + 80
+
+
+def test_sanitize_broker_detail_collapses_and_truncates() -> None:
+    assert harness.sanitize_broker_detail("a\n  b\tc") == "a b c"
+    assert len(harness.sanitize_broker_detail("y" * 999)) == (
+        harness.BROKER_DETAIL_MAX_LENGTH
+    )
+
+
+def test_sanitize_broker_detail_keeps_ordinary_broker_text_readable() -> None:
+    """Scrubbing must not mangle the detail the owner actually needs."""
+    detail = harness.sanitize_broker_detail(
+        "F @ SMART/USD rejected; tif=DAY; ref=ibkr-paper:2; 20%/day"
+    )
+    assert "SMART/USD" in detail
+    assert "ibkr-paper:2" in detail
+    assert "<path>" not in detail
+
+
+def test_sanitize_broker_detail_strips_secret_store_paths() -> None:
+    for path in ("/etc/secrets/paper/token", "C:\\secrets\\paper\\token"):
+        assert path not in harness.sanitize_broker_detail(f"reading {path} failed")
+
+
+# -- an unrelated Paper position must be visible, never hidden ---------------
+
+
+def test_verify_clean_names_an_unrelated_open_position() -> None:
+    """Owner-host inspection found DVLT 1352 with zero open orders.
+
+    verify-clean must still FAIL, but the position has to be named in the
+    evidence rather than collapsing into a generic broker error.
+    """
+    broker = _broker()
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="DVLT", quantity=Decimal("1352"), average_price=Decimal("2")),
+    )
+    report = _run(broker, _envelope(scenario="verify-clean"))
+    rendered = report.render()
+
+    assert not report.passed
+    assert "DVLT:1352" in rendered
+    assert "verify_no_open_position" in rendered
+    assert "raw_rows=1" in rendered
+    assert "non_zero_positions=1" in rendered
+    assert harness.OWNER_ACTION_BANNER in rendered
+    # The harness must not offer to act on it.
+    assert "never flattens" in rendered
+
+
+def test_verify_clean_reports_every_probe_independently() -> None:
+    """One failing probe must not erase the answers the others obtained."""
+
+    class _NoOrderFeedBroker(FakeBroker):
+        def get_open_orders(self, account_alias: str) -> Any:
+            raise BrokerPortError(BrokerErrorCode.BROKER_UNHEALTHY, "order feed down")
+
+    broker = _NoOrderFeedBroker(accounts={ALIAS: _snapshot()}, clock=_frozen_clock)
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="DVLT", quantity=Decimal("1352"), average_price=Decimal("2")),
+    )
+    report = _run(broker, _envelope(scenario="verify-clean"))
+    names = {name: ok for name, ok, _ in report.checks}
+    rendered = report.render()
+
+    assert not report.passed
+    # The failing probe is reported as failing...
+    assert names.get("verify_open_orders_read") is False
+    assert "order feed down" in rendered
+    assert "UNPROVEN" in rendered
+    # ...and the position is STILL reported.
+    assert "DVLT:1352" in rendered
+
+
+def test_verify_clean_stays_read_only_when_a_position_exists() -> None:
+    broker = _capturing()
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="DVLT", quantity=Decimal("1352"), average_price=Decimal("2")),
+    )
+    report = _run(broker, _envelope(scenario="verify-clean"))
+
+    assert not report.passed
+    assert broker.intents == [], "verify-clean must never submit, cancel or flatten"
+
+
+# -- harness evidence timestamps -------------------------------------------
+
+
+def test_the_harness_default_clock_is_real_utc() -> None:
+    """The harness's own default clock was already correct; keep it that way."""
+    import inspect
+
+    source = inspect.getsource(harness.run_lifecycle)
+    assert "datetime.now(tz=UTC)" in source
+    assert "monotonic or time.monotonic" in source

@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol, TypeVar, cast
@@ -583,14 +583,41 @@ class PaperTransport(Protocol):
         ...
 
 
-def _deterministic_clock(start: datetime) -> Callable[[], datetime]:
-    if start.tzinfo is None:
-        raise ValueError("clock start must be timezone-aware")
-    state = {"ticks": 0}
+def utc_now() -> datetime:
+    """The production clock: real, timezone-aware **UTC wall-clock** time.
+
+    Every timestamp this adapter puts into evidence — account snapshots,
+    receipts, broker events, reconciliation and health checks — is UTC
+    wall-clock, so an owner can correlate it with the Gateway log and with the
+    real world.
+
+    It is deliberately NOT used to measure elapsed time. Wall-clock subtraction
+    is unsafe for timeouts because the system clock can jump (NTP step, DST
+    database update, manual correction); every waiting loop in this package
+    uses a MONOTONIC source instead (``CallbackRouter`` and
+    ``threading.Event.wait``). The two are never mixed: monotonic values are
+    durations only and never reach evidence.
+    """
+    return datetime.now(tz=UTC)
+
+
+def _validated_clock(clock: Callable[[], datetime]) -> Callable[[], datetime]:
+    """Wrap a clock so a naive or non-UTC reading can never reach evidence.
+
+    Normalizes any timezone-aware reading to UTC (so the adapter never depends
+    on the host's local timezone) and fails closed on a naive one rather than
+    silently emitting an ambiguous timestamp.
+    """
 
     def now() -> datetime:
-        state["ticks"] += 1
-        return start + timedelta(seconds=state["ticks"])
+        stamp = clock()
+        if stamp.tzinfo is None:
+            raise BrokerPortError(
+                BrokerErrorCode.VALIDATION_FAILED,
+                "adapter clock returned a naive timestamp; evidence timestamps"
+                " must be timezone-aware UTC",
+            )
+        return stamp.astimezone(UTC)
 
     return now
 
@@ -624,7 +651,12 @@ class IbkrPaperAdapter:
         self._host = host
         self._port = port
         self._client_id = client_id
-        self._now = clock or _deterministic_clock(datetime(2026, 7, 10, 12, 0, tzinfo=UTC))
+        # PRODUCTION CLOCK (D-CLOCK-01). This default was a deterministic test
+        # clock frozen at 2026-07-10T12:00Z, so a REAL owner-run on
+        # 2026-07-30T17:05Z stamped every snapshot, receipt, broker event,
+        # reconciliation and health check with a ~20-day-stale fabricated
+        # timestamp. Tests inject their own clock; the default must be real.
+        self._now = _validated_clock(clock or utc_now)
         self._transport: PaperTransport | None = None
         self._orders: dict[str, BrokerOrderReceipt] = {}
         self._broker_ids: dict[str, int] = {}
@@ -1568,4 +1600,5 @@ __all__ = [
     "is_informational_ibkr_error",
     "mask_account_id",
     "resolve_cancel",
+    "utc_now",
 ]

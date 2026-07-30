@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -836,6 +837,60 @@ def _record_broker_order_identity(
     )
 
 
+#: Hard bound on any broker-supplied text copied into evidence.
+BROKER_DETAIL_MAX_LENGTH = 200
+
+
+def sanitize_broker_detail(text: str) -> str:
+    """Bound and scrub broker-supplied text before it reaches the evidence.
+
+    The adapter already masks account ids, but this is the last gate before an
+    owner-visible artifact, so it re-masks anything shaped like a broker
+    account, strips control characters and anything path-like, and truncates.
+    """
+    collapsed = " ".join(str(text).split())
+    scrubbed = re.sub(r"\b([DU]U?)\d{4,}\b", r"\1*****", collapsed)
+    # Never echo a filesystem path: it could name a secret-store location. The
+    # pattern deliberately requires a path-like TOKEN (leading separator or
+    # drive letter, plus two or more segments) so ordinary broker text such as
+    # "SMART/USD" survives intact.
+    scrubbed = re.sub(
+        r"(?<![\w/\\])(?:[A-Za-z]:)?[\\/][\w.\-]+(?:[\\/][\w.\-]+)+", "<path>", scrubbed
+    )
+    if len(scrubbed) > BROKER_DETAIL_MAX_LENGTH:
+        return scrubbed[: BROKER_DETAIL_MAX_LENGTH - 1] + "…"
+    return scrubbed
+
+
+def describe_broker_error(error: BrokerPortError) -> str:
+    """Sanitized, actionable description of a fail-closed broker error.
+
+    A real verify-clean owner-run reported only ``broker error
+    BROKER_UNHEALTHY; no retry`` while the account was in fact reachable and
+    merely held an unrelated position — the owner had no way to tell a dead
+    Gateway from a preflight refusal (D-CLOCK-02). The code alone is not
+    enough: the bounded message and the chained root-cause TYPE (never its
+    text, which may come from a third-party library) are what make the
+    artifact actionable. Fail-closed behaviour is unchanged; only the
+    reporting improves.
+    """
+    parts = [f"broker error {error.code.value}"]
+    detail = sanitize_broker_detail(str(error))
+    prefix = f"{error.code.value}: "
+    if detail.startswith(prefix):
+        detail = detail[len(prefix) :]
+    if detail:
+        parts.append(detail)
+    cause = error.__cause__ or error.__context__
+    if cause is not None:
+        # The TYPE only: a third-party exception's text is not ours to trust.
+        parts.append(f"cause={type(cause).__name__}")
+    if error.correlation_id:
+        parts.append(f"correlation_id={error.correlation_id}")
+    parts.append("no retry")
+    return "; ".join(parts)
+
+
 def _record_position_breakdown(
     report: LifecycleReport,
     positions: Sequence[BrokerPosition],
@@ -879,25 +934,30 @@ def _await_state(
     *,
     timeout_seconds: float,
     sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
     poll_seconds: float = 1.0,
 ) -> tuple[BrokerOrderEvent | None, list[BrokerOrderEvent]]:
     """Poll normalized order events until one reaches a wanted state.
 
     Returns the matching event (or ``None`` on timeout) plus everything
     observed. There is no retry of the ORDER here — only of the read.
+
+    The deadline is measured on a MONOTONIC clock (D-CLOCK-01): a wall-clock
+    subtraction would be corrupted by an NTP step or a manual correction, which
+    could either abandon a live order early or wait far past the timeout.
+    Monotonic values measure duration only and never reach the evidence, which
+    is UTC wall-clock throughout.
     """
     seen: list[BrokerOrderEvent] = []
-    deadline = timeout_seconds
-    elapsed = 0.0
+    deadline = monotonic() + timeout_seconds
     while True:
         for event in _drain_events(broker, client_order_id):
             seen.append(event)
             if event.state in wanted:
                 return event, seen
-        if elapsed >= deadline:
+        if monotonic() >= deadline:
             return None, seen
         sleep(poll_seconds)
-        elapsed += poll_seconds
 
 
 def _first_fill(events: Sequence[BrokerOrderEvent]) -> BrokerOrderEvent | None:
@@ -969,59 +1029,122 @@ def _reconcile(
     return result
 
 
+def _probe[T](report: LifecycleReport, name: str, read: Callable[[], T]) -> T | None:
+    """Run one READ-ONLY broker probe, recording its own pass/fail.
+
+    Returns ``None`` when the probe failed. The caller records the affected
+    check as UNPROVEN, so the run still fails closed while every other probe's
+    answer survives into the evidence.
+    """
+    try:
+        value = read()
+    except BrokerPortError as error:
+        report.record(name, False, describe_broker_error(error))
+        return None
+    report.record(name, True, "read")
+    return value
+
+
 def _preflight(broker: BrokerPort, envelope: LifecycleEnvelope, report: LifecycleReport) -> None:
-    """Read-only checks that must pass before anything may be submitted."""
-    health = broker.health_check()
-    report.record("broker_health", health.healthy, health.detail)
+    """Read-only checks that must pass before anything may be submitted.
 
-    snapshot = broker.get_account_snapshot(envelope.account_alias)
-    report.record(
-        "paper_environment",
-        snapshot.environment is Environment.PAPER,
-        f"environment={snapshot.environment.value}",
-    )
-    # Always masked: if an operator ever passes a raw DU id as the alias it
-    # must still never reach stdout or the evidence artifact in full.
-    report.record(
-        "paper_account_gate",
-        snapshot.account_alias.strip() != "",
-        f"alias={mask_account(snapshot.account_alias)} (the adapter enforces the"
-        f" {PAPER_ACCOUNT_PREFIX} prefix gate on the real account id)",
-    )
+    Every read is an INDEPENDENT probe (D-CLOCK-02). Previously the first
+    failing read raised out of the whole run, so a real verify-clean owner-run
+    reported nothing but ``broker error BROKER_UNHEALTHY; no retry`` and the
+    owner could not see that the account in fact held an unrelated position.
 
-    capabilities = broker.capabilities()
-    stop_mode = capabilities.order_types.get(OrderType.STOP, BrokerCapabilityMode.UNSUPPORTED)
-    report.record(
-        "protective_stop_supported",
-        stop_mode is BrokerCapabilityMode.NATIVE,
-        f"STOP={stop_mode.value}; bracket={capabilities.bracket.value}"
-        f"; oca={capabilities.oco.value}",
-    )
+    Fail-closed is unchanged: a failed probe records a FAILED check, so
+    ``report.passed`` is False and ``run_lifecycle`` still refuses to submit.
+    The difference is only that the other probes' answers survive into the
+    evidence instead of being thrown away.
+    """
+    health = _probe(report, "broker_health_read", broker.health_check)
+    if health is None:
+        report.record("broker_health", False, "UNPROVEN: health could not be read")
+    else:
+        report.record("broker_health", health.healthy, health.detail)
 
-    if envelope.scenario not in NON_ORDER_SCENARIOS:
-        instrument = broker.resolve_instrument(InstrumentQuery(symbol=envelope.symbol))
+    snapshot = _probe(
+        report,
+        "account_snapshot_read",
+        lambda: broker.get_account_snapshot(envelope.account_alias),
+    )
+    if snapshot is None:
+        report.record("paper_environment", False, "UNPROVEN: account snapshot unreadable")
+        report.record("paper_account_gate", False, "UNPROVEN: account snapshot unreadable")
+    else:
         report.record(
-            "instrument_resolved",
-            instrument.symbol == envelope.symbol,
-            f"{instrument.symbol} @ {instrument.exchange} {instrument.currency}",
+            "paper_environment",
+            snapshot.environment is Environment.PAPER,
+            f"environment={snapshot.environment.value}",
+        )
+        # Always masked: if an operator ever passes a raw DU id as the alias it
+        # must still never reach stdout or the evidence artifact in full.
+        report.record(
+            "paper_account_gate",
+            snapshot.account_alias.strip() != "",
+            f"alias={mask_account(snapshot.account_alias)} (the adapter enforces the"
+            f" {PAPER_ACCOUNT_PREFIX} prefix gate on the real account id)",
         )
 
-    open_orders = broker.get_open_orders(envelope.account_alias)
-    stale = tuple(o for o in open_orders if o.client_order_id.startswith(CLIENT_ORDER_PREFIX))
+    capabilities = _probe(report, "capabilities_read", broker.capabilities)
+    if capabilities is None:
+        report.record("protective_stop_supported", False, "UNPROVEN: capabilities unreadable")
+    else:
+        stop_mode = capabilities.order_types.get(OrderType.STOP, BrokerCapabilityMode.UNSUPPORTED)
+        report.record(
+            "protective_stop_supported",
+            stop_mode is BrokerCapabilityMode.NATIVE,
+            f"STOP={stop_mode.value}; bracket={capabilities.bracket.value}"
+            f"; oca={capabilities.oco.value}",
+        )
+
+    if envelope.scenario not in NON_ORDER_SCENARIOS:
+        instrument = _probe(
+            report,
+            "instrument_read",
+            lambda: broker.resolve_instrument(InstrumentQuery(symbol=envelope.symbol)),
+        )
+        report.record(
+            "instrument_resolved",
+            instrument is not None and instrument.symbol == envelope.symbol,
+            "UNPROVEN: instrument could not be resolved"
+            if instrument is None
+            else f"{instrument.symbol} @ {instrument.exchange} {instrument.currency}",
+        )
+
+    open_orders = _probe(
+        report, "open_orders_read", lambda: broker.get_open_orders(envelope.account_alias)
+    )
+    stale = (
+        ()
+        if open_orders is None
+        else tuple(o for o in open_orders if o.client_order_id.startswith(CLIENT_ORDER_PREFIX))
+    )
     if envelope.scenario not in LEFTOVER_TOLERANT_SCENARIOS:
         # Cleanup exists precisely to clear these and reconnect exists to
         # observe them, so neither may be blocked by them; every other
         # scenario refuses to start on top of a leftover.
         report.record(
             "no_stale_poi_orders",
-            not stale,
-            "none"
+            open_orders is not None and not stale,
+            "UNPROVEN: the open-order snapshot could not be read"
+            if open_orders is None
+            else "none"
             if not stale
             else f"{len(stale)} stale PoI order(s) still open: run --scenario cleanup first",
         )
-    else:
+    elif open_orders is not None:
         report.record("open_poi_orders", True, f"{len(stale)} still open at the broker")
-    positions = broker.get_positions(envelope.account_alias)
+
+    positions = _probe(
+        report, "positions_read", lambda: broker.get_positions(envelope.account_alias)
+    )
+    if positions is None:
+        report.record(
+            "position_snapshot", False, "UNPROVEN: the position snapshot could not be read"
+        )
+        return
     existing = tuple(p for p in positions if p.symbol == envelope.symbol and p.quantity != 0)
     if envelope.scenario in SUBMITTING_SCENARIOS:
         # A pre-existing holding in the SAME symbol would blend the average
@@ -1098,6 +1221,7 @@ def _run_cancel_path(
     *,
     now: datetime,
     sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
     timeout_seconds: float,
     quote_provider: Callable[[], QuoteObservation] | None = None,
 ) -> None:
@@ -1168,6 +1292,7 @@ def _run_cancel_path(
         frozenset({OrderState.ACKNOWLEDGED, OrderState.PARTIALLY_FILLED, OrderState.FILLED}),
         timeout_seconds=timeout_seconds,
         sleep=sleep,
+        monotonic=monotonic,
     )
     report.record(
         "acknowledged",
@@ -1207,6 +1332,7 @@ def _run_cancel_path(
         frozenset({OrderState.CANCELLED}),
         timeout_seconds=timeout_seconds,
         sleep=sleep,
+        monotonic=monotonic,
     )
     report.record(
         "cancel_confirmed",
@@ -1264,6 +1390,7 @@ def _run_fill_path(
     *,
     now: datetime,
     sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
     timeout_seconds: float,
 ) -> None:
     """Submit a marketable LIMIT, then protect the resulting position."""
@@ -1298,6 +1425,7 @@ def _run_fill_path(
         frozenset({OrderState.FILLED, OrderState.PARTIALLY_FILLED}),
         timeout_seconds=timeout_seconds,
         sleep=sleep,
+        monotonic=monotonic,
     )
     report.record(
         "fill_observed",
@@ -1769,8 +1897,8 @@ def _cancellable_lifecycle_orders(
         report.record(
             "cancellable_recovery",
             False,
-            f"same-client recovery refused ({error.code.value}); nothing may be"
-            " cancelled while the recovered identity is ambiguous",
+            f"same-client recovery refused — {describe_broker_error(error)};"
+            " nothing may be cancelled while the recovered identity is ambiguous",
         )
         return (), error.code.value
     owned = tuple(
@@ -1792,6 +1920,7 @@ def _run_cleanup(
     *,
     now: datetime,
     sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
     timeout_seconds: float,
 ) -> None:
     """Cancel every lifecycle-owned order this client may cancel. Never flattens.
@@ -1843,8 +1972,8 @@ def _run_cleanup(
             report.record(
                 f"cleanup_cancel[{client_order_id}]",
                 False,
-                f"cancel failed: {error.code.value} (no retry; continuing with"
-                " the remaining eligible orders)",
+                f"cancel failed — {describe_broker_error(error)}; continuing"
+                " with the remaining eligible orders",
             )
             unresolved.append(client_order_id)
             continue
@@ -1864,6 +1993,7 @@ def _run_cleanup(
             frozenset({OrderState.CANCELLED}),
             timeout_seconds=timeout_seconds,
             sleep=sleep,
+            monotonic=monotonic,
         )
         report.record(
             f"cleanup_cancel_confirmed[{client_order_id}]",
@@ -1960,60 +2090,100 @@ def _run_verify_clean(
     Makes no submission, no cancellation and no flatten call — it only reads.
     """
     report.mode_label = READ_ONLY_MODE_LABEL
-    open_orders = broker.get_open_orders(envelope.account_alias)
-    lifecycle = tuple(
-        o for o in open_orders if o.client_order_id.startswith(CLIENT_ORDER_PREFIX)
+    # Each read-only probe is recorded INDEPENDENTLY. A single failing probe
+    # used to abort the whole scenario, so a real owner-run reported nothing
+    # but `broker error BROKER_UNHEALTHY; no retry` and the owner could not see
+    # that the account actually held an unrelated position. A failed probe
+    # still records FAIL (fail-closed is unchanged) — it just no longer erases
+    # the answers the other probes already obtained.
+    open_orders = _probe(
+        report, "verify_open_orders_read", lambda: broker.get_open_orders(envelope.account_alias)
     )
-    working = tuple(o for o in lifecycle if o.state in _WORKING_ORDER_STATES)
-    report.record(
-        "verify_no_working_lifecycle_order",
-        not working,
-        "no PoI lifecycle order is working"
-        if not working
-        else f"{len(working)} still working: "
-        + ", ".join(f"{o.client_order_id}:{o.state.value}" for o in working),
+    if open_orders is None:
+        working: tuple[BrokerOrderReceipt, ...] = ()
+        report.record(
+            "verify_no_working_lifecycle_order",
+            False,
+            "UNPROVEN: the open-order snapshot could not be read",
+        )
+    else:
+        lifecycle = tuple(
+            o for o in open_orders if o.client_order_id.startswith(CLIENT_ORDER_PREFIX)
+        )
+        working = tuple(o for o in lifecycle if o.state in _WORKING_ORDER_STATES)
+        report.record(
+            "verify_no_working_lifecycle_order",
+            not working,
+            "no PoI lifecycle order is working"
+            if not working
+            else f"{len(working)} still working: "
+            + ", ".join(f"{o.client_order_id}:{o.state.value}" for o in working),
+        )
+        report.record(
+            "verify_foreign_orders_untouched",
+            True,
+            f"{len(open_orders) - len(lifecycle)} non-PoI order(s) visible; reported"
+            " for the owner, never cancelled or modified by this harness",
+        )
+
+    positions = _probe(
+        report, "verify_positions_read", lambda: tuple(broker.get_positions(envelope.account_alias))
     )
-    foreign = len(open_orders) - len(lifecycle)
-    report.record(
-        "verify_foreign_orders_untouched",
-        True,
-        f"{foreign} non-PoI order(s) visible; reported for the owner, never"
-        " cancelled or modified by this harness",
-    )
-    positions = tuple(broker.get_positions(envelope.account_alias))
-    nonzero = _record_position_breakdown(
-        report, positions, symbol=envelope.symbol, label="verify_position_breakdown"
-    )
-    report.record(
-        "verify_no_open_position",
-        not nonzero,
-        "flat"
-        if not nonzero
-        else "open: " + ", ".join(f"{p.symbol}:{p.quantity}" for p in nonzero),
-    )
-    result = _reconcile(
-        broker,
-        envelope,
+    if positions is None:
+        nonzero: tuple[BrokerPosition, ...] = ()
+        report.record(
+            "verify_no_open_position",
+            False,
+            "UNPROVEN: the position snapshot could not be read",
+        )
+    else:
+        nonzero = _record_position_breakdown(
+            report, positions, symbol=envelope.symbol, label="verify_position_breakdown"
+        )
+        report.record(
+            "verify_no_open_position",
+            not nonzero,
+            "flat"
+            if not nonzero
+            # Name every open position explicitly: an unrelated holding must be
+            # visible to the owner, not hidden behind a generic broker error.
+            else "open: " + ", ".join(f"{p.symbol}:{p.quantity}" for p in nonzero),
+        )
+
+    result = _probe(
         report,
-        open_orders=(),
-        positions={},
-        protected={},
-        processed_event_ids=frozenset(_event_id(e) for e in broker.order_events()),
-        now=now,
-        trigger=ReconciliationTrigger.PERIODIC,
+        "verify_reconciliation_read",
+        lambda: _reconcile(
+            broker,
+            envelope,
+            report,
+            open_orders=(),
+            positions={},
+            protected={},
+            processed_event_ids=frozenset(_event_id(e) for e in broker.order_events()),
+            now=now,
+            trigger=ReconciliationTrigger.PERIODIC,
+        ),
     )
     report.record(
         "verify_no_unresolved_broker_state",
-        not result.findings,
-        "no unresolved broker operation state"
+        result is not None and not result.findings,
+        "UNPROVEN: reconciliation could not be run"
+        if result is None
+        else "no unresolved broker operation state"
         if not result.findings
         else f"{len(result.findings)} unresolved finding(s): "
         + ", ".join(sorted({f.kind.value for f in result.findings})),
     )
-    if working or nonzero:
+    if working or nonzero or open_orders is None or positions is None:
         _owner_action_required(
             report,
-            "verify-clean found the account is NOT clean",
+            "verify-clean could not prove the account is clean"
+            + (
+                f" — open position(s): {', '.join(f'{p.symbol}:{p.quantity}' for p in nonzero)}"
+                if nonzero
+                else ""
+            ),
             "inspect open orders and positions in the IB Gateway/TWS UI (VNC)",
             "run --scenario cleanup to cancel any remaining PoI order",
             "close or protect any open position by hand — this harness never flattens",
@@ -2029,6 +2199,7 @@ def run_lifecycle(
     run_ref: str | None = None,
     clock: Callable[[], datetime] | None = None,
     sleep: Callable[[float], None] | None = None,
+    monotonic: Callable[[], float] | None = None,
     timeout_seconds: float = 30.0,
     journal: OwnerRunJournal | None = None,
     quote_provider: Callable[[], QuoteObservation] | None = None,
@@ -2036,6 +2207,11 @@ def run_lifecycle(
     """Run one scenario end to end, fail-closed, with cleanup on error."""
     now_fn = clock or (lambda: datetime.now(tz=UTC))
     sleep_fn = sleep or time.sleep
+    # Durations are measured monotonically so a system-clock jump can
+    # neither abandon a live order early nor wait far past the timeout.
+    # Evidence timestamps stay UTC wall-clock (``now_fn``) — the two are
+    # never mixed.
+    monotonic_fn = monotonic or time.monotonic
     expected_token = confirmation_token(envelope)
     params_hash = parameters_hash(envelope)
 
@@ -2096,9 +2272,19 @@ def run_lifecycle(
         connected = True
         report.record("connect", True, f"{envelope.host}:{envelope.port} (paper, localhost)")
         _preflight(broker, envelope, report)
-        if not report.passed:
+        if not report.passed and envelope.scenario not in READ_ONLY_SCENARIOS:
             report.note("preflight failed; nothing was submitted (fail closed)")
             return report
+        if not report.passed:
+            # A READ-ONLY scenario continues after a failed preflight: it can
+            # send nothing, and the owner needs the full picture (D-CLOCK-02).
+            # The run still reports FAIL — gathering more evidence never turns
+            # a failure into a pass.
+            report.note(
+                "preflight reported a failure; this scenario is read-only, so the"
+                " remaining inspections still ran to give the owner the complete"
+                " picture. NOTHING was submitted, cancelled or flattened."
+            )
 
         now = now_fn()
         if envelope.scenario == "cleanup":
@@ -2108,6 +2294,7 @@ def run_lifecycle(
                 report,
                 now=now,
                 sleep=sleep_fn,
+                monotonic=monotonic_fn,
                 timeout_seconds=timeout_seconds,
             )
         elif envelope.scenario == "verify-clean":
@@ -2153,6 +2340,7 @@ def run_lifecycle(
                 report,
                 now=now,
                 sleep=sleep_fn,
+                monotonic=monotonic_fn,
                 timeout_seconds=timeout_seconds,
                 quote_provider=quote_provider,
             )
@@ -2164,10 +2352,11 @@ def run_lifecycle(
                 report,
                 now=now,
                 sleep=sleep_fn,
+                monotonic=monotonic_fn,
                 timeout_seconds=timeout_seconds,
             )
     except BrokerPortError as error:
-        report.record("fail_closed", False, f"broker error {error.code.value}; no retry")
+        report.record("fail_closed", False, describe_broker_error(error))
         _emergency_cleanup(agent, envelope, report, execute=execute)
     except LifecycleRefused as refusal:
         report.record("fail_closed", False, str(refusal))

@@ -7,8 +7,9 @@ BrokerPort (same suite as the fake broker) plus IBKR/paper-specific gates.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -171,12 +172,31 @@ class FakePaperTransport:
         return tuple(row for row in rows if row.client_id == self.client_id)
 
 
+def deterministic_clock(
+    start: datetime = datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
+) -> Callable[[], datetime]:
+    """A monotonically-ticking UTC clock for tests that compare timestamps.
+
+    The adapter's production default is the REAL UTC clock (D-CLOCK-01), so any
+    test asserting reproducible receipts/events must inject its own time rather
+    than rely on a frozen default shipping in production code.
+    """
+    state = {"ticks": 0}
+
+    def now() -> datetime:
+        state["ticks"] += 1
+        return start + timedelta(seconds=state["ticks"])
+
+    return now
+
+
 def make_adapter(
     transport: FakePaperTransport | None = None,
     *,
     host: str = "127.0.0.1",
     port: int = 4002,
     aliases: dict[str, str] | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> IbkrPaperAdapter:
     fake = transport if transport is not None else FakePaperTransport()
     return IbkrPaperAdapter(
@@ -184,6 +204,8 @@ def make_adapter(
         account_aliases=aliases if aliases is not None else dict(ALIASES),
         host=host,
         port=port,
+        # Time is an explicit test input here; production uses the real clock.
+        clock=clock if clock is not None else deterministic_clock(),
     )
 
 
