@@ -41,7 +41,7 @@ reconciliation passes.
 | `<ALIAS>` | the configured account alias (never a `DU` id) |
 | `<BROKER_MODULE>` | `trading_broker_ibkr.paper_adapter` |
 | `<CURRENT_PRICE>` | a fresh positive quote for the symbol at run time |
-| `<FAR_BELOW_MARKET>` | a limit ≥ 20 % below `<CURRENT_PRICE>` (cannot fill) |
+| `<FAR_BELOW_MARKET>` | a limit ≥ 20 % below the observed bid (non-marketable at that quote; fill risk reduced, not eliminated) |
 | `<MARKETABLE_LIMIT>` | at/just above the ask, ≤ $50 notional (fills) |
 | `<TOKEN>` | the confirmation token printed by the matching dry-run |
 | `<RUN_REF>` | the operation reference printed in the fill-path evidence (NOT the token) |
@@ -67,6 +67,8 @@ Blocker vocabulary: `MARKET_CLOSED`, `OWNER_HOST_REQUIRED`,
     --scenario cancel-path --account-alias <ALIAS> --broker-module <BROKER_MODULE> \
     --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET> \
     --reference-price <CURRENT_PRICE> \
+    --quote-bid <OBSERVED_BID> --quote-ask <OBSERVED_ASK> \
+    --quote-at <QUOTE_OBSERVED_AT_ISO8601_UTC> --quote-session <SESSION> \
     --evidence-out /tmp/poi-ibkr-001-cancel-dryrun-<YYYYMMDD>.md
   ```
 - **Expected safe result:** what-if preview succeeds; `NOTHING WAS SENT`; an
@@ -81,13 +83,16 @@ Blocker vocabulary: `MARKET_CLOSED`, `OWNER_HOST_REQUIRED`,
 - **Sends / cancels / modifies an order:** **yes** (submits then cancels)
 - **Owner confirmation required:** **yes** (`--confirm <TOKEN>`)
 - **Prerequisites:** DEF-01 completed; `<TOKEN>` is that dry-run's token; the
-  resting limit is ≥ 20 % below the market so it **cannot fill**.
+  resting limit is ≥ 20 % below the observed bid, making it **non-marketable at that quote** — fill risk reduced, not eliminated.
 - **Command:**
   ```bash
   uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
     --scenario cancel-path --account-alias <ALIAS> --broker-module <BROKER_MODULE> \
     --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET> \
-    --reference-price <CURRENT_PRICE> --execute --confirm <TOKEN> \
+    --reference-price <CURRENT_PRICE> \
+    --quote-bid <OBSERVED_BID> --quote-ask <OBSERVED_ASK> \
+    --quote-at <QUOTE_OBSERVED_AT_ISO8601_UTC> --quote-session <SESSION> \
+    --journal-dir <OWNER_RUN_JOURNAL_DIR> --execute --confirm <TOKEN> \
     --evidence-out /tmp/poi-ibkr-001-cancel-execute-<YYYYMMDD>.md
   ```
 - **Expected safe result:** submit → `ACKNOWLEDGED` → cancel → `CANCELLED` →
@@ -130,7 +135,8 @@ Blocker vocabulary: `MARKET_CLOSED`, `OWNER_HOST_REQUIRED`,
   ```bash
   uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
     --scenario fill-path --account-alias <ALIAS> --broker-module <BROKER_MODULE> \
-    --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT> --execute --confirm <TOKEN> \
+    --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT> \
+    --journal-dir <OWNER_RUN_JOURNAL_DIR> --execute --confirm <TOKEN> \
     --evidence-out /tmp/poi-ibkr-001-fill-execute-<YYYYMMDD>.md
   ```
 - **Expected safe result:** submit → `FILLED` → position reported → protective
@@ -153,7 +159,8 @@ Blocker vocabulary: `MARKET_CLOSED`, `OWNER_HOST_REQUIRED`,
   ```bash
   uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
     --scenario fill-path --account-alias <ALIAS> --broker-module <BROKER_MODULE> \
-    --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT> --execute --confirm <TOKEN> \
+    --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT> \
+    --journal-dir <OWNER_RUN_JOURNAL_DIR> --execute --confirm <TOKEN> \
     --evidence-out /tmp/poi-ibkr-001-protection-<YYYYMMDD>.md
   ```
 - **Expected safe result:** exactly one protective `STOP` resting; `SELL`;
@@ -414,3 +421,98 @@ any open-market window. DEF-11–13 are host-only. DEF-14 stays deferred.
 **Every one of these is BLOCKED today** on the market being open, the owner
 host, IB Gateway, real Paper execution, or the deferred provider decision. None
 were performed. **POI-IBKR-001 remains BLOCKED / NOT RUN.**
+
+## DEF-18-post-fix-cancellation-verification — IMP-1302 / POI-IBKR-001
+- **Blocker:** `IBKR_PAPER_EXECUTION_REQUIRED`
+- **Sends / cancels / modifies an order:** yes · **owner confirmation:** yes
+- **Why this exists:** a real Paper owner-run reached the broker order path and
+  the **cancellation failed** — `cancel_sent=FAIL`, `cancel_confirmed=FAIL`, the
+  order stayed `ACKNOWLEDGED`, reconciliation reported
+  `UNEXPECTED_BROKER_ORDER`, and the owner cancelled it by hand. The
+  cancellation-hardening PR (D-CANCEL-01 … D-CANCEL-08) fixes the causes, but
+  **no post-fix real cancellation has been performed**. This run is what proves
+  the fix on real infrastructure.
+- **Prerequisites:**
+  - the cancellation-hardening PR is merged;
+  - DEF-19 `verify-clean` passes first (the account is flat and clean);
+  - a fresh dry run of the **identical** parameters printed `<TOKEN>`;
+  - a fresh two-sided quote observed within 120 seconds;
+  - `<OWNER_RUN_JOURNAL_DIR>` is a durable directory **outside the repository**
+    — the execute attempt is single-use and cannot be replayed.
+- **Command:**
+  ```bash
+  uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
+    --scenario cancel-path --account-alias <ALIAS> --broker-module <BROKER_MODULE> \
+    --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET> \
+    --reference-price <CURRENT_PRICE> \
+    --quote-bid <OBSERVED_BID> --quote-ask <OBSERVED_ASK> \
+    --quote-at <QUOTE_OBSERVED_AT_ISO8601_UTC> --quote-session <SESSION> \
+    --journal-dir <OWNER_RUN_JOURNAL_DIR> --execute --confirm <TOKEN> \
+    --evidence-out /tmp/poi-ibkr-001-cancel-postfix-<YYYYMMDD>.md
+  ```
+- **Expected safe result:** `cancel_sent` PASS and `cancel_confirmed` PASS with
+  a real `Cancelled`/`ApiCancelled` confirmation; `never_filled` observed; zero
+  remaining lifecycle orders; reconciliation clean.
+- **Abort criteria:** `cancel_confirmed` FAIL, any fill during cancellation, or
+  an `UNKNOWN` broker state. **The order may still be working.** Do **not**
+  re-run the scenario and do **not** reuse the token — the durable journal will
+  refuse it anyway. Cancel by hand in the Gateway/TWS UI, then run DEF-19.
+- **Evidence:** `/tmp/poi-ibkr-001-cancel-postfix-<YYYYMMDD>.md`
+- **Status before → after PASS:** `NOT_RUN` → `CANCELLATION_FIX_VERIFIED`
+- **Cleanup:** if the cancellation is unproven, cancel by hand, then run DEF-19
+  until it passes. **The harness never flattens.**
+
+## DEF-19-verify-clean-readonly — IMP-1302 / POI-IBKR-001
+- **Blocker:** `OWNER_HOST_REQUIRED`
+- **Sends / cancels / modifies an order:** no · **owner confirmation:** no
+- **Why this exists:** `reconnect` is the **fill-path** verifier — it proves a
+  position and its exact protective stop survived a restart, which is why it
+  needs a fill-path `--run-ref`. Using it to check a **cancel-path** run
+  conflates two different questions. `verify-clean` is the scenario-correct,
+  strictly read-only "is this account clear?" check.
+- **Prerequisites:** none beyond a running Paper Gateway. It cannot submit,
+  cancel or flatten, and it needs no `--run-ref`.
+- **Command:**
+  ```bash
+  uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
+    --scenario verify-clean --account-alias <ALIAS> --broker-module <BROKER_MODULE> \
+    --evidence-out /tmp/poi-ibkr-001-verify-clean-<YYYYMMDD>.md
+  ```
+- **Expected safe result:** zero working lifecycle orders; zero non-zero
+  positions; zero unresolved broker operation states; clean reconciliation.
+- **Abort criteria:** any working lifecycle order or any non-zero position. Run
+  DEF-09 cleanup, then close any position by hand.
+- **Evidence:** `/tmp/poi-ibkr-001-verify-clean-<YYYYMMDD>.md`
+- **Status before → after PASS:** `NOT_RUN` → `ACCOUNT_VERIFIED_CLEAN`
+- **Cleanup:** none (read-only). **The harness never flattens.**
+
+## DEF-20-restart-recovery-cancellation — IMP-1302 / POI-IBKR-001
+- **Blocker:** `IB_GATEWAY_RESTART_REQUIRED`
+- **Sends / cancels / modifies an order:** yes (cancel only) · **owner
+  confirmation:** yes
+- **Why this exists:** before this PR, cleanup after a restart could **see** a
+  resting lifecycle order and still fail `ORDER_NOT_FOUND` (D-CANCEL-04). The
+  fix recovers cancellation authority from the **same-client** open-order feed
+  only (D-CANCEL-06) — global `reqAllOpenOrders` visibility grants nothing. No
+  post-fix restart recovery has been performed on real infrastructure.
+- **Prerequisites:**
+  - a lifecycle order is resting at the broker and the harness process (or the
+    Gateway) has been restarted since it was submitted;
+  - `--client-id` **must** match the client id that submitted the order.
+- **Command:**
+  ```bash
+  uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
+    --scenario cleanup --account-alias <ALIAS> --broker-module <BROKER_MODULE> \
+    --client-id <SAME_CLIENT_ID_AS_THE_SUBMITTING_RUN> \
+    --evidence-out /tmp/poi-ibkr-001-restart-cleanup-<YYYYMMDD>.md
+  ```
+- **Expected safe result:** the recovered order is cancelled by its canonical
+  `client_order_id`; the post-cancel snapshot shows no targeted working order;
+  a foreign or manual order is never cancelled.
+- **Abort criteria:** recovery reports an ambiguous identity (nothing is
+  cancelled — by design), or the cancellation cannot be confirmed. Cancel by
+  hand and run DEF-19.
+- **Evidence:** `/tmp/poi-ibkr-001-restart-cleanup-<YYYYMMDD>.md`
+- **Status before → after PASS:** `NOT_RUN` → `RESTART_RECOVERY_CANCEL_VERIFIED`
+- **Cleanup:** cancels ORDERS only. Close any position by hand in the
+  Gateway/TWS UI. **The harness never flattens.**

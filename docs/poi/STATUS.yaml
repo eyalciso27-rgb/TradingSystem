@@ -96,9 +96,30 @@ items:
     priority: P0
     status: BLOCKED
     evidence: evidence/BLOCKED-P0.md
-    blocked_on: "Owner has not executed the Paper lifecycle run. The
-      order-lifecycle experiment itself has not run: no real submit, ack,
-      fill, protection, cancel or reconciliation evidence exists."
+    blocked_on: "The Paper lifecycle run has not completed. A real owner-run
+      DID reach the broker order path (submit + acknowledgement + idempotent
+      resubmit all passed, order never filled) but the CANCELLATION FAILED and
+      the owner had to cancel by hand; no fill, protection or restart-recovery
+      evidence exists at all. The cancellation root causes are fixed
+      (D-CANCEL-01..08) but NO post-fix real order or cancellation has been
+      performed."
+    # FAILED owner-run evidence. Recording an observed failure never changes
+    # status: this PoI stays BLOCKED until the owner records a passing run.
+    failed_owner_run_evidence:
+      - date: "2026-07-28"
+        scenario: cancel-path
+        result: FAIL
+        operation_reference: "05D0E19B631C2548"
+        broker_order_ref: "ibkr-paper:2"
+        summary: >-
+          submit and acknowledgement passed; cancel_sent and cancel_confirmed
+          FAILED; the order stayed ACKNOWLEDGED; reconciliation reported
+          UNEXPECTED_BROKER_ORDER; the owner cancelled manually; a later
+          reconnect was clean (open_poi_orders=0, non-zero positions=0,
+          reconciliation=PASS)
+        evidence: evidence/POI-IBKR-001-CANCEL-DEFECT.md
+        defects: D-CANCEL-01..D-CANCEL-08
+        post_fix_verification: NOT_RUN  # DEF-18, DEF-19, DEF-20
     # Market-data dependency (ADR-0016, 2026-07-21): the proven
     # POI-MD-001.realtime_subgate satisfies the market-data dependency for
     # THIS PoI only. The POI-MD-001 aggregate stays BLOCKED (external

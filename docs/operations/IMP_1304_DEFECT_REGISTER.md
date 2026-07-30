@@ -39,7 +39,15 @@
 | D-ADAPTER-01 | Reconnect owner-run cannot recover the harness order id / operation reference from a real Gateway after a restart: the paper adapter never set `order.orderRef` on `placeOrder`, and `get_open_orders` returned only in-memory orders (not a live `reqAllOpenOrders`) | **P1** | `broker-ibkr/paper_adapter.py` | ✅ **code fix implemented + contract-tested in this bundle**; **owner-host empirical verification BLOCKED / NOT RUN** (see below) |
 | D-TIF-01 | The IBKR transport built the `Order` with **no `tif`** (and no explicit `transmit`), so a real Paper submit reached the API with an empty TIF and was rejected: `ERROR 1 … 10052 Invalid time in force:Empty`. Observed on a real cancel-path owner-run (BUY LIMIT F qty 1). The harness then failed closed correctly (`UNKNOWN_BROKER_STATE`, `RECONCILE_BEFORE_ANY_RETRY`) — no unsafe outcome | **P1** | `broker-ibkr/paper_adapter.py` transport | ✅ **fixed** — canonical `TimeInForce` (default `DAY`), validated + translated before `placeOrder`; regression-proofed |
 | D-TIF-02 | The TIF fix defaulted **every** order to `DAY`, including the protective STOP — a DAY protective stop expires at session close and leaves the real position **naked overnight** | **P1** | `agent.py` / `poi_ibkr_lifecycle.py` | ✅ **fixed in pre-merge review** — protective STOP is now **GTC**; entry LIMIT stays DAY |
-| D-TIF-03 | Deterministic broker validation rejects (10052/321) time out into `UNKNOWN` (not a definite `REJECTED`), forcing unnecessary reconciliation | P2 | `broker-ibkr` host transport `_await_status`/`error()` | 📝 **documented** — determination + DEF-17 owner-host follow-up; not implemented (host-only, unverifiable offline; conservative-safe today) |
+| D-TIF-03 | Deterministic broker validation rejects (10052/321) time out into `UNKNOWN` (not a definite `REJECTED`), forcing unnecessary reconciliation | P2 | `broker-ibkr` host transport `_await_status`/`error()` | ✅ **implemented in this bundle** (was: documented only) — `error()` is now overridden and correlated, and a small conservative allowlist `{103, 201, 321, 10052}` maps to terminal `BROKER_REJECTED`; every other code stays `UNKNOWN`. DEF-17 remains open to empirically confirm the allowlist |
+| D-CANCEL-01 | The host transport called `self._app.cancelOrder(broker_order_id, "")`. The installed API is `EClient.cancelOrder(orderId, orderCancel: ibapi.order_cancel.OrderCancel)` and reads `orderCancel.manualOrderCancelTime` / `.extOperator` / `.manualOrderIndicator`, so a `str` raised **before any cancellation request was encoded**. Observed on a real Paper owner-run: `cancel_sent=FAIL`, order stayed `ACKNOWLEDGED`, owner cancelled by hand | **P1** | `broker-ibkr/paper_adapter.py` host transport | ✅ **fixed in this bundle** — real `OrderCancel()`; fail-closed if the SDK lacks the surface |
+| D-CANCEL-02 | Cancellation reused the generic "first order status wins" wait. A stale `Submitted`/`PreSubmitted` could be read as the cancellation result, a `Filled` during cancellation would have counted as success, and `Inactive` was not a deterministic failure | **P1** | `broker-ibkr/paper_adapter.py` cancel wait | ✅ **fixed in this bundle** — dedicated disposition classifier + reducer (stale ignored, PendingCancel accepted-not-final, fill = exposure, reject = terminal, timeout = UNKNOWN, never retried) |
+| D-CANCEL-03 | `EWrapper.error` was **not overridden at all**, so every order-scoped broker error was discarded; and all callbacks shared ONE `queue.Queue`, so a waiter could consume and discard the callback another operation was blocked on (a real cancellation could surface as a false timeout) | **P1** | `broker-ibkr` host transport | ✅ **fixed in this bundle** — `error()` normalized + correlated by issued id; lossless per-stream `CallbackRouter` replaces the shared queue |
+| D-CANCEL-04 | `get_open_orders()` recovered identity from the broker snapshot and returned receipts, but never populated the cancellation maps, so cleanup after a process/Gateway restart could SEE the resting order and still fail `ORDER_NOT_FOUND` | **P1** | `broker-ibkr/paper_adapter.py` | ✅ **fixed in this bundle** — `recover_cancellable_orders()` (see D-CANCEL-06 for why it is not simply hydrated from the global feed) |
+| D-CANCEL-05 | The `--execute` confirmation token is a deterministic digest of the run parameters, so it is **not single-use across processes**: the identical command could be replayed, and a crash between "order sent" and "status received" left the owner able to submit a duplicate | **P1 (safety)** | `scripts/poi_ibkr_lifecycle.py` + `trading_application` | ✅ **fixed in this bundle** — durable `OwnerRunJournal` with an atomic `O_EXCL` execute-attempt claim; `--execute` refused without `--journal-dir` |
+| D-CANCEL-06 | Hydrating cancellable state from `reqAllOpenOrders` would conflate **visibility** with **authority**: that feed reports orders from every API client and from the TWS/Gateway UI, so a foreign or manual order could have become cancellable through this adapter | **P1 (safety)** | `broker-ibkr/paper_adapter.py` | ✅ **fixed in this bundle** — global feed grants nothing; authority requires the same-client feed + matching `clientId` + account + canonical `orderRef` + valid non-zero id + unambiguous identity. No `reqGlobalCancel` anywhere |
+| D-CANCEL-07 | Cleanup evidence read `mode: DRY-RUN (nothing sent)` although cleanup sends cancellations; it did not wait for confirmation or re-read the broker; one failing cancel aborted the whole sweep; and `reconnect` (a fill-path protection verifier) was the only "is it clean" check available to a cancel-path run | **P1** | `scripts/poi_ibkr_lifecycle.py` | ✅ **fixed in this bundle** — `CANCEL-ONLY` header, wait + fresh re-read, one attempt per eligible order with no early abort and no retry, plus a dedicated read-only `--scenario verify-clean` |
+| D-CANCEL-08 | The cancel path asserted the resting limit "cannot fill", bound that claim to a possibly-stale hand-copied `--reference-price`, and reported zero-quantity broker rows as positions (a flat account could read as `1 position(s)`) | P2 | `scripts/poi_ibkr_lifecycle.py` | ✅ **fixed in this bundle** — "non-marketable at the observed quote; fill risk reduced but not eliminated", mandatory fresh two-sided quote (age/spread/session/drift, revalidated immediately before submit), and raw / non-zero / run-symbol position rows reported separately |
 | D-02 | Owner-run `--client-id` default (7) diverges from adapter `DEFAULT_CLIENT_ID` (1); stale-connection recovery undocumented | P2 | lifecycle CLI + runbook | ✅ (doc) — not done here (P2, out of P0/P1 scope) |
 | B-01 | POI-IBKR-001 Paper lifecycle (cancel-path/fill-path/protection/reconnect/reconciliation) not run | BLOCKED | owner-run | ❌ owner + host |
 | B-02 | Owner-run chaos/recovery host drills not run | BLOCKED | `CHAOS_RECOVERY_DRILLS.md` §4 | ❌ blocked on B-01 |
@@ -367,3 +375,178 @@ real Gateway) and is documented rather than shipped untested. This does **not**
 complete IMP-1304 or Phase 13: the blocked items (B-01…B-04, D-ADAPTER-01) are
 owner-run/host dependencies, and IMP-1302 / the POI-IBKR-001 owner-run remain
 outstanding. IMP-1304 stays open.
+
+## 8. Cancellation + restart-recovery hardening (D-CANCEL-01 … D-CANCEL-08)
+
+### 8.1 What the real owner-run proved
+
+A real POI-IBKR-001 Paper owner-run reached the actual broker order path. This
+is the first empirical evidence for this code, and it is the source of every
+defect in this section.
+
+**Worked:**
+
+- PAPER environment gate and `DU` account gate passed;
+- `F` resolved through `SMART` / `USD`;
+- `BUY 1 F LIMIT 12.02` submitted and **acknowledged** by the broker;
+- `broker_order_ref = ibkr-paper:2`;
+- `operation_reference = 05D0E19B631C2548` (non-authorizing, as designed —
+  the confirmation token never appeared in an order id or in the evidence);
+- an idempotent resubmit correctly returned the original outcome — no second
+  order;
+- the order never filled during the test window.
+
+**Failed:**
+
+- `cancel_sent = FAIL` (`status=FAILED`);
+- `cancel_confirmed = FAIL`;
+- the order remained `ACKNOWLEDGED` at the broker;
+- reconciliation reported `UNEXPECTED_BROKER_ORDER`;
+- **the owner had to cancel the order manually in the Gateway UI.**
+
+**Afterwards:** a later reconnect was clean — `open_poi_orders=0`, non-zero
+positions `0`, `reconciliation=PASS`.
+
+The harness's fail-closed behaviour held throughout (no retry, no resend, no
+false PASS), but the evidence was nearly useless: the only diagnostic was
+`status=FAILED`, because order-scoped broker errors were being discarded.
+
+### 8.2 Root cause 1 — the cancellation was never encoded (D-CANCEL-01)
+
+The installed API is:
+
+```
+EClient.cancelOrder(self, orderId: int, orderCancel: ibapi.order_cancel.OrderCancel)
+```
+
+and it reads `orderCancel.manualOrderCancelTime`, `orderCancel.extOperator`
+and `orderCancel.manualOrderIndicator`. The transport passed `""`. Attribute
+access on a `str` raised inside `ibapi` **before a valid cancellation request
+was encoded**, so nothing was ever sent to the broker.
+
+Fixed by importing `OrderCancel` alongside the other host-only `ibapi` imports
+and calling `cancelOrder(broker_order_id, OrderCancel())`. If the installed API
+does not expose `ibapi.order_cancel.OrderCancel`, the transport **fails closed**
+with `BROKER_UNHEALTHY` rather than guessing a compatibility shim that might
+send an invalid request. `ibapi` remains confined to the lazily-built host
+transport (enforced by `scripts/check_architecture.py`).
+
+### 8.3 Root cause 2 — recovery returned receipts but no cancellation state
+
+`get_open_orders()` recovered each order's canonical identity from its
+`orderRef` and returned `BrokerOrderReceipt`s, but never populated the
+adapter's `_orders` / `_broker_ids` maps. `cancel_order()` reads only those
+maps, so after a process or Gateway restart cleanup could **see** the resting
+order and still fail `ORDER_NOT_FOUND` (D-CANCEL-04).
+
+The obvious fix — hydrate from the same `reqAllOpenOrders` snapshot — is
+itself unsafe (D-CANCEL-06). That request is a **global visibility** feed: it
+reports orders placed by other API clients and by the TWS/Gateway UI. Seeing an
+order there proves it exists; it proves nothing about whether this API client
+may cancel it, and hydrating from it would have made a foreign or manual order
+cancellable through this adapter.
+
+The two concepts are now separate:
+
+| | `get_open_orders()` | `recover_cancellable_orders()` |
+|---|---|---|
+| request | `reqAllOpenOrders` (global) | `reqOpenOrders` (this client) |
+| purpose | reconciliation, anomaly detection, owner evidence | cancellation authority after a restart |
+| grants cancellation? | **never** | only under every condition below |
+
+An order becomes cancellable only when **all** hold: it came from the
+same-client feed; `order.clientId` equals the configured adapter client id; the
+account matches the configured Paper account; it is genuinely working; its
+`orderRef` is a valid canonical `poi1:` reference (**the prefix alone is not
+proof of ownership**); its broker order id is valid and non-zero; and its
+identity is unambiguous. Ambiguity — one identity mapping to two broker order
+ids, one broker order id carrying two identities, conflicting `permId`s, or a
+snapshot contradicting process-local state — raises `UNKNOWN_BROKER_RESPONSE`
+and hydrates **nothing**: cancelling the wrong order is far worse than
+cancelling none (D-CANCEL-15 semantics, tracked here under D-CANCEL-06).
+`reqGlobalCancel` does not appear anywhere in the adapter or the harness, and a
+test asserts that.
+
+### 8.4 Stale acknowledgements, order errors and the lossy queue
+
+Three further defects made the failure both possible and undiagnosable:
+
+- **D-CANCEL-02** — cancellation reused the generic "first order status wins"
+  wait. A leftover `Submitted`/`PreSubmitted` could have been read as the
+  cancellation result, and a fill arriving during cancellation would have
+  counted as success. Cancellation now has its own classifier and reducer:
+  stale acks are ignored, `PendingCancel` is accepted-but-not-final,
+  `Cancelled`/`ApiCancelled` (and IBKR error **202**, which is how the broker
+  reports "Order Cancelled") confirm, `Filled`/`PartiallyFilled` is an
+  **exposure** event mapped to `UNKNOWN_BROKER_RESPONSE`, `Inactive` is a
+  terminal `BROKER_REJECTED`, and a timeout is `UNKNOWN_BROKER_RESPONSE`
+  requiring reconciliation. Cancellation is never retried automatically.
+
+- **D-CANCEL-03 (errors)** — `EWrapper.error` was not overridden, so every
+  order-scoped broker error was silently dropped; that is why the owner saw
+  only `status=FAILED`. `error()` is now overridden with a version-tolerant
+  normalizer (the 10.48 signature inserts `errorTime`), and errors are
+  correlated to the waiting submit/cancel by the ids this transport actually
+  issued. Informational farm notices (`2104`, `2106`, `2107`, `2108`, `2119`,
+  `2158`) never fail an order but stay observable on a diagnostics stream. The
+  original numeric code, the sanitized bounded text and any advanced-rejection
+  string reach the evidence; no account id, credential, secret path or
+  authorization material ever does.
+
+- **D-CANCEL-03 (routing)** — every callback shared one `queue.Queue`, so a
+  waiter draining positions could consume and discard the `orderStatus` a
+  cancellation was blocked on, turning a real cancellation into a false
+  timeout. `CallbackRouter` replaces it with independent per-key streams
+  (order id, request id, open-order snapshot, positions, diagnostics). A
+  consumer only ever removes envelopes from its own stream, waiter cleanup is
+  explicit, and late callbacks are archived rather than dropped.
+
+### 8.5 Governance, evidence and honesty fixes
+
+- **D-CANCEL-05** — the confirmation token is a deterministic digest, so it
+  cannot be single-use on its own. `OwnerRunJournal` adds a durable,
+  crash-safe execute-attempt claim (`O_CREAT | O_EXCL`, which is atomic across
+  processes) keyed by the operation reference and a canonical parameters hash.
+  After `EXECUTE_STARTED`, a second `--execute` is refused regardless of any
+  freshly minted in-memory authorization; only reconciliation, cleanup and
+  read-only inspection may proceed; terminal-clean reconciliation closes the
+  operation without erasing the audit record or the marker. The journal stores
+  no token, account id, credential or authorization material.
+
+- **D-CANCEL-07** — cleanup is labelled
+  `CANCEL-ONLY (no order submission; existing POI orders may be cancelled)`
+  instead of the misleading `DRY-RUN (nothing sent)`; it waits for terminal
+  confirmation, re-reads the broker, and passes only when no targeted working
+  order remains. Every eligible order gets exactly one exposure-reducing
+  attempt even if an earlier one fails (still no retry), and the report lists
+  attempted / confirmed / unresolved / still-working. A new read-only
+  `--scenario verify-clean` is the scenario-correct verifier for a cancel-path
+  operation; `reconnect` stays dedicated to proving a fill-path position and
+  its exact protective stop survived a restart.
+
+- **D-CANCEL-08** — the cancel path no longer claims an order "cannot fill".
+  A limit below the market is **non-marketable at the observed quote**: fill
+  risk reduced, not eliminated. The approval is bound to a fresh two-sided
+  quote (positive bid/ask, sane spread, open session, bounded age) which is
+  revalidated immediately before submission and aborts on material drift, and
+  `never_filled` is reported as an observed post-run fact. Position evidence
+  now separates raw rows, non-zero positions and run-symbol positions, so a
+  flat account can no longer read as `1 position(s)`.
+
+### 8.6 What is still NOT proven
+
+Everything in this section is verified against fakes, a deterministic fake
+transport and a stubbed `ibapi` — no IBKR connection was made and no Paper or
+Live order was sent while implementing it. The following remain **NOT RUN**:
+
+- no real IBKR Paper order after the code change;
+- no real cancellation after the code change;
+- no fill-path owner-run;
+- no Gateway restart recovery owner-run;
+- no Live connection and no Live order;
+- no PAPER_AUTO activation.
+
+**POI-IBKR-001 stays BLOCKED / non-PASS.** Only the owner may change it, from a
+fresh post-merge Paper owner-run, in `docs/poi/STATUS.yaml`. The post-merge
+validation sequence is recorded as DEF-18 … DEF-20 in
+`docs/operations/PHASE_13_DEFERRED_OWNER_RUNS.yaml`.

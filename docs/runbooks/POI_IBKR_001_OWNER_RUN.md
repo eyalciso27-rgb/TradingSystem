@@ -27,7 +27,7 @@
 | BUY entries only | a SELL entry (which could open a short) is refused |
 | LIMIT entries only | the only STOP is the protective leg the ProtectionManager produces |
 | no unrestricted submit surface | every order is built from a validated `LifecycleEnvelope`; there is no free-form intent path |
-| dry-run first | `--execute` requires `--confirm <token>`; the token is derived from run-date+scenario+symbol+side+quantity+limit+reference price+alias+port, so a stale or copied token fails closed — **a token from an earlier day can never be replayed** |
+| dry-run first | `--execute` requires `--confirm <token>`; the token is derived from run-date+scenario+symbol+side+quantity+limit+reference price+alias+port, so a stale or copied token fails closed — **a token from an earlier day can never be replayed**. Because the token is a deterministic digest it is not single-use by itself, so `--execute` additionally requires `--journal-dir`: a durable, crash-safe journal that claims the execute attempt atomically and refuses any second attempt for the same operation |
 | one order at a time | the `client_order_id` is deterministic per scenario **and per run-date**; a re-run on the same day returns the original outcome and sends nothing, while a run on another day never collides with an earlier one |
 | no blind retry | broker `UNKNOWN` ⇒ `NEEDS_REVIEW` ⇒ reconciliation only |
 | fail-closed + cleanup | any error aborts, attempts to cancel what was sent, and reports FAIL |
@@ -60,10 +60,10 @@
    missing secret file, or a non-`DU` value all fail closed before the
    adapter is constructed.
 
-## Two prior failed attempts — reconcile before retrying
+## Three prior failed attempts — reconcile before retrying
 
-Two real cancel-path attempts on the Paper Gateway **failed** and are recorded
-as FAILED owner-run evidence (POI-IBKR-001 stays BLOCKED / NOT RUN):
+Three real cancel-path attempts on the Paper Gateway **failed** and are
+recorded as FAILED owner-run evidence (POI-IBKR-001 stays BLOCKED / NOT RUN):
 
 1. **Read-Only API enabled** during a submit scenario — the Gateway blocked the
    order path. Read-Only API must be **disabled** for submitting scenarios (it
@@ -73,6 +73,21 @@ as FAILED owner-run evidence (POI-IBKR-001 stays BLOCKED / NOT RUN):
    the adapter now sends an explicit, validated `DAY` TIF). The harness failed
    closed correctly: `UNKNOWN_BROKER_STATE`, `RECONCILE_BEFORE_ANY_RETRY` — **no
    retry was or may be performed after UNKNOWN state.**
+3. **Cancellation never reached the broker** (operation reference
+   `05D0E19B631C2548`, `broker_order_ref = ibkr-paper:2`). The submit side
+   worked for the first time: PAPER/`DU` gates passed, `F` resolved via
+   `SMART`/`USD`, `BUY 1 F LIMIT 12.02` was submitted and **acknowledged**, the
+   idempotent resubmit correctly returned the original outcome, and the order
+   never filled. Then `cancel_sent=FAIL` and `cancel_confirmed=FAIL`: the order
+   stayed `ACKNOWLEDGED`, reconciliation reported `UNEXPECTED_BROKER_ORDER`, and
+   **the owner cancelled it by hand in the Gateway UI**. A later reconnect was
+   clean (`open_poi_orders=0`, non-zero positions `0`, `reconciliation=PASS`).
+   **Root causes fixed** (D-CANCEL-01 … D-CANCEL-08): the transport called
+   `cancelOrder(id, "")` while the installed API requires an `OrderCancel`
+   instance, so no cancellation was ever encoded; `EWrapper.error` was not
+   overridden, so the only diagnostic was `status=FAILED`; and all callbacks
+   shared one queue, so a real cancellation could surface as a false timeout.
+   **No post-fix real cancellation has been performed** — that is DEF-18.
 
 > **MANDATORY first step now — read-only reconciliation.** Before any
 > `--execute`, confirm the account is clean for the failed operation reference
@@ -128,24 +143,46 @@ uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
   --scenario cancel-path --account-alias <ALIAS> --broker-module "$BM" \
   --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET> \
   --reference-price <CURRENT_PRICE> \
+  --quote-bid <OBSERVED_BID> --quote-ask <OBSERVED_ASK> \
+  --quote-at <QUOTE_OBSERVED_AT_ISO8601_UTC> --quote-session <SESSION> \
   --evidence-out /tmp/poi-ibkr-001-step2-dryrun.md
 ```
 
 Nothing is sent — without `--execute` the run takes the what-if branch.
 Record the printed `Confirmation token`.
 
-### Step 3 — cancel path (**first real order**; must not fill)
+### Step 3 — cancel path (**first real order**; non-marketable, not unfillable)
 
-Pick `--limit-price` at least **20 % below** the current bid and pass the
-current price as `--reference-price`. Both are **mandatory** for this
-scenario — without them the envelope refuses to build, and a limit closer than
-20 % is refused before any connection is made.
+Pick `--limit-price` at least **20 % below** the observed bid, pass the current
+price as `--reference-price`, and pass a **fresh two-sided quote**
+(`--quote-bid`, `--quote-ask`, `--quote-at`, `--quote-session`). All are
+**mandatory** for this scenario — without them the envelope refuses to build,
+and a limit closer than 20 % is refused before any connection is made.
+
+> **This makes the order NON-MARKETABLE at the observed quote. It does not
+> make a fill impossible** — a gap, a halt-and-reopen or a fast move can still
+> trade through it. `never_filled` in the evidence is an OBSERVED post-run
+> fact, never a pre-submit guarantee.
+
+The quote must be **fresh**: older than 120 s, crossed, non-positive, an
+unreasonably wide spread, or a `closed` session all refuse the run. The quote
+is revalidated immediately before submission and aborts on material drift.
+
+`--journal-dir` is **mandatory for every `--execute`**. It is a durable
+directory **outside the repository** holding the owner-run attempt journal:
+the confirmation token is a deterministic digest and is therefore replayable on
+its own, so the journal is what makes an execute attempt single-use across
+processes and crashes. A second `--execute` for the same operation is refused
+even with a valid token.
 
 ```bash
 uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
   --scenario cancel-path --account-alias <ALIAS> --broker-module "$BM" \
   --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET> \
   --reference-price <CURRENT_PRICE> \
+  --quote-bid <OBSERVED_BID> --quote-ask <OBSERVED_ASK> \
+  --quote-at <QUOTE_OBSERVED_AT_ISO8601_UTC> --quote-session <SESSION> \
+  --journal-dir <OWNER_RUN_JOURNAL_DIR> \
   --execute --confirm <TOKEN> \
   --evidence-out /tmp/poi-ibkr-001-step3-cancel.md
 ```
@@ -182,6 +219,7 @@ price changed.
 uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
   --scenario fill-path --account-alias <ALIAS> --broker-module "$BM" \
   --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT> \
+  --journal-dir <OWNER_RUN_JOURNAL_DIR> \
   --execute --confirm <TOKEN> \
   --evidence-out /tmp/poi-ibkr-001-step5-fill.md
 ```
@@ -249,10 +287,30 @@ uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
   --evidence-out /tmp/poi-ibkr-001-step7-cleanup.md
 ```
 
-Cleanup cancels only orders whose `client_order_id` starts with
-`poi-ibkr-001`; it never touches anything else and **never flattens**. Close
-the 1-share position manually in the Gateway UI, then re-run step 1 until
-`no_stale_poi_orders` and `position_snapshot` are clean.
+Cleanup is **CANCEL-ONLY**, not a dry run: its evidence header says
+`mode: CANCEL-ONLY (no order submission; existing POI orders may be
+cancelled)`. It cancels only lifecycle orders that this API client may
+actually cancel (same-client recovery + the `poi-ibkr-001` prefix); it never
+touches a foreign or manually placed order and **never flattens**. Every
+eligible order gets exactly one attempt even if an earlier one fails, and
+there is still no automatic retry. It reads clean only when a **fresh** broker
+snapshot shows no targeted working order; otherwise it prints
+`>>> OWNER ACTION REQUIRED <<<`.
+
+Then prove the account is clear with the scenario-correct, strictly read-only
+verifier (this is the right check for a **cancel-path** run; `reconnect` is
+the **fill-path** verifier and needs a fill-path `--run-ref`):
+
+```bash
+uv run --no-sync python scripts/poi_ibkr_lifecycle.py \
+  --scenario verify-clean --account-alias <ALIAS> --broker-module "$BM" \
+  --evidence-out /tmp/poi-ibkr-001-step7-verify-clean.md
+```
+
+It requires zero working lifecycle orders, zero non-zero positions, zero
+unresolved broker operation states and a clean reconciliation. Close any
+1-share position manually in the Gateway UI first — the harness never
+flattens.
 
 ## Abort at any point
 

@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from datetime import UTC, datetime
+import tempfile
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ from trading_broker_core.port import (
     BrokerOrderReceipt,
     BrokerPortError,
     BrokerPosition,
+    CancelReceipt,
     OrderIntent,
     OrderSide,
 )
@@ -137,6 +139,18 @@ class FillingBroker(FakeBroker):
         return receipt
 
 
+def _quote(**kwargs: Any) -> Any:
+    """A fresh, valid, two-sided observation for the frozen clock."""
+    defaults: dict[str, Any] = {
+        "bid": Decimal("10"),
+        "ask": Decimal("10.05"),
+        "observed_at": AS_OF,
+        "session": "regular",
+    }
+    defaults.update(kwargs)
+    return harness.QuoteObservation(**defaults)
+
+
 def _envelope(**kwargs: Any) -> Any:
     defaults: dict[str, Any] = {
         "scenario": "cancel-path",
@@ -151,6 +165,8 @@ def _envelope(**kwargs: Any) -> Any:
         "reference_price": Decimal("10"),
     }
     defaults.update(kwargs)
+    if defaults.get("scenario") == "cancel-path" and "quote" not in defaults:
+        defaults["quote"] = _quote()
     return harness.LifecycleEnvelope(**defaults)
 
 
@@ -169,6 +185,10 @@ def _run(broker: FakeBroker, envelope: Any, **kwargs: Any) -> Any:
         "timeout_seconds": 0.0,
     }
     defaults.update(kwargs)
+    if defaults["execute"] and defaults.get("journal") is None:
+        # Every execute needs a durable attempt journal; give each run its own
+        # directory so one test's attempt can never block another's.
+        defaults["journal"] = _journal()
     return harness.run_lifecycle(lambda: broker, envelope, **defaults)
 
 
@@ -375,7 +395,7 @@ def test_cancel_path_submits_acknowledges_cancels_and_reconciles() -> None:
         broker, envelope, execute=True, confirm_token=harness.confirmation_token(envelope)
     )
     names = {name: ok for name, ok, _ in report.checks}
-    assert names["cancel_path_price_safe"]
+    assert names["cancel_path_non_marketable"]
     assert names["submit"]
     assert names["acknowledged"]
     assert names["cancel_sent"]
@@ -867,8 +887,24 @@ def _fill_envelope(**kwargs: Any) -> Any:
     return _envelope(**defaults)
 
 
-def _execute(broker: Any, envelope: Any) -> Any:
-    return _run(broker, envelope, execute=True, confirm_token=harness.confirmation_token(envelope))
+def _journal(tmp: Path | None = None) -> Any:
+    """A durable owner-run journal in an isolated temp directory.
+
+    Every ``--execute`` now requires one; tests get a fresh directory so an
+    execute attempt from one test can never block another.
+    """
+    root = tmp if tmp is not None else Path(tempfile.mkdtemp(prefix="poi-journal-"))
+    return harness.OwnerRunJournal(root)
+
+
+def _execute(broker: Any, envelope: Any, **kwargs: Any) -> Any:
+    options: dict[str, Any] = {
+        "execute": True,
+        "confirm_token": harness.confirmation_token(envelope),
+        "journal": _journal(),
+    }
+    options.update(kwargs)
+    return _run(broker, envelope, **options)
 
 
 def test_gap1_rejected_protection_aborts_loudly_and_never_claims_protection() -> None:
@@ -1752,3 +1788,373 @@ def test_fill_path_entry_is_day_and_protective_stop_is_gtc() -> None:
     assert _OrderType.LIMIT in by_type and _OrderType.STOP in by_type  # entry + protective stop
     assert by_type[_OrderType.LIMIT].time_in_force is TimeInForce.DAY  # entry
     assert by_type[_OrderType.STOP].time_in_force is TimeInForce.GTC  # protection survives session
+
+
+# -- D-CANCEL-02/04/05/06/07/08: cancellation + governance hardening ---------
+
+
+def test_cleanup_is_labelled_cancel_only_not_dry_run() -> None:
+    """Cleanup SENDS cancellations; calling it a dry run misdescribes the run."""
+    broker = _broker()
+    _place_order(broker, f"{harness.CLIENT_ORDER_PREFIX}-leftover")
+    rendered = _run(broker, _envelope(scenario="cleanup")).render()
+
+    assert (
+        "mode: CANCEL-ONLY (no order submission; existing POI orders may be cancelled)"
+        in rendered
+    )
+    assert "DRY-RUN (nothing sent)" not in rendered
+
+
+def test_read_only_scenarios_are_labelled_read_only() -> None:
+    rendered = _run(_broker(), _envelope(scenario="verify-clean")).render()
+    assert "mode: READ-ONLY (nothing submitted, cancelled or flattened)" in rendered
+
+
+def test_cleanup_reports_attempts_confirmations_and_survivors() -> None:
+    broker = _broker()
+    _place_order(broker, f"{harness.CLIENT_ORDER_PREFIX}-a")
+    _place_order(broker, f"{harness.CLIENT_ORDER_PREFIX}-b")
+    report = _run(broker, _envelope(scenario="cleanup"))
+    names = {name: detail for name, _ok, detail in report.checks}
+
+    assert "cleanup_attempts" in names
+    assert "confirmed=" in names["cleanup_attempts"]
+    assert "unresolved=" in names["cleanup_attempts"]
+    assert "cleanup_no_working_order_remains" in names
+    assert "cleanup_observed_orders" in names
+
+
+class _OneCancelFailsBroker(FakeBroker):
+    """Cancelling the FIRST PoI order fails; the second must still be tried."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.cancel_attempts: list[str] = []
+
+    def cancel_order(self, request: Any) -> Any:
+        self.cancel_attempts.append(request.client_order_id)
+        if request.client_order_id.endswith("-a"):
+            raise BrokerPortError(BrokerErrorCode.BROKER_REJECTED, "cancel refused")
+        return super().cancel_order(request)
+
+
+def test_one_failed_cancel_never_blocks_the_remaining_attempts() -> None:
+    broker = _OneCancelFailsBroker(accounts={ALIAS: _snapshot()}, clock=_frozen_clock)
+    _place_order(broker, f"{harness.CLIENT_ORDER_PREFIX}-a")
+    _place_order(broker, f"{harness.CLIENT_ORDER_PREFIX}-b")
+
+    report = _run(broker, _envelope(scenario="cleanup"))
+
+    # Both eligible orders got their one exposure-reducing attempt.
+    assert sorted(broker.cancel_attempts) == [
+        f"{harness.CLIENT_ORDER_PREFIX}-a",
+        f"{harness.CLIENT_ORDER_PREFIX}-b",
+    ]
+    # And there was no retry of the failing one.
+    assert broker.cancel_attempts.count(f"{harness.CLIENT_ORDER_PREFIX}-a") == 1
+    assert not report.passed
+    assert harness.OWNER_ACTION_BANNER in report.render()
+
+
+class _StuckCancelBroker(FakeBroker):
+    def cancel_order(self, request: Any) -> Any:
+        raise BrokerPortError(BrokerErrorCode.UNKNOWN_BROKER_RESPONSE, "no reply")
+
+
+def test_cleanup_that_cannot_prove_it_is_clear_demands_owner_action() -> None:
+    broker = _StuckCancelBroker(accounts={ALIAS: _snapshot()}, clock=_frozen_clock)
+    _place_order(broker, f"{harness.CLIENT_ORDER_PREFIX}-stuck")
+    report = _run(broker, _envelope(scenario="cleanup"))
+    rendered = report.render()
+
+    assert not report.passed
+    assert "CLEANUP DID NOT PROVE THE ACCOUNT IS CLEAR" in rendered
+    assert "RESULT: FAIL" in rendered
+
+
+def test_cleanup_never_cancels_a_foreign_order() -> None:
+    broker = _broker()
+    _place_order(broker, "someone-elses-order")
+    report = _run(broker, _envelope(scenario="cleanup"))
+    attempts = {name: d for name, _ok, d in report.checks}["cleanup_attempts"]
+
+    # Visible and reported, but never targeted and never cancelled.
+    assert "someone-elses-order" not in attempts
+    assert "someone-elses-order" in {o.client_order_id for o in _open_orders(broker)}
+    # It surfaces to the owner as an unexpected broker order instead.
+    assert "UNEXPECTED_BROKER_ORDER" in report.render()
+
+
+# -- cancel-path evidence ----------------------------------------------------
+
+
+class _NeverConfirmsCancelBroker(FakeBroker):
+    """The owner-run failure shape: cancel accepted, confirmation never comes.
+
+    ``cancel_order`` reports CANCEL_PENDING and emits no terminal event, so the
+    order stays working at the broker exactly as it did in the real run.
+    """
+
+    def cancel_order(self, request: Any) -> Any:
+        existing = self._orders[request.client_order_id]
+        return CancelReceipt(
+            client_order_id=request.client_order_id,
+            broker_order_ref=existing.broker_order_ref,
+            state=OrderState.CANCEL_PENDING,
+            correlation_id=request.correlation_id,
+            received_at=AS_OF,
+        )
+
+
+def test_a_cancel_that_cannot_be_confirmed_demands_owner_action() -> None:
+    broker = _NeverConfirmsCancelBroker(
+        accounts={ALIAS: _snapshot()},
+        instruments={
+            "F": BrokerInstrument(
+                broker_instrument_ref="ref-F", symbol="F", exchange="SMART", currency="USD"
+            )
+        },
+        clock=_frozen_clock,
+    )
+    envelope = _envelope()
+    report = _execute(broker, envelope)
+    rendered = report.render()
+
+    assert not report.passed
+    assert "CANCELLATION NOT CONFIRMED" in rendered
+    assert "MAY STILL BE WORKING" in rendered
+    assert "do NOT blindly re-run this scenario" in rendered
+    assert "reuse the confirmation" in rendered
+    assert envelope.run_ref in rendered  # the sanitized operation reference
+    assert "reconnect" in rendered
+    # A run that could not prove cancellation can never read as a PoI PASS.
+    assert "RESULT: FAIL" in rendered
+
+
+def test_a_successful_cancel_path_proves_every_required_step() -> None:
+    report = _execute(_broker(), _envelope())
+    names = {name: ok for name, ok, _ in report.checks}
+
+    for required in (
+        "submit",
+        "entry_broker_order",
+        "acknowledged",
+        "cancel_sent",
+        "cancel_confirmed",
+        "never_filled",
+        "reconciliation",
+    ):
+        assert names.get(required), required
+    assert report.passed
+
+
+def test_never_filled_is_reported_as_an_observation_not_a_guarantee() -> None:
+    report = _execute(_broker(), _envelope())
+    detail = {name: detail for name, _ok, detail in report.checks}["never_filled"]
+    assert "observed" in detail.lower()
+
+
+# -- 13. quote freshness -----------------------------------------------------
+
+
+def test_the_cancel_path_refuses_to_claim_an_order_cannot_fill() -> None:
+    """Wording matters: non-marketable reduces fill risk, it does not remove it."""
+    report = _execute(_broker(), _envelope())
+    rendered = report.render()
+    assert "so it cannot fill" not in rendered
+    assert "non-marketable at the observed quote" in rendered
+    assert "NOT" in rendered
+    assert "eliminated" in rendered
+
+
+def test_the_cancel_path_requires_a_quote() -> None:
+    with pytest.raises(harness.LifecycleRefused) as error:
+        _envelope(quote=None)
+    assert "fresh two-sided quote" in str(error.value)
+
+
+def test_a_stale_quote_cannot_authorize_a_submission() -> None:
+    stale = _quote(
+        observed_at=AS_OF - timedelta(seconds=harness.MAX_QUOTE_AGE_SECONDS + 1)
+    )
+    report = _execute(_broker(), _envelope(quote=stale))
+    assert not report.passed
+    assert "old" in report.render()
+
+
+def test_a_closed_session_quote_cannot_authorize_a_submission() -> None:
+    report = _execute(_broker(), _envelope(quote=_quote(session="closed")))
+    assert not report.passed
+    assert "no live two-sided quote" in report.render()
+
+
+def test_a_crossed_quote_is_refused() -> None:
+    report = _execute(
+        _broker(), _envelope(quote=_quote(bid=Decimal("10.1"), ask=Decimal("10")))
+    )
+    assert not report.passed
+    assert "crossed or locked" in report.render()
+
+
+def test_a_non_positive_quote_is_refused() -> None:
+    report = _execute(
+        _broker(), _envelope(quote=_quote(bid=Decimal("0"), ask=Decimal("10")))
+    )
+    assert not report.passed
+    assert "positive bid and ask" in report.render()
+
+
+def test_an_insane_spread_is_refused() -> None:
+    report = _execute(
+        _broker(), _envelope(quote=_quote(bid=Decimal("10"), ask=Decimal("11")))
+    )
+    assert not report.passed
+    assert "sanity cap" in report.render()
+
+
+def test_a_materially_moved_market_aborts_before_submission() -> None:
+    broker = _capturing()
+    moved = _quote(bid=Decimal("5.2"), ask=Decimal("5.22"))
+    report = _execute(broker, _envelope(), quote_provider=lambda: moved)
+
+    assert not report.passed
+    assert "moved" in report.render()
+    assert broker.intents == [], "nothing may be submitted after a failed revalidation"
+
+
+def test_the_quote_session_is_recorded_in_the_evidence() -> None:
+    rendered = _execute(_broker(), _envelope()).render()
+    assert "quote_session_recorded" in rendered
+    assert "session=regular" in rendered
+
+
+def test_the_quote_is_revalidated_immediately_before_submission() -> None:
+    report = _execute(_broker(), _envelope())
+    names = {name for name, _ok, _detail in report.checks}
+    assert "approval_quote_valid" in names
+    assert "pre_submit_quote_revalidated" in names
+
+
+# -- 12. durable execute-attempt guard --------------------------------------
+
+
+def test_execute_without_a_journal_is_refused() -> None:
+    envelope = _envelope()
+    with pytest.raises(harness.LifecycleRefused) as error:
+        harness.run_lifecycle(
+            lambda: _broker(),
+            envelope,
+            execute=True,
+            confirm_token=harness.confirmation_token(envelope),
+            clock=_frozen_clock,
+            sleep=lambda _seconds: None,
+            timeout_seconds=0.0,
+            journal=None,
+        )
+    assert "durable owner-run journal" in str(error.value)
+
+
+def test_a_token_cannot_be_replayed_in_a_new_process(tmp_path: Path) -> None:
+    envelope = _envelope()
+    journal_dir = tmp_path / "journal"
+    _execute(_broker(), envelope, journal=harness.OwnerRunJournal(journal_dir))
+
+    # A brand-new journal object over the same directory == a new CLI process.
+    with pytest.raises(harness.LifecycleRefused) as error:
+        _execute(_broker(), envelope, journal=harness.OwnerRunJournal(journal_dir))
+    assert "cannot be replayed" in str(error.value)
+
+
+def test_the_execute_attempt_is_claimed_before_any_broker_call(tmp_path: Path) -> None:
+    envelope = _envelope()
+    journal = harness.OwnerRunJournal(tmp_path / "journal")
+    report = _execute(_broker(), envelope, journal=journal)
+
+    names = {name for name, _ok, _detail in report.checks}
+    assert "execute_attempt_claimed" in names
+    record = journal.get(envelope.run_ref)
+    assert record is not None
+    assert record.execute_started_at is not None
+    assert record.broker_order_ref is not None
+
+
+def test_a_read_only_scenario_never_claims_an_attempt(tmp_path: Path) -> None:
+    journal = harness.OwnerRunJournal(tmp_path / "journal")
+    envelope = _envelope(scenario="verify-clean")
+    _run(_broker(), envelope, journal=journal)
+    assert journal.get(envelope.run_ref) is None
+
+
+# -- 14. the scenario-correct clean-state verifier ---------------------------
+
+
+def test_verify_clean_passes_on_a_clean_account() -> None:
+    report = _run(_broker(), _envelope(scenario="verify-clean"))
+    names = {name: ok for name, ok, _ in report.checks}
+
+    assert report.passed
+    assert names["verify_no_working_lifecycle_order"]
+    assert names["verify_no_open_position"]
+    assert names["verify_no_unresolved_broker_state"]
+    assert names["reconciliation"]
+
+
+def test_verify_clean_fails_when_a_lifecycle_order_is_still_working() -> None:
+    broker = _broker()
+    _place_order(broker, f"{harness.CLIENT_ORDER_PREFIX}-leftover")
+    report = _run(broker, _envelope(scenario="verify-clean"))
+
+    assert not report.passed
+    assert "verify-clean found the account is NOT clean" in report.render()
+
+
+def test_verify_clean_needs_no_fill_path_run_reference() -> None:
+    """Unlike reconnect, which exists to match a position to ITS stop."""
+    report = _run(_broker(), _envelope(scenario="verify-clean"), run_ref=None)
+    assert report.passed
+
+
+def test_verify_clean_makes_no_state_changing_call() -> None:
+    broker = _capturing()
+    _run(broker, _envelope(scenario="verify-clean"))
+    assert broker.intents == []
+
+
+def test_verify_clean_refuses_execute() -> None:
+    envelope = _envelope(scenario="verify-clean")
+    with pytest.raises(harness.LifecycleRefused) as error:
+        _run(_broker(), envelope, execute=True, confirm_token="whatever")
+    assert "never submits" in str(error.value)
+
+
+# -- 16. zero-quantity position rows -----------------------------------------
+
+
+def test_a_zero_quantity_row_is_not_reported_as_a_position() -> None:
+    broker = _broker()
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="F", quantity=Decimal("0"), average_price=Decimal("12")),
+    )
+    report = _run(broker, _envelope(scenario="verify-clean"))
+    detail = {name: d for name, _ok, d in report.checks}["verify_position_breakdown"]
+
+    assert "raw_rows=1" in detail
+    assert "zero-quantity=1" in detail
+    assert "non_zero_positions=0" in detail
+    assert report.passed  # a flat account is clean
+
+
+def test_the_position_breakdown_separates_raw_nonzero_and_symbol_rows() -> None:
+    broker = _broker()
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="F", quantity=Decimal("0"), average_price=Decimal("12")),
+        BrokerPosition(symbol="MSFT", quantity=Decimal("3"), average_price=Decimal("400")),
+    )
+    report = _run(broker, _envelope(scenario="verify-clean"))
+    detail = {name: d for name, _ok, d in report.checks}["verify_position_breakdown"]
+
+    assert "raw_rows=2" in detail
+    assert "non_zero_positions=1" in detail
+    assert "MSFT:3" in detail
+    assert "F_positions=0" in detail

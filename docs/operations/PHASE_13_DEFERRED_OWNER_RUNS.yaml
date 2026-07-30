@@ -43,12 +43,19 @@ records:
       --scenario cancel-path --account-alias <ALIAS> --broker-module <BROKER_MODULE>
       --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET>
       --reference-price <CURRENT_PRICE>
+      --quote-bid <OBSERVED_BID> --quote-ask <OBSERVED_ASK>
+      --quote-at <QUOTE_OBSERVED_AT_ISO8601_UTC> --quote-session <SESSION>
       --evidence-out /tmp/poi-ibkr-001-cancel-dryrun-<YYYYMMDD>.md
     evidence_path_template: /tmp/poi-ibkr-001-cancel-dryrun-<YYYYMMDD>.md
     prerequisites:
       - IB Gateway Paper running on the owner host, API enabled, Read-Only API DISABLED
       - SECRETS_ROOT exported with $SECRETS_ROOT/PAPER/ibkr/paper-account-id present
-      - a fresh positive quote for F to choose <FAR_BELOW_MARKET> (>= 20% below <CURRENT_PRICE>)
+      - >-
+        a fresh positive two-sided quote for F, observed within 120 seconds, used for
+        <OBSERVED_BID>/<OBSERVED_ASK> and to choose <FAR_BELOW_MARKET> (>= 20% below the bid)
+      - >-
+        <SESSION> is one of regular / pre-market / after-hours. A closed session never
+        authorizes a submission
     pass_criteria: what-if preview succeeds; NOTHING WAS SENT; an operation reference is printed
     abort_criteria: preflight fails; any submit is attempted; the harness prints REFUSED
     current_status: NOT_RUN
@@ -69,14 +76,29 @@ records:
       uv run --no-sync python scripts/poi_ibkr_lifecycle.py
       --scenario cancel-path --account-alias <ALIAS> --broker-module <BROKER_MODULE>
       --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET>
-      --reference-price <CURRENT_PRICE> --execute --confirm <TOKEN>
+      --reference-price <CURRENT_PRICE>
+      --quote-bid <OBSERVED_BID> --quote-ask <OBSERVED_ASK>
+      --quote-at <QUOTE_OBSERVED_AT_ISO8601_UTC> --quote-session <SESSION>
+      --journal-dir <OWNER_RUN_JOURNAL_DIR> --execute --confirm <TOKEN>
       --evidence-out /tmp/poi-ibkr-001-cancel-execute-<YYYYMMDD>.md
     evidence_path_template: /tmp/poi-ibkr-001-cancel-execute-<YYYYMMDD>.md
     prerequisites:
       - DEF-01 dry-run completed; <TOKEN> is the confirmation token that dry-run printed
-      - the resting limit is >= 20% below the market so it CANNOT fill
-    pass_criteria: submit -> ACKNOWLEDGED -> cancel -> CANCELLED -> never_filled -> clean reconciliation
-    abort_criteria: any fill event; cancel not confirmed; UNKNOWN broker state (do not resend)
+      - >-
+        the resting limit is >= 20% below the observed bid, making it NON-MARKETABLE at
+        that quote; this reduces fill risk but does not eliminate it
+      - >-
+        <OWNER_RUN_JOURNAL_DIR> is a durable directory OUTSIDE the repository. It makes the
+        execute attempt single-use across processes and crashes; without it --execute is refused
+      - >-
+        the quote must be re-observed immediately before running; a stale quote or a
+        materially moved market aborts before anything is sent
+    pass_criteria: >-
+      submit -> ACKNOWLEDGED -> cancel accepted -> CANCELLED confirmed -> never_filled
+      (observed) -> zero remaining lifecycle orders -> clean reconciliation
+    abort_criteria: >-
+      any fill event; cancel not confirmed; UNKNOWN broker state. Do NOT resend and do NOT
+      reuse the token; reconcile via verify-clean first
     current_status: NOT_RUN
     status_after_pass: CANCEL_PATH_PASS
     cleanup: if the order did not cancel, cancel it by hand in the Gateway UI, then re-run reconnect
@@ -119,7 +141,8 @@ records:
     command_template: >-
       uv run --no-sync python scripts/poi_ibkr_lifecycle.py
       --scenario fill-path --account-alias <ALIAS> --broker-module <BROKER_MODULE>
-      --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT> --execute --confirm <TOKEN>
+      --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT>
+      --journal-dir <OWNER_RUN_JOURNAL_DIR> --execute --confirm <TOKEN>
       --evidence-out /tmp/poi-ibkr-001-fill-execute-<YYYYMMDD>.md
     evidence_path_template: /tmp/poi-ibkr-001-fill-execute-<YYYYMMDD>.md
     prerequisites:
@@ -145,7 +168,8 @@ records:
     command_template: >-
       uv run --no-sync python scripts/poi_ibkr_lifecycle.py
       --scenario fill-path --account-alias <ALIAS> --broker-module <BROKER_MODULE>
-      --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT> --execute --confirm <TOKEN>
+      --symbol F --quantity 1 --limit-price <MARKETABLE_LIMIT>
+      --journal-dir <OWNER_RUN_JOURNAL_DIR> --execute --confirm <TOKEN>
       --evidence-out /tmp/poi-ibkr-001-protection-<YYYYMMDD>.md
     evidence_path_template: /tmp/poi-ibkr-001-protection-<YYYYMMDD>.md
     prerequisites:
@@ -248,8 +272,12 @@ records:
     evidence_path_template: /tmp/poi-ibkr-001-cleanup-<YYYYMMDD>.md
     prerequisites:
       - runs after DEF-07/08; cancels only orders whose id starts with poi-ibkr-001
-    pass_criteria: every PoI order cancelled; reconciliation clean
-    abort_criteria: a cancel is refused; an unexpected order remains
+    pass_criteria: >-
+      every eligible lifecycle order is attempted exactly once and CONFIRMED cancelled; a
+      fresh broker snapshot shows no targeted working order; reconciliation clean
+    abort_criteria: >-
+      any cancellation is unconfirmed or refused, or any targeted order is still working in
+      the post-cancel snapshot. Cleanup then reports OWNER ACTION REQUIRED and never retries
     current_status: NOT_RUN
     status_after_pass: CLEANUP_VERIFIED
     cleanup: >-
@@ -457,4 +485,112 @@ records:
     current_status: DEFERRED
     status_after_pass: PROVIDER_BENCHMARK_RECORDED
     cleanup: none
+    never_flattens: true
+
+  - id: DEF-18-post-fix-cancellation-verification
+    task_id: IMP-1302
+    poi_id: POI-IBKR-001
+    blocker: IBKR_PAPER_EXECUTION_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: true
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario cancel-path --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --symbol F --quantity 1 --limit-price <FAR_BELOW_MARKET>
+      --reference-price <CURRENT_PRICE>
+      --quote-bid <OBSERVED_BID> --quote-ask <OBSERVED_ASK>
+      --quote-at <QUOTE_OBSERVED_AT_ISO8601_UTC> --quote-session <SESSION>
+      --journal-dir <OWNER_RUN_JOURNAL_DIR> --execute --confirm <TOKEN>
+      --evidence-out /tmp/poi-ibkr-001-cancel-postfix-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-cancel-postfix-<YYYYMMDD>.md
+    prerequisites:
+      - >-
+        the cancellation-hardening PR is merged. The previous owner-run reached the broker
+        and the cancellation FAILED (cancel_sent=FAIL, order stayed ACKNOWLEDGED, the owner
+        cancelled by hand); this run is what proves the fix on real infrastructure
+      - a fresh dry run of the IDENTICAL parameters printed <TOKEN>
+      - >-
+        <OWNER_RUN_JOURNAL_DIR> is a durable directory outside the repository; the execute
+        attempt is single-use and cannot be replayed
+      - the account is flat and clean (run DEF-19 first and confirm it passes)
+    pass_criteria: >-
+      cancel_sent PASS and cancel_confirmed PASS with a CANCELLED/ApiCancelled confirmation;
+      never_filled observed; zero remaining lifecycle orders; reconciliation clean
+    abort_criteria: >-
+      cancel_confirmed FAIL, any fill during cancellation, or an UNKNOWN broker state. The
+      order may still be working. Do NOT re-run the scenario and do NOT reuse the token;
+      cancel by hand in the Gateway UI, then run DEF-19
+    current_status: NOT_RUN
+    status_after_pass: CANCELLATION_FIX_VERIFIED
+    cleanup: >-
+      if the cancellation is unproven, cancel by hand in the Gateway/TWS UI, then run
+      DEF-19 verify-clean until it passes
+    never_flattens: true
+
+  - id: DEF-19-verify-clean-readonly
+    task_id: IMP-1302
+    poi_id: POI-IBKR-001
+    blocker: OWNER_HOST_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: false
+    owner_confirmation_required: false
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario verify-clean --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --evidence-out /tmp/poi-ibkr-001-verify-clean-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-verify-clean-<YYYYMMDD>.md
+    prerequisites:
+      - >-
+        the scenario-correct verifier for a cancel-path operation. It is strictly read-only
+        and cannot submit, cancel or flatten. Unlike reconnect it needs no --run-ref, because
+        it is not matching a position to its protective stop
+    pass_criteria: >-
+      zero working lifecycle orders; zero non-zero positions; zero unresolved broker
+      operation states; clean reconciliation
+    abort_criteria: >-
+      any working lifecycle order or any non-zero position. Run DEF-09 cleanup, then close
+      any position by hand; the harness never flattens
+    current_status: NOT_RUN
+    status_after_pass: ACCOUNT_VERIFIED_CLEAN
+    cleanup: none (read-only)
+    never_flattens: true
+
+  - id: DEF-20-restart-recovery-cancellation
+    task_id: IMP-1302
+    poi_id: POI-IBKR-001
+    blocker: IB_GATEWAY_RESTART_REQUIRED
+    requires_market_open: false
+    requires_owner_host: true
+    requires_broker_connection: true
+    mutates_broker_state: true
+    owner_confirmation_required: true
+    command_template: >-
+      uv run --no-sync python scripts/poi_ibkr_lifecycle.py
+      --scenario cleanup --account-alias <ALIAS> --broker-module <BROKER_MODULE>
+      --client-id <SAME_CLIENT_ID_AS_THE_SUBMITTING_RUN>
+      --evidence-out /tmp/poi-ibkr-001-restart-cleanup-<YYYYMMDD>.md
+    evidence_path_template: /tmp/poi-ibkr-001-restart-cleanup-<YYYYMMDD>.md
+    prerequisites:
+      - >-
+        a lifecycle order is resting at the broker and the harness process (or the Gateway)
+        has been restarted since it was submitted, so process-local state is empty
+      - >-
+        --client-id MUST match the client id that submitted the order. Cancellation authority
+        comes from the same-client open-order feed, never from global visibility
+    pass_criteria: >-
+      the recovered order is cancelled by its canonical client_order_id and the post-cancel
+      snapshot shows no targeted working order; a foreign or manual order is never cancelled
+    abort_criteria: >-
+      recovery reports an ambiguous identity (nothing is cancelled, by design), or the
+      cancellation cannot be confirmed. Cancel by hand and run DEF-19
+    current_status: NOT_RUN
+    status_after_pass: RESTART_RECOVERY_CANCEL_VERIFIED
+    cleanup: >-
+      cleanup cancels ORDERS only; it NEVER flattens. Close any position by hand in the
+      Gateway/TWS UI
     never_flattens: true
