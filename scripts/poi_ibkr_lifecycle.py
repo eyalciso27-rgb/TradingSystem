@@ -886,7 +886,10 @@ def describe_broker_error(error: BrokerPortError) -> str:
         # The TYPE only: a third-party exception's text is not ours to trust.
         parts.append(f"cause={type(cause).__name__}")
     if error.correlation_id:
-        parts.append(f"correlation_id={error.correlation_id}")
+        # Today's correlation ids are generated internally, but this helper is
+        # generic: an unsanitized field here would be an evidence path that
+        # bypasses every other gate. Bound and scrub it like any other input.
+        parts.append(f"correlation_id={sanitize_broker_detail(error.correlation_id)}")
     parts.append("no retry")
     return "; ".join(parts)
 
