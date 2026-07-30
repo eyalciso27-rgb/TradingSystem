@@ -60,6 +60,27 @@
    missing secret file, or a non-`DU` value all fail closed before the
    adapter is constructed.
 
+## Evidence produced before the clock fix must be regenerated
+
+A read-only host inspection on **2026-07-30** found the adapter stamping every
+timestamp from a deterministic **test** clock frozen at `2026-07-10T12:00Z`
+(+1s per call) while the host clock read `2026-07-30T17:05:22Z` — see
+`docs/poi/evidence/POI-IBKR-001-CLOCK-DEFECT.md` (D-CLOCK-01).
+
+Consequence: **every evidence artifact from a real owner-run before that fix
+carries fabricated timestamps.** Do not correlate them with the Gateway log and
+do not submit them as PoI evidence — re-run and regenerate instead. Artifacts
+produced from this version onward carry real UTC wall-clock time; elapsed-time
+bounds are measured on a monotonic clock, so an NTP step cannot extend or
+truncate a wait.
+
+The same inspection found an unrelated Paper position, **`DVLT` quantity
+1352**, with zero open orders. This harness never flattens and never acts on
+it. `--scenario verify-clean` will keep FAILING while any non-zero position
+exists — that is the correct, fail-closed answer — and now names the position
+explicitly instead of hiding it behind a generic broker error. Closing it (or
+not) is your decision, by hand, in the Gateway/TWS UI.
+
 ## Three prior failed attempts — reconcile before retrying
 
 Three real cancel-path attempts on the Paper Gateway **failed** and are
