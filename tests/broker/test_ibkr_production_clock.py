@@ -70,14 +70,78 @@ def test_the_default_clock_returns_current_utc() -> None:
     assert_is_current_utc(stamp, before=before, after=after)
 
 
-def test_the_default_clock_does_not_stay_frozen() -> None:
-    """Two calls must reflect the passage of time, never a fixed instant."""
+def test_the_default_resolves_through_utc_now_on_every_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default must CALL the clock source per reading, not capture one.
+
+    `second >= first` is not enough: an implementation that captured
+    `datetime.now(tz=UTC)` once during construction and returned that same
+    instant forever would satisfy it — the value would be current, would not
+    equal the old 2026-07-10 default, and would be trivially non-decreasing.
+
+    So the production source is monkeypatched to hand out two DISTINCT
+    controlled timestamps, the adapter is built with NO clock argument, and the
+    two readings must be exactly those two values. That proves:
+
+    1. the default resolves through the production `utc_now` (a hard-coded
+       `datetime.now(...)` inline would ignore the patch and fail);
+    2. the source is invoked once per reading (the call counter);
+    3. nothing is captured at import or construction time (a captured instant
+       would repeat the first value);
+
+    ...with no real sleep and no timing race anywhere.
+    """
+    import trading_broker_ibkr.paper_adapter as adapter_module
+
+    first_stamp = datetime(2026, 7, 30, 17, 5, 22, tzinfo=UTC)
+    second_stamp = datetime(2026, 7, 30, 17, 9, 44, tzinfo=UTC)
+    readings = iter((first_stamp, second_stamp))
+    calls = {"count": 0}
+
+    def fake_utc_now() -> datetime:
+        calls["count"] += 1
+        return next(readings)
+
+    # Patched BEFORE construction: the adapter must pick the source up from the
+    # module, not from a value frozen at import time.
+    monkeypatch.setattr(adapter_module, "utc_now", fake_utc_now)
+    adapter = production_adapter()
+
+    assert calls["count"] == 0, "construction must not read the clock"
+    assert adapter._now() == first_stamp
+    assert calls["count"] == 1
+    assert adapter._now() == second_stamp
+    assert calls["count"] == 2, "each reading must invoke the source separately"
+
+
+def test_a_clock_captured_once_would_fail_this_suite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guards the guard: the capture-once defect must actually be detectable.
+
+    Builds an adapter whose clock captures one instant (the defect shape the
+    weaker `second >= first` assertion could not catch) and shows the readings
+    repeat — which the assertion above would reject.
+    """
+    captured = datetime(2026, 7, 30, 17, 5, 22, tzinfo=UTC)
+    adapter = IbkrPaperAdapter(
+        FakePaperTransport,
+        account_aliases=dict(ALIASES),
+        clock=lambda: captured,  # a "current" but frozen instant
+    )
+    assert adapter._now() == adapter._now() == captured
+    # It is current and it is not the old default — yet it is still frozen.
+    assert abs(captured - STALE_DEFAULT) > timedelta(days=1)
+
+
+def test_the_real_default_advances_between_readings() -> None:
+    """End-to-end sanity on the unpatched default (no sleep, no exact time)."""
     adapter = production_adapter()
     first = adapter._now()
     second = adapter._now()
 
     assert second >= first
-    # And neither is the old fabricated tick sequence.
     assert (first - STALE_DEFAULT) > timedelta(days=1)
     assert (second - first) < timedelta(seconds=5), (
         "consecutive readings must be real elapsed time, not a +1s per call tick"

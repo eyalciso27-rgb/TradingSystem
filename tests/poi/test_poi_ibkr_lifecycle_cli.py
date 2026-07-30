@@ -2398,3 +2398,298 @@ def test_the_harness_default_clock_is_real_utc() -> None:
     source = inspect.getsource(harness.run_lifecycle)
     assert "datetime.now(tz=UTC)" in source
     assert "monotonic or time.monotonic" in source
+
+
+# -- PR #53 pre-merge audit --------------------------------------------------
+#
+# Read-only continuation after a failed preflight is a safety-relevant
+# widening. These tests pin it STRUCTURALLY (which scenarios may continue) and
+# BEHAVIOURALLY (that nothing state-changing is reachable when they do).
+
+
+class _MutationDetectingBroker(FakeBroker):
+    """Fails loudly if the harness attempts ANY state-changing broker call.
+
+    Deliberately not a spy: an assertion here means the read-only guarantee is
+    broken, and a test that merely recorded the call could be misread as a pass.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.preflight_should_fail = False
+
+    def get_account_snapshot(self, account_alias: str) -> Any:
+        if self.preflight_should_fail:
+            raise BrokerPortError(BrokerErrorCode.BROKER_UNHEALTHY, "snapshot unavailable")
+        return super().get_account_snapshot(account_alias)
+
+    def submit_order(self, intent: Any) -> Any:
+        raise AssertionError("submit_order must be unreachable after a failed preflight")
+
+    def cancel_order(self, request: Any) -> Any:
+        raise AssertionError("cancel_order must be unreachable after a failed preflight")
+
+    def preview_order(self, intent: Any) -> Any:
+        raise AssertionError("preview_order must be unreachable after a failed preflight")
+
+
+def _failing_preflight_broker() -> _MutationDetectingBroker:
+    broker = _MutationDetectingBroker(
+        accounts={ALIAS: _snapshot()},
+        instruments={
+            "F": BrokerInstrument(
+                broker_instrument_ref="ref-F", symbol="F", exchange="SMART", currency="USD"
+            )
+        },
+        clock=_frozen_clock,
+    )
+    broker.preflight_should_fail = True
+    return broker
+
+
+def test_read_only_scenarios_are_exactly_the_three_non_mutating_ones() -> None:
+    """Structural: the continuation set is fixed, not incidental control flow."""
+    assert harness.READ_ONLY_SCENARIOS == frozenset(
+        {"preflight", "reconnect", "verify-clean"}
+    )
+    # Every one of them is a real scenario.
+    assert harness.READ_ONLY_SCENARIOS <= set(harness.SCENARIOS)
+    # And none of them may ever submit.
+    assert not (harness.READ_ONLY_SCENARIOS & harness.SUBMITTING_SCENARIOS)
+    # The mutating scenarios are explicitly excluded.
+    for excluded in ("cleanup", "cancel-path", "fill-path", "dry-run"):
+        assert excluded not in harness.READ_ONLY_SCENARIOS, excluded
+
+
+@pytest.mark.parametrize("scenario", sorted({"preflight", "reconnect", "verify-clean"}))
+def test_a_read_only_scenario_continues_but_changes_nothing(scenario: str) -> None:
+    broker = _failing_preflight_broker()
+    report = _run(broker, _envelope(scenario=scenario), run_ref=None)
+
+    # It kept going (more evidence than just the failed probe)...
+    names = {name for name, _ok, _detail in report.checks}
+    assert "account_snapshot_read" in names
+    assert len(names) > 3
+    # ...it still FAILS closed...
+    assert not report.passed
+    # ...and the _MutationDetectingBroker never raised, i.e. nothing was sent.
+
+
+@pytest.mark.parametrize("scenario", ["cleanup", "cancel-path", "fill-path", "dry-run"])
+def test_a_mutating_scenario_stops_dead_on_a_failed_preflight(scenario: str) -> None:
+    broker = _failing_preflight_broker()
+    report = _run(broker, _envelope(scenario=scenario))
+
+    assert not report.passed
+    assert "preflight failed; nothing was submitted (fail closed)" in report.render()
+    # The scenario body never ran: no scenario-specific check was recorded.
+    names = {name for name, _ok, _detail in report.checks}
+    for scenario_check in ("cleanup_scope", "submit", "what_if_preview", "cancel_sent"):
+        assert scenario_check not in names, scenario_check
+
+
+def test_the_harness_has_no_flatten_or_modify_or_global_cancel_path() -> None:
+    """Structural: these surfaces must not exist anywhere in the harness."""
+    module_path = harness.__file__
+    assert module_path is not None
+    source = Path(module_path).read_text(encoding="utf-8")
+    for forbidden in (
+        "reqGlobalCancel",
+        ".flatten(",
+        "flatten_position",
+        "modify_order",
+        "replace_order",
+    ):
+        assert forbidden not in source, forbidden
+
+
+#: Broker methods that can change state at the broker. None may be CALLED from
+#: a read-only scenario body (prose mentioning them is fine — hence the AST).
+STATE_CHANGING_CALLS = frozenset(
+    {"submit_order", "cancel_order", "preview_order", "flatten", "modify_order"}
+)
+
+
+def _called_method_names(function: Any) -> set[str]:
+    """Every attribute/direct call name in a function body, via the AST."""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        if isinstance(target, ast.Attribute):
+            names.add(target.attr)
+        elif isinstance(target, ast.Name):
+            names.add(target.id)
+    return names
+
+
+def test_read_only_continuation_cannot_reach_a_state_changing_call() -> None:
+    """Structural (AST, not substring): read-only bodies CALL reads only."""
+    for runner in (harness._run_reconnect, harness._run_verify_clean):
+        called = _called_method_names(runner)
+        offenders = called & STATE_CHANGING_CALLS
+        assert not offenders, f"{runner.__name__} calls {sorted(offenders)}"
+
+
+def test_the_ast_guard_would_catch_a_real_state_changing_call() -> None:
+    """Guards the guard: the AST check must actually detect a call."""
+
+    def _offender(broker: Any) -> None:
+        broker.cancel_order(None)
+
+    assert _called_method_names(_offender) & STATE_CHANGING_CALLS == {"cancel_order"}
+
+
+def test_cleanup_is_the_only_scenario_body_that_cancels() -> None:
+    """Cancelling is exposure-reducing, but it is still a mutation."""
+    assert "cancel_order" in _called_method_names(harness._run_cleanup)
+    assert "cleanup" not in harness.READ_ONLY_SCENARIOS
+
+
+# -- correlation-id sanitization ---------------------------------------------
+
+
+def test_correlation_id_is_sanitized_before_reaching_evidence() -> None:
+    """The generic helper must not open an unsanitized evidence path."""
+    account = "DU" + "1234567"
+    error = BrokerPortError(
+        BrokerErrorCode.NOT_CONNECTED,
+        "gateway down",
+        correlation_id=f"corr-{account}-/etc/secrets/paper/token",
+    )
+    detail = harness.describe_broker_error(error)
+
+    assert account not in detail
+    assert "DU*****" in detail
+    assert "/etc/secrets" not in detail
+    assert "<path>" in detail
+
+
+def test_correlation_id_control_characters_are_collapsed() -> None:
+    error = BrokerPortError(
+        BrokerErrorCode.NOT_CONNECTED, "down", correlation_id="a\nb\r\nc\td"
+    )
+    detail = harness.describe_broker_error(error)
+
+    assert "\n" not in detail
+    assert "\r" not in detail
+    assert "\t" not in detail
+    assert "correlation_id=a b c d" in detail
+
+
+def test_an_excessively_long_correlation_id_is_bounded() -> None:
+    error = BrokerPortError(
+        BrokerErrorCode.NOT_CONNECTED, "down", correlation_id="z" * 5000
+    )
+    detail = harness.describe_broker_error(error)
+
+    assert len(detail) < 600, "evidence must stay bounded"
+    assert "z" * (harness.BROKER_DETAIL_MAX_LENGTH + 1) not in detail
+
+
+def test_the_whole_broker_error_line_stays_bounded() -> None:
+    error = BrokerPortError(
+        BrokerErrorCode.NOT_CONNECTED, "m" * 5000, correlation_id="c" * 5000
+    )
+    assert len(harness.describe_broker_error(error)) < 600
+
+
+# -- verify-clean, audited ---------------------------------------------------
+
+
+def test_verify_clean_reports_dvlt_and_fails_without_touching_it() -> None:
+    """Zero PoI orders + DVLT 1352: reported explicitly, FAIL, never modified."""
+    broker = _MutationDetectingBroker(accounts={ALIAS: _snapshot()}, clock=_frozen_clock)
+    broker._positions[ALIAS] = (
+        BrokerPosition(symbol="DVLT", quantity=Decimal("1352"), average_price=Decimal("2")),
+    )
+    report = _run(broker, _envelope(scenario="verify-clean"))
+    rendered = report.render()
+
+    assert not report.passed
+    assert "RESULT: FAIL" in rendered
+    assert "DVLT:1352" in rendered
+    assert "non_zero_positions=1" in rendered
+    # zero PoI orders is stated positively, not by omission
+    assert "no PoI lifecycle order is working" in rendered
+    assert harness.OWNER_ACTION_BANNER in rendered
+    assert "never flattens" in rendered
+    # The position is unchanged and untouched.
+    assert broker._positions[ALIAS][0].quantity == Decimal("1352")
+
+
+def test_a_failed_position_probe_is_unproven_never_flat() -> None:
+    """The dangerous misreading: 'could not read' must never mean 'clean'."""
+
+    class _NoPositionFeed(FakeBroker):
+        def get_positions(self, account_alias: str) -> Any:
+            raise BrokerPortError(BrokerErrorCode.BROKER_UNHEALTHY, "position feed down")
+
+    broker = _NoPositionFeed(accounts={ALIAS: _snapshot()}, clock=_frozen_clock)
+    report = _run(broker, _envelope(scenario="verify-clean"))
+    details = {name: d for name, _ok, d in report.checks}
+    names = {name: ok for name, ok, _ in report.checks}
+
+    assert not report.passed
+    assert names["verify_no_open_position"] is False
+    assert "UNPROVEN" in details["verify_no_open_position"]
+    assert "flat" != details["verify_no_open_position"]
+    assert harness.OWNER_ACTION_BANNER in report.render()
+
+
+def test_a_reconciliation_failure_cannot_make_verify_clean_pass() -> None:
+    class _BadReconcile(FakeBroker):
+        def get_open_orders(self, account_alias: str) -> Any:
+            # A foreign working order the engine will flag as unexpected.
+            return (
+                BrokerOrderReceipt(
+                    client_order_id="someone-else",
+                    broker_order_ref="FAKE-x",
+                    state=OrderState.ACKNOWLEDGED,
+                    authorization_ref="auth",
+                    correlation_id="corr",
+                    received_at=AS_OF,
+                ),
+            )
+
+    broker = _BadReconcile(accounts={ALIAS: _snapshot()}, clock=_frozen_clock)
+    report = _run(broker, _envelope(scenario="verify-clean"))
+    names = {name: ok for name, ok, _ in report.checks}
+
+    assert names["reconciliation"] is False
+    assert names["verify_no_unresolved_broker_state"] is False
+    assert not report.passed, "an unresolved broker state can never read as PASS"
+
+
+# -- monotonic values never reach the evidence -------------------------------
+
+
+def test_monotonic_readings_never_appear_in_the_evidence() -> None:
+    """Durations are monotonic; evidence is UTC wall-clock. Never mixed."""
+    import inspect
+
+    body = inspect.getsource(harness._await_state)
+    # The polling loop measures time but records nothing.
+    assert "report.record" not in body
+    assert "report.note" not in body
+
+    # And a real run's artifact carries no bare monotonic float.
+    elapsed = [1234.5]
+    broker = _broker()
+    envelope = _envelope(scenario="fill-path", symbol="F", limit_price=Decimal("12"))
+    report = _run(
+        broker,
+        envelope,
+        execute=True,
+        confirm_token=harness.confirmation_token(envelope),
+        sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
+        monotonic=lambda: elapsed[0],
+        timeout_seconds=2.0,
+    )
+    assert "1234.5" not in report.render()

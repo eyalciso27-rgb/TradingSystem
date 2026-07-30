@@ -50,6 +50,8 @@
 | D-CANCEL-08 | The cancel path asserted the resting limit "cannot fill", bound that claim to a possibly-stale hand-copied `--reference-price`, and reported zero-quantity broker rows as positions (a flat account could read as `1 position(s)`) | P2 | `scripts/poi_ibkr_lifecycle.py` | ✅ **fixed in this bundle** — "non-marketable at the observed quote; fill risk reduced but not eliminated", mandatory fresh two-sided quote (age/spread/session/drift, revalidated immediately before submit), and raw / non-zero / run-symbol position rows reported separately |
 | D-CLOCK-01 | `IbkrPaperAdapter.__init__` defaulted to a **deterministic TEST clock** frozen at `2026-07-10T12:00Z` (`clock or _deterministic_clock(...)`, +1s per call). On a real owner-run at host time `2026-07-30T17:05:22Z` the adapter stamped every account snapshot, receipt, broker event, reconciliation result and health check with a fabricated timestamp ~20 days stale — evidence that could not be correlated with the Gateway log, with the harness's own real-UTC timestamps, or with reality | **P1 (evidence integrity)** | `broker-ibkr/paper_adapter.py` | ✅ **fixed in this bundle** — production default is real tz-aware UTC (`utc_now`); injected clocks still honoured; naive clocks fail closed; non-UTC normalized; durations measured monotonically |
 | D-CLOCK-02 | A real `verify-clean` owner-run reported only `broker error BROKER_UNHEALTHY; no retry`. The first failing read aborted the whole scenario, so the owner could not distinguish a dead Gateway from a reachable account that merely held an unrelated position (`DVLT` 1352, zero open orders), and got no code detail or root cause | **P1 (diagnosability)** | `scripts/poi_ibkr_lifecycle.py` | ✅ **fixed in this bundle** — sanitized bounded message + chained root-cause TYPE + correlation id; every read-only probe recorded independently; read-only scenarios continue past a failed preflight; open positions named explicitly. Fail-closed behaviour unchanged |
+| D-CLOCK-03 | `health_check()` called `transport.is_connected()` (→ `EClient.isConnected`) with **no guard**, and `disconnect()` let an arbitrary SDK exception escape. The harness normalizes `BrokerPortError` only, so an ibapi/socket failure on the **first probe of every preflight** collapsed the whole run into "unknown error, failing closed" — re-creating the D-CLOCK-02 blindness on a path the D-CLOCK-02 fix did not cover | **P1** | `broker-ibkr/paper_adapter.py` | ✅ **fixed in the PR #53 pre-merge audit** — `health_check` answers UNHEALTHY with the exception TYPE in `detail` (keeping the agent's tested `BROKER_UNHEALTHY`/`NOT_SENT` refusal on its normal path); `disconnect` normalizes to `BrokerPortError` and still clears the transport. A parametrized test asserts **no public adapter method** raises anything but `BrokerPortError`, and a completeness test fails if a new public method is added un-audited |
+| D-CLOCK-04 | `describe_broker_error` sanitized the broker message but passed `error.correlation_id` into the evidence **unsanitized** — a generic-helper evidence path that bypassed every other gate (today's ids are internally generated, so latent, not realised) | P2 | `scripts/poi_ibkr_lifecycle.py` | ✅ **fixed in the PR #53 pre-merge audit** — the correlation id goes through the same bounded sanitizer; tests cover account-shaped tokens, filesystem paths, control characters and over-long values |
 | D-02 | Owner-run `--client-id` default (7) diverges from adapter `DEFAULT_CLIENT_ID` (1); stale-connection recovery undocumented | P2 | lifecycle CLI + runbook | ✅ (doc) — not done here (P2, out of P0/P1 scope) |
 | B-01 | POI-IBKR-001 Paper lifecycle (cancel-path/fill-path/protection/reconnect/reconciliation) not run | BLOCKED | owner-run | ❌ owner + host |
 | B-02 | Owner-run chaos/recovery host drills not run | BLOCKED | `CHAOS_RECOVERY_DRILLS.md` §4 | ❌ blocked on B-01 |
@@ -714,3 +716,106 @@ DEF-19 → DEF-18 → DEF-20 in
 `docs/operations/PHASE_13_DEFERRED_OWNER_RUNS.yaml`; every evidence artifact
 produced before this fix carries fabricated adapter timestamps and must be
 re-generated rather than trusted.
+
+### 9.7 Pre-merge audit of PR #53
+
+An independent audit of the clock fix before merge. No owner-run was performed
+and no order was submitted, cancelled, modified or flattened.
+
+#### A-01 (test efficacy, mandated finding) — the regression test was too weak
+
+`test_the_default_clock_does_not_stay_frozen` asserted `second >= first`. That
+does **not** prove the clock is dynamic: an implementation capturing
+`datetime.now(tz=UTC)` **once at construction** and returning that instant
+forever satisfies every assertion it made — the value is current, it is not the
+old `2026-07-10` default, and it is trivially non-decreasing.
+
+Replaced by `test_the_default_resolves_through_utc_now_on_every_reading`, which
+monkeypatches the module-level `utc_now` **before** constructing the adapter to
+hand out two distinct controlled timestamps, builds the adapter with **no**
+`clock` argument, and asserts both readings equal those two values with a call
+counter. That proves (1) the default resolves through the production source —
+an inline `datetime.now(...)` would ignore the patch and fail; (2) the source is
+invoked once per reading; (3) nothing is captured at import or construction
+time (the counter is asserted to be 0 after construction). No sleep, no timing
+race.
+
+**Verified by mutation.** With the capture-once defect deliberately injected,
+the old-style assertions still passed and only the new test failed:
+
+```
+assert calls["count"] == 0, "construction must not read the clock"
+E   AssertionError: construction must not read the clock
+E   assert 1 == 0
+1 failed, 17 passed
+```
+
+The mutant was then reverted. Two supporting tests remain: one demonstrating
+the capture-once shape is detectable, one keeping the end-to-end sanity check on
+the unpatched default.
+
+#### D-CLOCK-03 (P1) — arbitrary exceptions could bypass the error boundary
+
+`_probe` catches `BrokerPortError` by design. The audit therefore checked every
+public adapter read for arbitrary-exception leakage:
+
+| Method | Before | Now |
+|---|---|---|
+| `health_check` | **LEAKED** — unguarded `transport.is_connected()` | UNHEALTHY + exception TYPE in `detail` |
+| `disconnect` | **LEAKED** — unguarded `transport.disconnect()` | `BrokerPortError`; transport still cleared |
+| `get_account_snapshot`, `resolve_instrument`, `get_open_orders`, `get_positions`, `recover_cancellable_orders`, `reconcile` | `_guarded` ✓ | unchanged |
+| `capabilities`, `order_events` | pure, no I/O ✓ | unchanged |
+| `connect`, `submit_order`, `cancel_order`, `preview_order` | normalized ✓ | unchanged |
+
+`health_check` was the worst case: it is the **first** probe of every preflight,
+so a single SDK hiccup blanked the entire artifact — exactly the blindness
+D-CLOCK-02 set out to remove, on a path that fix did not cover.
+
+It is normalized to a **value** (`healthy=False`) rather than a raise, because
+that is this method's contract and it keeps the Execution Agent's tested
+`BROKER_UNHEALTHY` / `NOT_SENT` pre-submit refusal on its normal path instead of
+rerouting a safety gate through an exception. The failure is not swallowed: the
+exception TYPE is reported (its text is not — it may come from a third party).
+
+`_probe` was deliberately **not** broadened to catch `Exception`; that would
+hide programmer errors instead of fixing the adapter boundary.
+
+#### D-CLOCK-04 (P2) — unsanitized correlation id in evidence
+
+`describe_broker_error` bounded and scrubbed the broker message but interpolated
+`error.correlation_id` raw. Current ids are internally generated, so this was
+latent rather than realised, but the helper is generic and would have been an
+evidence path bypassing every other gate. Now sanitized identically.
+
+#### Structural confirmations (no change required)
+
+- **Read-only continuation** is `READ_ONLY_SCENARIOS = {preflight, reconnect,
+  verify-clean}` — asserted exactly, asserted disjoint from
+  `SUBMITTING_SCENARIOS`, and asserted to exclude `cleanup`, `cancel-path`,
+  `fill-path` and `dry-run`. Behaviourally, a broker that raises `AssertionError`
+  on `submit_order` / `cancel_order` / `preview_order` is driven through a failed
+  preflight in every scenario: the three read-only ones continue and never call
+  one, and the four mutating ones stop dead with "nothing was submitted".
+  An **AST** check (not a substring match — the words appear in prose) proves the
+  read-only scenario bodies contain no call to a state-changing method, and a
+  guard-the-guard test proves the AST check detects a real one.
+- **`verify-clean`**: `DVLT 1352` with zero PoI orders is reported explicitly,
+  the result stays FAIL, the position is asserted unmodified, an unresolved
+  reconciliation finding cannot produce PASS, a failed open-order probe still
+  shows the position, and a failed position probe reads `UNPROVEN` — never
+  "flat".
+- **Clock coverage**: all seven `self._now()` call sites map to evidence fields
+  (`AccountSnapshot.observed_at`; `received_at` on submit, cancel, recovered and
+  same-client-recovered receipts; `reconciled_at`; `checked_at`), and
+  `BrokerOrderEvent.observed_at` derives from the receipt. Each is covered by a
+  bounded current-UTC test.
+- **Monotonic isolation**: `monotonic` appears only as the `_await_state`
+  deadline and as a threaded parameter; `_await_state` records nothing, and a
+  run driven by a fake monotonic of `1234.5` is asserted not to contain that
+  value anywhere in its artifact.
+
+#### Still NOT EXECUTED
+
+Unchanged by this audit: no cancel-path execute, no real cancellation, no
+fill-path, no restart-recovery owner-run, no Live connection or order, no
+PAPER_AUTO. **POI-IBKR-001 remains BLOCKED / non-PASS.**

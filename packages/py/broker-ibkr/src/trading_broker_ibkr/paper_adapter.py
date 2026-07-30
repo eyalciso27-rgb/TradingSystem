@@ -694,11 +694,26 @@ class IbkrPaperAdapter:
         self._transport = transport
 
     def disconnect(self) -> None:
-        if self._transport is not None:
-            try:
-                self._transport.disconnect()
-            finally:
-                self._transport = None
+        """Drop the transport. Normalizes any SDK failure, never leaks it.
+
+        The transport is cleared FIRST-class in ``finally`` so the adapter can
+        never be left holding a half-dead connection, and an arbitrary SDK
+        exception is converted to a ``BrokerPortError`` so every public method
+        on this port raises only the canonical taxonomy.
+        """
+        if self._transport is None:
+            return
+        try:
+            self._transport.disconnect()
+        except BrokerPortError:
+            raise
+        except Exception as error:  # noqa: BLE001 - unknown => fail closed
+            raise BrokerPortError(
+                BrokerErrorCode.BROKER_UNHEALTHY,
+                f"disconnect failed: {type(error).__name__}",
+            ) from error
+        finally:
+            self._transport = None
 
     def capabilities(self) -> BrokerCapabilities:
         return IBKR_PAPER_CAPABILITIES
@@ -973,10 +988,35 @@ class IbkrPaperAdapter:
         )
 
     def health_check(self) -> IntegrationHealth:
-        connected = self._transport is not None and self._transport.is_connected()
+        """Probe the gateway. Never raises an arbitrary transport exception.
+
+        ``is_connected()`` reaches into the SDK (``EClient.isConnected``), so a
+        dead socket or an ibapi internal error could previously escape as an
+        ARBITRARY exception. The harness only normalizes ``BrokerPortError``, so
+        that collapsed a whole read-only run into "unknown error" and hid the
+        account state — the D-CLOCK-02 failure mode, on the very first probe.
+
+        A failed probe is answered as UNHEALTHY rather than by raising: that is
+        this method's contract, and it keeps the Execution Agent's tested
+        ``BROKER_UNHEALTHY``/``NOT_SENT`` pre-submit refusal on its normal path
+        instead of rerouting a safety gate through an exception. The failure is
+        not swallowed — the exception TYPE is reported in ``detail`` (its text
+        is not, as it may come from a third-party library).
+        """
+        if self._transport is None:
+            connected, detail = False, "not connected"
+        else:
+            try:
+                connected = self._transport.is_connected()
+                detail = "ibkr paper gateway connected" if connected else "not connected"
+            except BrokerPortError as error:
+                connected, detail = False, f"health probe failed: {error.code.value}"
+            except Exception as error:  # noqa: BLE001 - unknown => unhealthy
+                connected = False
+                detail = f"health probe raised {type(error).__name__}; treated as unhealthy"
         return IntegrationHealth(
             healthy=connected,
-            detail="ibkr paper gateway connected" if connected else "not connected",
+            detail=detail,
             checked_at=self._now(),
         )
 
