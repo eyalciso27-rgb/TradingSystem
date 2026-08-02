@@ -555,8 +555,17 @@ records:
     abort_criteria: >-
       any working lifecycle order or any non-zero position. Run DEF-09 cleanup, then close
       any position by hand; the harness never flattens
-    current_status: NOT_RUN
+    current_status: PASS
     status_after_pass: ACCOUNT_VERIFIED_CLEAN
+    completed_at: "2026-07-30T17:49:25Z"
+    evidence: docs/poi/evidence/POI-IBKR-001-VERIFY-CLEAN.md
+    result: >-
+      PASS on the real Paper Gateway. Zero working lifecycle orders; zero non-zero
+      positions (the one remaining row carries quantity zero only); zero unresolved
+      broker operation states; reconciliation reconciled=True findings=0; clean
+      connect and clean disconnect. Read-only throughout - nothing was submitted,
+      cancelled, modified or flattened
+    post_clock_fix: true
     cleanup: none (read-only)
     never_flattens: true
 
