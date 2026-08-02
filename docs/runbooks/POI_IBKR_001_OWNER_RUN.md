@@ -60,10 +60,11 @@
    missing secret file, or a non-`DU` value all fail closed before the
    adapter is constructed.
 
-## NEXT OWNER ACTION — the only remaining broker-changing step
+## NEXT OWNER ACTION — the next broker-changing step
 
-Read-only verification is complete. **One** step remains that can change broker
-state, and it must be performed exactly once, in this order:
+Read-only verification is complete (DEF-19 PASS, 2026-07-30T17:49:25Z). The
+**next** step that can change broker state is DEF-18, and it must be performed
+exactly once, in this order:
 
 > **fresh realtime quote → cancel-path dry run → new same-day token →
 > exactly ONE DEF-18 execute attempt (with `--journal-dir`) → verify-clean**
@@ -97,6 +98,12 @@ Every one of the following is mandatory:
   or not at all.
 
 Finish by re-running `--scenario verify-clean` and confirming it passes.
+
+**DEF-18 is not the last one.** `DEF-20-restart-recovery-cancellation` also
+remains **NOT_RUN**: cancelling a lifecycle order recovered from the broker
+after a process/Gateway restart, using the same `--client-id` that submitted
+it. Completing DEF-18 does not complete DEF-20, and neither completes
+POI-IBKR-001.
 
 > **There is exactly one permitted submit path: this lifecycle harness.** Do
 > not add, script around, or wrap another execution route — a parallel

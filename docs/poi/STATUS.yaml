@@ -2,7 +2,7 @@
 # States: PASS | FAIL | BLOCKED. The backlog itself is frozen in
 # docs/baseline-v0.5/POI_BACKLOG.yaml. Evidence lives in docs/poi/evidence/.
 version: "0.1"
-updated: "2026-07-10"
+updated: "2026-08-02"
 
 # PHASE-5 exit gate (DoD of IMP-0501: "Every P0 item PASS/approved alternate
 # ADR."). The three PHASE-5 tasks are implementation-complete (registry,
@@ -92,6 +92,37 @@ items:
       status: PASS
       date: "2026-07-21"
       evidence: evidence/POI-MD-001-REALTIME.md
+    # Read-only owner-host market-data observations. Each is real evidence for
+    # the IBKR realtime path only; none advances the aggregate PoI, which stays
+    # BLOCKED until the external-provider work (benchmark, outage/fallback,
+    # field-ownership matrix, provider ADR) is done — still DEFERRED, DEF-14.
+    owner_host_observations:
+      - date: "2026-07-31T06:02:42Z"
+        scenario: market-data-readonly
+        symbol: F
+        result: PASS
+        read_only: true
+        market_data_type: "1 (REALTIME)"
+        freshness: REALTIME
+        summary: >-
+          paper account gate PASS; contract F resolved; no entitlement error;
+          marketDataType=1 REALTIME; positive bid, ask and last; canonical
+          freshness REALTIME; EXECUTION_ELIGIBLE=true (a DATA-QUALITY verdict
+          only - execution stays gated by POI-IBKR-001); clean disconnect.
+          Read-only: no order or cancel API was ever callable
+        evidence: evidence/POI-MD-001-REALTIME-F-20260731.md
+        # HISTORICAL/STALE. The observed quote was evidence for THAT run only.
+        # It must never be copied into a future dry-run or execute command; a
+        # submission requires a quote observed fresh immediately before the run
+        # (the harness enforces a 120s bound and re-validates before submitting).
+        quote_reuse: FORBIDDEN_STALE
+        # Does not advance the aggregate: the external-provider benchmark,
+        # outage/fallback test, field-ownership matrix and provider ADR are
+        # still deferred (Track A / A2, DEF-14).
+        aggregate_poi_md_001: BLOCKED
+        external_provider_work: DEFERRED
+        # Nor does it affect the order-lifecycle PoI.
+        affects_poi_ibkr_001: false
   - id: POI-IBKR-001
     priority: P0
     status: BLOCKED
@@ -121,10 +152,11 @@ items:
           reconciliation=PASS)
         evidence: evidence/POI-IBKR-001-CANCEL-DEFECT.md
         defects: D-CANCEL-01..D-CANCEL-08
-        post_fix_verification: NOT_RUN  # DEF-18, DEF-19, DEF-20
-    # PASSING read-only owner-host runs. These are real, post-clock-fix
-    # evidence, but a read-only verification can never complete an
-    # ORDER-LIFECYCLE PoI: POI-IBKR-001 stays BLOCKED regardless.
+        post_fix_verification: PARTIAL  # DEF-19 PASS; DEF-18 + DEF-20 NOT_RUN
+    # PASSING read-only owner-host runs FOR THIS PoI ONLY. These are real,
+    # post-clock-fix evidence, but a read-only verification can never complete
+    # an ORDER-LIFECYCLE PoI: POI-IBKR-001 stays BLOCKED regardless. Evidence
+    # belonging to another PoI is recorded under that PoI, never here.
     owner_host_passes:
       - date: "2026-07-30T17:49:25Z"
         deferred_id: DEF-19-verify-clean-readonly
@@ -140,26 +172,6 @@ items:
           PASS. Nothing was submitted, cancelled, modified or flattened
         evidence: evidence/POI-IBKR-001-VERIFY-CLEAN.md
         status_after_pass: ACCOUNT_VERIFIED_CLEAN
-      - date: "2026-07-31T06:02:42Z"
-        poi_id: POI-MD-001
-        scenario: market-data-readonly
-        symbol: F
-        result: PASS
-        read_only: true
-        summary: >-
-          paper account gate PASS; contract F resolved; no entitlement error;
-          marketDataType=1 REALTIME; positive bid, ask and last; canonical
-          freshness REALTIME; EXECUTION_ELIGIBLE=true (a DATA-QUALITY verdict
-          only - execution stays gated by POI-IBKR-001); clean disconnect
-        evidence: evidence/POI-MD-001-REALTIME-F-20260731.md
-        # The observed quote was evidence for THAT run only. It is now stale and
-        # must never be copied into a future dry-run or execute command; a
-        # submission requires a quote observed fresh immediately before the run.
-        quote_reuse: FORBIDDEN_STALE
-        # Does not advance the aggregate: the external-provider benchmark,
-        # outage/fallback test, field-ownership matrix and provider ADR are
-        # still deferred (Track A / A2, DEF-14).
-        aggregate_poi_md_001: BLOCKED
     # Read-only owner-host findings. No order was submitted, cancelled or
     # modified to produce these; recording them never changes status.
     owner_host_findings:
