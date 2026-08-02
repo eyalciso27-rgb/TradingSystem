@@ -249,7 +249,12 @@ def test_no_manifest_command_uses_a_global_cancel(records: list[dict[str, Any]])
 def test_the_post_fix_cancellation_verification_is_recorded(
     records: list[dict[str, Any]],
 ) -> None:
-    """The failed real cancellation must leave a visible, unrun follow-up."""
+    """The failed real cancellation must leave a visible, unrun follow-up.
+
+    DEF-19 is read-only and the owner has completed it, so it may legitimately
+    read PASS. The two BROKER-CHANGING follow-ups must not: neither has been
+    performed, and neither may be marked complete from a documentation change.
+    """
     by_id = {r["id"]: r for r in records}
     for required in (
         "DEF-18-post-fix-cancellation-verification",
@@ -257,5 +262,30 @@ def test_the_post_fix_cancellation_verification_is_recorded(
         "DEF-20-restart-recovery-cancellation",
     ):
         assert required in by_id, f"{required} missing from the manifest"
-        # Claude did not and cannot run these: they must stay NOT_RUN.
-        assert by_id[required]["current_status"] == "NOT_RUN", required
+
+    for unrun in (
+        "DEF-18-post-fix-cancellation-verification",
+        "DEF-20-restart-recovery-cancellation",
+    ):
+        assert by_id[unrun]["current_status"] == "NOT_RUN", unrun
+        assert by_id[unrun]["mutates_broker_state"] is True, unrun
+
+
+def test_a_completed_record_must_carry_evidence(records: list[dict[str, Any]]) -> None:
+    """A status may never be advanced without an artifact behind it.
+
+    This is what stops a documentation edit from turning an unrun step into a
+    PASS — the same evidence-integrity rule D-CLOCK-01 was about.
+    """
+    repo_root = MANIFEST.parents[2]
+    #: Statuses that claim nothing was done, so they need no artifact.
+    incomplete = {"NOT_RUN", "DEFERRED", "BLOCKED"}
+    for record in records:
+        if record["current_status"] in incomplete:
+            continue
+        evidence = record.get("evidence")
+        assert evidence, f"{record['id']} is {record['current_status']} with no evidence"
+        assert (repo_root / evidence).is_file(), (
+            f"{record['id']} points at a missing evidence file: {evidence}"
+        )
+        assert record.get("completed_at"), f"{record['id']} has no completed_at"

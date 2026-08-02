@@ -482,8 +482,15 @@ were performed. **POI-IBKR-001 remains BLOCKED / NOT RUN.**
   positions; zero unresolved broker operation states; clean reconciliation.
 - **Abort criteria:** any working lifecycle order or any non-zero position. Run
   DEF-09 cleanup, then close any position by hand.
-- **Evidence:** `/tmp/poi-ibkr-001-verify-clean-<YYYYMMDD>.md`
-- **Status before → after PASS:** `NOT_RUN` → `ACCOUNT_VERIFIED_CLEAN`
+- **Evidence:** `docs/poi/evidence/POI-IBKR-001-VERIFY-CLEAN.md`
+  (host source `/tmp/poi-ibkr-001-verify-clean-20260730T174925Z.md`)
+- **Status:** ✅ **PASS — completed 2026-07-30T17:49:25Z** on the real Paper
+  Gateway (`NOT_RUN` → `ACCOUNT_VERIFIED_CLEAN`). Zero working lifecycle
+  orders; zero non-zero positions (the one remaining row carries quantity
+  **zero** only); zero unresolved broker operation states; reconciliation
+  `reconciled=True findings=0`; clean connect and clean disconnect. Read-only
+  throughout — nothing was submitted, cancelled, modified or flattened. Run
+  **after** the D-CLOCK-01 fix, so its timestamps are real UTC.
 - **Cleanup:** none (read-only). **The harness never flattens.**
 
 ## DEF-20-restart-recovery-cancellation — IMP-1302 / POI-IBKR-001

@@ -60,6 +60,63 @@
    missing secret file, or a non-`DU` value all fail closed before the
    adapter is constructed.
 
+## NEXT OWNER ACTION — the only remaining broker-changing step
+
+Read-only verification is complete. **One** step remains that can change broker
+state, and it must be performed exactly once, in this order:
+
+> **fresh realtime quote → cancel-path dry run → new same-day token →
+> exactly ONE DEF-18 execute attempt (with `--journal-dir`) → verify-clean**
+
+Every one of the following is mandatory:
+
+- **Only during a permitted live market session.** A closed session has no live
+  two-sided quote, and the harness refuses to authorize a submission against
+  one. Do not attempt this out of hours.
+- **Observe the quote fresh, immediately before the run.** The bid/ask must be
+  read at that moment and passed via `--quote-bid`, `--quote-ask`, `--quote-at`
+  and `--quote-session`. A quote older than 120 s is refused, and the harness
+  re-validates it immediately before submitting and aborts on material drift.
+- **Never reuse the historical `F` prices** recorded in any earlier evidence
+  artifact or log. Those were evidence for that run only and are now stale;
+  copying them into a dry run or an execute is exactly the mistake the
+  freshness gate exists to prevent.
+- **Never reuse an old confirmation token.** Produce a new token from a dry run
+  of the *identical* parameters **on the same UTC day** as the execute. A token
+  from an earlier day is refused by construction.
+- **Exactly one execute attempt.** `--journal-dir` is mandatory and must point
+  at a durable directory **outside the repository**. It claims the attempt
+  atomically, so a second `--execute` for the same operation is refused even
+  with a valid token, and a crash does not reset the guard.
+- **Never retry after `UNKNOWN` or an unconfirmed cancellation.** If the run
+  reports `UNKNOWN`, or `cancel_confirmed` is not PASS, the order **may still
+  be working**. Do not re-run the scenario and do not resend anything.
+- **If cancellation is not proven: inspect and cancel by hand** in the IB
+  Gateway/TWS UI (VNC), then run `--scenario verify-clean` until it passes.
+- **The harness never flattens.** Any open position is closed by you, by hand,
+  or not at all.
+
+Finish by re-running `--scenario verify-clean` and confirming it passes.
+
+> **There is exactly one permitted submit path: this lifecycle harness.** Do
+> not add, script around, or wrap another execution route — a parallel
+> submission path would bypass the durable attempt journal, the quote
+> freshness gate and the single-use token, which are the only things making
+> the execute unrepeatable.
+
+### NOT EXECUTED
+
+As of this document's last update, none of the following has been performed:
+
+- ❌ no post-fix real cancel-path **execute**;
+- ❌ no real **cancellation** after the latest changes;
+- ❌ no **fill-path** owner-run;
+- ❌ no Gateway **restart-recovery** cancellation;
+- ❌ no **Live** connection and no Live order;
+- ❌ no **PAPER_AUTO** activation.
+
+**POI-IBKR-001 remains BLOCKED / non-PASS.**
+
 ## Evidence produced before the clock fix must be regenerated
 
 A read-only host inspection on **2026-07-30** found the adapter stamping every
