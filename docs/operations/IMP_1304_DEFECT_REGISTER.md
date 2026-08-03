@@ -998,3 +998,83 @@ Unchanged from 10.6: no IBKR connection, no `systemctl` against a real host, no
 Gateway start/stop/restart/relogin, no order submitted/cancelled/modified/
 flattened, no firewall/nftables/firewalld/OCI change, no credential or account
 id, no PAPER_AUTO, no LIVE.
+
+---
+
+## 12. Installer safety corrections (D-WATCHDOG-08, D-WATCHDOG-09)
+
+A second pre-merge review accepted the section 11 fixes and confirmed two
+remaining defects in the installer itself.
+
+| ID | Defect | Sev | Why it mattered | Status |
+|---|---|---|---|---|
+| D-WATCHDOG-08 | `--dest-root` presented itself as a scratch rehearsal but still ran `systemctl daemon-reload` and `systemd-tmpfiles --create <scratch>/etc/tmpfiles.d/ibgateway.conf` against the real host | **P1** | The tmpfiles rule names the **absolute** path `/run/ibgateway`, so staging the config elsewhere isolates nothing — the rehearsal would have created and chowned the REAL directory. A rehearsal that mutates the thing it is rehearsing is not a rehearsal | ✅ fixed |
+| D-WATCHDOG-09 | Runtime-directory creation was nested under `RELOAD == 1 && changed > 0` | **P1** | An apply where every asset already matched, or an apply with `--no-reload`, reported success while `/run/ibgateway` could be missing. `/run` is volatile: the directory vanishes on reboot while the config on disk still looks perfectly installed, so the *most likely* real-world repair run was exactly the one that silently did nothing | ✅ fixed |
+
+### 12.1 The fixes
+
+**D-WATCHDOG-08 — structural isolation.** `--dest-root` now invokes neither
+`systemctl` nor `systemd-tmpfiles`; the calls are not written in that branch,
+and a test parses the script to prove it rather than relying on PATH stubs.
+The rehearsal validates the staged rule and materialises the directory inside
+the scratch root, then verifies it exactly as a real apply would. It reports
+what a real apply *would* do about the reload, so that decision is observable
+without a privileged run, and it states plainly that it cannot establish
+`opc:opc` ownership rather than implying it did.
+
+**D-WATCHDOG-09 — a mandatory runtime-directory phase.** Creation and
+verification now run on every apply, independently of `changed` and of
+`--no-reload`. `--no-reload` suppresses the daemon-reload only. A reload is
+attempted only when a **unit** file changed — a logrotate or tmpfiles change
+does not make systemd's view of the units stale. Verification checks
+existence, directory-ness, mode `0700` and owner `opc:opc`, all read from the
+tmpfiles rule itself so the installer and the canonical owner cannot drift.
+
+**Installer truth.** The script now distinguishes files copied · daemon reload
+performed or intentionally skipped · tmpfiles validated or applied · runtime
+directory created and verified · install COMPLETE or INCOMPLETE. No success
+message and no timer-enable instruction is ever printed after a failure.
+
+### 12.2 Execution matrix
+
+| Mode | copies | `systemctl` | `systemd-tmpfiles` | runtime directory |
+|---|---|---|---|---|
+| CHECK (default) | no | never | never | untouched |
+| APPLY, unit changed | yes | `daemon-reload` once | `--create` | create + verify |
+| APPLY, nothing changed | no writes needed | no | `--create` | **create + verify** |
+| APPLY `--no-reload` | yes | no | `--create` | **create + verify** |
+| APPLY `--dest-root=DIR` | into `DIR` | **never** | **never** | validate + create + verify in `DIR` |
+
+### 12.3 Safety truth unchanged
+
+CHECK remains completely read-only; APPLY never enables or starts a service;
+no Gateway start/stop/restart; no firewall, OCI, SSH or VNC mutation;
+tmpfiles.d remains the sole owner of `/run/ibgateway`; both units remain
+without `RuntimeDirectory=`; state and lock remain `0600`; passive supervision
+only.
+
+**B-02, B-03 and B-04 remain OPEN. DEF-12 and DEF-13 remain `NOT_RUN`.
+POI-IBKR-001 and POI-MD-001 remain BLOCKED. PAPER_AUTO and LIVE remain
+DISABLED.**
+
+### 12.4 Mutation testing
+
+Eight installer mutations were injected — rehearsal invoking `systemctl`,
+rehearsal invoking `systemd-tmpfiles`, the runtime-directory step skipped when
+nothing changed, `--no-reload` suppressing it, the mode check removed, the
+owner check removed, a loosened `0755` rule accepted, and the tmpfiles failure
+swallowed again. **All eight fail the suite.**
+
+Five initially survived because their guards were POSIX-gated and skip on
+non-Linux developer machines. Rather than accept a proof that only exists in
+CI, the checks that do not actually need settable mode bits were re-gated to
+run anywhere, and the structural test was strengthened: it now rejects **any**
+early exit or `changed`/`RELOAD` condition ahead of the verification, not just
+the original literal guard that the first version matched on.
+
+### 12.5 NOT EXECUTED
+
+No IBKR connection; no `systemctl` or `systemd-tmpfiles` run against the owner
+host; nothing installed on the owner host; no Gateway start/stop/restart/
+relogin; no order submitted/cancelled/modified/flattened; no firewall/
+nftables/firewalld/OCI change; no credential; no PAPER_AUTO; no LIVE.

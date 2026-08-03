@@ -194,8 +194,10 @@ failure.
 ## 4. Installing the assets
 
 ```bash
-scripts/install_ops_assets.sh            # CHECK / DRY-RUN (default) — shows a diff
-scripts/install_ops_assets.sh --apply    # writes files, daemon-reload, tmpfiles
+scripts/install_ops_assets.sh                        # CHECK / DRY-RUN (default)
+scripts/install_ops_assets.sh --apply                # real install
+scripts/install_ops_assets.sh --apply --no-reload    # skip the reload only
+scripts/install_ops_assets.sh --apply --dest-root=DIR  # isolated REHEARSAL
 ```
 
 Installs `ibgateway-ibc.service`, `ibgateway-watchdog.service`,
@@ -205,11 +207,57 @@ Installs `ibgateway-ibc.service`, `ibgateway-watchdog.service`,
 **It never enables or starts a unit**, never touches firewall/OCI/SSH/VNC, and
 never reads a credential.
 
-**A failed `systemd-tmpfiles --create` fails the install** (non-zero exit, no
-success message, no suggestion to enable the timer). It previously ran with
-`|| true` and printed `tmpfiles applied` regardless — reporting success on the
-one step that creates the directory holding the marker, the budget and the
-lock, and then telling the operator to go ahead on a half-installed host.
+### Execution matrix
+
+| Mode | copies files | `systemctl daemon-reload` | `systemd-tmpfiles` | runtime directory |
+|---|---|---|---|---|
+| **CHECK** (default) | no | **never** | **never** | untouched (read-only) |
+| **APPLY**, a unit changed | yes | **once** | `--create /etc/tmpfiles.d/ibgateway.conf` | create + verify `/run/ibgateway` |
+| **APPLY**, nothing changed | no writes needed | no (nothing stale) | `--create …` | **create + verify** |
+| **APPLY --no-reload** | yes | no | `--create …` | **create + verify** |
+| **APPLY --dest-root=DIR** | into `DIR` | **never** | **never** | validate rule + create + verify `DIR/run/ibgateway` |
+
+CHECK mode runs **no system command at all** — it only diffs.
+
+### Rehearsal is structurally isolated
+
+`--dest-root=DIR` invokes neither `systemctl` nor `systemd-tmpfiles`. Not
+"invokes them harmlessly" — the calls are not written in that branch, and a
+test parses the script to prove it.
+
+This matters because staging the config elsewhere **isolates nothing**. The
+rule is `d /run/ibgateway 0700 opc opc`: an **absolute** path. Running
+`systemd-tmpfiles --create <scratch>/etc/tmpfiles.d/ibgateway.conf` would have
+created and chowned the **real** `/run/ibgateway` on the host. A rehearsal that
+mutates the thing it is rehearsing is not a rehearsal.
+
+Instead the rehearsal validates the staged rule and materialises the directory
+inside `DIR`, then verifies it exactly as a real apply would. It reports what a
+real apply *would* do about the reload, so that decision is observable without
+a privileged run. It cannot `chown` to `opc:opc`, and it says so rather than
+implying the ownership was established.
+
+### The runtime directory step is mandatory
+
+Creation and verification of `/run/ibgateway` runs on **every** apply,
+independently of whether any file changed and independently of `--no-reload`.
+It was previously nested under `reload enabled AND changed > 0`, so an apply
+where every asset already matched reported success while the directory could
+be missing entirely. **A tmpfiles config on disk is not a runtime directory on
+the filesystem**: `/run` is volatile, so the directory disappears on reboot
+while the config still looks perfectly installed.
+
+Verification checks existence, that it *is* a directory, mode `0700` and owner
+`opc:opc` — read from the tmpfiles rule itself, so the installer and the
+canonical owner can never drift apart. `--no-reload` suppresses the reload and
+nothing else.
+
+**Any failure exits non-zero**, prints no success message and gives no
+instruction to enable the timer. The script distinguishes: files copied ·
+daemon reload performed or intentionally skipped · tmpfiles validated or
+applied · runtime directory created and verified · install COMPLETE or
+INCOMPLETE. It previously ran tmpfiles with `|| true` and printed
+`tmpfiles applied` regardless.
 
 Enabling is an owner decision:
 
