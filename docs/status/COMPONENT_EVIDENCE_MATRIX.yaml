@@ -1,0 +1,625 @@
+# Component Evidence Matrix — machine-readable project truth.
+#
+# The single machine-readable companion to
+# docs/roadmaps/TRADING_SYSTEM_MASTER_PLAN.md. Schema-validated and
+# cross-checked against the prose plan, CLAUDE_CODE_TASKS.yaml, docs/poi/
+# STATUS.yaml and the Phase-13 deferred ledger by
+# tests/status/test_project_consistency.py.
+#
+# BINDING RULES enforced by that test suite:
+#   * a component may only claim real_integration_status INTEGRATION_VERIFIED
+#     when it names an evidence file that EXISTS in docs/poi/evidence/;
+#   * no strategy may be called eligible without OUT_OF_SAMPLE_PASS AND
+#     SHADOW_PASS evidence;
+#   * a component whose PoI is BLOCKED may not be described as active;
+#   * DEF statuses here must match the Phase-13 ledger exactly;
+#   * the AI Review Committee may never be described as execution authority;
+#   * PAPER_AUTO and LIVE must read DISABLED until every gate passes;
+#   * the canonical task count must equal the count in CLAUDE_CODE_TASKS.yaml.
+#
+# Tests passing is NEVER integration evidence.
+version: "1.0"
+updated: "2026-08-02"
+baseline: docs/baseline-v0.5/
+authoritative_prose: docs/roadmaps/TRADING_SYSTEM_MASTER_PLAN.md
+
+# -- canonical task accounting (must match CLAUDE_CODE_TASKS.yaml) -----------
+canonical_tasks:
+  source: docs/baseline-v0.5/CLAUDE_CODE_TASKS.yaml
+  total: 82
+  implemented: 72          # IMP-0001 … IMP-1206 plus IMP-1301
+  remaining: 10            # IMP-1302..1304, IMP-1401..1404, IMP-1501..1503
+  # PHASE-5 (IMP-0501..0503) is implementation-complete but its EXIT GATE is
+  # NOT satisfied: 2 of 12 P0 PoIs are PASS and 0 alternate ADRs exist.
+  # "IMPLEMENTED" is a code-merged claim only; it is never integration proof.
+  phase5_exit_gate_satisfied: false
+
+# -- global execution-mode gates (binding) ----------------------------------
+execution_modes:
+  shadow: EVALUATE_ONLY          # no SubmitAuthorization on the shadow path
+  paper_manual: BLOCKED          # gated on POI-IBKR-001
+  paper_auto: DISABLED           # frozen: IMP-1402, Track C
+  live: DISABLED                 # frozen; never enabled by any current plan
+  flatten: NOT_IMPLEMENTED       # the harness never flattens, by design
+
+# -- vocabularies -----------------------------------------------------------
+enums:
+  implementation_status: [IMPLEMENTED, PARTIAL, SKELETON, NOT_IMPLEMENTED]
+  evidence_class:
+    - IMPLEMENTED
+    - TESTED_WITH_FAKES
+    - INTEGRATION_VERIFIED
+    - HISTORICALLY_TESTED
+    - OUT_OF_SAMPLE_PASS
+    - SHADOW_PASS
+    - PAPER_PASS
+    - PROFITABILITY_NOT_PROVEN
+    - BLOCKED
+  real_integration_status: [NONE, READ_ONLY_VERIFIED, INTEGRATION_VERIFIED, BLOCKED]
+  strategy_dependency: [REQUIRED, OPTIONAL, NONE]
+  owner_dependency: [NONE, OWNER_ACCOUNT, OWNER_HOST, OWNER_DECISION, OWNER_RUN]
+
+components:
+  # ---------------------------------------------------------------- platform
+  - component_id: platform
+    name: Platform / ARM64 host and container toolchain
+    canonical_task_ids: [IMP-0001, IMP-0002, IMP-0003, IMP-0004, IMP-0401]
+    implementation_status: IMPLEMENTED
+    evidence_class: INTEGRATION_VERIFIED
+    real_integration_status: INTEGRATION_VERIFIED
+    evidence: docs/poi/evidence/POI-PLAT-ARM-001.md
+    poi_id: POI-PLAT-ARM-001
+    strategy_dependency: NONE
+    current_blocker: none
+    owner_dependency: NONE
+    next_action: >-
+      none; encrypted-backup smoke still needs `age` on the host, tracked as a
+      limitation on the PoI record
+    exit_criterion: met (POI-PLAT-ARM-001 PASS)
+
+  - component_id: persistence
+    name: PostgreSQL schema, point-in-time storage, outbox/inbox, object store
+    canonical_task_ids: [IMP-0201, IMP-0202, IMP-0203, IMP-0204, IMP-0205]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: REQUIRED
+    current_blocker: >-
+      no real point-in-time research dataset has been loaded; migrations are
+      exercised in the CI db-migration job only
+    owner_dependency: NONE
+    next_action: build the point-in-time research dataset (Track A, EVD-0004)
+    exit_criterion: >-
+      a real as_of/lineage dataset is loaded and a no-look-ahead audit passes
+
+  - component_id: security
+    name: Auth/RBAC, secrets, session store, tamper-evident audit, trust
+    canonical_task_ids: [IMP-0301, IMP-0302, IMP-0303, IMP-0304, IMP-0305]
+    implementation_status: IMPLEMENTED
+    evidence_class: INTEGRATION_VERIFIED
+    real_integration_status: INTEGRATION_VERIFIED
+    evidence: docs/poi/evidence/POI-SEC-SESS-002.md
+    poi_id: POI-SEC-SESS-002
+    strategy_dependency: NONE
+    current_blocker: none
+    owner_dependency: NONE
+    next_action: none
+    exit_criterion: met (POI-SEC-SESS-002 PASS)
+
+  # -------------------------------------------------------- social connectors
+  - component_id: whatsapp-user
+    name: WhatsApp personal-user adapter (mandatory user-session path)
+    canonical_task_ids: [IMP-0601, IMP-0605]
+    implementation_status: IMPLEMENTED
+    evidence_class: BLOCKED
+    real_integration_status: BLOCKED
+    poi_id: POI-SOC-WA-USER
+    strategy_dependency: OPTIONAL
+    current_blocker: >-
+      PoI BLOCKED: needs the owner's personal WhatsApp account and QR pairing
+      on a controlled host (risk accepted, ADR-0013)
+    owner_dependency: OWNER_ACCOUNT
+    next_action: owner performs the WhatsApp user-session PoI
+    exit_criterion: POI-SOC-WA-USER PASS with masked evidence
+    read_only_for_trading: true
+
+  - component_id: discord-user
+    name: Discord personal-user adapter (mandatory user-session path)
+    canonical_task_ids: [IMP-0602, IMP-0605]
+    implementation_status: IMPLEMENTED
+    evidence_class: BLOCKED
+    real_integration_status: BLOCKED
+    poi_id: POI-SOC-DC-USER
+    strategy_dependency: OPTIONAL
+    current_blocker: "PoI BLOCKED: owner's Discord user session on a controlled host"
+    owner_dependency: OWNER_ACCOUNT
+    next_action: owner performs the Discord user-session PoI
+    exit_criterion: POI-SOC-DC-USER PASS with masked evidence
+    read_only_for_trading: true
+
+  - component_id: telegram-user
+    name: Telegram personal-user adapter via TDLib (primary Telegram path)
+    canonical_task_ids: [IMP-0603, IMP-0605]
+    implementation_status: IMPLEMENTED
+    evidence_class: BLOCKED
+    real_integration_status: BLOCKED
+    poi_id: POI-SOC-TG-USER
+    strategy_dependency: OPTIONAL
+    current_blocker: >-
+      PoI BLOCKED: TDLib build, api_id/api_hash via IMP-0302, owner login and
+      an arm64 TDLib host proof
+    owner_dependency: OWNER_ACCOUNT
+    next_action: owner completes the TDLib build and user login PoI
+    exit_criterion: POI-SOC-TG-USER PASS with masked evidence
+    read_only_for_trading: true
+
+  - component_id: telegram-bot
+    name: Telegram Bot API adapter (SUPPLEMENTAL only)
+    canonical_task_ids: [IMP-0604]
+    implementation_status: IMPLEMENTED
+    evidence_class: BLOCKED
+    real_integration_status: BLOCKED
+    poi_id: POI-SOC-TG-BOT
+    strategy_dependency: OPTIONAL
+    current_blocker: "PoI BLOCKED (P1): bot token and owner-controlled test chat"
+    owner_dependency: OWNER_ACCOUNT
+    next_action: owner performs the bot PoI
+    exit_criterion: POI-SOC-TG-BOT PASS
+    # Binding: the bot path must NEVER substitute for the user path.
+    supplemental_only: true
+    read_only_for_trading: true
+
+  - component_id: telegram-coexistence
+    name: Telegram user + bot coexistence proof
+    canonical_task_ids: [IMP-0603, IMP-0604, IMP-0605]
+    implementation_status: IMPLEMENTED
+    evidence_class: BLOCKED
+    real_integration_status: BLOCKED
+    poi_id: POI-SOC-TG-COEX
+    strategy_dependency: OPTIONAL
+    current_blocker: "PoI BLOCKED: depends on POI-SOC-TG-USER and POI-SOC-TG-BOT"
+    owner_dependency: OWNER_ACCOUNT
+    next_action: run after both Telegram PoIs pass
+    exit_criterion: POI-SOC-TG-COEX PASS with no silent fallback between paths
+    read_only_for_trading: true
+
+  # -------------------------------------------------------- other externals
+  - component_id: investingpro
+    name: InvestingPro adapter
+    canonical_task_ids: [IMP-0606]
+    implementation_status: IMPLEMENTED
+    evidence_class: BLOCKED
+    real_integration_status: BLOCKED
+    poi_id: POI-INVPRO-001
+    strategy_dependency: OPTIONAL
+    current_blocker: "PoI BLOCKED: authorized login + browser-automation host"
+    owner_dependency: OWNER_ACCOUNT
+    next_action: owner supplies an authorized session and host
+    exit_criterion: POI-INVPRO-001 PASS
+    read_only_for_trading: true
+
+  - component_id: news
+    name: News / filings adapters
+    canonical_task_ids: [IMP-0607, IMP-0803]
+    implementation_status: IMPLEMENTED
+    evidence_class: BLOCKED
+    real_integration_status: BLOCKED
+    poi_id: POI-NEWS-001
+    strategy_dependency: OPTIONAL
+    current_blocker: "PoI BLOCKED: provider access/credentials not supplied"
+    owner_dependency: OWNER_ACCOUNT
+    next_action: owner selects and authorizes a news/filings source
+    exit_criterion: POI-NEWS-001 PASS
+    read_only_for_trading: true
+
+  - component_id: tradingview
+    name: TradingView adapter
+    canonical_task_ids: [IMP-0608]
+    implementation_status: IMPLEMENTED
+    evidence_class: BLOCKED
+    real_integration_status: BLOCKED
+    poi_id: POI-TV-001
+    strategy_dependency: OPTIONAL
+    current_blocker: "PoI BLOCKED (P1): owner account/session"
+    owner_dependency: OWNER_ACCOUNT
+    next_action: owner supplies an authorized session
+    exit_criterion: POI-TV-001 PASS
+    read_only_for_trading: true
+
+  # ------------------------------------------------------------ market data
+  - component_id: market-data
+    name: Market-data port, instrument master, calendar, feature snapshots
+    canonical_task_ids: [IMP-0701, IMP-0702, IMP-0703, IMP-0704, IMP-0705]
+    implementation_status: IMPLEMENTED
+    evidence_class: BLOCKED
+    real_integration_status: READ_ONLY_VERIFIED
+    poi_id: POI-MD-001
+    evidence: docs/poi/evidence/POI-MD-001-REALTIME-F-20260731.md
+    strategy_dependency: REQUIRED
+    current_blocker: >-
+      POI-MD-001 aggregate BLOCKED. The IBKR realtime read-only path is proven
+      (subgate PASS 2026-07-21; observation for F PASS 2026-07-31,
+      marketDataType=1 REALTIME) but the aggregate needs the external-provider
+      work
+    owner_dependency: OWNER_DECISION
+    next_action: >-
+      no action for the IBKR path; the aggregate waits on the provider decision
+    exit_criterion: >-
+      POI-MD-001 aggregate PASS, which requires the external-provider benchmark,
+      outage/fallback test, field-ownership matrix and provider ADR
+    # Historical quotes in evidence are never reusable as run inputs.
+    quote_reuse: FORBIDDEN_STALE
+
+  - component_id: external-market-data-provider
+    name: External (non-IBKR) market-data provider
+    canonical_task_ids: [IMP-0702, IMP-0503]
+    implementation_status: NOT_IMPLEMENTED
+    evidence_class: BLOCKED
+    real_integration_status: BLOCKED
+    poi_id: POI-MD-001
+    deferred_id: DEF-14-external-provider-benchmark
+    strategy_dependency: OPTIONAL
+    current_blocker: >-
+      no provider selected, assumed, purchased or integrated; deferred by owner
+      decision (Track A / A2)
+    owner_dependency: OWNER_DECISION
+    next_action: >-
+      owner selects and approves a provider with access, commercial terms, data
+      scope, freshness class and test credentials
+    exit_criterion: provider ADR + benchmark + outage/fallback evidence
+
+  # --------------------------------------------------------------------- AI
+  - component_id: ai-provider
+    name: AI/LLM provider integration
+    canonical_task_ids: [IMP-0804]
+    implementation_status: IMPLEMENTED
+    evidence_class: BLOCKED
+    real_integration_status: BLOCKED
+    poi_id: POI-AI-001
+    strategy_dependency: OPTIONAL
+    current_blocker: "PoI BLOCKED: provider credentials/authorization not supplied"
+    owner_dependency: OWNER_ACCOUNT
+    next_action: owner authorizes an AI provider and supplies test credentials
+    exit_criterion: >-
+      POI-AI-001 PASS with schema-validated structured output and a
+      malformed-output rejection drill
+    # LLM output is untrusted structured input and must pass schema validation.
+    output_trust: UNTRUSTED_SCHEMA_VALIDATED
+
+  - component_id: ai-analysis-engines
+    name: Technical / fundamental / news-NLP / regime engines + model registry
+    canonical_task_ids: [IMP-0801, IMP-0802, IMP-0803, IMP-0805, IMP-0806]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: REQUIRED
+    current_blocker: >-
+      deterministic fixtures only; no real historical dataset has been run, so
+      nothing is HISTORICALLY_TESTED
+    owner_dependency: NONE
+    next_action: run the engines over the point-in-time dataset (Track A)
+    exit_criterion: HISTORICALLY_TESTED on a real point-in-time dataset
+
+  - component_id: ai-review-committee
+    name: AI Review Committee (7 roles, Chair synthesizes only)
+    canonical_task_ids: [IMP-0804, IMP-0901]
+    implementation_status: NOT_IMPLEMENTED
+    evidence_class: BLOCKED
+    real_integration_status: NONE
+    strategy_dependency: OPTIONAL
+    current_blocker: >-
+      DESIGNED ONLY in docs/roadmaps/EVIDENCE_ROADMAP.md; there is no runtime
+      implementation, no I/O contract module and no replayable orchestration
+    owner_dependency: OWNER_DECISION
+    next_action: >-
+      define the committee I/O contract and deterministic replay (EVD-0010),
+      then run the ablation as an experiment-matrix cell
+    exit_criterion: >-
+      contract + deterministic replay + ablation showing marginal value over
+      the no-committee baseline
+    # BINDING SEPARATION — the committee is a formal INPUT to the Decision
+    # Engine and NEVER an execution authority. It does not create OrderIntent,
+    # does not create SubmitAuthorization, sends no order, changes no strategy,
+    # promotes no version, and can never bypass Risk or Pre-Submit.
+    execution_authority: false
+    role: DECISION_INPUT_ONLY
+
+  # ------------------------------------------------------- decision pipeline
+  - component_id: strategy-manifests
+    name: Strategy manifest evaluator and manifest grammar
+    canonical_task_ids: [IMP-0901]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: REQUIRED
+    current_blocker: >-
+      the evaluator exists but NO frozen strategy manifest exists; no hypothesis
+      has been frozen
+    owner_dependency: OWNER_DECISION
+    next_action: >-
+      owner completes docs/strategies/STRATEGY_FREEZE_TEMPLATE.md for
+      baseline-trend-breakout-v1 BEFORE inspecting any evaluation result
+    exit_criterion: a frozen, owner-approved manifest registered before data inspection
+
+  - component_id: fusion
+    name: Signal fusion
+    canonical_task_ids: [IMP-0902]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: REQUIRED
+    current_blocker: deterministic fixtures only
+    owner_dependency: NONE
+    next_action: exercise on the point-in-time dataset
+    exit_criterion: HISTORICALLY_TESTED
+
+  - component_id: decision
+    name: Deterministic decision engine (ENTER / WATCH / REJECT)
+    canonical_task_ids: [IMP-0903]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: REQUIRED
+    current_blocker: deterministic fixtures only
+    owner_dependency: NONE
+    next_action: exercise on the point-in-time dataset
+    exit_criterion: HISTORICALLY_TESTED
+
+  - component_id: risk
+    name: Risk engine (absolute veto authority)
+    canonical_task_ids: [IMP-0904]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: REQUIRED
+    current_blocker: deterministic fixtures only
+    owner_dependency: NONE
+    next_action: exercise on the point-in-time dataset
+    exit_criterion: HISTORICALLY_TESTED with veto paths covered
+    veto_authority: absolute
+
+  - component_id: allocation
+    name: Portfolio allocator
+    canonical_task_ids: [IMP-0905]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: REQUIRED
+    current_blocker: deterministic fixtures only
+    owner_dependency: NONE
+    next_action: exercise on the point-in-time dataset
+    exit_criterion: HISTORICALLY_TESTED
+
+  - component_id: pre-submit
+    name: Final pre-submit check + single-use SubmitAuthorization
+    canonical_task_ids: [IMP-0906]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: REQUIRED
+    current_blocker: >-
+      exercised against the fake broker and the owner-run harness only; no real
+      order has been authorized through it
+    owner_dependency: OWNER_RUN
+    next_action: covered by the DEF-18 owner-run
+    exit_criterion: a real Paper order authorized and reconciled end to end
+
+  # ------------------------------------------------------------ broker stack
+  - component_id: ibkr-adapter
+    name: IBKR Paper adapter (broker-ibkr)
+    canonical_task_ids: [IMP-1001, IMP-1002]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: READ_ONLY_VERIFIED
+    poi_id: POI-IBKR-001
+    evidence: docs/poi/evidence/POI-IBKR-001-VERIFY-CLEAN.md
+    strategy_dependency: NONE
+    current_blocker: >-
+      POI-IBKR-001 BLOCKED. Submit + acknowledgement + idempotent resubmit were
+      proven on a real owner-run, but the cancellation FAILED and was fixed
+      afterwards (D-CANCEL-01..08, D-CLOCK-01..04); DEF-19 verify-clean PASSES
+      post-fix, but no post-fix real order or cancellation exists
+    owner_dependency: OWNER_RUN
+    next_action: DEF-18 post-fix cancellation verification (live session only)
+    exit_criterion: >-
+      DEF-18 and DEF-20 PASS with real submit/ack/cancel-confirm evidence
+    deferred_ids: [DEF-18-post-fix-cancellation-verification, DEF-20-restart-recovery-cancellation]
+
+  - component_id: execution
+    name: Execution agent (the only permitted submit path)
+    canonical_task_ids: [IMP-1003, IMP-1004]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: NONE
+    current_blocker: >-
+      the full lifecycle is proven over the canonical FakeBroker only; the one
+      real submit that occurred could not be cancelled and predates the fixes
+    owner_dependency: OWNER_RUN
+    next_action: DEF-18
+    exit_criterion: real Paper submit → ack → cancel-confirm → clean reconciliation
+    single_submit_path: true
+
+  - component_id: protection
+    name: Broker-side protection (protective STOP, GTC)
+    canonical_task_ids: [IMP-1005]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: NONE
+    current_blocker: no real fill has ever occurred, so protection has never been exercised
+    owner_dependency: OWNER_RUN
+    next_action: DEF-04 fill-path execute then DEF-05 protection verification
+    exit_criterion: a real fill protected by a resting GTC STOP, verified after restart
+    never_flattens: true
+
+  - component_id: reconciliation
+    name: Reconciliation engine (recommends, never acts)
+    canonical_task_ids: [IMP-1006]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: READ_ONLY_VERIFIED
+    evidence: docs/poi/evidence/POI-IBKR-001-VERIFY-CLEAN.md
+    strategy_dependency: NONE
+    current_blocker: >-
+      clean reconciliation is proven read-only (DEF-19, findings=0); it has
+      never reconciled a real fill or a real protective stop
+    owner_dependency: OWNER_RUN
+    next_action: DEF-08 reconciliation after a real fill
+    exit_criterion: reconciliation of a real position + protection after restart
+
+  # ------------------------------------------------------------- operations
+  - component_id: dashboard
+    name: Operations Console (7 screens)
+    canonical_task_ids: [IMP-1101, IMP-1102, IMP-1103, IMP-1104, IMP-1105, IMP-1106, IMP-1107]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: NONE
+    current_blocker: no real data has flowed through it
+    owner_dependency: NONE
+    next_action: none; expansion is frozen without an explicit owner request + ADR
+    exit_criterion: displays real reconciled Paper state during Track A evidence runs
+
+  - component_id: ibc
+    name: IBC auto-login for IB Gateway
+    canonical_task_ids: [IMP-0401, IMP-1303]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    deferred_id: DEF-12-ibc-watchdog-host-evidence
+    strategy_dependency: NONE
+    current_blocker: >-
+      B-03: host patches (gateway version/config/java paths, systemd drop-ins)
+      are not upstreamed and no host transcript is recorded in the repo
+    owner_dependency: OWNER_HOST
+    next_action: owner upstreams host patches and records a transcript (DEF-12)
+    exit_criterion: host evidence committed and reproducible from the repo
+
+  - component_id: watchdog
+    name: IB Gateway watchdog (process/socket/session probes)
+    canonical_task_ids: [IMP-0402, IMP-1303]
+    implementation_status: PARTIAL
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    deferred_id: DEF-13-watchdog-deep-probe-activation
+    strategy_dependency: NONE
+    current_blocker: >-
+      B-04: the deep probe is not enabled because it needs the broker package
+      on the host
+    owner_dependency: OWNER_HOST
+    next_action: owner enables the deep probe on the host (DEF-13)
+    exit_criterion: deep probe active with recorded host evidence
+
+  - component_id: event-bus-nats
+    name: Event bus / NATS JetStream adapter
+    canonical_task_ids: [IMP-0102, IMP-0203, IMP-0204]
+    implementation_status: SKELETON
+    evidence_class: BLOCKED
+    real_integration_status: NONE
+    strategy_dependency: NONE
+    current_blocker: >-
+      N-01: trading_event_bus is a skeleton package; no NATS JetStream adapter
+      exists. Introducing one requires an approved ADR
+    owner_dependency: OWNER_DECISION
+    next_action: none; out of current scope (Docker Compose MVP)
+    exit_criterion: an approved ADR plus a working adapter with delivery evidence
+
+  # --------------------------------------------------- research and analysis
+  - component_id: replay
+    name: Replay runner (point-in-time, no look-ahead)
+    canonical_task_ids: [IMP-1201]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: REQUIRED
+    current_blocker: no real point-in-time dataset exists to replay
+    owner_dependency: NONE
+    next_action: build the dataset (EVD-0004), then replay the frozen baseline
+    exit_criterion: >-
+      deterministic replay over a real dataset with a passing no-look-ahead audit
+
+  - component_id: backtest
+    name: Backtest engine + opportunity funnel + champion/challenger
+    canonical_task_ids: [IMP-1202, IMP-1203, IMP-1205, IMP-1206]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: REQUIRED
+    current_blocker: >-
+      no real dataset, no frozen hypothesis, no cost/slippage assumptions
+      approved
+    owner_dependency: OWNER_DECISION
+    next_action: freeze baseline-trend-breakout-v1, then backtest in-sample only
+    exit_criterion: HISTORICALLY_TESTED, then OUT_OF_SAMPLE_PASS via walk-forward
+
+  - component_id: shadow
+    name: Counterfactual + E2E live shadow (evaluate-only)
+    canonical_task_ids: [IMP-1204, IMP-1301]
+    implementation_status: IMPLEMENTED
+    evidence_class: TESTED_WITH_FAKES
+    real_integration_status: NONE
+    strategy_dependency: REQUIRED
+    current_blocker: >-
+      frozen fixtures only; no live-shadow window has been measured. The shadow
+      path mints no SubmitAuthorization by construction
+    owner_dependency: NONE
+    next_action: run a defined live-shadow window after OOS evidence exists
+    exit_criterion: SHADOW_PASS over a defined window with no orders
+    evaluate_only: true
+
+# -- strategies -------------------------------------------------------------
+# No strategy is eligible for any automated mode. Eligibility requires BOTH
+# OUT_OF_SAMPLE_PASS and SHADOW_PASS evidence, plus a formal owner Go decision.
+strategies:
+  - strategy_id: baseline-trend-breakout-v1
+    status: NOT_FROZEN
+    evidence_class: PROFITABILITY_NOT_PROVEN
+    eligible: false
+    out_of_sample_pass: false
+    shadow_pass: false
+    hypothesis_frozen: false
+    freeze_template: docs/strategies/STRATEGY_FREEZE_TEMPLATE.md
+    rationale: >-
+      recommended FIRST hypothesis because it needs no social and no AI input,
+      so it establishes a clean baseline against which any social or committee
+      contribution can later be measured
+    blocker: >-
+      the owner has not frozen the hypothesis; no parameter is defined anywhere
+      in this repository and none may be invented
+    next_action: owner completes the freeze template before any data inspection
+
+# -- open blockers (mirrors the defect register and PoI registry) -----------
+blockers:
+  - id: B-01
+    summary: POI-IBKR-001 Paper lifecycle not complete (no real fill/protection/restart)
+    owner_dependency: OWNER_RUN
+  - id: B-02
+    summary: owner-run chaos/recovery host drills not run
+    owner_dependency: OWNER_HOST
+  - id: B-03
+    summary: IBC/watchdog host patches not upstreamed; no host transcript in repo
+    owner_dependency: OWNER_HOST
+  - id: B-04
+    summary: watchdog deep probe not enabled (needs the broker package on the host)
+    owner_dependency: OWNER_HOST
+  - id: N-01
+    summary: NATS JetStream adapter absent (event bus is a skeleton)
+    owner_dependency: OWNER_DECISION
+  - id: N-02
+    summary: external market-data provider not selected
+    owner_dependency: OWNER_DECISION
+  - id: N-03
+    summary: POI-MD-001 aggregate BLOCKED (provider-gated)
+    owner_dependency: OWNER_DECISION
+  - id: STRAT-01
+    summary: no frozen hypothesis, no point-in-time dataset, no OOS, no shadow
+    owner_dependency: OWNER_DECISION
+
+# -- deferred owner-run states (must match the Phase-13 ledger exactly) ------
+deferred_owner_runs:
+  source: docs/operations/PHASE_13_DEFERRED_OWNER_RUNS.yaml
+  highlighted:
+    DEF-18-post-fix-cancellation-verification: NOT_RUN
+    DEF-19-verify-clean-readonly: PASS
+    DEF-20-restart-recovery-cancellation: NOT_RUN

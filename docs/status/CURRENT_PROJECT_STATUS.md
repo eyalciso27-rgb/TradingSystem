@@ -2,8 +2,16 @@
 
 > Canonical status snapshot. The **repository is authoritative**; where this
 > document and any chat summary disagree, the repo wins (§10). Verified against
-> `main` @ `624343b` (PR #34 merged). Tests passing is **never** integration
+> `main` @ `b4d65de` (PR #55 merged). Tests passing is **never** integration
 > evidence; nothing is marked verified without real masked evidence.
+>
+> **Authoritative project map:**
+> [`docs/roadmaps/TRADING_SYSTEM_MASTER_PLAN.md`](../roadmaps/TRADING_SYSTEM_MASTER_PLAN.md)
+> with the machine-readable
+> [`docs/status/COMPONENT_EVIDENCE_MATRIX.yaml`](COMPONENT_EVIDENCE_MATRIX.yaml)
+> and the four-track
+> [`docs/roadmaps/ACCELERATED_EXECUTION_PLAN.md`](../roadmaps/ACCELERATED_EXECUTION_PLAN.md).
+> This file remains the dated snapshot; the master plan is the map.
 >
 > **Mode: EVIDENCE DELIVERY**, approved and frozen by
 > [ADR-0015](../adr/ADR-0015-evidence-delivery-governance.md). Automatic
@@ -30,13 +38,18 @@
 
 | Field | Value |
 |---|---|
-| Date | 2026-07-16 |
-| `main` commit | `624343b` (Merge PR #34) |
+| Date | 2026-08-02 |
+| `main` commit | `b4d65de` (Merge PR #55) |
 | Baseline | `docs/baseline-v0.5/` |
 | Canonical tasks (counted from YAML) | **82** |
 | `IMPLEMENTED` canonical tasks | **72** (IMP-0001…IMP-1206 + IMP-1301) |
+| Remaining canonical tasks | **10** (IMP-1302–1304, IMP-1401–1404, IMP-1501–1503) |
+| PoIs PASS | **2 of 15** (POI-PLAT-ARM-001, POI-SEC-SESS-002) |
+| Deferred owner-runs | **DEF-19 PASS**; DEF-14 DEFERRED; the other **18 NOT_RUN** |
 | Current stage | **Evidence Delivery** (feature delivery paused after PHASE-13/IMP-1301) |
-| Single next task | **Owner executes the POI-IBKR-001 Paper lifecycle run** (§9) — `docs/runbooks/POI_IBKR_001_OWNER_RUN.md`; no code task remains open |
+| Paper Auto / Live | **DISABLED / DISABLED** |
+| Next broker-changing action | **DEF-18** post-fix cancellation, any permitted non-closed session (§9) |
+| Next non-broker action | **freeze `baseline-trend-breakout-v1`** — needs no broker (§9) |
 
 ## 3. What is completed in code (`IMPLEMENTED`)
 
@@ -76,8 +89,8 @@ invalid prices fail; 10167 = non-blocking delayed notice).
 | PoI | Status | Evidence / gap | Next action |
 |---|---|---|---|
 | POI-IBKR-READONLY | **PASS** (read-only scope only) | `evidence/POI-IBKR-READONLY.md`, 2026-07-10, DU*****32 | none |
-| POI-MD-001 | **BLOCKED** (aggregate) — **realtime sub-gate PASS** | `evidence/POI-MD-001-REALTIME.md` (owner run 2026-07-21): `marketDataType=1` REALTIME, no entitlement error, valid bid/ask/last + sizes, timestamp, clean disconnect, read-only. Blocker: *"External provider not selected; benchmark/fallback/provider ADR deferred until owner-approved provider availability."* | deferred to a future provider-selection task; unfreeze only on an owner-approved provider (Track A / A2) |
-| POI-IBKR-001 | **NOT RUN / BLOCKED** | read-only pre-check only; missing: real submit/ack/fill/cancel/protection/reconciliation evidence. Market-data dependency narrowed by [ADR-0016](../adr/ADR-0016-poi-ibkr-001-market-data-dependency.md); owner-run CLI **built but never executed** (WP-A3) | owner runs `docs/runbooks/POI_IBKR_001_OWNER_RUN.md` (7 steps) and marks the PoI |
+| POI-MD-001 | **BLOCKED** (aggregate) — **realtime sub-gate PASS** | `evidence/POI-MD-001-REALTIME.md` (owner run 2026-07-21) **plus a second read-only observation for `F`**, `evidence/POI-MD-001-REALTIME-F-20260731.md` (2026-07-31): `marketDataType=1` REALTIME, no entitlement error, valid bid/ask/last + sizes, canonical freshness REALTIME, clean disconnect, read-only. **The observed quote is historical and marked `quote_reuse: FORBIDDEN_STALE` — it may never be reused as a run input.** Blocker: *"External provider not selected; benchmark/fallback/provider ADR deferred until owner-approved provider availability."* | deferred to a future provider-selection task (DEF-14); unfreeze only on an owner-approved provider |
+| POI-IBKR-001 | **BLOCKED** (order lifecycle incomplete) | A real owner-run DID reach the broker order path: **submit, acknowledgement and idempotent resubmit passed**, the order never filled — but the **cancellation FAILED** and the owner cancelled by hand. Root causes fixed (`D-CANCEL-01…08`, `D-CLOCK-01…04`). Post-fix, **DEF-19 `verify-clean` PASSES** (2026-07-30T17:49:25Z, `evidence/POI-IBKR-001-VERIFY-CLEAN.md`): account verified clean — zero working lifecycle orders, zero non-zero positions, zero unresolved broker state, reconciliation `findings=0`, clean disconnect. **Still missing: any post-fix real cancellation, any real fill, any protection, any restart recovery.** | **DEF-18** post-fix cancellation (live session), then fill/protection/ reconciliation, then **DEF-20** restart recovery |
 | Other P0/P1 PoIs | per `docs/poi/STATUS.yaml` | social/news/AI/TV remain BLOCKED on external accounts/hosts (ADR-0014) | Track A/C |
 
 No other integration is verified. A real submit path now **exists in code**
@@ -120,15 +133,31 @@ from a dry run of identical parameters, and it is `TESTED_WITH_FAKES` only.
    data scope, freshness class and test credentials available.
    *(`DEFERRED` is not used as a status: it is absent from the ADR-0015
    vocabulary and is not a canonical registry state.)*
-3. Real Paper submit/ack/fill/cancel never run (POI-IBKR-001) — **the only
-   remaining blocker is the owner executing the run**; ADR-0016 cleared the
-   market-data dependency and the CLI is built.
-4. ~~Owner-run lifecycle CLI not built~~ — **built 2026-07-21 (WP-A3)**,
-   `TESTED_WITH_FAKES`, never executed.
+3. POI-IBKR-001 order lifecycle incomplete. Submit and acknowledgement are
+   proven on a real Paper run; **cancellation is not** (it failed, was fixed,
+   and has not been re-run). **DEF-19 verify-clean PASSES** post-fix, so the
+   account is verified clean, but **DEF-18 (post-fix cancellation) and DEF-20
+   (restart-recovery cancellation) are both `NOT_RUN`**, and there is **no real
+   fill, protection or restart-recovery evidence of any kind**.
+4. ~~Owner-run lifecycle CLI not built~~ — **built 2026-07-21 (WP-A3)** and
+   since hardened; partially exercised for real (submit/ack/verify-clean).
+   Evidence produced **before** the D-CLOCK-01 fix carries fabricated
+   timestamps and **must be regenerated, not trusted**.
 5. IMP-1302 gated on POI-IBKR-001 PASS.
 6. Strategy profitability: **PROFITABILITY_NOT_PROVEN** for every strategy —
    no hypothesis freeze, no point-in-time dataset, no out-of-sample, no
-   shadow evidence exists yet (Track B).
+   shadow evidence exists yet. **No strategy is eligible for any automated
+   mode**, and eligibility requires BOTH `OUT_OF_SAMPLE_PASS` AND
+   `SHADOW_PASS` plus a formal owner Go.
+7. Social, AI, news, InvestingPro and TradingView PoIs all remain
+   **BLOCKED** on owner-supplied accounts/hosts (ADR-0014, ADR-0013).
+8. The **AI Review Committee is designed but not implemented** as an active
+   runtime: no I/O contract module, no replayable orchestration. It is a
+   decision **input** and never an execution authority.
+9. **PAPER_AUTO and LIVE remain frozen/DISABLED**; no plan in this repository
+   enables Live (IMP-1503 produces a recommendation only).
+10. Host operations: **B-02** chaos drills not run, **B-03** IBC/watchdog host
+    patches not upstreamed, **B-04** watchdog deep probe not enabled.
 
 ## 8. Remaining canonical tasks (all kept; none deleted)
 
@@ -151,16 +180,30 @@ cancelled.
 
 ## 9. Single next task
 
-> **Next: the owner executes the POI-IBKR-001 Paper lifecycle run** — the
-> seven steps in
-> [`docs/runbooks/POI_IBKR_001_OWNER_RUN.md`](../runbooks/POI_IBKR_001_OWNER_RUN.md)
-> (preflight → dry-run → cancel-path → verify flat → fill-path → reconnect →
-> cleanup), then records `docs/poi/evidence/POI-IBKR-001.md` and marks the
-> PoI. Only the owner may run it; only the owner may mark it.
+> **There are now TWO next actions, and they run in parallel.** Treating them
+> as sequential is the single largest avoidable delay in the project.
 >
-> No coding task is open. WP-A3 delivered ADR-0016, the owner-run CLI and its
-> fakes-only proof; everything downstream (IMP-1302 → 1303 → 1304) stays gated
-> on the owner-run evidence, and PAPER_AUTO and LIVE stay prohibited.
+> **1 — Broker (needs a permitted non-closed session).** **DEF-18**, the
+> post-fix cancellation verification: fresh realtime quote → cancel-path dry
+> run → new same-day token → **exactly one** `--execute` with
+> `--journal-dir` → `verify-clean`. **Regular, pre-market or after-hours all
+> qualify** — only a *closed* session is refused, because it has no live
+> two-sided quote. See
+> [`POI_IBKR_001_OWNER_RUN.md`](../runbooks/POI_IBKR_001_OWNER_RUN.md).
+> Never reuse a historical quote or an old token; never retry after `UNKNOWN`
+> or an unconfirmed cancellation. **DEF-20 remains NOT_RUN afterwards**, and
+> runs in its own window — broker-mutating owner-runs are never concurrent.
+>
+> **2 — Strategy (needs no broker at all).** Freeze
+> **`baseline-trend-breakout-v1`** using
+> [`STRATEGY_FREEZE_TEMPLATE.md`](../strategies/STRATEGY_FREEZE_TEMPLATE.md).
+> It requires no social and no AI input, so it is unblocked today and it
+> creates the baseline every later claim must beat. The freeze must happen
+> **before** any evaluation result is inspected.
+>
+> Only the owner may run either; only the owner may mark a PoI. Everything
+> downstream (IMP-1302 → 1303 → 1304, then PHASE-14) stays gated, and
+> PAPER_AUTO and LIVE stay prohibited.
 
 ### Background (how we got here)
 
