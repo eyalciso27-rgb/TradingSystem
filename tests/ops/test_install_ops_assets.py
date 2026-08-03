@@ -862,3 +862,20 @@ def test_the_rehearsal_root_privacy_check_covers_mode_and_owner() -> None:
     assert len(calls) >= 3, (
         f"every path that establishes a root must check it, found {calls}"
     )
+
+
+def test_the_rehearsal_completion_notice_points_at_the_manual_apply() -> None:
+    """It used to say "re-run without --dest-root", which no longer exists.
+
+    Telling an owner to re-run with a flag that has been removed from the
+    public interface is a dead end at exactly the moment they are deciding
+    whether to touch the host.
+    """
+    notice = SOURCE.split("cat <<'REHEARSALNEXT'", 1)[1].split("REHEARSALNEXT", 1)[0]
+    assert "--dest-root" not in notice, "the notice must not name a removed flag"
+    assert "WITHOUT --rehearsal" in notice
+    assert "OPERATIONAL_HARDENING.md" in notice, "point at the documented step"
+    assert "Do NOT" in notice and "enable any timer" in notice
+    # The manual step stays manual: nothing here starts a privileged action.
+    for command in PRIVILEGED:
+        assert command not in notice

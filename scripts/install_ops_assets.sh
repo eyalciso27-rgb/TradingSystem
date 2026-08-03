@@ -480,8 +480,12 @@ if [[ "${REHEARSAL}" -eq 1 ]]; then
   cat <<'REHEARSALNEXT'
 This was a REHEARSAL. Nothing was installed on the host, no systemd command
 ran, and the real /run/ibgateway was neither created nor inspected. Do NOT
-enable any timer on the basis of this run — re-run without --dest-root, as
-the service user, to perform the real install.
+enable any timer on the basis of this run.
+
+To perform the real install, re-run WITHOUT --rehearsal, as the service user,
+following the documented privileged owner-host apply step in
+docs/runbooks/OPERATIONAL_HARDENING.md. That step is deliberately manual and
+is never started for you.
 REHEARSALNEXT
   exit 0
 fi
