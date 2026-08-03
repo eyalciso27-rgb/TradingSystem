@@ -1,6 +1,9 @@
 # Runs the IB Gateway watchdog cycle shortly after boot and then periodically.
-# The watchdog itself is lock-guarded and rate-limited, so overlapping or rapid
-# firings can never cause a restart loop.
+#
+# This timer drives PASSIVE supervision. The watchdog is lock-guarded and
+# rate-limited, and every unattended process action is additionally gated on a
+# complete read-only proof that the account is CLEAN — so no firing frequency,
+# overlap or budget can produce a blind restart.
 
 [Unit]
 Description=Periodic IB Gateway (Paper) watchdog

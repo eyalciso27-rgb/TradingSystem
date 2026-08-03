@@ -1,0 +1,387 @@
+# Operational hardening — implementation, activation and evidence
+
+> **Implementation readiness is not host activation evidence.** This document
+> separates the two on purpose, and the separation is load-bearing:
+>
+> | | State |
+> |---|---|
+> | Code + units + tests | ✅ **IMPLEMENTED AND TESTED WITH FAKES** |
+> | Owner-host installation | 🟡 **READY FOR OWNER-HOST ACTIVATION** |
+> | Owner-host evidence | ❌ **NOT EXECUTED** |
+>
+> **B-03 and B-04 remain OPEN. DEF-12 and DEF-13 remain `NOT_RUN`.**
+> Nothing here marks POI-PLAT-ARM-001 newly passed, POI-IBKR-001 PASS,
+> IMP-1303 complete or IMP-1304 complete.
+
+---
+
+## 1. What changed, and why it matters
+
+The watchdog used to restart IB Gateway whenever the process was down or the
+API was unresponsive. It knew about **processes**; it knew nothing about the
+**account**.
+
+That is the dangerous kind of gap, because the two look similar and are not.
+Restarting a Gateway while an order is working can orphan that order. Doing it
+while a position is open removes the session that was supposed to be watching
+it. Doing it while the broker state is unresolved destroys the very evidence
+reconciliation needs. In each case the watchdog would have reported success:
+the process came back.
+
+So a restart now requires a **positive proof about the account**, not the
+absence of a process.
+
+### The account-safety gate
+
+Every unattended `START` / `RESTART` / `RELOGIN` is gated on one complete
+read-only snapshot:
+
+| Classification | Meaning | Unattended action |
+|---|---|---|
+| **CLEAN** | every check below passed | policy may be evaluated |
+| **NOT_CLEAN** | a **complete** snapshot proves something exists | `WAIT` + alert, launcher never called |
+| **UNKNOWN** | the proof could not be completed | `ALERT`, fail closed, launcher never called |
+
+`CLEAN` requires **all** of: localhost only · Paper port 4002 only · `DU`/Paper
+account validation · successful API connection · successful liveness round trip
+· complete open-order snapshot · complete position snapshot · zero working
+orders · zero non-zero positions · zero unresolved operation states · clean
+reconciliation with zero blocking findings · clean disconnect.
+
+> **Connectivity failure is `UNKNOWN`. It is never `CLEAN`.** Absence of
+> evidence is not evidence of absence. A watchdog that cannot reach the broker
+> knows *less*, not more.
+
+Historical, cached or last-known-clean state is **never** consulted. Only a
+snapshot taken *now* can speak for *now*.
+
+### One snapshot, not several reads
+
+"One complete snapshot" is structural, not aspirational. A single probe run
+reads the broker **exactly once per method** — account, open orders, positions,
+order events, reconciliation — and every count and finding is derived from that
+captured data.
+
+The reconciliation engine calls `reconcile()` and `order_events()` itself. It
+is therefore handed a **snapshot replay view**, never the live broker, so it
+cannot issue a second round trip. Previously it received the live view: the
+counts came from one instant and the findings from another, and a `CLEAN`
+verdict built from two instants describes a moment that never existed — an
+order can appear between the reads and be counted by neither.
+
+Because `reconcile()` also returns the account, orders and positions, the two
+reads **overlap**, and that overlap is a free coherence check. If they
+disagree — an order gained or lost, a state or quantity changed, a different
+account answering — the parts are not one snapshot and the result is
+**`UNKNOWN`**. Duplicated orders or positions within one snapshot are likewise
+`UNKNOWN`. *Mixed-time data is never classified.*
+
+### Exactly one disconnect
+
+Each successful connect is followed by exactly one disconnect attempt, on every
+path including an unexpected exception. A failed connect never calls
+disconnect. **A failed disconnect downgrades the verdict to `UNKNOWN` with
+`DISCONNECT_FAILED`** — a session that could not be closed cannot be reasoned
+about, and there is no path from a failed disconnect to `CLEAN`. The gathered
+counts are kept in the structured fields for the alert; only the verdict
+changes. The probe previously disconnected twice and swallowed the second
+failure entirely.
+
+### The consequence: the unattended watchdog no longer restarts anything
+
+This follows directly and is intended. Every state that could trigger a restart
+cannot answer a broker query:
+
+| State | Why the account cannot be proven | Result |
+|---|---|---|
+| `PROCESS_DOWN` | nothing to query | `UNKNOWN` → refuse |
+| `API_DOWN` | API not answering | `UNKNOWN` → refuse |
+| `LOGIN_REQUIRED` | login incomplete | `UNKNOWN` → refuse |
+| `TWO_FA_PENDING` | awaiting the owner | `UNKNOWN` → refuse |
+| `API_READY` | probe can run — but no action is needed | n/a |
+
+So the timer now performs **passive supervision**: observe, classify, alert.
+Bringing a Gateway back is an **owner-authorized** action.
+
+**Manual owner-authorized recovery and unattended watchdog restart are separate
+capabilities, and only the second one was removed.** The controlled, serialized
+DEF-20 restart under `POI_IBKR_001_OWNER_RUN.md` and
+`CHAOS_RECOVERY_DRILLS.md` is untouched.
+
+The lifecycle/reconciliation marker still inhibits action. It is **necessary
+but not sufficient** — its absence proves nothing on its own, which is exactly
+why the gate exists above it.
+
+Budgets, locks, structured alerts and 2FA waiting semantics are all preserved,
+and **none of them can override the gate.** A freed restart budget is not a
+proof about the account.
+
+---
+
+## 2. Read-only commands (safe at any time)
+
+Both are strictly read-only. Neither constructs a launcher; neither can start,
+restart or relogin anything. Both work with `uv run --no-sync`, so the owner
+host never needs `uv sync`.
+
+### Status
+
+```bash
+uv run --no-sync python scripts/ib_gateway_watchdog.py --status
+```
+
+Reports process state, TCP state, login marker, lifecycle marker, configured
+unit, restart budget, whether any action would be permitted, and an explicit
+**proof level**.
+
+### Status with the deep account-safety probe
+
+```bash
+uv run --no-sync python scripts/ib_gateway_watchdog.py \
+  --deep-probe --status \
+  --account-alias <ALIAS> --secrets-root "$SECRETS_ROOT"
+```
+
+Adds `CLEAN` / `NOT_CLEAN` / `UNKNOWN`, order and position counts,
+unresolved-state count, reconciliation result, sanitized reason codes and
+connect/disconnect results.
+
+### JSON for evidence capture
+
+```bash
+uv run --no-sync python scripts/ib_gateway_watchdog.py --status --json \
+  > /tmp/watchdog-status-$(date -u +%Y%m%dT%H%M%SZ).json
+```
+
+### Proof levels
+
+Each level proves a strictly different claim. A higher level is not "more
+confident about the same thing".
+
+| Level | Proves | Does **not** prove |
+|---|---|---|
+| `NONE` | nothing observed | — |
+| `PROCESS_ONLY` | a matching process exists | nothing about the API or account |
+| `TCP_OPEN` | the port accepts connections | **not** that the Gateway is logged in; **never** that the account is clean |
+| `API_ROUND_TRIP` | the API answered a request | nothing about orders, positions or reconciliation |
+| `FULL_ACCOUNT_SNAPSHOT` | a complete read-only classification | — the only level that can support `CLEAN` |
+
+---
+
+## 3. Host audit (read-only)
+
+```bash
+uv run --no-sync python scripts/host_operations_audit.py
+uv run --no-sync python scripts/host_operations_audit.py --json \
+  --json-out /tmp/host-audit.json --markdown-out /tmp/host-audit.md
+```
+
+Collects: architecture and OS · Python/uv availability · unit definitions and
+actual `ExecStart` paths · Gateway/IBC/Java paths · active process count ·
+listeners on 4002/5901 and whether they bind localhost or all interfaces ·
+firewalld/nftables local state (read-only) · chrony/NTP synchronization ·
+ownership and mode of the lifecycle journal, watchdog state, lock and IBC logs
+· logrotate configuration · service restart policy · whether the broker package
+the deep probe needs is importable.
+
+It **redacts** usernames, account ids and credential-shaped values, **never**
+prints IBC `config.ini` contents or environment secrets, **never** changes
+firewall or service state, and exits non-zero on a security or readiness
+failure.
+
+---
+
+## 4. Installing the assets
+
+```bash
+scripts/install_ops_assets.sh                        # CHECK / DRY-RUN (default)
+scripts/install_ops_assets.sh --apply                # real install
+scripts/install_ops_assets.sh --apply --no-reload    # skip the reload only
+scripts/install_ops_assets.sh --apply --dest-root=DIR  # isolated REHEARSAL
+```
+
+Installs `ibgateway-ibc.service`, `ibgateway-watchdog.service`,
+`ibgateway-watchdog.timer`, `/etc/tmpfiles.d/ibgateway.conf` and
+`/etc/logrotate.d/ibgateway`.
+
+**It never enables or starts a unit**, never touches firewall/OCI/SSH/VNC, and
+never reads a credential.
+
+### Execution matrix
+
+| Mode | copies files | `systemctl daemon-reload` | `systemd-tmpfiles` | runtime directory |
+|---|---|---|---|---|
+| **CHECK** (default) | no | **never** | **never** | untouched (read-only) |
+| **APPLY**, a unit changed | yes | **once** | `--create /etc/tmpfiles.d/ibgateway.conf` | create + verify `/run/ibgateway` |
+| **APPLY**, nothing changed | no writes needed | no (nothing stale) | `--create …` | **create + verify** |
+| **APPLY --no-reload** | yes | no | `--create …` | **create + verify** |
+| **APPLY --dest-root=DIR** | into `DIR` | **never** | **never** | validate rule + create + verify `DIR/run/ibgateway` |
+
+CHECK mode runs **no system command at all** — it only diffs.
+
+### Rehearsal is structurally isolated
+
+`--dest-root=DIR` invokes neither `systemctl` nor `systemd-tmpfiles`. Not
+"invokes them harmlessly" — the calls are not written in that branch, and a
+test parses the script to prove it.
+
+This matters because staging the config elsewhere **isolates nothing**. The
+rule is `d /run/ibgateway 0700 opc opc`: an **absolute** path. Running
+`systemd-tmpfiles --create <scratch>/etc/tmpfiles.d/ibgateway.conf` would have
+created and chowned the **real** `/run/ibgateway` on the host. A rehearsal that
+mutates the thing it is rehearsing is not a rehearsal.
+
+Instead the rehearsal validates the staged rule and materialises the directory
+inside `DIR`, then verifies it exactly as a real apply would. It reports what a
+real apply *would* do about the reload, so that decision is observable without
+a privileged run. It cannot `chown` to `opc:opc`, and it says so rather than
+implying the ownership was established.
+
+### The runtime directory step is mandatory
+
+Creation and verification of `/run/ibgateway` runs on **every** apply,
+independently of whether any file changed and independently of `--no-reload`.
+It was previously nested under `reload enabled AND changed > 0`, so an apply
+where every asset already matched reported success while the directory could
+be missing entirely. **A tmpfiles config on disk is not a runtime directory on
+the filesystem**: `/run` is volatile, so the directory disappears on reboot
+while the config still looks perfectly installed.
+
+Verification checks existence, that it *is* a directory, mode `0700` and owner
+`opc:opc` — read from the tmpfiles rule itself, so the installer and the
+canonical owner can never drift apart. `--no-reload` suppresses the reload and
+nothing else.
+
+**Any failure exits non-zero**, prints no success message and gives no
+instruction to enable the timer. The script distinguishes: files copied ·
+daemon reload performed or intentionally skipped · tmpfiles validated or
+applied · runtime directory created and verified · install COMPLETE or
+INCOMPLETE. It previously ran tmpfiles with `|| true` and printed
+`tmpfiles applied` regardless.
+
+Enabling is an owner decision:
+
+```bash
+systemctl enable --now ibgateway-watchdog.timer   # passive supervision only
+```
+
+### One canonical Gateway service
+
+There is exactly one: **`ibgateway-ibc.service`**. A second unit, a user-level
+copy, a cron entry or a supervisor wrapper would be a competing restart
+manager — two managers can race and produce two API clients on one account.
+The host audit's `single_gateway_service` check FAILs if it finds another.
+
+### Runtime directory: one owner, one lifetime
+
+`/run/ibgateway` holds the watchdog state (the restart **budget**), the launch
+lock and the order-lifecycle **marker**. Because the marker *inhibits*
+unattended action and the budget *rate-limits* it, this directory is
+supervision authority — losing it silently removes both brakes.
+
+**`/etc/tmpfiles.d/ibgateway.conf` is its single canonical owner** (`0700`,
+`opc:opc`, created at boot by `systemd-tmpfiles-setup.service`). **Neither unit
+declares `RuntimeDirectory=`, and neither may.**
+
+That is a correction, not a preference. `ibgateway-watchdog.service` is
+`Type=oneshot`: it goes inactive the instant its cycle ends, and
+`RuntimeDirectory=` is torn down when a unit goes inactive unless
+`RuntimeDirectoryPreserve=` says otherwise. Both units previously declared it,
+so **every watchdog cycle would have deleted the marker, the budget and the
+lock** — a supervisor quietly erasing the two things that stop it acting, while
+appearing healthy. `RuntimeDirectory=` is also wrong here on its own terms: the
+directory must exist while the Gateway is **stopped** (exactly when the marker
+matters) and before either unit has ever started.
+
+Consequences, all deliberate:
+
+- both units are ordered `After=systemd-tmpfiles-setup.service`, so reboot-time
+  recreation is deterministic rather than a race;
+- both declare `ReadWritePaths=/run/ibgateway` with **no leading `-`** — a
+  missing directory *fails the unit* instead of being ignored, because running
+  the watchdog without its budget, lock and marker is the dangerous case;
+- the CLI's last-resort `mkdir` sets `0700` explicitly (`mkdir(mode=…)` is
+  masked by the umask) and never widens an existing directory — drift is a
+  finding for the host audit, not something the watchdog papers over;
+- `systemd-tmpfiles` failing during install is **fatal** (see §4).
+
+`tests/ops/test_runtime_directory_ownership.py` parses the units and asserts
+all of the above, so a re-added `RuntimeDirectory=` cannot pass review.
+
+### State and lock file integrity
+
+`watchdog-state.json` is written **atomically** (temp file in the same
+directory, `fsync`, `os.replace`) at mode `0600`, enforced by an explicit
+`chmod` rather than inherited from the invoking service's umask. A truncated
+state file would load as an *empty* budget — that is, a fresh full set of
+restarts — so a failed write must leave the previous valid state untouched.
+`watchdog.lock` is likewise `0600` by explicit `chmod`, because `os.open`'s
+mode argument is umask-masked.
+
+Service hardening deliberately stops short of network namespacing: the Gateway
+must keep binding its local API socket and the watchdog must keep reaching it,
+so `RestrictAddressFamilies` permits local IP access on purpose.
+
+---
+
+## 5. Port security
+
+See [`HOST_PORT_SECURITY.md`](HOST_PORT_SECURITY.md). Detection is automated;
+remediation is not. **OCI network security cannot be verified from the host and
+is always reported `UNKNOWN`.**
+
+---
+
+## 6. Owner-host evidence commands (NOT executed)
+
+Run on the owner host, in this order. Every command below is read-only: none
+mutates broker state, none restarts anything, none contains a quote or token.
+
+```bash
+# 1. Read-only host audit -> B-03/B-04 evidence
+uv run --no-sync python scripts/host_operations_audit.py \
+  --markdown-out /tmp/host-audit-$(date -u +%Y%m%dT%H%M%SZ).md \
+  --json-out    /tmp/host-audit-$(date -u +%Y%m%dT%H%M%SZ).json
+
+# 2. Read-only watchdog status (no launcher, no broker connection)
+uv run --no-sync python scripts/ib_gateway_watchdog.py --status --json \
+  > /tmp/watchdog-status-$(date -u +%Y%m%dT%H%M%SZ).json
+
+# 3. Read-only deep probe (connects read-only; places nothing)
+uv run --no-sync python scripts/ib_gateway_watchdog.py \
+  --deep-probe --status --json \
+  --account-alias <ALIAS> --secrets-root "$SECRETS_ROOT" \
+  > /tmp/watchdog-deep-probe-$(date -u +%Y%m%dT%H%M%SZ).json
+
+# 4. Asset installation, CHECK mode first
+scripts/install_ops_assets.sh
+```
+
+Then review the artifacts, redact nothing further (they are already
+sanitized), and record them. **Only after that review may B-03/B-04 and
+DEF-12/DEF-13 change state — and only the owner may change them.**
+
+---
+
+## 7. Status
+
+| Item | State |
+|---|---|
+| Account-safety probe, gate, CLI, units, audit, installer | ✅ IMPLEMENTED AND TESTED WITH FAKES |
+| Owner-host installation | 🟡 READY FOR OWNER-HOST ACTIVATION |
+| B-02 chaos drills | ❌ OPEN / NOT_RUN |
+| B-03 IBC/watchdog host evidence | ❌ OPEN / NOT_RUN (DEF-12) |
+| B-04 watchdog deep probe activation | ❌ OPEN / NOT_RUN (DEF-13) |
+| POI-PLAT-ARM-001 | unchanged (PASS from its own earlier run; **not** re-proven here) |
+| POI-IBKR-001 | **BLOCKED** — unchanged |
+| IMP-1303 / IMP-1304 | **not complete** — unchanged |
+
+### NOT EXECUTED
+
+- ❌ no IBKR connection of any kind;
+- ❌ no `systemctl` command run against a real host;
+- ❌ no Gateway start, stop, restart or relogin;
+- ❌ no order submitted, cancelled, modified or flattened;
+- ❌ no firewall, nftables, firewalld or OCI change;
+- ❌ no credential, account id or IBC config content added;
+- ❌ no PAPER_AUTO, no LIVE.

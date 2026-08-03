@@ -1,51 +1,88 @@
-"""IB Gateway (Paper) watchdog — health/restart supervision for IBC.
+"""IB Gateway (Paper) watchdog — passive supervision for IBC.
 
 Runs one cycle per invocation (driven by a systemd timer). It observes the
 Gateway/IBC process, the API port (4002) and the IBC log, classifies a single
-state, and takes at most one controlled action:
+state, and — subject to the ACCOUNT-SAFETY GATE below — takes at most one
+controlled action.
 
-    PROCESS_DOWN  -> start via IBC (rate-limited, lock-guarded)
-    LOGIN_REQUIRED-> IBC enters credentials itself; on repeated LOGIN_FAILED do
-                     a rate-limited controlled relogin, else alert fail-closed
-    TWO_FA_PENDING-> WAIT for the owner's phone approval (never an immediate
-                     restart); on 2FA timeout do a rate-limited relogin
-    API_DOWN      -> a single restart within a defined window
-    API_READY     -> no action
+    PROCESS_DOWN  -> cannot query the broker  => account safety UNKNOWN
+    LOGIN_REQUIRED-> cannot prove cleanliness  => UNKNOWN
+    TWO_FA_PENDING-> cannot prove cleanliness  => UNKNOWN (never bypassed)
+    API_DOWN      -> cannot prove cleanliness  => UNKNOWN
+    API_READY     -> the read-only probe may run; no action is needed anyway
     UNKNOWN       -> alert + fail closed
+
+## The account-safety gate (the reason this file was rewritten)
+
+Process liveness is **not** account safety. Restarting the Gateway while an
+order is working, a position is open or the broker state is unresolved can
+orphan that order and destroy the evidence needed to reconcile it. So no
+unattended START / RESTART / RELOGIN may proceed unless a COMPLETE read-only
+snapshot proves the account ``CLEAN``:
+
+    CLEAN      -> policy may be evaluated (budgets, locks, 2FA still apply)
+    NOT_CLEAN  -> WAIT/ALERT, launcher is never called
+    UNKNOWN    -> ALERT, fail closed, launcher is never called
+
+**Connectivity failure is UNKNOWN; it is never CLEAN.** Historical, cached or
+last-known-clean state proves nothing about *now* and is never consulted.
+
+The practical consequence is deliberate and important: **every state that
+could trigger a restart is definitionally UNKNOWN**, because a down process or
+a dead API cannot answer a broker query. The unattended watchdog therefore
+**supervises and alerts; it does not restart.** Recovering the Gateway is an
+owner-authorized action performed under the canonical runbook — see
+``docs/runbooks/CHAOS_RECOVERY_DRILLS.md``. That manual capability is separate
+from, and unaffected by, this gate.
 
 Hard rules:
 - NO credentials: the watchdog never reads or logs the IB login id/password;
   those live only in the IBC config file that IBC itself reads.
-- NO orders / NO broker execution: it can only start/stop/relogin the Gateway
-  process; there is no order, cancel or submit surface anywhere.
+- NO orders / NO broker execution: there is no order, cancel, modify or submit
+  surface anywhere, and the safety probe is handed a read-only facade that
+  does not define one.
 - 2FA is never bypassed: TWO_FA_PENDING waits for the owner.
-- One restart manager: a file lock prevents two concurrent launches and a
-  windowed budget prevents restart/relogin loops.
-- A reconciliation gate can INHIBIT any restart/kill (for a future order
-  lifecycle): when inhibited, the watchdog only alerts and waits.
+- One restart manager, one Gateway service (``ibgateway-ibc.service``): a file
+  lock prevents concurrent launches and windowed budgets prevent loops.
+  Budgets and locks may never *override* the account-safety gate.
+- The lifecycle/reconciliation marker still INHIBITS action. It is necessary
+  but NOT sufficient — its absence proves nothing on its own.
 
-Everything with side effects (process probe, socket, log read, launching) is
-injected, so the classification and decision logic is pure and fully tested
-with fakes — no real IBKR contact, ever.
+Everything with side effects (process probe, socket, log read, launching,
+broker probe) is injected, so the classification and decision logic is pure
+and fully tested with fakes — no real IBKR contact, ever.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
-WATCHDOG_VERSION = "ib-gateway-watchdog-1.0.0"
+WATCHDOG_VERSION = "ib-gateway-watchdog-2.0.0"
+
+#: Canonical account-safety vocabulary. Mirrored as plain strings so this
+#: script imports on a host without the application packages installed; the
+#: real classification comes from
+#: ``trading_execution_agent.account_safety`` and is imported lazily.
+SAFETY_CLEAN = "CLEAN"
+SAFETY_NOT_CLEAN = "NOT_CLEAN"
+SAFETY_UNKNOWN = "UNKNOWN"
+#: The only value that may permit an unattended action.
+SAFETY_PERMITTING: frozenset[str] = frozenset({SAFETY_CLEAN})
 
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 4002  # paper API port; the live port is never used here
@@ -94,6 +131,11 @@ class ExitCode:
     RESTART_LIMIT = 30
     UNKNOWN_STATE = 40
     LOGIN_FAIL_LIMIT = 41
+    #: An action was otherwise indicated but the account could not be
+    #: proven clean. This is the normal outcome of an unattended cycle that
+    #: sees a problem — it is a refusal, not a crash.
+    ACCOUNT_UNKNOWN = 42
+    ACCOUNT_NOT_CLEAN = 43
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +320,59 @@ def decide_action(
     )
 
 
+def probe_is_possible(state: WatchdogState) -> bool:
+    """Can an account-safety proof even be attempted in this state?
+
+    Only when the API is answering. A down process, a dead API, an incomplete
+    login and a pending 2FA all make the broker unreachable, so the account
+    cannot be proven clean and the answer is UNKNOWN — never CLEAN.
+    """
+    return state is WatchdogState.API_READY
+
+
+#: Actions that change the Gateway process. These are the ones the gate guards.
+MUTATING_ACTIONS: frozenset[Action] = frozenset(
+    {Action.START, Action.RESTART, Action.RELOGIN}
+)
+
+
+def apply_account_safety_gate(plan: ActionPlan, account_safety: str) -> ActionPlan:
+    """Downgrade any process-mutating action unless the account is proven CLEAN.
+
+    This runs AFTER the policy decision on purpose: budgets, locks and 2FA
+    semantics are preserved exactly as they were, and this gate sits in front
+    of all of them. A budget that still has room, or a lock that is free, can
+    never re-open a gate the account state has closed.
+    """
+    if plan.action not in MUTATING_ACTIONS:
+        return plan
+    if account_safety in SAFETY_PERMITTING:
+        return plan
+    if account_safety == SAFETY_NOT_CLEAN:
+        return ActionPlan(
+            plan.state,
+            Action.WAIT,
+            True,
+            (
+                f"{plan.action.value} refused: account NOT_CLEAN (a working order,"
+                " a position, an unresolved state or a reconciliation finding"
+                " exists); owner action required"
+            ),
+            ExitCode.ACCOUNT_NOT_CLEAN,
+        )
+    return ActionPlan(
+        plan.state,
+        Action.ALERT,
+        True,
+        (
+            f"{plan.action.value} refused: account safety UNKNOWN (the read-only"
+            " proof could not be completed); failing closed — connectivity"
+            " failure is never CLEAN"
+        ),
+        ExitCode.ACCOUNT_UNKNOWN,
+    )
+
+
 def _within_window(timestamps: list[float], now: float, window: float) -> int:
     return sum(1 for stamp in timestamps if now - stamp <= window)
 
@@ -316,9 +411,42 @@ class SystemdLauncher:
         self._run("restart")
 
 
+#: Modes for /run/ibgateway and the files in it. The lifecycle marker inhibits
+#: unattended action and the state file rate-limits it, so both are supervision
+#: authority: they are enforced explicitly, never inherited from a umask.
+RUNTIME_DIR_MODE = 0o700
+RUNTIME_FILE_MODE = 0o600
+
+
+def ensure_runtime_dir(path: Path) -> None:
+    """Guarantee ``path``'s parent exists at 0700 — no permissive fallback.
+
+    /run/ibgateway has one canonical owner, ``/etc/tmpfiles.d/ibgateway.conf``.
+    This is the last resort for a host where tmpfiles has not run: it may
+    create the directory, but only at 0700. ``Path.mkdir(mode=...)`` is masked
+    by the umask, so the mode is set explicitly afterwards.
+
+    An EXISTING directory is left alone deliberately — widening or narrowing
+    someone else's directory is not this process's call. Drift is a finding for
+    ``scripts/host_operations_audit.py``, not something to paper over here.
+    """
+    parent = path.parent
+    if parent.is_dir():
+        return
+    parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        parent.chmod(RUNTIME_DIR_MODE)
+
+
 @dataclass
 class StateStore:
-    """Persists restart/relogin timestamps as JSON (no secrets)."""
+    """Persists restart/relogin timestamps as JSON (no secrets).
+
+    The file holds the restart BUDGET, which is a safety control: it is what
+    rate-limits unattended action. So the write is atomic (a crash must not
+    truncate the budget to zero and silently re-arm the watchdog) and the mode
+    is enforced rather than inherited from the invoking service's umask.
+    """
 
     path: Path
     restart_times: list[float] = field(default_factory=list)
@@ -345,13 +473,37 @@ class StateStore:
         ]
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(
-                {"restart_times": self.restart_times, "relogin_times": self.relogin_times}
-            ),
-            encoding="utf-8",
+        """Write 0600 and atomically; a failed write keeps the previous state.
+
+        ``Path.write_text`` was none of those things: the mode came from the
+        umask, and a crash mid-write left truncated JSON that ``load`` would
+        silently read as an empty budget — i.e. a full set of fresh restarts.
+        """
+        ensure_runtime_dir(self.path)
+        payload = json.dumps(
+            {"restart_times": self.restart_times, "relogin_times": self.relogin_times}
         )
+        # Same directory, so os.replace is a true atomic rename and never a
+        # cross-filesystem copy. mkstemp opens O_EXCL at 0600.
+        handle_fd, temp_name = tempfile.mkstemp(
+            dir=str(self.path.parent), prefix=f".{self.path.name}.", suffix=".tmp"
+        )
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Explicit: the 0600 guarantee must not depend on mkstemp's
+            # platform semantics or on the caller's umask.
+            os.chmod(temp_path, RUNTIME_FILE_MODE)
+            # Atomic: a concurrent reader sees either the old file or the new
+            # one, never a partially written one.
+            os.replace(temp_path, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                temp_path.unlink()
+            raise
 
 
 class LockBusyError(Exception):
@@ -366,11 +518,17 @@ class FileLock:
         self._fd: int | None = None
 
     def __enter__(self) -> FileLock:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_dir(self._path)
         try:
-            self._fd = os.open(str(self._path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            self._fd = os.open(
+                str(self._path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, RUNTIME_FILE_MODE
+            )
         except FileExistsError as error:
             raise LockBusyError(f"lock held: {self._path}") from error
+        # os.open's mode is masked by the umask. This lock is what prevents two
+        # concurrent launches, so its mode is enforced, not merely requested.
+        with contextlib.suppress(OSError):
+            os.chmod(str(self._path), RUNTIME_FILE_MODE)
         os.write(self._fd, str(os.getpid()).encode("ascii"))
         return self
 
@@ -444,6 +602,15 @@ class Probes:
     current_time: Callable[[], bool]
     login: Callable[[], LoginMarker]
     restart_inhibited: Callable[[], bool]
+    #: Complete read-only account-safety proof. Returns a mapping with at
+    #: least ``safety`` and ``reasons``. Defaults to fail-closed UNKNOWN so
+    #: a caller that forgets to wire it can never unlock an action.
+    account_safety: Callable[[], dict[str, Any]] = field(
+        default=lambda: {
+            "safety": SAFETY_UNKNOWN,
+            "reasons": ["NOT_PROBEABLE_IN_THIS_STATE"],
+        }
+    )
 
 
 def run_cycle(
@@ -472,6 +639,26 @@ def run_cycle(
         policy=policy,
         restart_inhibited=probes.restart_inhibited(),
     )
+
+    # The account-safety gate. Only attempt the proof when the state could
+    # possibly support one AND an action is actually on the table; otherwise
+    # the answer is UNKNOWN by construction and no broker call is made.
+    safety = SAFETY_UNKNOWN
+    safety_report: dict[str, Any] = {
+        "safety": SAFETY_UNKNOWN,
+        "reasons": ["NOT_PROBEABLE_IN_THIS_STATE"],
+    }
+    if plan.action in MUTATING_ACTIONS and probe_is_possible(state):
+        try:
+            safety_report = dict(probes.account_safety())
+            safety = str(safety_report.get("safety", SAFETY_UNKNOWN))
+        except Exception:  # noqa: BLE001 - any probe failure => UNKNOWN
+            safety_report = {
+                "safety": SAFETY_UNKNOWN,
+                "reasons": ["PROBE_EXCEPTION"],
+            }
+            safety = SAFETY_UNKNOWN
+    plan = apply_account_safety_gate(plan, safety)
 
     if plan.action is Action.START:
         launcher.start()
@@ -525,6 +712,289 @@ def _default_restart_inhibited(marker_path: Path) -> Callable[[], bool]:
     return probe
 
 
+# -- read-only status reporting (WP3) --------------------------------------------
+#
+# `--status` and `--deep-probe --status` are STRICTLY read-only: they observe,
+# classify and print. They construct no launcher, and a test asserts the
+# launcher is never even instantiated on these paths.
+
+
+class ProofLevel(StrEnum):
+    """How much was actually PROVEN, stated explicitly rather than implied.
+
+    A higher level is not "more confident about the same thing" — each level
+    proves a strictly different claim, and only the last one says anything
+    about the ACCOUNT.
+    """
+
+    #: Nothing was observed (probe unavailable).
+    NONE = "NONE"
+    #: The OS says a process matching the pattern exists. Says nothing about
+    #: the API and nothing about the account.
+    PROCESS_ONLY = "PROCESS_ONLY"
+    #: A TCP connection to the API port succeeded. A listening socket is NOT
+    #: proof that the Gateway is logged in, and NEVER proof the account is clean.
+    TCP_OPEN = "TCP_OPEN"
+    #: The API answered a request (reqCurrentTime-class round trip). Still
+    #: says nothing about orders, positions or reconciliation.
+    API_ROUND_TRIP = "API_ROUND_TRIP"
+    #: A complete read-only account snapshot was obtained and classified.
+    #: This is the ONLY level that can support CLEAN.
+    FULL_ACCOUNT_SNAPSHOT = "FULL_ACCOUNT_SNAPSHOT"
+
+
+@dataclass(frozen=True, slots=True)
+class StatusReport:
+    """Sanitized, deterministic status. Contains no credential and no account id."""
+
+    watchdog_version: str
+    observed_at: str
+    process_running: bool
+    api_tcp_open: bool
+    api_round_trip_ok: bool
+    login_marker: str
+    lifecycle_marker_present: bool
+    configured_unit: str
+    restart_count: int
+    max_restarts: int
+    relogin_count: int
+    max_relogins: int
+    state: str
+    proof_level: str
+    account_safety: str
+    action_permitted: bool
+    action_permitted_reason: str
+    deep_probe: dict[str, Any] | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "watchdog_version": self.watchdog_version,
+            "observed_at": self.observed_at,
+            "process_running": self.process_running,
+            "api_tcp_open": self.api_tcp_open,
+            "api_round_trip_ok": self.api_round_trip_ok,
+            "login_marker": self.login_marker,
+            "lifecycle_marker_present": self.lifecycle_marker_present,
+            "configured_unit": self.configured_unit,
+            "restart_budget": {
+                "restarts_used": self.restart_count,
+                "max_restarts": self.max_restarts,
+                "relogins_used": self.relogin_count,
+                "max_relogins": self.max_relogins,
+            },
+            "state": self.state,
+            "proof_level": self.proof_level,
+            "account_safety": self.account_safety,
+            "action_permitted": self.action_permitted,
+            "action_permitted_reason": self.action_permitted_reason,
+        }
+        if self.deep_probe is not None:
+            payload["deep_probe"] = self.deep_probe
+        return payload
+
+    def render(self) -> str:
+        """Human-readable form. Same facts, no extra claims."""
+        lines = [
+            f"IB Gateway watchdog status ({self.watchdog_version})",
+            f"  observed_at              : {self.observed_at}",
+            f"  process_running          : {self.process_running}",
+            f"  api_tcp_open             : {self.api_tcp_open}",
+            f"  api_round_trip_ok        : {self.api_round_trip_ok}",
+            f"  login_marker             : {self.login_marker}",
+            f"  lifecycle_marker_present : {self.lifecycle_marker_present}",
+            f"  configured_unit          : {self.configured_unit}",
+            f"  restart_budget           : {self.restart_count}/{self.max_restarts}"
+            f" restarts, {self.relogin_count}/{self.max_relogins} relogins",
+            f"  state                    : {self.state}",
+            f"  proof_level              : {self.proof_level}",
+            f"  account_safety           : {self.account_safety}",
+            f"  action_permitted         : {self.action_permitted}",
+            f"  reason                   : {self.action_permitted_reason}",
+        ]
+        if self.deep_probe is not None:
+            lines.append("  deep probe:")
+            for key in (
+                "safety",
+                "reasons",
+                "working_orders",
+                "non_zero_positions",
+                "unresolved_states",
+                "reconciled",
+                "blocking_findings",
+                "connect_ok",
+                "api_round_trip_ok",
+                "disconnect_ok",
+                "detail",
+            ):
+                if key in self.deep_probe:
+                    lines.append(f"    {key:<22}: {self.deep_probe[key]}")
+        lines.append("")
+        lines.append(
+            "  NOTE: this command is read-only. It never starts, restarts or"
+            " relogins the Gateway."
+        )
+        return "\n".join(lines)
+
+
+def _proof_level(
+    *, process: bool, tcp: bool, round_trip: bool, deep: bool
+) -> ProofLevel:
+    """The highest claim the observations actually support."""
+    if deep:
+        return ProofLevel.FULL_ACCOUNT_SNAPSHOT
+    if round_trip:
+        return ProofLevel.API_ROUND_TRIP
+    if tcp:
+        return ProofLevel.TCP_OPEN
+    if process:
+        return ProofLevel.PROCESS_ONLY
+    return ProofLevel.NONE
+
+
+def build_status_report(
+    probes: Probes,
+    store: StateStore,
+    *,
+    policy: Policy,
+    unit: str,
+    now: float,
+    observed_at: str,
+    deep: bool = False,
+) -> StatusReport:
+    """Observe and classify WITHOUT taking any action. Never calls a launcher."""
+    signals = Signals(
+        process_running=probes.process(),
+        api_tcp_open=probes.tcp(),
+        current_time_ok=probes.current_time(),
+        login_marker=probes.login(),
+    )
+    state = classify_state(signals)
+    inhibited = probes.restart_inhibited()
+
+    deep_report: dict[str, Any] | None = None
+    safety = SAFETY_UNKNOWN
+    if deep:
+        try:
+            deep_report = dict(probes.account_safety())
+            safety = str(deep_report.get("safety", SAFETY_UNKNOWN))
+        except Exception as error:  # noqa: BLE001 - any failure => UNKNOWN
+            deep_report = {
+                "safety": SAFETY_UNKNOWN,
+                "reasons": ["PROBE_EXCEPTION"],
+                "detail": type(error).__name__,
+            }
+            safety = SAFETY_UNKNOWN
+
+    restart_count = _within_window(store.restart_times, now, policy.restart_window_seconds)
+    relogin_count = _within_window(store.relogin_times, now, policy.relogin_window_seconds)
+
+    # Would an unattended process action be permitted right now? Answer it the
+    # same way run_cycle does, without doing it.
+    plan = decide_action(
+        state,
+        signals.login_marker,
+        restart_count=restart_count,
+        relogin_count=relogin_count,
+        policy=policy,
+        restart_inhibited=inhibited,
+    )
+    gated = apply_account_safety_gate(plan, safety)
+    permitted = gated.action in MUTATING_ACTIONS
+    if permitted:
+        reason = f"{gated.action.value} would be permitted: account proven CLEAN"
+    elif plan.action in MUTATING_ACTIONS:
+        reason = gated.reason
+    elif inhibited:
+        reason = "no process action indicated; lifecycle marker present (inhibited)"
+    else:
+        reason = f"no process action indicated in state {state.value}"
+
+    return StatusReport(
+        watchdog_version=WATCHDOG_VERSION,
+        observed_at=observed_at,
+        process_running=signals.process_running,
+        api_tcp_open=signals.api_tcp_open,
+        api_round_trip_ok=signals.current_time_ok,
+        login_marker=signals.login_marker.value,
+        lifecycle_marker_present=inhibited,
+        configured_unit=unit,
+        restart_count=restart_count,
+        max_restarts=policy.max_restarts,
+        relogin_count=relogin_count,
+        max_relogins=policy.max_relogins,
+        state=state.value,
+        proof_level=_proof_level(
+            process=signals.process_running,
+            tcp=signals.api_tcp_open,
+            round_trip=signals.current_time_ok,
+            deep=deep and safety != SAFETY_UNKNOWN,
+        ).value,
+        account_safety=safety,
+        action_permitted=permitted,
+        action_permitted_reason=reason,
+        deep_probe=deep_report,
+    )
+
+
+def _build_account_safety_probe(  # pragma: no cover - host-only wiring
+    *,
+    host: str,
+    port: int,
+    account_alias: str,
+    account_secret: str,
+    secrets_root: str | None,
+) -> Callable[[], dict[str, Any]]:
+    """Build the real read-only account-safety probe (owner host only).
+
+    Everything is imported lazily so this script still imports, and is fully
+    tested, on a machine with no application packages and no ibapi. Any failure
+    at any point becomes UNKNOWN — never CLEAN.
+
+    The secret STORE ROOT is passed in as a path (``--secrets-root``); this
+    module never reads the environment and never touches a credential value.
+    The account id itself is resolved by the canonical ``FileSecretStore`` and
+    is used only to construct the adapter — it is never logged or printed.
+    """
+
+    def probe() -> dict[str, Any]:
+        try:
+            from trading_broker_ibkr.paper_adapter import build_paper_adapter
+            from trading_config.secrets import FileSecretStore
+            from trading_contracts.enums import Environment
+            from trading_execution_agent.account_safety import (
+                ProbeConfig,
+                ReadOnlyBrokerFacade,
+                probe_account_safety,
+            )
+
+            if not secrets_root:
+                return {
+                    "safety": SAFETY_UNKNOWN,
+                    "reasons": ["PROBE_EXCEPTION"],
+                    "detail": "secret store root not configured (--secrets-root)",
+                }
+            store = FileSecretStore(Path(secrets_root), Environment.PAPER)
+            account_id = store.get(account_secret).reveal()
+            broker = build_paper_adapter(
+                account_aliases={account_alias: account_id}, host=host, port=port
+            )
+            view = ReadOnlyBrokerFacade(broker)
+            report = probe_account_safety(
+                view,
+                ProbeConfig(account_alias=account_alias, host=host, port=port),
+                now=datetime.now(tz=UTC),
+            )
+            return report.as_dict()
+        except Exception as error:  # noqa: BLE001 - any failure => UNKNOWN
+            return {
+                "safety": SAFETY_UNKNOWN,
+                "reasons": ["PROBE_EXCEPTION"],
+                "detail": type(error).__name__,
+            }
+
+    return probe
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -548,6 +1018,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--restart-window", type=float, default=1800.0)
     parser.add_argument("--max-relogins", type=int, default=3)
     parser.add_argument("--relogin-window", type=float, default=1800.0)
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="READ-ONLY: print structured status and exit. Never starts,"
+        " restarts or relogins anything.",
+    )
+    parser.add_argument(
+        "--deep-probe",
+        action="store_true",
+        help="with --status: additionally run the complete READ-ONLY"
+        " account-safety probe (CLEAN / NOT_CLEAN / UNKNOWN)",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="emit deterministic JSON (evidence capture)"
+    )
+    parser.add_argument("--account-alias", default="paper-poi")
+    parser.add_argument("--account-secret", default="ibkr/paper-account-id")
+    parser.add_argument(
+        "--secrets-root",
+        default=None,
+        help="path to the PAPER secret store root used ONLY to resolve the"
+        " account id for the read-only probe; without it the probe is UNKNOWN",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -565,9 +1058,35 @@ def main(argv: list[str] | None = None) -> int:
         current_time=_build_default_current_time_probe(args.host, args.port),
         login=lambda: default_login_probe(log_path),
         restart_inhibited=_default_restart_inhibited(Path(args.reconciliation_marker)),
+        account_safety=_build_account_safety_probe(
+            host=args.host,
+            port=args.port,
+            account_alias=args.account_alias,
+            account_secret=args.account_secret,
+            secrets_root=args.secrets_root,
+        ),
     )
-    launcher = SystemdLauncher(args.unit)
     store = StateStore.load(Path(args.state_file))
+
+    if args.status:
+        # READ-ONLY path: no launcher is constructed, no lock is taken, no
+        # state is written. Observation only.
+        report = build_status_report(
+            probes,
+            store,
+            policy=policy,
+            unit=args.unit,
+            now=time.time(),
+            observed_at=datetime.now(tz=UTC).isoformat(),
+            deep=args.deep_probe,
+        )
+        if args.json:
+            print(json.dumps(report.as_dict(), indent=2, sort_keys=True))
+        else:
+            print(report.render())
+        return ExitCode.OK
+
+    launcher = SystemdLauncher(args.unit)
     try:
         with FileLock(Path(args.lock_file)):
             plan = run_cycle(probes, launcher, store, policy=policy, now=time.time())

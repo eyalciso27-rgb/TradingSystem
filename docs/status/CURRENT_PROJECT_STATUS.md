@@ -158,6 +158,14 @@ from a dry run of identical parameters, and it is `TESTED_WITH_FAKES` only.
    enables Live (IMP-1503 produces a recommendation only).
 10. Host operations: **B-02** chaos drills not run, **B-03** IBC/watchdog host
     patches not upstreamed, **B-04** watchdog deep probe not enabled.
+    Operational hardening (account-safety gate, read-only status/deep-probe
+    CLI, systemd/tmpfiles/logrotate assets, read-only host audit) is
+    **IMPLEMENTED AND TESTED WITH FAKES** and **READY FOR OWNER-HOST
+    ACTIVATION**, but **NOT EXECUTED** on the host — so B-02/B-03/B-04 stay
+    OPEN and DEF-12/DEF-13 stay `NOT_RUN`. See
+    [`OPERATIONAL_HARDENING.md`](../runbooks/OPERATIONAL_HARDENING.md).
+    Note the deliberate behaviour change: the **unattended watchdog no longer
+    restarts the Gateway** (D-WATCHDOG-01) — recovery is owner-authorized.
 
 ## 8. Remaining canonical tasks (all kept; none deleted)
 
