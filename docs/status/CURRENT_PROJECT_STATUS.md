@@ -48,7 +48,7 @@
 | Deferred owner-runs | **DEF-19 PASS**; DEF-14 DEFERRED; the other **18 NOT_RUN** |
 | Current stage | **Evidence Delivery** (feature delivery paused after PHASE-13/IMP-1301) |
 | Paper Auto / Live | **DISABLED / DISABLED** |
-| Next broker-changing action | **DEF-18** post-fix cancellation, live session only (§9) |
+| Next broker-changing action | **DEF-18** post-fix cancellation, any permitted non-closed session (§9) |
 | Next non-broker action | **freeze `baseline-trend-breakout-v1`** — needs no broker (§9) |
 
 ## 3. What is completed in code (`IMPLEMENTED`)
@@ -183,13 +183,16 @@ cancelled.
 > **There are now TWO next actions, and they run in parallel.** Treating them
 > as sequential is the single largest avoidable delay in the project.
 >
-> **1 — Broker (needs a live market session).** **DEF-18**, the post-fix
-> cancellation verification: fresh realtime quote → cancel-path dry run → new
-> same-day token → **exactly one** `--execute` with `--journal-dir` →
-> `verify-clean`. See
+> **1 — Broker (needs a permitted non-closed session).** **DEF-18**, the
+> post-fix cancellation verification: fresh realtime quote → cancel-path dry
+> run → new same-day token → **exactly one** `--execute` with
+> `--journal-dir` → `verify-clean`. **Regular, pre-market or after-hours all
+> qualify** — only a *closed* session is refused, because it has no live
+> two-sided quote. See
 > [`POI_IBKR_001_OWNER_RUN.md`](../runbooks/POI_IBKR_001_OWNER_RUN.md).
 > Never reuse a historical quote or an old token; never retry after `UNKNOWN`
-> or an unconfirmed cancellation. **DEF-20 remains NOT_RUN afterwards.**
+> or an unconfirmed cancellation. **DEF-20 remains NOT_RUN afterwards**, and
+> runs in its own window — broker-mutating owner-runs are never concurrent.
 >
 > **2 — Strategy (needs no broker at all).** Freeze
 > **`baseline-trend-breakout-v1`** using

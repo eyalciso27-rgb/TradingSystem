@@ -18,13 +18,26 @@
 | Track | Name | Blocked by | Can start |
 |---|---|---|---|
 | **A** | Strategy and evidence | nothing | **now** |
-| **B** | IBKR and operations | live market session + owner host | **now** |
+| **B** | IBKR and operations | permitted non-closed session + owner host | **now** |
 | **C** | External sources | owner accounts | when accounts exist |
-| **D** | AI and committee | AI provider + Track A baseline | after A-WP1 |
+| **D** | AI and committee | provider authorization (ablation only: Track A baseline) | **now**, on provider authorization |
 
 **A and B run fully in parallel.** C is owner-gated and can start the moment an
-account appears. D is deliberately last: the committee's value can only be
-*measured* against a baseline that Track A produces.
+account appears. D's provider work can start as soon as the owner authorizes a
+provider; only the committee **ablation** waits for Track A, because its value
+is a comparative claim that needs a baseline to be measured against.
+
+> ### ⛔ Parallelism is ACROSS tracks, never between broker-mutating runs
+> **Parallelism applies to Tracks A/B/C/D — not to state-changing broker
+> experiments on one account.** On the same Paper account and Gateway, the
+> following must **never overlap**: DEF-18 cancel-path execution ·
+> fill/protection/reconciliation · DEF-20 restart-recovery cancellation ·
+> Gateway/process restarts · destructive host chaos drills.
+>
+> Two concurrent owner-runs on one account cannot be reconciled: an order or
+> position observed by one run may have been created, cancelled or orphaned by
+> the other, a restart can sever a run mid-flight, and the resulting evidence
+> proves nothing about either. Serialize them; see the global hard stops.
 
 ---
 
@@ -97,7 +110,13 @@ Every other track is plumbing by comparison.
 ### B-WP1 — DEF-18 post-fix cancellation ◀ **the next broker-changing action**
 - **Work:** fresh realtime quote → cancel-path dry run → new same-day token →
   **exactly one** `--execute` with `--journal-dir` → `verify-clean`.
-- **Dependencies:** merged fixes (done); a **permitted live market session**.
+- **Dependencies:** merged fixes (done); a **permitted non-closed session
+  (regular, pre-market or after-hours)** with a fresh positive two-sided quote
+  and every existing freshness, spread and non-marketable guard satisfied. A
+  **closed** session is refused — it has no live two-sided quote. Regular hours
+  are **not** required for a cancel-path run.
+- **Serialization:** exclusive. No other broker-mutating run and no
+  Gateway/process restart may be in progress on this account.
 - **Evidence:** artifact showing submit → ack → cancel accepted →
   **cancel confirmed** → never-filled (observed) → zero remaining lifecycle
   orders → clean reconciliation.
@@ -109,35 +128,73 @@ Every other track is plumbing by comparison.
 ### B-WP2 — Fill, protection, reconciliation
 - **Work:** DEF-03/04 fill-path, DEF-05 protection verification, DEF-08
   reconciliation after a real fill.
-- **Dependencies:** B-WP1 PASS; regular market hours.
+- **Dependencies:** B-WP1 PASS; **market-open conditions appropriate for a real
+  fill** (a marketable entry must actually be fillable — unlike the cancel path,
+  this genuinely needs an open, liquid session).
+- **Serialization:** exclusive. Never concurrent with DEF-18, DEF-20, a
+  Gateway restart or a destructive drill.
 - **Evidence:** a real fill; exactly one resting **GTC** protective STOP sized
   never above the position; reconciliation with zero unexplained findings.
 - **Exit:** protection and reconciliation leave `TESTED_WITH_FAKES`.
 - **Hard stop:** any unprotected fill ⇒ owner action, by hand, immediately.
 
-### B-WP3 — DEF-20 restart-recovery cancellation
+### B-WP3 — DEF-20 restart-recovery cancellation *(own window, after DEF-18)*
 - **Work:** cancel a lifecycle order recovered after a process/Gateway restart,
   using the **same** `--client-id` that submitted it.
-- **Dependencies:** B-WP1; can run **in parallel with B-WP2**.
+- **Dependencies:** B-WP1 (DEF-18) complete. It runs in its **own controlled
+  clean-account window** — `verify-clean` must PASS immediately before it
+  starts, so the only working order on the account is the one this drill
+  deliberately created.
+- **Serialization:** ⛔ **exclusive — NOT concurrent with B-WP2.** DEF-20
+  deliberately restarts the Gateway/process while an order is working. If a
+  fill-path run were live at that moment the restart could sever it mid-flight,
+  and neither run's evidence would be interpretable. Run B-WP2 and B-WP3 in
+  separate windows, in either order, with a passing `verify-clean` between them.
 - **Evidence:** recovered order cancelled by canonical `client_order_id`;
   post-cancel snapshot clean; no foreign/manual order ever touched.
 - **Exit:** DEF-20 PASS; restart recovery proven.
 - **Hard stop:** ambiguous recovered identity ⇒ nothing is cancelled (by
-  design) ⇒ owner resolves by hand.
+  design) ⇒ owner resolves by hand. Never begin while any other broker-mutating
+  run is in progress.
 
-### B-WP4 — Host operations: B-02 / B-03 / B-04
-- **Work:** chaos and recovery drills (B-02, DEF-11); upstream IBC/watchdog host
-  patches with a recorded transcript (B-03, DEF-12); enable the watchdog deep
-  probe (B-04, DEF-13).
-- **Dependencies:** owner host access. **Fully parallel with B-WP1–3.**
+### B-WP4a — Non-mutating operational hardening *(safe to parallelize)*
+Touches no broker state and restarts nothing, so it may run alongside any
+other track and alongside B-WP1–3.
+- **Work:** repository / systemd / IBC configuration and **upstreaming the host
+  patches with a recorded transcript (B-03, DEF-12)**; watchdog code and
+  **read-only** deep-probe preparation (B-04, DEF-13 groundwork); port-exposure
+  audit; journal directory permissions; log rotation; NTP/chrony verification;
+  reproducibility documentation for the host build.
+- **Dependencies:** owner host access. **Runs in parallel — it changes no
+  broker state and triggers no restart.**
+- **Evidence:** committed configuration, audit output and host build docs.
+- **Exit:** the host is reproducible from the repo; the deep probe is ready to
+  arm.
+- **Hard stop:** no host secret, credential or account id enters the repo. If a
+  step would restart the Gateway or touch an order, it belongs in B-WP4b.
+
+> NTP/chrony matters more than it looks: evidence timestamps are UTC
+> wall-clock (D-CLOCK-01), so a drifting host clock silently corrupts every
+> artifact it stamps.
+
+### B-WP4b — Destructive / open-lifecycle host drills *(scheduled window only)*
+- **Work:** chaos and recovery drills (B-02, DEF-11); Gateway/process restart
+  drills; arming the deep probe against a live Gateway; anything exercised with
+  an order open.
+- **Dependencies:** owner host access **and an explicitly scheduled owner-run
+  window**.
+- **Serialization:** ⛔ **exclusive.** Must **never** run while DEF-18, the
+  fill-path or DEF-20 is in progress. Start from a passing `verify-clean`.
 - **Evidence:** host transcripts committed and reproducible from the repo.
 - **Exit:** IMP-1303 satisfiable.
-- **Hard stop:** no host secret, credential or account id enters the repo.
+- **Hard stop:** no host secret, credential or account id enters the repo. Any
+  position or order left behind is resolved by the owner, by hand — the harness
+  never flattens.
 
 ### B-WP5 — IMP-1302 / 1303 / 1304 closure
 - **Work:** Paper Manual one-trade record; chaos-drill record; defect-register
   closure.
-- **Dependencies:** B-WP1–4.
+- **Dependencies:** B-WP1, B-WP2, B-WP3, B-WP4a, B-WP4b.
 - **Evidence:** owner marks POI-IBKR-001 from real evidence.
 - **Exit:** POI-IBKR-001 PASS; the Paper-Auto **precondition** (not permission)
   is met.
@@ -183,22 +240,43 @@ supply. Each is independent — one account unblocks exactly one package.
 
 ## Track D — AI and committee
 
-**Why last.** The committee's worth is a *comparative* claim. Without the Track
-A baseline there is nothing to compare against, and an unmeasured committee is
-just cost and latency on the critical path.
+**Only the ablation waits.** The committee's *worth* is a comparative claim, so
+**D-WP3 ablation** needs the Track A baseline. Everything before it does not:
+provider governance, secret storage, budgets, timeouts, rate limits and
+malformed-output rejection are safe, useful and independent, and they may run
+**in parallel with Track A**. Deferring the whole track would waste that
+window; running the ablation early would produce a number with nothing to
+compare it to.
 
-### D-WP1 — AI provider PoI
+### D-WP1 — AI provider PoI *(may start immediately)*
 - **Work:** POI-AI-001 against an owner-authorized provider.
-- **Dependencies:** owner credentials.
+- **Dependencies:** the owner supplies an **authorized provider, credentials
+  and an evaluation budget**. Nothing else. **This may start immediately once
+  those exist — it does not wait for Track A.**
+- **Parallel:** runs alongside Track A.
 - **Evidence:** schema-validated structured output **plus** a malformed-output
   rejection drill.
 - **Exit:** POI-AI-001 PASS.
 - **Hard stop:** LLM output is untrusted structured input; unvalidated output
-  never reaches a decision.
+  never reaches a decision. No credential in the repo.
+
+### D-WP1b — Provider governance *(parallel with Track A)*
+- **Work:** provider governance and selection record; secret storage; spend
+  budgets and caps; request timeouts; rate limiting and backoff;
+  malformed-output rejection paths.
+- **Dependencies:** none beyond D-WP1's provider authorization. **Runs in
+  parallel with Track A.**
+- **Evidence:** governance record + budget/timeout/rate-limit configuration +
+  a rejection drill.
+- **Exit:** the provider can be used within owner-approved limits.
+- **Hard stop:** no uncapped spend; no unbounded retry; the kill-switch never
+  waits for an LLM.
 
 ### D-WP2 — Committee I/O contract and replayable orchestration
 - **Work:** define the 7-role contract; deterministic replay of reviews.
-- **Dependencies:** D-WP1.
+- **Dependencies:** D-WP1 **and explicit owner approval to begin**. Contract
+  groundwork may then proceed in parallel with Track A — it is design and
+  plumbing, not evaluation.
 - **Evidence:** contract module + a review that replays identically.
 - **Exit:** the committee becomes runnable — as a **decision input only**.
 - **Hard stop:** the committee creates no `OrderIntent`, no
@@ -209,11 +287,14 @@ just cost and latency on the critical path.
 ### D-WP3 — Committee ablation
 - **Work:** run the experiment matrix with the committee **on** and **off**
   against the Track A baseline.
-- **Dependencies:** A-WP4, D-WP2.
+- **Dependencies:** ⛔ **gated** — the **frozen Track A baseline** (A-WP1) plus
+  the required historical/OOS evidence (A-WP3, A-WP4), and D-WP2. This gate
+  does not move.
 - **Evidence:** ablation report with confidence intervals.
 - **Exit:** an evidence-based decision to keep or drop the committee.
-- **Hard stop:** if ablation shows no marginal value, the committee does **not**
-  enter the decision path.
+- **Hard stop:** **no committee output enters the decision path before the
+  ablation demonstrates marginal value.** If it shows none, the committee does
+  **not** enter the decision path.
 
 ---
 
@@ -236,18 +317,24 @@ These stay **FROZEN** and are listed for completeness only.
 
 Any one of these stops the affected track immediately:
 
-1. An `UNKNOWN` broker state or an unconfirmed cancellation ⇒ **no retry**,
+1. ⛔ **No two broker-mutating or Gateway-restarting owner-run procedures may
+   run concurrently on the same Paper account/Gateway.** DEF-18, fill-path,
+   DEF-20, Gateway/process restarts and destructive chaos drills are each
+   **exclusive**: one at a time, each starting from a passing `verify-clean`.
+   Non-mutating work (B-WP4a, and Tracks A/C/D) is unaffected and stays
+   parallel.
+2. An `UNKNOWN` broker state or an unconfirmed cancellation ⇒ **no retry**,
    reconcile and inspect by hand.
-2. An unprotected real position ⇒ owner acts by hand; the harness never
+3. An unprotected real position ⇒ owner acts by hand; the harness never
    flattens.
-3. A parameter changed after inspecting evaluation results ⇒ the OOS window is
+4. A parameter changed after inspecting evaluation results ⇒ the OOS window is
    burned; new `strategy_id` required.
-4. A GO recorded without both OOS and Shadow evidence ⇒ invalid.
-5. Social input reaching an execution verb ⇒ architectural violation.
-6. The AI committee described or wired as an execution authority ⇒
+5. A GO recorded without both OOS and Shadow evidence ⇒ invalid.
+6. Social input reaching an execution verb ⇒ architectural violation.
+7. The AI committee described or wired as an execution authority ⇒
    architectural violation.
-7. A credential, token or unmasked account id entering the repo.
-8. PAPER_AUTO or LIVE enabled before every listed gate ⇒ prohibited.
+8. A credential, token or unmasked account id entering the repo.
+9. PAPER_AUTO or LIVE enabled before every listed gate ⇒ prohibited.
 
 ---
 
@@ -256,12 +343,17 @@ Any one of these stops the affected track immediately:
 ```
 now ──┬── Track A: freeze ─▶ dataset ─▶ replay/backtest ─▶ OOS ─▶ shadow ─▶ Go/No-Go
       │
-      ├── Track B: DEF-18 ─▶ fill/protection/reconciliation ─▶ DEF-20 ─▶ 1302/1303/1304
-      │           └── B-WP4 host drills (fully parallel)
+      ├── Track B: broker-mutating runs are SERIALIZED, one window each:
+      │     DEF-18 ─▶ verify-clean ─▶ fill/protection/reconciliation
+      │            ─▶ verify-clean ─▶ DEF-20 ─▶ verify-clean ─▶ 1302/1303/1304
+      │     (B-WP2 and B-WP3 may be swapped, never overlapped)
+      │     └── B-WP4a non-mutating hardening ....... parallel, always safe
+      │     └── B-WP4b destructive drills ........... own scheduled window only
       │
       ├── Track C: (owner accounts) social ─ news ─ InvestingPro ─ TV ─ provider
       │
-      └── Track D: (after A baseline) AI PoI ─▶ committee contract ─▶ ablation
+      └── Track D: AI PoI + governance (parallel with A) ─▶ committee contract
+                     ─▶ ablation (GATED on the frozen A baseline + OOS)
                                    │
                                    ▼
                      IMP-1401 ─▶ IMP-1402 Paper Auto ─▶ IMP-1403/1404

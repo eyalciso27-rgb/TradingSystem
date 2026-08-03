@@ -246,14 +246,22 @@ I/O contract and no replayable orchestration.
 
 ## 6. Strategy state
 
-**There is no strategy.** Not a weak one — none.
+**There is no frozen, owner-approved, evidence-qualified or
+production-eligible strategy.** That is a precise claim, and the distinction
+matters — what is missing is *evidence and an owner decision*, not machinery:
 
-- No hypothesis is frozen; no Strategy Manifest data exists in the repo.
-- No point-in-time research dataset exists.
-- Nothing is `HISTORICALLY_TESTED`; there is no `OUT_OF_SAMPLE_PASS` and no
-  `SHADOW_PASS`.
-- Every strategy is `PROFITABILITY_NOT_PROVEN` and **no strategy is eligible**
-  for any automated mode.
+| | State |
+|---|---|
+| Strategy **infrastructure** | ✅ **exists** — manifest evaluator, fusion, decision, risk, allocator, pre-submit, replay, backtest, funnel, champion/challenger (all `TESTED_WITH_FAKES`) |
+| Proposed **hypotheses** | ✅ **exist** — e.g. `baseline-trend-breakout-v1`, and the WhatsApp measurement/experiment ideas in the evidence roadmap |
+| A **frozen** hypothesis | ❌ none — no manifest data is committed, no owner freeze record exists |
+| Point-in-time **dataset** | ❌ none |
+| `HISTORICALLY_TESTED` | ❌ none |
+| `OUT_OF_SAMPLE_PASS` | ❌ none |
+| `SHADOW_PASS` | ❌ none |
+| Eligibility | ❌ **no strategy is eligible** for any automated mode |
+
+Every strategy is `PROFITABILITY_NOT_PROVEN`.
 
 The recommended first hypothesis is **`baseline-trend-breakout-v1`**, because
 it requires **no social and no AI input**. That makes it a clean baseline: any
@@ -336,6 +344,12 @@ is waiting on code.
 not block each other and should run in parallel — that is the single largest
 schedule saving available.
 
+**But parallelism is ACROSS tracks only.** Within Track B, every
+broker-mutating owner-run is **exclusive**: DEF-18, the fill path, DEF-20,
+Gateway/process restarts and destructive chaos drills must never overlap on
+the same Paper account and Gateway, and each starts from a passing
+`verify-clean`. Non-mutating operational hardening stays parallel.
+
 ---
 
 ## 10. Frozen expansion
@@ -369,8 +383,13 @@ The four-track plan is
 > Track C (sources) and Track D (AI) unblock only as the owner supplies
 > accounts and decisions.**
 
-The single next broker-changing action is **DEF-18**, in a live market session,
-per [`POI_IBKR_001_OWNER_RUN.md`](../runbooks/POI_IBKR_001_OWNER_RUN.md).
+The single next broker-changing action is **DEF-18**, in a **permitted
+non-closed session (regular, pre-market or after-hours)** with a fresh
+positive two-sided quote — regular hours are not required for a cancel-path
+run, only a **closed** session is refused — per
+[`POI_IBKR_001_OWNER_RUN.md`](../runbooks/POI_IBKR_001_OWNER_RUN.md).
+Broker-mutating owner-runs are **serialized**: DEF-18, the fill path, DEF-20,
+Gateway restarts and destructive drills never overlap on one account.
 The single next strategy action is **freezing `baseline-trend-breakout-v1`**,
 which needs no broker at all.
 

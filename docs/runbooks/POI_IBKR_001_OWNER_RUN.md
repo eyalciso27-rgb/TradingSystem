@@ -71,9 +71,16 @@ exactly once, in this order:
 
 Every one of the following is mandatory:
 
-- **Only during a permitted live market session.** A closed session has no live
-  two-sided quote, and the harness refuses to authorize a submission against
-  one. Do not attempt this out of hours.
+- **Only during a permitted non-closed session — `regular`, `pre-market` or
+  `after-hours`.** All three are accepted by `--quote-session`; **regular
+  hours are not required for the cancel path.** Only a **closed** session is
+  refused, because it has no live two-sided quote to authorize against.
+  (A real *fill* is different: the fill path still needs market-open
+  conditions, see step 5.)
+- **Never concurrently with another broker-mutating owner-run.** DEF-18, the
+  fill path, DEF-20, a Gateway/process restart and any destructive drill are
+  each **exclusive** on this account — run one at a time, each starting from
+  a passing `verify-clean`.
 - **Observe the quote fresh, immediately before the run.** The bid/ask must be
   read at that moment and passed via `--quote-bid`, `--quote-ask`, `--quote-at`
   and `--quote-session`. A quote older than 120 s is refused, and the harness

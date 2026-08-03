@@ -492,3 +492,195 @@ def test_every_planning_document_records_what_was_not_executed(doc: Path) -> Non
     assert "NOT EXECUTED" in text or "NOT_RUN" in text, (
         f"{doc.name} must state what has not been executed"
     )
+
+
+# -- 9. broker-mutating owner-runs must stay serialized ----------------------
+#
+# Two owner-runs on one Paper account cannot be reconciled: an order or position
+# seen by one may have been created, cancelled or orphaned by the other, and a
+# Gateway restart can sever a run mid-flight. The plan describing them as
+# concurrent would be an instruction to destroy the evidence, so the phrasing is
+# pinned here.
+
+#: Work packages that change broker state or restart the Gateway.
+MUTATING_WORK_PACKAGES = ("B-WP1", "B-WP2", "B-WP3", "B-WP4b")
+
+#: Words that assert concurrency.
+_CONCURRENCY = ("in parallel", "fully parallel", "concurrent", "concurrently", "alongside")
+
+#: A concurrency word is acceptable only inside a negated clause.
+_NEGATIONS = ("never", "not ", "no other", "no two", "must not", "cannot", "⛔")
+
+
+def _section(text: str, heading_prefix: str) -> str:
+    """The body of one '### <heading_prefix>...' block."""
+    lines = text.splitlines()
+    start = next(
+        i for i, line in enumerate(lines) if line.startswith(f"### {heading_prefix}")
+    )
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith(("### ", "## "))),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def _claims_concurrency(block: str) -> list[str]:
+    """Sentences that assert concurrency without negating it."""
+    offenders = []
+    for raw in re.split(r"(?<=[.!?])\s+|\n-\s+", block):
+        sentence = " ".join(raw.split())
+        lowered = sentence.lower()
+        if not any(word in lowered for word in _CONCURRENCY):
+            continue
+        if any(negation in lowered for negation in _NEGATIONS):
+            continue
+        offenders.append(sentence)
+    return offenders
+
+
+@pytest.mark.parametrize("work_package", MUTATING_WORK_PACKAGES)
+def test_a_broker_mutating_work_package_never_claims_concurrency(
+    work_package: str,
+) -> None:
+    text = ACCEL_PLAN.read_text(encoding="utf-8")
+    offenders = _claims_concurrency(_section(text, work_package))
+    assert not offenders, (
+        f"{work_package} is broker-mutating but claims concurrency: {offenders}"
+    )
+
+
+def test_def20_runs_after_def18_in_its_own_clean_account_window() -> None:
+    block = _section(ACCEL_PLAN.read_text(encoding="utf-8"), "B-WP3")
+    lowered = block.lower()
+    assert "def-20" in lowered
+    assert "own controlled\n  clean-account window" in lowered or (
+        "own" in lowered and "clean-account window" in lowered
+    ), "DEF-20 must declare its own clean-account window"
+    assert "b-wp1" in lowered, "DEF-20 must depend on DEF-18 (B-WP1)"
+    assert "not concurrent with b-wp2" in lowered, (
+        "DEF-20 must state explicitly that it is NOT concurrent with the fill path"
+    )
+    assert "verify-clean" in lowered
+
+
+def test_destructive_host_drills_have_their_own_scheduled_window() -> None:
+    block = _section(ACCEL_PLAN.read_text(encoding="utf-8"), "B-WP4b")
+    lowered = block.lower()
+    assert "scheduled" in lowered and "window" in lowered
+    for phase in ("def-18", "def-20"):
+        assert phase in lowered, f"B-WP4b must name {phase} as mutually exclusive"
+    assert "never" in lowered
+
+
+def test_non_mutating_operational_hardening_stays_parallel() -> None:
+    """Serializing broker runs must not accidentally serialize safe work."""
+    block = _section(ACCEL_PLAN.read_text(encoding="utf-8"), "B-WP4a").lower()
+    assert "parallel" in block, "non-mutating hardening must remain parallel"
+    assert "no broker state" in block or "changes no broker state" in block
+    # ...and it must not be *labelled* exclusive anywhere, heading included:
+    # a contradictory heading over a parallel-safe body is exactly how this
+    # would silently regress.
+    for exclusive in ("serialized", "exclusive", "own scheduled window",
+                      "own window", "one at a time"):
+        assert exclusive not in block, (
+            f"B-WP4a is non-mutating but is labelled {exclusive!r}; that would"
+            " needlessly serialize safe work"
+        )
+    # The safe-work list mandated by the owner review.
+    for item in ("systemd", "watchdog", "port", "permission", "log rotation",
+                 "ntp", "reproducib"):
+        assert item in block, f"B-WP4a omits non-mutating item {item!r}"
+
+
+def test_the_plan_states_the_global_serialization_hard_stop() -> None:
+    text = ACCEL_PLAN.read_text(encoding="utf-8").lower()
+    assert "no two broker-mutating or gateway-restarting owner-run procedures may" in text
+    assert "same paper account/gateway" in text
+
+
+def test_the_master_plan_repeats_the_serialization_rule() -> None:
+    text = MASTER_PLAN.read_text(encoding="utf-8").lower()
+    assert "never overlap" in text or "exclusive" in text
+    assert "verify-clean" in text
+
+
+# -- 10. DEF-18 session wording ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "doc", (ACCEL_PLAN, MASTER_PLAN, CURRENT_STATUS), ids=lambda p: p.name
+)
+def test_def18_is_not_described_as_requiring_regular_hours(doc: Path) -> None:
+    """The lifecycle gate accepts regular, pre-market and after-hours alike."""
+    text = doc.read_text(encoding="utf-8").lower()
+    # The cancel path must never be described as regular-hours-only.
+    for phrase in ("regular market hours for def-18", "def-18 requires regular hours"):
+        assert phrase not in text
+    assert "non-closed session" in text, (
+        f"{doc.name} must describe DEF-18's session as a permitted non-closed session"
+    )
+
+
+def test_the_permitted_sessions_are_named_explicitly() -> None:
+    text = ACCEL_PLAN.read_text(encoding="utf-8").lower()
+    for session in ("regular", "pre-market", "after-hours"):
+        assert session in text, f"the plan must name the {session} session"
+    assert "closed" in text and "refused" in text
+
+
+def test_the_fill_path_still_requires_market_open_conditions() -> None:
+    """Relaxing the cancel-path session must not relax the fill path."""
+    block = _section(ACCEL_PLAN.read_text(encoding="utf-8"), "B-WP2").lower()
+    assert "market-open conditions" in block
+
+
+# -- 11. strategy verdict must be precise, not categorical -------------------
+
+
+def test_the_strategy_verdict_is_precise_not_categorical() -> None:
+    text = MASTER_PLAN.read_text(encoding="utf-8")
+    assert "There is no strategy." not in text, (
+        "the categorical claim erases the infrastructure and hypotheses that exist"
+    )
+    assert (
+        "no frozen, owner-approved, evidence-qualified or\nproduction-eligible\nstrategy"
+        in text
+        or "no frozen, owner-approved, evidence-qualified or" in text
+    )
+    lowered = text.lower()
+    # The distinctions that must survive.
+    assert "infrastructure" in lowered
+    assert "hypothes" in lowered
+    assert "profitability_not_proven" in lowered
+
+
+# -- 12. AI track: safe work early, ablation still gated ---------------------
+
+
+def test_the_ai_provider_poi_may_start_immediately() -> None:
+    block = _section(ACCEL_PLAN.read_text(encoding="utf-8"), "D-WP1 ").lower()
+    assert "may start immediately" in block or "start immediately" in block
+    assert "budget" in block
+    assert "credential" in block
+
+
+def test_provider_governance_runs_parallel_with_track_a() -> None:
+    block = _section(ACCEL_PLAN.read_text(encoding="utf-8"), "D-WP1b").lower()
+    assert "parallel with track a" in block
+    for item in ("secret storage", "budget", "timeout", "rate limit", "malformed"):
+        assert item in block, f"provider governance omits {item!r}"
+
+
+def test_the_committee_ablation_remains_gated_on_the_baseline() -> None:
+    block = _section(ACCEL_PLAN.read_text(encoding="utf-8"), "D-WP3").lower()
+    assert "gated" in block
+    assert "baseline" in block
+    assert "oos" in block or "out-of-sample" in block
+    assert "no committee output enters the decision path" in block
+
+
+def test_no_committee_output_before_ablation_anywhere() -> None:
+    for doc in (ACCEL_PLAN, MASTER_PLAN):
+        text = doc.read_text(encoding="utf-8").lower()
+        assert "execution authority" in text or "decision input" in text
