@@ -20,6 +20,7 @@ from trading_broker_core.port import (
     BrokerPortError,
     BrokerPosition,
     IntegrationHealth,
+    ReconciliationResult,
 )
 from trading_contracts.enums import Environment, OrderState
 from trading_execution_agent.account_safety import (
@@ -99,6 +100,13 @@ class FakeView:
         snapshot: AccountSnapshot | None = None,
         fail_on: str | None = None,
         failure: Exception | None = None,
+        events: tuple[Any, ...] = (),
+        unresolved: tuple[str, ...] = (),
+        #: Broker state AFTER the first read of each kind — used to prove that
+        #: mixed-time data can never be classified CLEAN.
+        orders_on_second_read: tuple[BrokerOrderReceipt, ...] | None = None,
+        positions_on_second_read: tuple[BrokerPosition, ...] | None = None,
+        reconcile_result: Any = None,
     ) -> None:
         self._orders = orders
         self._positions = positions
@@ -109,7 +117,16 @@ class FakeView:
         self._failure = failure or BrokerPortError(
             BrokerErrorCode.UNKNOWN_BROKER_RESPONSE, "boom"
         )
+        self._events = events
+        self._unresolved = unresolved
+        self._orders_on_second_read = orders_on_second_read
+        self._positions_on_second_read = positions_on_second_read
+        self._reconcile_result = reconcile_result
         self.calls: list[str] = []
+
+    def count(self, name: str) -> int:
+        """How many times the LIVE broker method was called."""
+        return self.calls.count(name)
 
     def _maybe_fail(self, name: str) -> None:
         self.calls.append(name)
@@ -140,11 +157,35 @@ class FakeView:
 
     def order_events(self) -> Any:
         self._maybe_fail("order_events")
-        return iter(())
+        return iter(self._events)
 
-    def reconcile(self, account_alias: str) -> Any:  # pragma: no cover - engine path
+    def reconcile(self, account_alias: str) -> Any:
+        """Faithful to the port: returns a ``ReconciliationResult``.
+
+        This is the SECOND read of the same underlying state, so by default it
+        must agree with ``get_open_orders`` / ``get_positions``. The
+        ``*_on_second_read`` knobs make it disagree, which is exactly what a
+        broker mutating mid-probe looks like.
+        """
         self._maybe_fail("reconcile")
-        return self._reconciliation
+        if self._reconcile_result is not None:
+            return self._reconcile_result
+        orders = (
+            self._orders if self._orders_on_second_read is None else self._orders_on_second_read
+        )
+        positions = (
+            self._positions
+            if self._positions_on_second_read is None
+            else self._positions_on_second_read
+        )
+        return ReconciliationResult(
+            account_alias=account_alias,
+            snapshot=self._snapshot,
+            positions=positions,
+            open_orders=orders,
+            unresolved_client_order_ids=self._unresolved,
+            reconciled_at=NOW,
+        )
 
 
 def probe(view: FakeView, **over: Any) -> AccountSafetyReport:
@@ -154,8 +195,10 @@ def probe(view: FakeView, **over: Any) -> AccountSafetyReport:
     config = ProbeConfig(account_alias=ALIAS, **over)
     original = module._reconcile
 
-    def stub(v: Any, c: Any, *, now: Any) -> Any:
-        return v._reconciliation
+    def stub(snapshot: Any, c: Any, *, now: Any) -> Any:
+        # _reconcile no longer receives the live view — it only ever sees the
+        # captured snapshot. The desired report comes from the fake itself.
+        return view._reconciliation
 
     module._reconcile = stub  # type: ignore[assignment]
     try:

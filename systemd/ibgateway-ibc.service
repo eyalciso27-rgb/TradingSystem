@@ -24,6 +24,8 @@
 Description=IB Gateway (Paper) via IBC
 After=network-online.target
 Wants=network-online.target
+# /run/ibgateway is owned by tmpfiles.d, NOT by this unit (see below).
+After=systemd-tmpfiles-setup.service
 
 [Service]
 Type=simple
@@ -38,11 +40,18 @@ Environment=IBC_LOG_PATH=/home/opc/ibc/logs
 ExecStart=/usr/bin/env bash /opt/trading/scripts/start_ibc_gateway.sh
 # NO automatic restart: recovery is owner-authorized, never blind.
 Restart=no
-# Runtime dir for the lock, watchdog state and lifecycle marker. systemd
-# creates it 0700 and removes it on stop; /etc/tmpfiles.d/ibgateway.conf
-# keeps it present for the watchdog when the Gateway is down.
-RuntimeDirectory=ibgateway
-RuntimeDirectoryMode=0700
+#
+# RuntimeDirectory= IS DELIBERATELY ABSENT. DO NOT ADD IT.
+#
+# /run/ibgateway holds the lock, the watchdog restart budget and the
+# order-lifecycle marker. Those must survive this service being STOPPED — the
+# whole point of the marker is to inhibit action while the Gateway is down, and
+# RuntimeDirectory is torn down on stop. It also must exist BEFORE this service
+# has ever started, which RuntimeDirectory cannot provide.
+#
+# Exactly one owner: /etc/tmpfiles.d/ibgateway.conf (0700 opc:opc, created at
+# boot). Declaring RuntimeDirectory here as well would give the directory two
+# independent lifetimes and let either unit's stop delete the other's state.
 # Hardening. NOTE: the Gateway must keep binding its LOCAL API socket
 # (127.0.0.1:4002) and reaching IBKR outbound, so no IP/socket namespace
 # restriction is applied here — that would break the very API the

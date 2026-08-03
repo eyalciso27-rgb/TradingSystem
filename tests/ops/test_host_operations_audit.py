@@ -280,11 +280,18 @@ def test_the_runtime_directory_is_restrictive() -> None:
     assert "0700" in text
 
 
-def test_the_units_declare_a_runtime_directory() -> None:
+def test_no_unit_declares_a_runtime_directory() -> None:
+    """tmpfiles.d owns /run/ibgateway. A unit must never claim it too.
+
+    RuntimeDirectory= on the Type=oneshot watchdog would delete the inhibit
+    marker and the restart budget at the end of every cycle. See
+    tests/ops/test_runtime_directory_ownership.py for the full model.
+    """
     for unit in (IBC_SERVICE, WATCHDOG_SERVICE):
         text = unit.read_text(encoding="utf-8")
-        assert "RuntimeDirectory=ibgateway" in text
-        assert "RuntimeDirectoryMode=0700" in text
+        for line in text.splitlines():
+            assert not line.strip().startswith("RuntimeDirectory="), unit.name
+            assert not line.strip().startswith("RuntimeDirectoryMode="), unit.name
 
 
 def test_logrotate_is_configured_restrictively() -> None:

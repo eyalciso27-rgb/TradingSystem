@@ -55,6 +55,38 @@ reconciliation with zero blocking findings · clean disconnect.
 Historical, cached or last-known-clean state is **never** consulted. Only a
 snapshot taken *now* can speak for *now*.
 
+### One snapshot, not several reads
+
+"One complete snapshot" is structural, not aspirational. A single probe run
+reads the broker **exactly once per method** — account, open orders, positions,
+order events, reconciliation — and every count and finding is derived from that
+captured data.
+
+The reconciliation engine calls `reconcile()` and `order_events()` itself. It
+is therefore handed a **snapshot replay view**, never the live broker, so it
+cannot issue a second round trip. Previously it received the live view: the
+counts came from one instant and the findings from another, and a `CLEAN`
+verdict built from two instants describes a moment that never existed — an
+order can appear between the reads and be counted by neither.
+
+Because `reconcile()` also returns the account, orders and positions, the two
+reads **overlap**, and that overlap is a free coherence check. If they
+disagree — an order gained or lost, a state or quantity changed, a different
+account answering — the parts are not one snapshot and the result is
+**`UNKNOWN`**. Duplicated orders or positions within one snapshot are likewise
+`UNKNOWN`. *Mixed-time data is never classified.*
+
+### Exactly one disconnect
+
+Each successful connect is followed by exactly one disconnect attempt, on every
+path including an unexpected exception. A failed connect never calls
+disconnect. **A failed disconnect downgrades the verdict to `UNKNOWN` with
+`DISCONNECT_FAILED`** — a session that could not be closed cannot be reasoned
+about, and there is no path from a failed disconnect to `CLEAN`. The gathered
+counts are kept in the structured fields for the alert; only the verdict
+changes. The probe previously disconnected twice and swallowed the second
+failure entirely.
+
 ### The consequence: the unattended watchdog no longer restarts anything
 
 This follows directly and is intended. Every state that could trigger a restart
@@ -171,7 +203,15 @@ Installs `ibgateway-ibc.service`, `ibgateway-watchdog.service`,
 `/etc/logrotate.d/ibgateway`.
 
 **It never enables or starts a unit**, never touches firewall/OCI/SSH/VNC, and
-never reads a credential. Enabling is an owner decision:
+never reads a credential.
+
+**A failed `systemd-tmpfiles --create` fails the install** (non-zero exit, no
+success message, no suggestion to enable the timer). It previously ran with
+`|| true` and printed `tmpfiles applied` regardless — reporting success on the
+one step that creates the directory holding the marker, the budget and the
+lock, and then telling the operator to go ahead on a half-installed host.
+
+Enabling is an owner decision:
 
 ```bash
 systemctl enable --now ibgateway-watchdog.timer   # passive supervision only
@@ -184,14 +224,51 @@ copy, a cron entry or a supervisor wrapper would be a competing restart
 manager — two managers can race and produce two API clients on one account.
 The host audit's `single_gateway_service` check FAILs if it finds another.
 
-### Runtime directory and permissions
+### Runtime directory: one owner, one lifetime
 
-`/run/ibgateway` is created by `RuntimeDirectory=` (mode `0700`) and by
-`/etc/tmpfiles.d/ibgateway.conf` so it survives while the Gateway is down. It
-holds the watchdog state, the launch lock and the lifecycle marker. Because the
-marker **inhibits unattended action**, a world-writable directory would be a
-control surface: `0700` is the minimum defensible mode, and the audit FAILs on
-anything wider.
+`/run/ibgateway` holds the watchdog state (the restart **budget**), the launch
+lock and the order-lifecycle **marker**. Because the marker *inhibits*
+unattended action and the budget *rate-limits* it, this directory is
+supervision authority — losing it silently removes both brakes.
+
+**`/etc/tmpfiles.d/ibgateway.conf` is its single canonical owner** (`0700`,
+`opc:opc`, created at boot by `systemd-tmpfiles-setup.service`). **Neither unit
+declares `RuntimeDirectory=`, and neither may.**
+
+That is a correction, not a preference. `ibgateway-watchdog.service` is
+`Type=oneshot`: it goes inactive the instant its cycle ends, and
+`RuntimeDirectory=` is torn down when a unit goes inactive unless
+`RuntimeDirectoryPreserve=` says otherwise. Both units previously declared it,
+so **every watchdog cycle would have deleted the marker, the budget and the
+lock** — a supervisor quietly erasing the two things that stop it acting, while
+appearing healthy. `RuntimeDirectory=` is also wrong here on its own terms: the
+directory must exist while the Gateway is **stopped** (exactly when the marker
+matters) and before either unit has ever started.
+
+Consequences, all deliberate:
+
+- both units are ordered `After=systemd-tmpfiles-setup.service`, so reboot-time
+  recreation is deterministic rather than a race;
+- both declare `ReadWritePaths=/run/ibgateway` with **no leading `-`** — a
+  missing directory *fails the unit* instead of being ignored, because running
+  the watchdog without its budget, lock and marker is the dangerous case;
+- the CLI's last-resort `mkdir` sets `0700` explicitly (`mkdir(mode=…)` is
+  masked by the umask) and never widens an existing directory — drift is a
+  finding for the host audit, not something the watchdog papers over;
+- `systemd-tmpfiles` failing during install is **fatal** (see §4).
+
+`tests/ops/test_runtime_directory_ownership.py` parses the units and asserts
+all of the above, so a re-added `RuntimeDirectory=` cannot pass review.
+
+### State and lock file integrity
+
+`watchdog-state.json` is written **atomically** (temp file in the same
+directory, `fsync`, `os.replace`) at mode `0600`, enforced by an explicit
+`chmod` rather than inherited from the invoking service's umask. A truncated
+state file would load as an *empty* budget — that is, a fresh full set of
+restarts — so a failed write must leave the previous valid state untouched.
+`watchdog.lock` is likewise `0600` by explicit `chmod`, because `os.open`'s
+mode argument is umask-masked.
 
 Service hardening deliberately stops short of network namespacing: the Gateway
 must keep binding its local API socket and the watchdog must keep reaching it,

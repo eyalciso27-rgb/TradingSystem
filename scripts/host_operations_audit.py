@@ -220,11 +220,20 @@ def audit_units(audit: Audit) -> None:
                 if not expected_no_restart
                 else "the Gateway must NOT auto-restart: recovery is owner-authorized",
             )
+            # INVERTED on purpose. /run/ibgateway is owned by tmpfiles.d alone.
+            # A unit declaring RuntimeDirectory takes over the directory's
+            # LIFETIME, and the watchdog is Type=oneshot — so systemd would
+            # delete the inhibit marker, the restart budget and the lock at the
+            # end of every cycle. Declaring it is the defect, not the fix.
+            declared = props.get("RuntimeDirectory", "")
             audit.add(
                 "systemd",
-                f"{unit}:runtime_directory",
-                Level.PASS if props.get("RuntimeDirectory") else Level.WARN,
-                props.get("RuntimeDirectory", "(none)"),
+                f"{unit}:no_runtime_directory_ownership",
+                Level.FAIL if declared else Level.PASS,
+                declared or "(none — tmpfiles.d owns /run/ibgateway)",
+                "RuntimeDirectory= would delete shared safety state on stop"
+                if declared
+                else "",
             )
             # A credential must never appear in a unit's Environment.
             environment = props.get("Environment", "")

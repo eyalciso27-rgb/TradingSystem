@@ -27,10 +27,15 @@ SYSTEMD_SRC="${REPO_ROOT}/systemd"
 
 APPLY=0
 RELOAD=1
+# Prefix for every destination path. Empty means the real system paths.
+# Used to REHEARSE an apply into a scratch tree (and by the test suite); it
+# cannot make the script touch anything it would not otherwise touch.
+DEST_ROOT=""
 for arg in "$@"; do
   case "${arg}" in
     --apply) APPLY=1 ;;
     --no-reload) RELOAD=0 ;;
+    --dest-root=*) DEST_ROOT="${arg#*=}" ;;
     -h|--help) sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: ${arg}" >&2; exit 2 ;;
   esac
@@ -57,7 +62,7 @@ changed=0
 for entry in "${ASSETS[@]}"; do
   src="${SYSTEMD_SRC}/${entry%%::*}"
   rest="${entry#*::}"
-  dst="${rest%%::*}"
+  dst="${DEST_ROOT}${rest%%::*}"
   mode="${rest#*::}"
 
   if [[ ! -f "${src}" ]]; then
@@ -90,7 +95,20 @@ if [[ "${APPLY}" -eq 1 ]]; then
     systemctl daemon-reload
     echo "systemd daemon-reload done"
     # Creates /run/ibgateway 0700 now, without starting anything.
-    systemd-tmpfiles --create /etc/tmpfiles.d/ibgateway.conf || true
+    #
+    # NO '|| true' HERE, AND NEVER AGAIN. /etc/tmpfiles.d/ibgateway.conf is the
+    # single canonical owner of /run/ibgateway; neither unit declares
+    # RuntimeDirectory. If this command fails, the directory that holds the
+    # lock, the restart budget and the order-lifecycle marker may not exist at
+    # the declared 0700 — and the watchdog units are configured to fail closed
+    # rather than run without it. Reporting "tmpfiles applied" in that state
+    # would be a false success on a security-relevant step.
+    if ! systemd-tmpfiles --create "${DEST_ROOT}/etc/tmpfiles.d/ibgateway.conf"; then
+      echo "ERROR: systemd-tmpfiles --create FAILED." >&2
+      echo "       /run/ibgateway may be missing or have the wrong mode." >&2
+      echo "       The install is INCOMPLETE. Do NOT enable the timer." >&2
+      exit 1
+    fi
     echo "tmpfiles applied"
   fi
   echo ">>> Files installed. NOTHING was enabled or started."

@@ -41,7 +41,7 @@ the whole classification is deterministic and testable with fakes.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -54,6 +54,7 @@ from trading_broker_core.port import (
     BrokerPortError,
     BrokerPosition,
     IntegrationHealth,
+    ReconciliationResult,
 )
 from trading_contracts.enums import Environment, OrderState
 
@@ -121,6 +122,7 @@ class SafetyReason(StrEnum):
     ACCOUNT_MISMATCH = "ACCOUNT_MISMATCH"
     OPEN_ORDERS_UNREADABLE = "OPEN_ORDERS_UNREADABLE"
     POSITIONS_UNREADABLE = "POSITIONS_UNREADABLE"
+    ORDER_EVENTS_UNREADABLE = "ORDER_EVENTS_UNREADABLE"
     RECONCILIATION_UNREADABLE = "RECONCILIATION_UNREADABLE"
     SNAPSHOT_INCOMPLETE = "SNAPSHOT_INCOMPLETE"
     SNAPSHOT_INCONSISTENT = "SNAPSHOT_INCONSISTENT"
@@ -305,6 +307,72 @@ class ReadOnlyBrokerFacade:
         return self._broker.reconcile(account_alias)  # type: ignore[attr-defined]
 
 
+@dataclass(frozen=True, slots=True)
+class BrokerSnapshot:
+    """ONE instant of broker truth, captured once and never re-read.
+
+    Every count and every reconciliation finding in a report is derived from a
+    single instance of this class. That is the point: if the counts came from
+    one round trip and the reconciliation from another, a `CLEAN` verdict would
+    describe a moment that never existed — orders could have appeared between
+    the two reads, and the probe would have proven nothing.
+    """
+
+    account: AccountSnapshot
+    open_orders: tuple[BrokerOrderReceipt, ...]
+    positions: tuple[BrokerPosition, ...]
+    order_events: tuple[BrokerOrderEvent, ...]
+    reconciliation: ReconciliationResult
+
+
+class SnapshotMismatchError(Exception):
+    """A consumer asked the replay view for data it did not capture."""
+
+
+class _SnapshotBrokerView:
+    """Replays one captured :class:`BrokerSnapshot`. Holds no connection.
+
+    :class:`ReconciliationEngine` calls ``reconcile()`` and ``order_events()``
+    itself. Handing it the live view would issue a SECOND round trip, so the
+    findings could describe a different instant from the counts. This view is
+    what the engine gets instead: it serves the already-captured data and
+    cannot reach the broker, so reconciliation is provably free of extra reads.
+
+    Like :class:`ReadOnlyBrokerFacade` it defines no order verb.
+    """
+
+    __slots__ = ("_alias", "_snapshot")
+
+    def __init__(self, snapshot: BrokerSnapshot, account_alias: str) -> None:
+        self._snapshot = snapshot
+        self._alias = account_alias
+
+    def _check(self, account_alias: str) -> None:
+        if account_alias != self._alias:
+            raise SnapshotMismatchError(
+                "replay asked for an alias that was never captured"
+            )
+
+    def get_account_snapshot(self, account_alias: str) -> AccountSnapshot:
+        self._check(account_alias)
+        return self._snapshot.account
+
+    def get_open_orders(self, account_alias: str) -> tuple[BrokerOrderReceipt, ...]:
+        self._check(account_alias)
+        return self._snapshot.open_orders
+
+    def get_positions(self, account_alias: str) -> tuple[BrokerPosition, ...]:
+        self._check(account_alias)
+        return self._snapshot.positions
+
+    def order_events(self) -> Iterator[BrokerOrderEvent]:
+        return iter(self._snapshot.order_events)
+
+    def reconcile(self, account_alias: str) -> ReconciliationResult:
+        self._check(account_alias)
+        return self._snapshot.reconciliation
+
+
 def validate_endpoint(host: str, port: int) -> SafetyReason | None:
     """Endpoint envelope, checked BEFORE any connection is attempted."""
     if port == LIVE_API_PORT:
@@ -362,11 +430,10 @@ def probe_account_safety(
             detail=f"endpoint refused: {config.host}:{config.port}",
         )
 
-    connect_ok = False
     try:
         view.connect()
-        connect_ok = True
     except BrokerPortError as error:
+        # Never connected => nothing to close. disconnect() is NOT called here.
         return unknown_report(
             SafetyReason.CONNECT_FAILED, now=now, detail=f"connect: {error.code.value}"
         )
@@ -375,165 +442,119 @@ def probe_account_safety(
             SafetyReason.CONNECT_FAILED, now=now, detail=type(error).__name__
         )
 
+    # One connection is open. Exactly one disconnect attempt follows on EVERY
+    # path below, including an unexpected exception — and exactly one, because
+    # nothing under here disconnects on its own.
     try:
-        return _probe_connected(view, config, now=now, connect_ok=connect_ok)
-    finally:
-        # A disconnect failure is recorded inside _probe_connected; this is the
-        # last-resort guarantee that we never leave a session open.
-        try:
-            view.disconnect()
-        except Exception:  # noqa: BLE001 - best effort, already reported
-            pass
+        report = _snapshot_and_classify(view, config, now=now)
+    except _ProbeAborted as aborted:
+        report = aborted.report
+    except Exception as error:  # noqa: BLE001 - unknown => fail closed
+        report = unknown_report(
+            SafetyReason.PROBE_EXCEPTION,
+            now=now,
+            detail=type(error).__name__,
+            connect_ok=True,
+        )
+    return _close_session(view, report, now=now)
 
 
-def _probe_connected(  # noqa: PLR0911 - one explicit return per failure mode
+class _ProbeAborted(Exception):
+    """Internal control flow: carries the UNKNOWN report that ends the probe.
+
+    Using an exception keeps every read on the happy path readable while still
+    guaranteeing that the single disconnect in :func:`probe_account_safety`
+    runs — a plain early ``return`` from a helper could not do both.
+    """
+
+    def __init__(self, report: AccountSafetyReport) -> None:
+        super().__init__(report.reasons[0].value if report.reasons else "aborted")
+        self.report = report
+
+
+def _close_session(
+    view: ReadOnlyBrokerView, report: AccountSafetyReport, *, now: datetime
+) -> AccountSafetyReport:
+    """The ONE disconnect attempt per successful connection.
+
+    A session we could not close is a session we cannot reason about, so a
+    disconnect failure downgrades the verdict to UNKNOWN even when every other
+    check passed. There is deliberately no path from a failed disconnect to
+    CLEAN. The counts already gathered are kept in the structured fields; only
+    the reason vocabulary changes, so an UNKNOWN report never carries a
+    NOT_CLEAN reason code.
+    """
+    try:
+        view.disconnect()
+    except Exception as error:  # noqa: BLE001 - any failure => fail closed
+        return replace(
+            report,
+            safety=AccountSafety.UNKNOWN,
+            reasons=(SafetyReason.DISCONNECT_FAILED,),
+            disconnect_ok=False,
+            detail=sanitize_detail(
+                f"disconnect failed after {report.safety.value}: {type(error).__name__}"
+            ),
+        )
+    return replace(report, disconnect_ok=True)
+
+
+def _snapshot_and_classify(
     view: ReadOnlyBrokerView,
     config: ProbeConfig,
     *,
     now: datetime,
-    connect_ok: bool,
 ) -> AccountSafetyReport:
+    """Liveness, then ONE snapshot, then classification. Never disconnects."""
     alias = config.account_alias
-    base: dict[str, object] = {"connect_ok": connect_ok}
+    base: dict[str, object] = {"connect_ok": True}
 
-    # 1. health
-    try:
-        health = view.health_check()
-    except Exception as error:  # noqa: BLE001
-        return unknown_report(
-            SafetyReason.HEALTH_CHECK_FAILED, now=now, detail=type(error).__name__, **base
-        )
-    if not health.healthy:
-        return unknown_report(
-            SafetyReason.HEALTH_CHECK_FAILED,
-            now=now,
-            detail=sanitize_detail(health.detail),
-            **base,
-        )
-
-    # 2. optional literal current-time round trip
-    if config.current_time is not None:
-        try:
-            stamp = config.current_time()
-        except Exception as error:  # noqa: BLE001
-            return unknown_report(
-                SafetyReason.CURRENT_TIME_FAILED, now=now, detail=type(error).__name__, **base
-            )
-        if stamp is None or not str(stamp).strip():
-            return unknown_report(
-                SafetyReason.CURRENT_TIME_FAILED, now=now, detail="empty response", **base
-            )
-
-    # 3. account snapshot — a real API round trip AND the Paper/DU gate
-    try:
-        snapshot = view.get_account_snapshot(alias)
-    except BrokerPortError as error:
-        return unknown_report(
-            SafetyReason.API_ROUND_TRIP_FAILED,
-            now=now,
-            detail=f"account snapshot: {error.code.value}",
-            **base,
-        )
-    except Exception as error:  # noqa: BLE001
-        return unknown_report(
-            SafetyReason.API_ROUND_TRIP_FAILED, now=now, detail=type(error).__name__, **base
-        )
+    _check_liveness(view, config, now=now, base=base)
+    snapshot = _capture_snapshot(view, alias, now=now, base=base)
     base["api_round_trip_ok"] = True
+    _assert_coherent(snapshot, alias, now=now, base=base)
 
-    if snapshot.environment is not Environment.PAPER:
-        return unknown_report(
-            SafetyReason.ACCOUNT_NOT_PAPER,
-            now=now,
-            detail=f"environment={snapshot.environment.value}",
-            **base,
-        )
-    if snapshot.account_alias != alias:
-        # Answering for a different alias means we are not looking at the
-        # account we are about to make a decision about.
-        return unknown_report(
-            SafetyReason.ACCOUNT_MISMATCH, now=now, detail="alias mismatch", **base
-        )
-
-    # 4. open orders
+    # Counts come from the captured snapshot, never from a fresh read.
     try:
-        orders = tuple(view.get_open_orders(alias))
-    except BrokerPortError as error:
-        return unknown_report(
-            SafetyReason.OPEN_ORDERS_UNREADABLE,
-            now=now,
-            detail=error.code.value,
-            **base,
-        )
-    except Exception as error:  # noqa: BLE001
-        return unknown_report(
-            SafetyReason.OPEN_ORDERS_UNREADABLE, now=now, detail=type(error).__name__, **base
-        )
-    try:
-        working = count_working_orders(orders)
+        working = count_working_orders(snapshot.open_orders)
+        non_zero = count_non_zero_positions(snapshot.positions)
     except (AttributeError, TypeError) as error:
-        return unknown_report(
-            SafetyReason.MALFORMED_DATA, now=now, detail=type(error).__name__, **base
-        )
+        raise _ProbeAborted(
+            unknown_report(
+                SafetyReason.MALFORMED_DATA, now=now, detail=type(error).__name__, **base
+            )
+        ) from error
     base["working_orders"] = working
-
-    # 5. positions
-    try:
-        positions = tuple(view.get_positions(alias))
-    except BrokerPortError as error:
-        return unknown_report(
-            SafetyReason.POSITIONS_UNREADABLE, now=now, detail=error.code.value, **base
-        )
-    except Exception as error:  # noqa: BLE001
-        return unknown_report(
-            SafetyReason.POSITIONS_UNREADABLE, now=now, detail=type(error).__name__, **base
-        )
-    try:
-        non_zero = count_non_zero_positions(positions)
-    except (AttributeError, TypeError) as error:
-        return unknown_report(
-            SafetyReason.MALFORMED_DATA, now=now, detail=type(error).__name__, **base
-        )
     base["non_zero_positions"] = non_zero
 
-    # 6. reconciliation — the only thing that resolves UNKNOWN broker state
+    # Reconciliation reads the SAME snapshot through a replay view, so it
+    # cannot reach the broker and cannot observe a later instant.
     try:
-        report = _reconcile(view, config, now=now)
-    except BrokerPortError as error:
-        return unknown_report(
-            SafetyReason.RECONCILIATION_UNREADABLE,
-            now=now,
-            detail=error.code.value,
-            **base,
-        )
-    except Exception as error:  # noqa: BLE001
-        return unknown_report(
-            SafetyReason.RECONCILIATION_UNREADABLE,
-            now=now,
-            detail=type(error).__name__,
-            **base,
-        )
+        report = _reconcile(snapshot, config, now=now)
+    except SnapshotMismatchError as error:
+        raise _ProbeAborted(
+            unknown_report(
+                SafetyReason.SNAPSHOT_INCONSISTENT, now=now, detail=str(error), **base
+            )
+        ) from error
+    except Exception as error:  # noqa: BLE001 - unknown => fail closed
+        raise _ProbeAborted(
+            unknown_report(
+                SafetyReason.RECONCILIATION_UNREADABLE,
+                now=now,
+                detail=type(error).__name__,
+                **base,
+            )
+        ) from error
+
     unresolved = sum(
         1 for finding in report.findings if finding.kind.value == "UNRESOLVED_UNKNOWN_ORDER"
     )
-    blocking = len(report.findings) if report.entry_block_required else 0
     base["unresolved_states"] = unresolved
     base["reconciled"] = report.reconciled
-    base["blocking_findings"] = blocking
+    base["blocking_findings"] = len(report.findings) if report.entry_block_required else 0
 
-    # 7. clean disconnect
-    disconnect_ok = True
-    try:
-        view.disconnect()
-    except Exception as error:  # noqa: BLE001
-        disconnect_ok = False
-        detail = type(error).__name__
-    base["disconnect_ok"] = disconnect_ok
-    if not disconnect_ok:
-        return unknown_report(
-            SafetyReason.DISCONNECT_FAILED, now=now, detail=detail, **base
-        )
-
-    # -- the snapshot is complete; now classify what it proves ---------------
+    # -- the snapshot is complete and coherent; classify what it proves ------
     problems: list[SafetyReason] = []
     if working > 0:
         problems.append(SafetyReason.WORKING_ORDER_PRESENT)
@@ -560,18 +581,204 @@ def _probe_connected(  # noqa: PLR0911 - one explicit return per failure mode
         safety=AccountSafety.CLEAN,
         reasons=(SafetyReason.ALL_CHECKS_PASSED,),
         checked_at=now,
-        detail="complete read-only snapshot; nothing outstanding",
+        detail="one complete read-only snapshot; nothing outstanding",
         **base,  # type: ignore[arg-type]
     )
 
 
+def _check_liveness(
+    view: ReadOnlyBrokerView,
+    config: ProbeConfig,
+    *,
+    now: datetime,
+    base: dict[str, object],
+) -> None:
+    """Health, then the optional literal current-time round trip."""
+    try:
+        health = view.health_check()
+    except Exception as error:  # noqa: BLE001
+        raise _ProbeAborted(
+            unknown_report(
+                SafetyReason.HEALTH_CHECK_FAILED,
+                now=now,
+                detail=type(error).__name__,
+                **base,
+            )
+        ) from error
+    if not health.healthy:
+        raise _ProbeAborted(
+            unknown_report(
+                SafetyReason.HEALTH_CHECK_FAILED,
+                now=now,
+                detail=sanitize_detail(health.detail),
+                **base,
+            )
+        )
+
+    if config.current_time is None:
+        return
+    try:
+        stamp = config.current_time()
+    except Exception as error:  # noqa: BLE001
+        raise _ProbeAborted(
+            unknown_report(
+                SafetyReason.CURRENT_TIME_FAILED,
+                now=now,
+                detail=type(error).__name__,
+                **base,
+            )
+        ) from error
+    if stamp is None or not str(stamp).strip():
+        raise _ProbeAborted(
+            unknown_report(
+                SafetyReason.CURRENT_TIME_FAILED, now=now, detail="empty response", **base
+            )
+        )
+
+
+def _capture_snapshot(
+    view: ReadOnlyBrokerView,
+    alias: str,
+    *,
+    now: datetime,
+    base: dict[str, object],
+) -> BrokerSnapshot:
+    """Read every part of the broker state EXACTLY ONCE.
+
+    Each read appears here once and nowhere else in the module; nothing
+    downstream is given the live view again. That is what makes "one snapshot"
+    a structural property rather than a convention.
+    """
+
+    def read(reason: SafetyReason, call: Callable[[], object]) -> object:
+        try:
+            return call()
+        except BrokerPortError as error:
+            raise _ProbeAborted(
+                unknown_report(reason, now=now, detail=error.code.value, **base)
+            ) from error
+        except Exception as error:  # noqa: BLE001 - unknown => fail closed
+            raise _ProbeAborted(
+                unknown_report(reason, now=now, detail=type(error).__name__, **base)
+            ) from error
+
+    account = read(
+        SafetyReason.API_ROUND_TRIP_FAILED, lambda: view.get_account_snapshot(alias)
+    )
+    assert isinstance(account, AccountSnapshot)  # noqa: S101 - port contract
+
+    # The Paper/DU gate runs before anything else is read: if this is not the
+    # account we think it is, further reads would only add false confidence.
+    if account.environment is not Environment.PAPER:
+        raise _ProbeAborted(
+            unknown_report(
+                SafetyReason.ACCOUNT_NOT_PAPER,
+                now=now,
+                detail=f"environment={account.environment.value}",
+                **base,
+            )
+        )
+    if account.account_alias != alias:
+        raise _ProbeAborted(
+            unknown_report(
+                SafetyReason.ACCOUNT_MISMATCH, now=now, detail="alias mismatch", **base
+            )
+        )
+
+    orders = read(
+        SafetyReason.OPEN_ORDERS_UNREADABLE, lambda: tuple(view.get_open_orders(alias))
+    )
+    positions = read(
+        SafetyReason.POSITIONS_UNREADABLE, lambda: tuple(view.get_positions(alias))
+    )
+    events = read(SafetyReason.ORDER_EVENTS_UNREADABLE, lambda: tuple(view.order_events()))
+    reconciliation = read(
+        SafetyReason.RECONCILIATION_UNREADABLE, lambda: view.reconcile(alias)
+    )
+    if not isinstance(reconciliation, ReconciliationResult):
+        raise _ProbeAborted(
+            unknown_report(
+                SafetyReason.MALFORMED_DATA,
+                now=now,
+                detail=f"reconcile returned {type(reconciliation).__name__}",
+                **base,
+            )
+        )
+
+    return BrokerSnapshot(
+        account=account,
+        open_orders=orders,  # type: ignore[arg-type]
+        positions=positions,  # type: ignore[arg-type]
+        order_events=events,  # type: ignore[arg-type]
+        reconciliation=reconciliation,
+    )
+
+
+def _assert_coherent(
+    snapshot: BrokerSnapshot,
+    alias: str,
+    *,
+    now: datetime,
+    base: dict[str, object],
+) -> None:
+    """Prove the captured parts describe ONE instant of ONE account.
+
+    ``reconcile()`` returns its own account/orders/positions, so the two reads
+    overlap — and that overlap is a free consistency check. If the broker
+    changed between them, or answered for a different account, the parts
+    disagree and the snapshot is not a snapshot. Mixed-time data must never be
+    classified; it becomes UNKNOWN.
+    """
+
+    def abort(reason: SafetyReason, detail: str) -> _ProbeAborted:
+        return _ProbeAborted(unknown_report(reason, now=now, detail=detail, **base))
+
+    result = snapshot.reconciliation
+    if result.account_alias != alias or result.snapshot.account_alias != alias:
+        raise abort(SafetyReason.ACCOUNT_MISMATCH, "reconciliation alias mismatch")
+    if result.snapshot.environment is not Environment.PAPER:
+        raise abort(
+            SafetyReason.ACCOUNT_NOT_PAPER,
+            f"reconciliation environment={result.snapshot.environment.value}",
+        )
+
+    order_ids = [order.client_order_id for order in snapshot.open_orders]
+    if len(set(order_ids)) != len(order_ids):
+        raise abort(SafetyReason.SNAPSHOT_INCONSISTENT, "duplicate order in snapshot")
+    symbols = [position.symbol for position in snapshot.positions]
+    if len(set(symbols)) != len(symbols):
+        raise abort(SafetyReason.SNAPSHOT_INCONSISTENT, "duplicate position in snapshot")
+
+    # The cross-check that catches a broker mutating mid-probe.
+    direct_orders = {(o.client_order_id, o.state) for o in snapshot.open_orders}
+    reconciled_orders = {(o.client_order_id, o.state) for o in result.open_orders}
+    if direct_orders != reconciled_orders:
+        raise abort(
+            SafetyReason.SNAPSHOT_INCONSISTENT,
+            "open orders differ between reads: the broker changed mid-probe",
+        )
+    direct_positions = {p.symbol: p.quantity for p in snapshot.positions if p.quantity != 0}
+    reconciled_positions = {
+        p.symbol: p.quantity for p in result.positions if p.quantity != 0
+    }
+    if direct_positions != reconciled_positions:
+        raise abort(
+            SafetyReason.SNAPSHOT_INCONSISTENT,
+            "positions differ between reads: the broker changed mid-probe",
+        )
+
+
 def _reconcile(
-    view: ReadOnlyBrokerView, config: ProbeConfig, *, now: datetime
+    snapshot: BrokerSnapshot, config: ProbeConfig, *, now: datetime
 ) -> ReconciliationReport:
-    """Reconcile against an EMPTY internal expectation.
+    """Reconcile the CAPTURED snapshot against an EMPTY internal expectation.
 
     The watchdog expects the account to hold nothing, so anything the broker
     reports surfaces as a finding rather than being silently accepted.
+
+    The engine is handed :class:`_SnapshotBrokerView`, not the live view: it
+    calls ``reconcile()`` and ``order_events()`` itself, and those must resolve
+    to the data already captured. No second broker read happens here.
     """
     engine = ReconciliationEngine(
         ReconciliationPolicy(
@@ -589,12 +796,12 @@ def _reconcile(
         protected_quantities={},
         processed_fill_event_ids=frozenset(
             f"{event.sequence}:{event.client_order_id}:{event.state.value}"
-            for event in view.order_events()
+            for event in snapshot.order_events
         ),
         as_of=now,
     )
     report: ReconciliationReport = engine.run(
-        view,  # type: ignore[arg-type]  # the engine only reads
+        _SnapshotBrokerView(snapshot, config.account_alias),  # type: ignore[arg-type]
         internal,
         trigger=ReconciliationTrigger.PERIODIC,
         as_of=now,

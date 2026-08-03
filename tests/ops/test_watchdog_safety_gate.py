@@ -18,6 +18,7 @@ import stat
 import sys
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -491,10 +492,166 @@ def test_status_output_contains_no_account_or_credential(tmp_path: Path, capsys:
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
 def test_state_and_lock_files_use_restrictive_permissions(tmp_path: Path) -> None:
+    """BOTH files, and the state file across repeated saves.
+
+    This previously checked only the lock, which left the state file — the
+    restart BUDGET, i.e. the thing that rate-limits unattended action — written
+    at whatever the umask happened to allow.
+    """
     lock_path = tmp_path / "watchdog.lock"
     with wd.FileLock(lock_path):
         mode = stat.S_IMODE(lock_path.stat().st_mode)
         assert mode == 0o600, f"lock mode {mode:04o} must be 0600"
+
+    state_path = tmp_path / "watchdog-state.json"
+    store = wd.StateStore(path=state_path)
+    store.restart_times = [1.0]
+    store.save()
+    first = stat.S_IMODE(state_path.stat().st_mode)
+    assert first == 0o600, f"state mode {first:04o} must be 0600 after the first save"
+
+    # A later save must not relax the mode (os.replace swaps the inode, so a
+    # careless implementation would inherit the umask again).
+    store.restart_times = [1.0, 2.0]
+    store.save()
+    second = stat.S_IMODE(state_path.stat().st_mode)
+    assert second == 0o600, f"state mode {second:04o} must stay 0600 after re-save"
+    assert wd.StateStore.load(state_path).restart_times == [1.0, 2.0]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+@pytest.mark.parametrize(
+    "umask_value", [0o000, 0o022, 0o077], ids=["permissive", "default", "restrictive"]
+)
+def test_permissions_do_not_depend_on_the_invoking_umask(
+    tmp_path: Path, umask_value: int
+) -> None:
+    """0600 is enforced, not requested.
+
+    A service inheriting umask 000 must not end up with a world-readable
+    restart budget, and a restrictive umask must not break the files either.
+    """
+    previous = os.umask(umask_value)
+    try:
+        state_path = tmp_path / f"state-{umask_value:03o}.json"
+        store = wd.StateStore(path=state_path)
+        store.restart_times = [7.0]
+        store.save()
+        assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+
+        lock_path = tmp_path / f"lock-{umask_value:03o}"
+        with wd.FileLock(lock_path):
+            assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+    finally:
+        os.umask(previous)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_the_runtime_directory_is_created_restrictively(tmp_path: Path) -> None:
+    """The last-resort mkdir must never be a permissive fallback."""
+    previous = os.umask(0o000)
+    try:
+        nested = tmp_path / "run" / "ibgateway" / "watchdog-state.json"
+        wd.ensure_runtime_dir(nested)
+        assert stat.S_IMODE(nested.parent.stat().st_mode) == 0o700
+    finally:
+        os.umask(previous)
+
+
+def _chmod_calls_for(target: Path, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record the modes explicitly applied to ``target`` (platform-independent)."""
+    modes: list[int] = []
+    real_chmod = os.chmod
+
+    def spy(path: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+        if str(path) == str(target):
+            modes.append(mode)
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", spy)
+    return modes
+
+
+def test_the_state_file_mode_is_enforced_not_inherited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Portable proof of INTENT; the POSIX test above proves the EFFECT.
+
+    Mode bits are meaningless on Windows, so without this the 0600 guarantee
+    would be unguarded on half the platforms the suite runs on — and a
+    regression to 0644 would only surface in CI.
+    """
+    state_path = tmp_path / "watchdog-state.json"
+    store = wd.StateStore(path=state_path)
+    store.restart_times = [1.0]
+    # The temp file is chmod'ed before the rename, so watch the whole directory.
+    modes: list[int] = []
+    real_chmod = os.chmod
+
+    def spy(path: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+        modes.append(mode)
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", spy)
+    store.save()
+    assert modes, "save() must set the mode explicitly, not rely on the umask"
+    assert all(mode == 0o600 for mode in modes), f"modes applied: {[oct(m) for m in modes]}"
+
+
+def test_the_lock_file_mode_is_enforced_not_inherited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """os.open's mode argument is masked by the umask; chmod is not."""
+    lock_path = tmp_path / "watchdog.lock"
+    modes = _chmod_calls_for(lock_path, monkeypatch)
+    with wd.FileLock(lock_path):
+        pass
+    assert modes == [0o600], f"modes applied to the lock: {[oct(m) for m in modes]}"
+
+
+def test_the_state_write_is_atomic_and_keeps_the_previous_value(tmp_path: Path) -> None:
+    """A failed save must not destroy a valid budget.
+
+    Truncating the file would read back as an EMPTY budget — that is, a fresh
+    full set of restarts. Losing the file must never be the permissive outcome.
+    """
+    state_path = tmp_path / "watchdog-state.json"
+    store = wd.StateStore(path=state_path)
+    store.restart_times = [1.0, 2.0, 3.0]
+    store.save()
+
+    broken = wd.StateStore(path=state_path)
+    # A value json.dumps cannot serialize, to force the write to fail.
+    broken.restart_times = [object()]
+    with pytest.raises(TypeError):
+        broken.save()
+
+    assert wd.StateStore.load(state_path).restart_times == [1.0, 2.0, 3.0]
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != state_path.name]
+    assert leftovers == [], f"temporary files left behind: {leftovers}"
+
+
+def test_a_partially_written_state_file_is_never_visible(tmp_path: Path) -> None:
+    """os.replace is atomic: a reader sees the old file or the new one."""
+    state_path = tmp_path / "watchdog-state.json"
+    store = wd.StateStore(path=state_path)
+    store.restart_times = [1.0]
+    store.save()
+
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def spy(src: object, dst: object) -> None:
+        # At this instant the new content exists only under the temp name.
+        seen.append(state_path.read_text(encoding="utf-8"))
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    store.restart_times = [1.0, 2.0]
+    with mock.patch.object(os, "replace", spy):
+        store.save()
+
+    assert seen == ['{"restart_times": [1.0], "relogin_times": []}'], seen
+    assert wd.StateStore.load(state_path).restart_times == [1.0, 2.0]
 
 
 def test_the_lock_is_exclusive(tmp_path: Path) -> None:

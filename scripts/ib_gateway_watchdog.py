@@ -56,12 +56,14 @@ and fully tested with fakes — no real IBKR contact, ever.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -409,9 +411,42 @@ class SystemdLauncher:
         self._run("restart")
 
 
+#: Modes for /run/ibgateway and the files in it. The lifecycle marker inhibits
+#: unattended action and the state file rate-limits it, so both are supervision
+#: authority: they are enforced explicitly, never inherited from a umask.
+RUNTIME_DIR_MODE = 0o700
+RUNTIME_FILE_MODE = 0o600
+
+
+def ensure_runtime_dir(path: Path) -> None:
+    """Guarantee ``path``'s parent exists at 0700 — no permissive fallback.
+
+    /run/ibgateway has one canonical owner, ``/etc/tmpfiles.d/ibgateway.conf``.
+    This is the last resort for a host where tmpfiles has not run: it may
+    create the directory, but only at 0700. ``Path.mkdir(mode=...)`` is masked
+    by the umask, so the mode is set explicitly afterwards.
+
+    An EXISTING directory is left alone deliberately — widening or narrowing
+    someone else's directory is not this process's call. Drift is a finding for
+    ``scripts/host_operations_audit.py``, not something to paper over here.
+    """
+    parent = path.parent
+    if parent.is_dir():
+        return
+    parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        parent.chmod(RUNTIME_DIR_MODE)
+
+
 @dataclass
 class StateStore:
-    """Persists restart/relogin timestamps as JSON (no secrets)."""
+    """Persists restart/relogin timestamps as JSON (no secrets).
+
+    The file holds the restart BUDGET, which is a safety control: it is what
+    rate-limits unattended action. So the write is atomic (a crash must not
+    truncate the budget to zero and silently re-arm the watchdog) and the mode
+    is enforced rather than inherited from the invoking service's umask.
+    """
 
     path: Path
     restart_times: list[float] = field(default_factory=list)
@@ -438,13 +473,37 @@ class StateStore:
         ]
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(
-                {"restart_times": self.restart_times, "relogin_times": self.relogin_times}
-            ),
-            encoding="utf-8",
+        """Write 0600 and atomically; a failed write keeps the previous state.
+
+        ``Path.write_text`` was none of those things: the mode came from the
+        umask, and a crash mid-write left truncated JSON that ``load`` would
+        silently read as an empty budget — i.e. a full set of fresh restarts.
+        """
+        ensure_runtime_dir(self.path)
+        payload = json.dumps(
+            {"restart_times": self.restart_times, "relogin_times": self.relogin_times}
         )
+        # Same directory, so os.replace is a true atomic rename and never a
+        # cross-filesystem copy. mkstemp opens O_EXCL at 0600.
+        handle_fd, temp_name = tempfile.mkstemp(
+            dir=str(self.path.parent), prefix=f".{self.path.name}.", suffix=".tmp"
+        )
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Explicit: the 0600 guarantee must not depend on mkstemp's
+            # platform semantics or on the caller's umask.
+            os.chmod(temp_path, RUNTIME_FILE_MODE)
+            # Atomic: a concurrent reader sees either the old file or the new
+            # one, never a partially written one.
+            os.replace(temp_path, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                temp_path.unlink()
+            raise
 
 
 class LockBusyError(Exception):
@@ -459,11 +518,17 @@ class FileLock:
         self._fd: int | None = None
 
     def __enter__(self) -> FileLock:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_dir(self._path)
         try:
-            self._fd = os.open(str(self._path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            self._fd = os.open(
+                str(self._path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, RUNTIME_FILE_MODE
+            )
         except FileExistsError as error:
             raise LockBusyError(f"lock held: {self._path}") from error
+        # os.open's mode is masked by the umask. This lock is what prevents two
+        # concurrent launches, so its mode is enforced, not merely requested.
+        with contextlib.suppress(OSError):
+            os.chmod(str(self._path), RUNTIME_FILE_MODE)
         os.write(self._fd, str(os.getpid()).encode("ascii"))
         return self
 
