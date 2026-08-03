@@ -493,23 +493,35 @@ components:
       B-03: host patches (gateway version/config/java paths, systemd drop-ins)
       are not upstreamed and no host transcript is recorded in the repo
     owner_dependency: OWNER_HOST
-    next_action: owner upstreams host patches and records a transcript (DEF-12)
+    next_action: >-
+      owner runs scripts/install_ops_assets.sh (CHECK mode) and
+      scripts/host_operations_audit.py, then upstreams host patches and
+      records the transcript (DEF-12)
     exit_criterion: host evidence committed and reproducible from the repo
 
   - component_id: watchdog
-    name: IB Gateway watchdog (process/socket/session probes)
+    name: IB Gateway watchdog (account-safety gated, passive supervision)
     canonical_task_ids: [IMP-0402, IMP-1303]
-    implementation_status: PARTIAL
+    implementation_status: IMPLEMENTED
     evidence_class: TESTED_WITH_FAKES
     real_integration_status: NONE
     deferred_id: DEF-13-watchdog-deep-probe-activation
     strategy_dependency: NONE
     current_blocker: >-
-      B-04: the deep probe is not enabled because it needs the broker package
-      on the host
+      B-04 OPEN: the read-only account-safety probe, the CLEAN/NOT_CLEAN/UNKNOWN
+      gate and the --status / --deep-probe CLI are implemented and tested with
+      fakes, but NOTHING has been activated or observed on the owner host
     owner_dependency: OWNER_HOST
-    next_action: owner enables the deep probe on the host (DEF-13)
+    next_action: >-
+      owner installs the assets (CHECK mode first), runs the read-only host
+      audit and the read-only --status / --deep-probe, and reviews the
+      artifacts (DEF-13); see docs/runbooks/OPERATIONAL_HARDENING.md
     exit_criterion: deep probe active with recorded host evidence
+    # The unattended watchdog can no longer START/RESTART/RELOGIN: every
+    # restart-triggering state is UNKNOWN because a dead API cannot answer a
+    # broker query. Recovery is owner-authorized. This is deliberate.
+    unattended_restart: DISABLED_BY_ACCOUNT_SAFETY_GATE
+    defects: D-WATCHDOG-01, D-WATCHDOG-02
 
   - component_id: event-bus-nats
     name: Event bus / NATS JetStream adapter

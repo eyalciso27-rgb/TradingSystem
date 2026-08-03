@@ -1,9 +1,20 @@
-# IB Gateway (Paper) via IBC — auto-start unit.
+# IB Gateway (Paper) via IBC — THE ONE CANONICAL GATEWAY SERVICE.
+#
+# There is exactly one Gateway service in this repository and on the host:
+# `ibgateway-ibc.service`. A second unit, a user-level copy, a cron entry or
+# a supervisor wrapper would be a competing restart manager: two managers can
+# race, double-launch the Gateway and produce two API clients on one account.
+# Do not add one.
 #
 # Credentials are NOT here: they live only in the IBC config file (chmod 600),
 # read by IBC itself. No credential appears in this unit, in the command line
-# or in a visible Environment= entry. Restart is managed by the watchdog (the
-# single restart manager), so this unit does NOT auto-restart on its own.
+# or in a visible Environment= entry.
+#
+# `Restart=no` is deliberate. Automatic restart is exactly the blind recovery
+# the account-safety gate exists to prevent: systemd cannot know whether an
+# order is working. Recovery is an owner-authorized action under
+# docs/runbooks/CHAOS_RECOVERY_DRILLS.md; the unattended watchdog only
+# supervises and alerts.
 #
 # Install: copy to /etc/systemd/system/, then `systemctl daemon-reload`.
 # Do NOT enable/start until the owner has completed secure IBC setup and is
@@ -25,14 +36,28 @@ Environment=IBC_INI=/home/opc/.config/ibc/config.ini
 Environment=TWS_MAJOR_VRSN=1048
 Environment=IBC_LOG_PATH=/home/opc/ibc/logs
 ExecStart=/usr/bin/env bash /opt/trading/scripts/start_ibc_gateway.sh
-# The watchdog is the single restart manager (avoids double management).
+# NO automatic restart: recovery is owner-authorized, never blind.
 Restart=no
-# Hardening.
+# Runtime dir for the lock, watchdog state and lifecycle marker. systemd
+# creates it 0700 and removes it on stop; /etc/tmpfiles.d/ibgateway.conf
+# keeps it present for the watchdog when the Gateway is down.
+RuntimeDirectory=ibgateway
+RuntimeDirectoryMode=0700
+# Hardening. NOTE: the Gateway must keep binding its LOCAL API socket
+# (127.0.0.1:4002) and reaching IBKR outbound, so no IP/socket namespace
+# restriction is applied here — that would break the very API the
+# read-only probe depends on.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/opc/ibc /home/opc/.config/ibc /run/ibgateway
 PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

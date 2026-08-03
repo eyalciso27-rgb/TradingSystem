@@ -52,6 +52,8 @@
 | D-CLOCK-02 | A real `verify-clean` owner-run reported only `broker error BROKER_UNHEALTHY; no retry`. The first failing read aborted the whole scenario, so the owner could not distinguish a dead Gateway from a reachable account that merely held an unrelated position (`DVLT` 1352, zero open orders), and got no code detail or root cause | **P1 (diagnosability)** | `scripts/poi_ibkr_lifecycle.py` | ✅ **fixed in this bundle** — sanitized bounded message + chained root-cause TYPE + correlation id; every read-only probe recorded independently; read-only scenarios continue past a failed preflight; open positions named explicitly. Fail-closed behaviour unchanged |
 | D-CLOCK-03 | `health_check()` called `transport.is_connected()` (→ `EClient.isConnected`) with **no guard**, and `disconnect()` let an arbitrary SDK exception escape. The harness normalizes `BrokerPortError` only, so an ibapi/socket failure on the **first probe of every preflight** collapsed the whole run into "unknown error, failing closed" — re-creating the D-CLOCK-02 blindness on a path the D-CLOCK-02 fix did not cover | **P1** | `broker-ibkr/paper_adapter.py` | ✅ **fixed in the PR #53 pre-merge audit** — `health_check` answers UNHEALTHY with the exception TYPE in `detail` (keeping the agent's tested `BROKER_UNHEALTHY`/`NOT_SENT` refusal on its normal path); `disconnect` normalizes to `BrokerPortError` and still clears the transport. A parametrized test asserts **no public adapter method** raises anything but `BrokerPortError`, and a completeness test fails if a new public method is added un-audited |
 | D-CLOCK-04 | `describe_broker_error` sanitized the broker message but passed `error.correlation_id` into the evidence **unsanitized** — a generic-helper evidence path that bypassed every other gate (today's ids are internally generated, so latent, not realised) | P2 | `scripts/poi_ibkr_lifecycle.py` | ✅ **fixed in the PR #53 pre-merge audit** — the correlation id goes through the same bounded sanitizer; tests cover account-shaped tokens, filesystem paths, control characters and over-long values |
+| D-WATCHDOG-01 | The unattended watchdog restarted IB Gateway on `PROCESS_DOWN` / `API_DOWN` / login failure / 2FA timeout with **no knowledge of account state**. A restart while an order is working, a position is open or the broker state is unresolved can orphan the order, sever a run mid-flight and destroy the evidence reconciliation needs — and the watchdog would have reported success, because the process came back. Process liveness was being used as an account-safety signal | **P1** | `scripts/ib_gateway_watchdog.py` | ✅ **fixed in this bundle** — a read-only account-safety probe (`CLEAN`/`NOT_CLEAN`/`UNKNOWN`) gates every unattended START/RESTART/RELOGIN. Connectivity failure is UNKNOWN, never CLEAN; every restart-triggering state is definitionally UNKNOWN, so the unattended watchdog now supervises and alerts rather than restarting. **Owner-host activation NOT RUN** |
+| D-WATCHDOG-02 | The deferred ledger referenced `--status` and `--deep-probe --status` commands that **did not exist**; `/run/ibgateway` permissions, IBC log rotation and 4002/5901 exposure were unaudited; and OCI network security had no stated verification boundary | P2 | watchdog CLI + systemd assets + host audit | ✅ **fixed in this bundle** — read-only `--status` / `--deep-probe --status` with JSON, `RuntimeDirectory` 0700 + tmpfiles, logrotate, a read-only host audit and an explicit "OCI is never verifiable from the host" rule. **Owner-host activation NOT RUN** |
 | D-02 | Owner-run `--client-id` default (7) diverges from adapter `DEFAULT_CLIENT_ID` (1); stale-connection recovery undocumented | P2 | lifecycle CLI + runbook | ✅ (doc) — not done here (P2, out of P0/P1 scope) |
 | B-01 | POI-IBKR-001 Paper lifecycle (cancel-path/fill-path/protection/reconnect/reconciliation) not run | BLOCKED | owner-run | ❌ owner + host |
 | B-02 | Owner-run chaos/recovery host drills not run | BLOCKED | `CHAOS_RECOVERY_DRILLS.md` §4 | ❌ blocked on B-01 |
@@ -819,3 +821,98 @@ evidence path bypassing every other gate. Now sanitized identically.
 Unchanged by this audit: no cancel-path execute, no real cancellation, no
 fill-path, no restart-recovery owner-run, no Live connection or order, no
 PAPER_AUTO. **POI-IBKR-001 remains BLOCKED / non-PASS.**
+
+## 10. Operational hardening (D-WATCHDOG-01, D-WATCHDOG-02)
+
+### 10.1 The defect
+
+The watchdog supervised a **process**. It restarted IB Gateway whenever the
+process was down or the API was unresponsive, and it knew nothing about the
+**account** behind that process.
+
+Those two signals look similar and are not. Restarting a Gateway while an order
+is working can orphan that order; doing it while a position is open removes the
+session that was supposed to be watching it; doing it while the broker state is
+unresolved destroys the evidence reconciliation needs. In every one of those
+cases the old watchdog would have reported success — the process came back.
+
+### 10.2 The fix: an account-safety gate
+
+Every unattended `START` / `RESTART` / `RELOGIN` is now gated on ONE complete
+read-only snapshot classified as `CLEAN` / `NOT_CLEAN` / `UNKNOWN`.
+
+`CLEAN` requires all of: localhost only · Paper port 4002 only · `DU`/Paper
+account validation · successful API connection · successful liveness round trip
+· complete open-order snapshot · complete position snapshot · zero working
+orders · zero non-zero positions · zero unresolved operation states · clean
+reconciliation with zero blocking findings · clean disconnect.
+
+| Classification | Unattended action |
+|---|---|
+| `CLEAN` | policy may be evaluated (budgets, locks, 2FA unchanged) |
+| `NOT_CLEAN` | `WAIT` + alert; the launcher is never called |
+| `UNKNOWN` | `ALERT`, fail closed; the launcher is never called |
+
+**Connectivity failure is `UNKNOWN`; it is never `CLEAN`.** Historical, cached
+or last-known-clean state is never consulted.
+
+The probe is handed a facade that **does not define** `submit_order`,
+`cancel_order` or any modify verb — the order surface is not merely unused, it
+is unreachable.
+
+### 10.3 The deliberate consequence
+
+Every state that could trigger a restart cannot query the broker, so it is
+definitionally `UNKNOWN`. **The unattended watchdog therefore no longer
+restarts anything; it supervises and alerts.** Recovering a Gateway is an
+owner-authorized action.
+
+The controlled, serialized DEF-20 restart under the canonical runbook is
+**unaffected** — manual owner-authorized restart and unattended watchdog
+restart are separate capabilities, and only the second was removed.
+
+The lifecycle marker still inhibits action; it is **necessary but not
+sufficient**, which is precisely why the gate sits above it. Budgets and locks
+are preserved and can never override the gate: a freed restart budget is not a
+proof about the account.
+
+### 10.4 Also delivered
+
+Read-only `--status` and `--deep-probe --status` (with deterministic JSON and
+an explicit **proof level**, so `TCP_OPEN` can never be mistaken for a claim
+about the account) · `RuntimeDirectory=ibgateway` at `0700` plus tmpfiles ·
+logrotate for the IBC log · one canonical Gateway service asserted in code and
+in the host audit · a read-only host audit for B-03/B-04 with redaction and a
+non-zero exit on security failure · port-exposure detection with an explicit
+**"OCI network security is never verifiable from the host"** rule · an
+installer that defaults to CHECK/DRY-RUN and never touches firewall, OCI, SSH
+or VNC.
+
+### 10.5 Implementation readiness vs host activation
+
+| | State |
+|---|---|
+| Code, units, audit, installer, tests | ✅ **IMPLEMENTED AND TESTED WITH FAKES** |
+| Owner-host installation | 🟡 **READY FOR OWNER-HOST ACTIVATION** |
+| Owner-host evidence | ❌ **NOT EXECUTED** |
+
+**B-02, B-03 and B-04 remain OPEN. DEF-12 and DEF-13 remain `NOT_RUN`.**
+Nothing here marks POI-PLAT-ARM-001 newly passed, POI-IBKR-001 PASS, IMP-1303
+complete or IMP-1304 complete.
+
+Twelve safety mutations were injected to prove the guards are real (UNKNOWN
+permitting a restart, NOT_CLEAN permitting a restart, the gate removed,
+`PROCESS_DOWN` treated as probeable, an optimistic default probe, a connection
+failure reported as CLEAN, a working order or position no longer blocking, the
+facade gaining an order surface, the service auto-restarting, redaction
+removed, OCI claimed as verified). **All twelve fail the suite.**
+
+### 10.6 NOT EXECUTED
+
+- ❌ no IBKR connection of any kind;
+- ❌ no `systemctl` command run against a real host;
+- ❌ no Gateway start, stop, restart or relogin;
+- ❌ no order submitted, cancelled, modified or flattened;
+- ❌ no firewall, nftables, firewalld or OCI change;
+- ❌ no credential, account id or IBC config content added;
+- ❌ no PAPER_AUTO, no LIVE.

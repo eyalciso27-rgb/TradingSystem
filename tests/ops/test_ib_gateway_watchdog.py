@@ -123,25 +123,58 @@ def test_api_ready_takes_no_action(tmp_path: Path) -> None:
     assert alerts == []
 
 
-def test_process_down_starts_within_budget(tmp_path: Path) -> None:
+def test_process_down_would_start_but_the_safety_gate_refuses(tmp_path: Path) -> None:
+    """PROCESS_DOWN cannot query the broker, so the account is UNKNOWN.
+
+    The POLICY still says START (budget available, not inhibited) — that logic
+    is unchanged and is asserted directly below. What changed is that the
+    account-safety gate refuses to act on it, because a down process proves
+    nothing about whether an order is working.
+    """
+    policy = wd.Policy()
+    # The pure policy decision is unchanged:
+    raw = wd.decide_action(
+        wd.WatchdogState.PROCESS_DOWN,
+        wd.LoginMarker.NONE,
+        restart_count=0,
+        relogin_count=0,
+        policy=policy,
+        restart_inhibited=False,
+    )
+    assert raw.action is wd.Action.START
+
     launcher = FakeLauncher()
     plan, store, _ = cycle(tmp_path, probes(process=False), launcher)
     assert plan.state is wd.WatchdogState.PROCESS_DOWN
-    assert plan.action is wd.Action.START
-    assert plan.exit_code == wd.ExitCode.STARTED
-    assert launcher.calls == ["start"]
-    assert len(store.restart_times) == 1  # recorded
+    assert plan.action is wd.Action.ALERT
+    assert plan.exit_code == wd.ExitCode.ACCOUNT_UNKNOWN
+    assert launcher.calls == []
+    assert store.restart_times == []  # nothing was launched, nothing recorded
 
 
-def test_api_down_does_single_restart(tmp_path: Path) -> None:
+def test_api_down_restart_is_refused_because_the_account_is_unprovable(
+    tmp_path: Path,
+) -> None:
+    """A dead API cannot answer a broker query, so cleanliness is UNKNOWN."""
+    raw = wd.decide_action(
+        wd.WatchdogState.API_DOWN,
+        wd.LoginMarker.LOGGED_IN,
+        restart_count=0,
+        relogin_count=0,
+        policy=wd.Policy(),
+        restart_inhibited=False,
+    )
+    assert raw.action is wd.Action.RESTART  # policy unchanged
+
     launcher = FakeLauncher()
     plan, store, _ = cycle(
         tmp_path, probes(tcp=True, current_time=False, login=wd.LoginMarker.LOGGED_IN), launcher
     )
     assert plan.state is wd.WatchdogState.API_DOWN
-    assert plan.action is wd.Action.RESTART
-    assert plan.exit_code == wd.ExitCode.RESTARTED
-    assert launcher.calls == ["restart"]
+    assert plan.action is wd.Action.ALERT
+    assert plan.exit_code == wd.ExitCode.ACCOUNT_UNKNOWN
+    assert launcher.calls == []
+    assert store.restart_times == []
 
 
 def test_restart_budget_exhausted_fails_closed(tmp_path: Path) -> None:
@@ -157,14 +190,30 @@ def test_restart_budget_exhausted_fails_closed(tmp_path: Path) -> None:
 
 
 def test_old_restarts_outside_window_are_pruned(tmp_path: Path) -> None:
+    """Pruning still works — but a freed budget still cannot open the gate."""
     launcher = FakeLauncher()
     policy = wd.Policy(max_restarts=1, restart_window_seconds=100.0)
     store = make_store(tmp_path, restart_times=[10.0])  # far outside the window
     plan = wd.run_cycle(
         probes(process=False), launcher, store, policy=policy, now=1000.0, alert=lambda _p: None
     )
-    assert plan.action is wd.Action.START  # old restart pruned, budget available
-    assert launcher.calls == ["start"]
+    assert store.restart_times == []  # the stale entry was pruned
+    # Budget is available, so the POLICY would start...
+    assert (
+        wd.decide_action(
+            wd.WatchdogState.PROCESS_DOWN,
+            wd.LoginMarker.NONE,
+            restart_count=0,
+            relogin_count=0,
+            policy=policy,
+            restart_inhibited=False,
+        ).action
+        is wd.Action.START
+    )
+    # ...but the account-safety gate still refuses. A budget is not a proof.
+    assert plan.action is wd.Action.ALERT
+    assert plan.exit_code == wd.ExitCode.ACCOUNT_UNKNOWN
+    assert launcher.calls == []
 
 
 # -- 2FA handling ----------------------------------------------------------------
@@ -183,17 +232,28 @@ def test_two_fa_prompt_waits_and_alerts_but_never_restarts(tmp_path: Path) -> No
     assert len(alerts) == 1
 
 
-def test_two_fa_timeout_does_rate_limited_relogin(tmp_path: Path) -> None:
+def test_two_fa_timeout_relogin_is_refused_by_the_safety_gate(tmp_path: Path) -> None:
+    """A 2FA timeout cannot prove account cleanliness, so no relogin happens."""
+    raw = wd.decide_action(
+        wd.WatchdogState.TWO_FA_PENDING,
+        wd.LoginMarker.TWO_FA_TIMEOUT,
+        restart_count=0,
+        relogin_count=0,
+        policy=wd.Policy(),
+        restart_inhibited=False,
+    )
+    assert raw.action is wd.Action.RELOGIN  # policy unchanged
+
     launcher = FakeLauncher()
     plan, store, _ = cycle(
         tmp_path,
         probes(tcp=False, current_time=False, login=wd.LoginMarker.TWO_FA_TIMEOUT),
         launcher,
     )
-    assert plan.action is wd.Action.RELOGIN
-    assert plan.exit_code == wd.ExitCode.RELOGIN
-    assert launcher.calls == ["relogin"]
-    assert len(store.relogin_times) == 1
+    assert plan.action is wd.Action.ALERT
+    assert plan.exit_code == wd.ExitCode.ACCOUNT_UNKNOWN
+    assert launcher.calls == []
+    assert store.relogin_times == []
 
 
 def test_two_fa_relogin_budget_exhausted(tmp_path: Path) -> None:
@@ -212,21 +272,35 @@ def test_two_fa_relogin_budget_exhausted(tmp_path: Path) -> None:
 # -- login failures --------------------------------------------------------------
 
 
-def test_login_failed_relogins_then_hits_limit(tmp_path: Path) -> None:
+def test_login_failed_relogin_is_refused_and_the_limit_still_holds(
+    tmp_path: Path,
+) -> None:
+    """Login failure cannot prove cleanliness; the budget logic is untouched."""
+    policy = wd.Policy(max_relogins=1, relogin_window_seconds=1000.0)
+    # Pure policy: relogin while budget remains, ALERT once exhausted.
+    assert (
+        wd.decide_action(
+            wd.WatchdogState.LOGIN_REQUIRED, wd.LoginMarker.LOGIN_FAILED,
+            restart_count=0, relogin_count=0, policy=policy, restart_inhibited=False,
+        ).action
+        is wd.Action.RELOGIN
+    )
+    exhausted = wd.decide_action(
+        wd.WatchdogState.LOGIN_REQUIRED, wd.LoginMarker.LOGIN_FAILED,
+        restart_count=0, relogin_count=1, policy=policy, restart_inhibited=False,
+    )
+    assert exhausted.action is wd.Action.ALERT
+    assert exhausted.exit_code == wd.ExitCode.LOGIN_FAIL_LIMIT
+
+    # Through run_cycle, neither case ever reaches the launcher.
     launcher = FakeLauncher()
     plan, _, _ = cycle(
         tmp_path, probes(tcp=False, current_time=False, login=wd.LoginMarker.LOGIN_FAILED),
         launcher,
     )
-    assert plan.action is wd.Action.RELOGIN
-    policy = wd.Policy(max_relogins=1, relogin_window_seconds=1000.0)
-    store = make_store(tmp_path, relogin_times=[950.0])
-    plan2 = wd.run_cycle(
-        probes(tcp=False, current_time=False, login=wd.LoginMarker.LOGIN_FAILED),
-        launcher, store, policy=policy, now=1000.0, alert=lambda _p: None,
-    )
-    assert plan2.action is wd.Action.ALERT
-    assert plan2.exit_code == wd.ExitCode.LOGIN_FAIL_LIMIT
+    assert plan.action is wd.Action.ALERT
+    assert plan.exit_code == wd.ExitCode.ACCOUNT_UNKNOWN
+    assert launcher.calls == []
 
 
 def test_login_in_progress_is_benign_wait(tmp_path: Path) -> None:
@@ -309,6 +383,9 @@ def test_watchdog_source_has_no_orders_credentials_or_2fa_bypass() -> None:
         "getpass", "input(", "os.environ",
     ):
         assert fragment not in source, fragment
+    # The read-only probe must not reach a mutating broker verb either.
+    for verb in ("submit_order", "modify_order", "flatten"):
+        assert verb not in source, verb
     # the watchdog never reads the IBC config / credentials file
     assert "config.ini" not in source
 
