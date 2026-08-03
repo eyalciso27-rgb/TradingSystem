@@ -1013,7 +1013,7 @@ remaining defects in the installer itself.
 
 ### 12.1 The fixes
 
-**D-WATCHDOG-08 — structural isolation.** `--dest-root` now invokes neither
+**D-WATCHDOG-08 — structural isolation.** The rehearsal now invokes neither
 `systemctl` nor `systemd-tmpfiles`; the calls are not written in that branch,
 and a test parses the script to prove it rather than relying on PATH stubs.
 The rehearsal validates the staged rule and materialises the directory inside
@@ -1043,7 +1043,7 @@ message and no timer-enable instruction is ever printed after a failure.
 | APPLY, unit changed | yes | `daemon-reload` once | `--create` | create + verify |
 | APPLY, nothing changed | no writes needed | no | `--create` | **create + verify** |
 | APPLY `--no-reload` | yes | no | `--create` | **create + verify** |
-| APPLY `--dest-root=DIR` | into `DIR` | **never** | **never** | validate + create + verify in `DIR` |
+| `--rehearsal` | into a private scratch dir | **never** | **never** | validate + create + verify in that dir (see D-WATCHDOG-10) |
 
 ### 12.3 Safety truth unchanged
 
@@ -1078,3 +1078,57 @@ No IBKR connection; no `systemctl` or `systemd-tmpfiles` run against the owner
 host; nothing installed on the owner host; no Gateway start/stop/restart/
 relogin; no order submitted/cancelled/modified/flattened; no firewall/
 nftables/firewalld/OCI change; no credential; no PAPER_AUTO; no LIVE.
+
+---
+
+## 13. Rehearsal containment (D-WATCHDOG-10)
+
+| ID | Defect | Sev | Why it mattered | Status |
+|---|---|---|---|---|
+| D-WATCHDOG-10 | `--dest-root=DIR` accepted an arbitrary path and concatenated it onto the absolute destinations, with no canonicalization and no constraint | **P1** | The rehearsal avoided `systemctl` and `systemd-tmpfiles` but still ran `install -D`, `mkdir -p` and `chmod`. Those three alone are enough to overwrite a host: `--dest-root=/` installed into the real `/etc/systemd/system` and chmod'ed the real `/run/ibgateway`. Also reachable via a symlinked root, an `etc -> /etc` or `run -> /run` child, or path traversal | ✅ fixed |
+
+**Absence of privileged commands is not containment.** The previous fix
+removed the privileged *commands* from the rehearsal and stopped there; the
+*destination* was still unconstrained, so the isolation claim was overstated.
+
+### 13.1 The fix
+
+`--dest-root` is removed from the public interface. The owner-facing mode is
+`--rehearsal`, and the installer creates its own root with `mktemp -d`. That
+root is newly created by the invocation, proven empty, `0700`, owned by the
+caller, not a symlink, canonically not `/`, **printed**, and deliberately
+**never deleted** so it can be inspected.
+
+Every write then re-resolves its destination and proves it is still beneath
+that root, which also defeats a symlink planted *after* validation.
+
+A deterministic destination is still needed by the tests, so `--dest-root=`
+exists only when `OPS_INSTALL_TEST_MODE=1`; without it the script exits 2 and
+points at `--rehearsal`. Even then the supplied path is canonicalized and
+rejected if it is empty, `/`, a symlink, reached through a symlinked parent,
+inside a system tree, an existing directory without this installer's
+`.ops-rehearsal-root` marker, not owned by the caller, or not `0700`.
+
+Ordering is deliberate: hostile *structure* (symlinks, `/`, system trees) is
+rejected before ownership and mode, so a rejection never depends on a
+filesystem that can represent `0700`. Symlinked components are checked on the
+**supplied** path before canonicalization, because `realpath` resolves them
+silently.
+
+### 13.2 Safety truth unchanged
+
+tmpfiles.d remains the only owner of `/run/ibgateway`; neither unit declares
+`RuntimeDirectory=`; state and lock are `0600` and state writes are atomic;
+one immutable broker snapshot; one disconnect attempt; passive supervision
+only; no automatic Gateway restart; owner-authorized DEF-20 remains manual.
+
+**B-02, B-03 and B-04 remain OPEN. DEF-12 and DEF-13 remain `NOT_RUN`.
+POI-IBKR-001 and POI-MD-001 remain BLOCKED. PAPER_AUTO and LIVE remain
+DISABLED.**
+
+### 13.3 NOT EXECUTED
+
+No IBKR connection; no `systemctl` or `systemd-tmpfiles` against the owner
+host; nothing installed on the owner host; no Gateway start/stop/restart/
+relogin; no order; no firewall/OCI change; no credential; no PAPER_AUTO; no
+LIVE.

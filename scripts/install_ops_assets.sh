@@ -17,17 +17,27 @@
 # host. This installer places files; the owner decides what runs.
 #
 # Usage:
-#   scripts/install_ops_assets.sh                          # CHECK (default)
-#   scripts/install_ops_assets.sh --apply                  # real install
-#   scripts/install_ops_assets.sh --apply --no-reload      # skip reload only
-#   scripts/install_ops_assets.sh --apply --dest-root=DIR  # REHEARSAL
+#   scripts/install_ops_assets.sh                      # CHECK (default)
+#   scripts/install_ops_assets.sh --apply              # real install
+#   scripts/install_ops_assets.sh --apply --no-reload  # skip reload only
+#   scripts/install_ops_assets.sh --rehearsal          # REHEARSAL
 #
-# REHEARSAL (--dest-root=DIR) is STRUCTURALLY isolated: it stages every file
-# under DIR and never invokes systemctl or systemd-tmpfiles at all. Staging
-# the tmpfiles config elsewhere does NOT isolate it — the rule names the
-# ABSOLUTE path /run/ibgateway, so `systemd-tmpfiles --create <scratch>/...`
-# would create and chown the REAL directory. A rehearsal that mutates the
-# thing it is rehearsing is not a rehearsal.
+# REHEARSAL is STRUCTURALLY isolated in two independent ways.
+#
+# 1. It never invokes systemctl or systemd-tmpfiles. Staging the tmpfiles
+#    config elsewhere would NOT isolate it — the rule names the ABSOLUTE path
+#    /run/ibgateway, so `systemd-tmpfiles --create <scratch>/...` would create
+#    and chown the REAL directory. A rehearsal that mutates the thing it is
+#    rehearsing is not a rehearsal.
+#
+# 2. It writes ONLY beneath a private directory that this script creates for
+#    itself with `mktemp -d`, 0700, owned by the caller. There is no
+#    caller-supplied destination to get wrong: absence of privileged COMMANDS
+#    is not containment, because `install -D`, `mkdir -p` and `chmod` are by
+#    themselves enough to overwrite a host given a bad root.
+#
+# The rehearsal directory is PRINTED and deliberately NOT deleted, so the
+# owner can inspect exactly what a real apply would have produced.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -86,6 +96,142 @@ verify_runtime_dir() {
     || fail "runtime directory ${dir} has group ${group}, expected ${want_group}"
 }
 
+# -- rehearsal containment ----------------------------------------------------
+#
+# A rehearsal that avoids systemctl and systemd-tmpfiles is still not isolated:
+# it runs `install -D`, `mkdir -p` and `chmod`. With an unconstrained
+# destination root those three are enough to overwrite the real host —
+# `--dest-root=/` would write straight into /etc/systemd/system and chmod the
+# real /run/ibgateway. Absence of privileged COMMANDS is not containment; the
+# destination has to be constrained too.
+
+#: Written into a directory this installer created as a rehearsal root. We
+#: refuse to write into an existing directory that does not carry it, so a
+#: mistyped root can never turn into "install into someone else's directory".
+REHEARSAL_MARKER=".ops-rehearsal-root"
+
+#: Trees a rehearsal must never resolve into, however it was spelled.
+SYSTEM_TREES=(
+  /etc /run /usr /bin /sbin /boot /dev /proc /sys /lib /lib64 /var/lib /root /home
+)
+
+absolute_path() {
+  case "$1" in
+    /*) printf '%s' "$1" ;;
+    *) printf '%s' "${PWD}/$1" ;;
+  esac
+}
+
+canonicalize() {
+  realpath -m -- "$1" 2>/dev/null
+}
+
+# Checked on the SUPPLIED path, before canonicalization: realpath resolves
+# symlinks silently and would hand back an innocent-looking result for
+# `--dest-root=/tmp/link` where link -> /.
+reject_symlinked_components() {
+  local path="$1" current="" part
+  local -a parts=()
+  IFS='/' read -ra parts <<<"${path#/}"
+  for part in ${parts[@]+"${parts[@]}"}; do
+    [[ -n "${part}" ]] || continue
+    current="${current}/${part}"
+    if [[ -L "${current}" ]]; then
+      fail "rehearsal root path component is a symlink: ${current}"
+    fi
+  done
+}
+
+# A symlink anywhere inside the tree is a write-through into whatever it
+# points at (`etc -> /etc`, `run -> /run`). Rejected before ANY write.
+reject_symlinks_inside() {
+  local root="$1" found
+  found="$(find "${root}" -type l -print 2>/dev/null | head -1 || true)"
+  [[ -z "${found}" ]] || fail "symlink inside the rehearsal root: ${found}"
+}
+
+require_private_dir() {
+  local dir="$1" mode owner me
+  mode="$(stat -c '%a' "${dir}")" || fail "cannot stat ${dir}"
+  owner="$(stat -c '%U' "${dir}")" || fail "cannot stat owner of ${dir}"
+  [[ "${mode}" == "700" || "${mode}" == "0700" ]] \
+    || fail "rehearsal root ${dir} must be 0700, found ${mode}"
+  me="$(id -un 2>/dev/null || id -u)"
+  [[ "${owner}" == "${me}" ]] \
+    || fail "rehearsal root ${dir} must be owned by ${me}, found ${owner}"
+}
+
+# Sets REHEARSAL_ROOT. Deliberately NOT a command substitution: `fail` must
+# exit the script, and inside $(...) it would only exit a subshell.
+validate_rehearsal_root() {
+  local supplied="$1" absolute canonical tree
+  [[ -n "${supplied}" ]] || fail "rehearsal root must not be empty"
+  absolute="$(absolute_path "${supplied}")"
+  reject_symlinked_components "${absolute}"
+
+  canonical="$(canonicalize "${absolute}")" \
+    || fail "cannot canonicalize rehearsal root: ${supplied}"
+  [[ -n "${canonical}" ]] || fail "rehearsal root canonicalizes to nothing: ${supplied}"
+  # Traversal is handled here: whatever ../.. spelled, the canonical form is
+  # what every containment check below is measured against.
+  [[ "${canonical}" != "/" ]] || fail "rehearsal root must not be /"
+  for tree in "${SYSTEM_TREES[@]}"; do
+    if [[ "${canonical}" == "${tree}" || "${canonical}" == "${tree}"/* ]]; then
+      fail "rehearsal root must not be inside a system tree: ${canonical}"
+    fi
+  done
+
+  if [[ -e "${canonical}" ]]; then
+    [[ -d "${canonical}" ]] \
+      || fail "rehearsal root exists and is not a directory: ${canonical}"
+    # Structure first, ownership second: a hostile tree is rejected even on a
+    # filesystem that cannot represent 0700.
+    reject_symlinks_inside "${canonical}"
+    [[ -f "${canonical}/${REHEARSAL_MARKER}" ]] \
+      || fail "refusing to write into an existing directory with no ${REHEARSAL_MARKER}: ${canonical}"
+    require_private_dir "${canonical}"
+  else
+    mkdir -p -- "${canonical}"
+    chmod 0700 -- "${canonical}"
+    printf 'created by scripts/install_ops_assets.sh\n' \
+      > "${canonical}/${REHEARSAL_MARKER}"
+    require_private_dir "${canonical}"
+  fi
+  REHEARSAL_ROOT="${canonical}"
+}
+
+# The owner-facing mode: the installer picks its own private directory, so
+# there is no root to get wrong. Never deleted — the point is to inspect it.
+create_private_rehearsal_root() {
+  local root canonical
+  root="$(mktemp -d "${TMPDIR:-/tmp}/ops-rehearsal-XXXXXXXX")" \
+    || fail "could not create a private rehearsal directory"
+  [[ ! -L "${root}" ]] || fail "mktemp returned a symlink: ${root}"
+  chmod 0700 -- "${root}"
+  canonical="$(canonicalize "${root}")" || fail "cannot canonicalize ${root}"
+  [[ "${canonical}" != "/" ]] || fail "refusing to rehearse into /"
+  if [[ -n "$(ls -A -- "${canonical}" 2>/dev/null || true)" ]]; then
+    fail "a fresh rehearsal root must be empty: ${canonical}"
+  fi
+  printf 'created by scripts/install_ops_assets.sh\n' \
+    > "${canonical}/${REHEARSAL_MARKER}"
+  require_private_dir "${canonical}"
+  REHEARSAL_ROOT="${canonical}"
+}
+
+# Belt and braces for every single write: resolve the destination and prove it
+# is still under the root. This catches a symlink created AFTER validation,
+# which the scan above cannot.
+assert_within_root() {
+  local target="$1" canonical
+  [[ "${REHEARSAL:-0}" -eq 1 ]] || return 0
+  canonical="$(canonicalize "${target}")" || fail "cannot canonicalize ${target}"
+  case "${canonical}" in
+    "${REHEARSAL_ROOT}" | "${REHEARSAL_ROOT}"/*) ;;
+    *) fail "destination escapes the rehearsal root: ${target} -> ${canonical}" ;;
+  esac
+}
+
 # Test seam: source this file with OPS_INSTALL_LIB_ONLY=1 to get the helpers
 # above without running an install. Nothing below this line has executed yet,
 # so sourcing is side-effect free. It changes no behaviour of a normal run.
@@ -97,21 +243,46 @@ fi
 
 APPLY=0
 RELOAD=1
+REHEARSAL=0
+REHEARSAL_ROOT=""
 # Prefix for every destination path. Empty means the real system paths.
 DEST_ROOT=""
+SUPPLIED_ROOT=""
+#: Tracked separately from the value: `--dest-root=` with an EMPTY value must
+#: be rejected, not silently upgraded into a private root.
+DEST_ROOT_GIVEN=0
 for arg in "$@"; do
   case "${arg}" in
     --apply) APPLY=1 ;;
     --no-reload) RELOAD=0 ;;
-    --dest-root=*) DEST_ROOT="${arg#*=}" ;;
-    -h|--help) sed -n '2,31p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --rehearsal) REHEARSAL=1; APPLY=1 ;;
+    --dest-root=*)
+      # NOT a public interface. A caller-supplied destination is the whole
+      # attack surface fixed here, so it exists only for deterministic tests.
+      # Owners use --rehearsal, where the installer picks the directory.
+      if [[ "${OPS_INSTALL_TEST_MODE:-}" != "1" ]]; then
+        echo "--dest-root is a test-only interface; use --rehearsal" >&2
+        exit 2
+      fi
+      SUPPLIED_ROOT="${arg#*=}"
+      DEST_ROOT_GIVEN=1
+      REHEARSAL=1
+      ;;
+    -h|--help) sed -n '2,33p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: ${arg}" >&2; exit 2 ;;
   esac
 done
 
-REHEARSAL=0
-if [[ -n "${DEST_ROOT}" ]]; then
-  REHEARSAL=1
+# Establish and validate the rehearsal root BEFORE anything is written.
+if [[ "${REHEARSAL}" -eq 1 ]]; then
+  if [[ "${DEST_ROOT_GIVEN}" -eq 1 ]]; then
+    validate_rehearsal_root "${SUPPLIED_ROOT}"
+  else
+    create_private_rehearsal_root
+  fi
+  DEST_ROOT="${REHEARSAL_ROOT}"
+  echo ">>> REHEARSAL ROOT: ${REHEARSAL_ROOT}"
+  echo ">>> It is kept for inspection and is NOT deleted on exit."
 fi
 
 # Reported state, so the final summary can never overstate what happened.
@@ -159,6 +330,9 @@ for entry in "${ASSETS[@]}"; do
     echo "MISSING SOURCE: ${src}" >&2
     exit 1
   fi
+
+  # Before we even READ the destination: prove it resolves inside the root.
+  assert_within_root "${dst}"
 
   if [[ -f "${dst}" ]] && diff -q "${src}" "${dst}" >/dev/null 2>&1; then
     echo "unchanged : ${dst}"
@@ -266,7 +440,11 @@ if [[ "${REHEARSAL}" -eq 1 ]]; then
   # inside the scratch root, then verify it exactly as a real apply would.
   STATE_TMPFILES="VALIDATED (rehearsal — systemd-tmpfiles NOT invoked)"
   echo "tmpfiles config: ${STATE_TMPFILES}"
+  # `run -> /run` inside the root would make this mkdir/chmod hit the real
+  # /run/ibgateway, so the destination is re-resolved immediately before use.
+  assert_within_root "${runtime_dir}"
   mkdir -p "${runtime_dir}"
+  assert_within_root "${runtime_dir}"
   chmod "${rule_mode}" "${runtime_dir}"
   # A non-privileged rehearsal cannot chown to opc:opc, so ownership is
   # verified against the invoking user and the REAL owner check is explicitly
