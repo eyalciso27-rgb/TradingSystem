@@ -27,9 +27,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import logging
-import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -612,42 +610,20 @@ def test_the_audit_never_prints_the_process_command_line() -> None:
 
 
 # =============================================================================
-# WP7 — the remediation tool
+# WP7 — the remediation tool (static contract only)
+#
+# Behavioural coverage — phase ordering, zero-mutation prechecks, the
+# transaction/rollback matrix, the persisted VERIFY baseline and REAL
+# apply-twice idempotency — lives in test_remediation_transaction.py, which
+# builds a full sysroot fixture. The tests here assert properties of the
+# script TEXT and need no fixture.
 # =============================================================================
 
 
-def _remediate(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    sysroot = tmp_path / "sysroot"
-    (sysroot / "etc/systemd/system/ibgateway-ibc.service.d").mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, OPS_REMEDIATE_TEST_MODE="1")
-    return subprocess.run(  # noqa: S603
-        ["bash", str(REMEDIATE), f"--sysroot={sysroot.as_posix()}", *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-        timeout=120,
-        check=False,
-    )
-
-
-@BASH_ONLY
-def test_remediation_defaults_to_check_and_changes_nothing(tmp_path: Path) -> None:
-    sysroot = tmp_path / "sysroot"
-    result = _remediate(tmp_path)
-    assert "MODE: CHECK" in result.stdout.upper()
-    assert "CHECK ONLY — nothing was changed" in result.stdout
-    # The scratch tree is untouched apart from the dirs the fixture created.
-    created = sorted(p.name for p in (sysroot / "etc/systemd/system").rglob("*"))
-    assert created == ["ibgateway-ibc.service.d"]
-
-
-@BASH_ONLY
-def test_remediation_never_invokes_a_process_action(tmp_path: Path) -> None:
+def test_remediation_never_invokes_a_process_action() -> None:
     """No start/stop/restart/relogin/enable exists anywhere in the tool."""
     source = REMEDIATE.read_text(encoding="utf-8")
-    code = "\n".join(
+    code = chr(10).join(
         line
         for line in source.splitlines()
         if line.strip() and not line.strip().startswith("#")
@@ -665,64 +641,13 @@ def test_remediation_never_invokes_a_process_action(tmp_path: Path) -> None:
         assert forbidden not in code, forbidden
 
 
-@BASH_ONLY
-def test_remediation_check_is_read_only(tmp_path: Path) -> None:
-    result = _remediate(tmp_path)
-    assert result.returncode == 0, result.stderr
-    assert "NEVER started, stopped, restarted or relogged in" in result.stdout
-
-
-@BASH_ONLY
-def test_remediation_is_idempotent(tmp_path: Path) -> None:
-    first = _remediate(tmp_path)
-    second = _remediate(tmp_path)
-    assert first.returncode == second.returncode
-    # Same findings, same verdict, on an unchanged tree.
-    assert _verdict(first.stdout) == _verdict(second.stdout)
-
-
-def _verdict(text: str) -> str:
-    for line in text.splitlines():
-        if "worst finding:" in line:
-            return line.strip()
-    return ""
-
-
-@BASH_ONLY
-def test_remediation_preserves_the_gateway_identity(tmp_path: Path) -> None:
-    sysroot = tmp_path / "sysroot"
-    sysroot.mkdir(parents=True, exist_ok=True)
-    (sysroot / "gateway.pid").write_text("4242\n", encoding="utf-8")
-    (sysroot / "gateway.start").write_text("Mon Aug 4 00:00:00 2026\n", encoding="utf-8")
-    result = _remediate(tmp_path, "--verify")
-    assert "gateway_untouched" in result.stdout
-    assert "PID and start time unchanged" in result.stdout
-
-
-@BASH_ONLY
-def test_remediation_sysroot_is_test_only(tmp_path: Path) -> None:
-    env = dict(os.environ)
-    env.pop("OPS_REMEDIATE_TEST_MODE", None)
-    result = subprocess.run(  # noqa: S603
-        ["bash", str(REMEDIATE), "--sysroot=/tmp/x"],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=60,
-        check=False,
-    )
-    assert result.returncode == 2
-    assert "test-only" in result.stderr
-
-
 def test_remediation_never_prints_sensitive_operational_data() -> None:
     source = REMEDIATE.read_text(encoding="utf-8")
-    code = "\n".join(
+    code = chr(10).join(
         line
         for line in source.splitlines()
         if line.strip() and not line.strip().startswith("#")
     )
-    # No java argv, no IBC config, no account id, no credential.
     for forbidden in ("config.ini", "IbLoginId", "IbPassword", "ps -o args", "cmdline"):
         assert forbidden not in code, forbidden
     assert "never prints Java command-line arguments" in source

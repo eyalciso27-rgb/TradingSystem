@@ -1358,3 +1358,88 @@ No IBKR connection from this bundle; no owner-host modification; no
 `systemctl`; no Gateway start/stop/restart/relogin; no timer enable; no order,
 cancel, modify or flatten; no firewall/OCI/SSH/VNC change; no credential or
 account id recorded.
+
+
+---
+
+## 15. Independent-review corrections to the remediation package (D-WATCHDOG-18 … D-WATCHDOG-24)
+
+Green CI does not resolve a review finding when the finding IS that a test is
+missing or wrongly constructed. Seven such defects were confirmed.
+
+| ID | Defect | Sev | Status |
+|---|---|---|---|
+| D-WATCHDOG-18 | Redaction matched only 1-2 letter account prefixes | **P1** | fixed: 1-4 letters |
+| D-WATCHDOG-19 | Drop-in classification ran through a heredoc; import/parse failure degraded to a WARN | **P1** | fixed: pinned-venv CLI, hard preflight failure |
+| D-WATCHDOG-20 | Validation interleaved with mutation | **P1** | fixed: COLLECT -> VALIDATE_ALL -> BUILD_PLAN before any write |
+| D-WATCHDOG-21 | No transaction, no backup verification, no rollback | **P1** | fixed: manifest + hashed private backup + reverse-order rollback |
+| D-WATCHDOG-22 | VERIFY self-baselined; PID alone was treated as identity | **P1** | fixed: persisted pre-APPLY baseline, PID + start ticks + cgroup |
+| D-WATCHDOG-23 | The "idempotency" test invoked default CHECK twice | **P2** | fixed: real APPLY-twice test; the old one renamed |
+| D-WATCHDOG-24 | Deep-probe test counted one wrapper callback | **P2** | fixed: transports/connects/requests/disconnects counted |
+
+### 15.1 Redaction bound
+
+`[A-Z]{1,2}` covered only the two shapes in front of us. A three- or
+four-letter prefix passed straight through. Now `[A-Z]{1,4}`, proven against
+**synthetic** ids only — the real owner-host identifier is never written into
+this repository, and widening the bound costs nothing while under-redacting is
+permanent.
+
+### 15.2 Deterministic classification
+
+Drop-ins are classified by invoking `scripts/systemd_contract.py classify` at an
+ABSOLUTE path with the pinned venv interpreter, under `-B` and
+`PYTHONDONTWRITEBYTECODE=1`. Exit codes are distinct: `0` clean, `1`
+contradicts, `2` **cannot classify**. A heredoc has no stable identity — it
+cannot be reviewed, hashed or pinned, and any import problem inside it
+degrades to text on stdout. Parsing is strict: an unparseable drop-in raises
+rather than reading as "no overrides", because *"I could not read this" must
+never be reported as "this is fine"*. Any `2` is a hard preflight failure and
+permits **zero** mutation.
+
+### 15.3 Phase order is the safety property
+
+`COLLECT -> VALIDATE_ALL -> BUILD_PLAN -> [EXECUTE] -> POST_COLLECT -> STATE`.
+Nothing is copied, moved, renamed or written until the first three complete. A
+tool that validates as it goes has already changed the host by the time it
+discovers it should not have started. On any precheck failure no transaction is
+opened, no backup directory is created and no baseline is written.
+
+### 15.4 Transaction, backup, rollback
+
+A collision-resistant `mktemp` transaction directory (0700, root-owned) holds a
+0600 manifest of `action, original, backup, sha256, destination`. Every backup
+is hash-verified against its original before the move. On any failure after a
+mutation, rollback replays the manifest in reverse, restores each original,
+verifies the restored hash and removes what the move created — so a rolled-back
+host is byte-identical, not "the original plus a stray artefact".
+
+### 15.5 daemon-reload matrix
+
+Exactly once, and only when something changed. **A quarantined drop-in changes
+the EFFECTIVE unit even when the base unit file is byte-identical**, so a reload
+keyed only on "did the unit file change" would leave systemd serving the
+contradicted contract.
+
+### 15.6 Persisted baseline
+
+`--apply` writes `/var/lib/ibgateway-remediation/gateway-baseline.env` (0600)
+before the first mutation: `schema`, `captured_phase`, `gateway_pid`,
+`gateway_start_ticks`, `gateway_cgroup`. Standalone `--verify` REQUIRES that
+file and refuses to run without it — it must never create its own, because
+comparing a value to itself proves nothing. **PID alone is not identity**: PIDs
+are reused, so `/proc/PID/stat` field 22 (start ticks) and the cgroup are
+carried too.
+
+### 15.7 Final states
+
+`FAILED_PRECHECK` · `FAILED_APPLY_ROLLED_BACK` · `FAILED_APPLY_PARTIAL_ROLLBACK`
+· `REMEDIATED_RESTART_REQUIRED` · `VERIFIED_COMPLETE` · `NO_CHANGES_REQUIRED`.
+VERIFY also requires the timer **disabled AND inactive** and the watchdog
+service inactive.
+
+### 15.8 Status truth
+
+Unchanged. **B-02/B-03/B-04 OPEN. DEF-12/DEF-13 NOT_RUN. IMP-1303/IMP-1304
+incomplete. POI-IBKR-001 and POI-MD-001 BLOCKED. PAPER_AUTO and LIVE DISABLED.**
+The owner host has not been modified by this bundle.

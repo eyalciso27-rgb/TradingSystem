@@ -328,11 +328,59 @@ verify_runtime_contract() {
   [[ -x "${RUNTIME_VENV_PYTHON}" ]]     || fail "venv interpreter missing or not executable: ${RUNTIME_VENV_PYTHON}"
   [[ -r "${RUNTIME_WATCHDOG}" ]]     || fail "canonical watchdog script missing: ${RUNTIME_WATCHDOG}"
 
+  probe_runtime_imports || fail "${RUNTIME_IMPORT_DETAIL}"
+  echo "  runtime imports   : VERIFIED with ${RUNTIME_VENV_PYTHON}"
+}
+
+#: Import probe shared by CHECK and APPLY. Returns non-zero and sets
+#: RUNTIME_IMPORT_DETAIL on failure; writes NOTHING either way.
+#:
+#: -B and PYTHONDONTWRITEBYTECODE=1 are not cosmetic. Importing a package
+#: normally creates __pycache__ directories inside the repository, so a CHECK
+#: that imported anything would no longer be read-only — it would leave
+#: artefacts behind on the very host it claims not to touch.
+RUNTIME_IMPORT_DETAIL=""
+probe_runtime_imports() {
+  RUNTIME_IMPORT_DETAIL=""
+  if [[ ! -x "${RUNTIME_VENV_PYTHON}" ]]; then
+    RUNTIME_IMPORT_DETAIL="venv interpreter missing or not executable: ${RUNTIME_VENV_PYTHON}"
+    return 1
+  fi
   local module
   for module in ${RUNTIME_REQUIRED_IMPORTS}; do
-    "${RUNTIME_VENV_PYTHON}" -c "import ${module}" >/dev/null 2>&1       || fail "the pinned interpreter cannot import ${module}; the deep probe would never work"
+    if ! PYTHONDONTWRITEBYTECODE=1 "${RUNTIME_VENV_PYTHON}" -B -c "import ${module}"         >/dev/null 2>&1; then
+      RUNTIME_IMPORT_DETAIL="the pinned interpreter cannot import ${module}; the deep probe would never work"
+      return 1
+    fi
   done
-  echo "  runtime imports   : VERIFIED with ${RUNTIME_VENV_PYTHON}"
+  return 0
+}
+
+#: CHECK-side validation. Genuinely executes the checks and REPORTS them; it
+#: never mutates and never fails the run, because "this host is not ready yet"
+#: is information a dry run exists to give, not a dry-run failure.
+report_runtime_readiness() {
+  local ready=1
+  if [[ -d "${RUNTIME_REPO_ROOT}" ]]; then
+    echo "  repo root         : PRESENT ${RUNTIME_REPO_ROOT}"
+  else
+    echo "  repo root         : MISSING ${RUNTIME_REPO_ROOT}"; ready=0
+  fi
+  if [[ -r "${RUNTIME_WATCHDOG}" ]]; then
+    echo "  watchdog script   : READABLE"
+  else
+    echo "  watchdog script   : MISSING ${RUNTIME_WATCHDOG}"; ready=0
+  fi
+  if probe_runtime_imports; then
+    echo "  runtime imports   : OK via ${RUNTIME_VENV_PYTHON} (-B, no bytecode written)"
+  else
+    echo "  runtime imports   : NOT SATISFIED — ${RUNTIME_IMPORT_DETAIL}"; ready=0
+  fi
+  if [[ "${ready}" -eq 1 ]]; then
+    echo "  runtime readiness : READY — an --apply would satisfy the contract"
+  else
+    echo "  runtime readiness : NOT READY — an --apply would FAIL here"
+  fi
 }
 
 # Test seam: source this file with OPS_INSTALL_LIB_ONLY=1 to get the helpers
@@ -485,6 +533,9 @@ if [[ "${APPLY}" -eq 0 ]]; then
   echo "  * verify the installed watchdog unit's runtime contract:"
   describe_runtime_contract
   echo "  * verify the pinned interpreter can import: ${RUNTIME_REQUIRED_IMPORTS}"
+  echo
+  echo "READ-ONLY VALIDATION (executed now; nothing is written):"
+  report_runtime_readiness
   echo
   cat <<'CHECKNEXT'
 NEXT STEPS (owner decisions, performed by hand — deliberately not automated):

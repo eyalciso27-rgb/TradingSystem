@@ -27,8 +27,10 @@ text, so the whole contract is testable without systemd.
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 
 CANONICAL_GATEWAY_UNIT = "ibgateway-ibc.service"
 CANONICAL_WATCHDOG_UNIT = "ibgateway-watchdog.service"
@@ -124,6 +126,32 @@ def parse_dropin(path: str, text: str) -> DropIn:
         key, _, value = line.partition("=")
         settings.setdefault(key.strip(), []).append(value.strip())
     return DropIn(path=path, settings=settings)
+
+
+class DropInParseError(Exception):
+    """A drop-in could not be parsed, so it cannot be judged."""
+
+
+def parse_dropin_strict(path: str, text: str) -> DropIn:
+    """Parse, refusing anything that is not recognisable unit syntax.
+
+    The lenient parser skips lines it does not understand, which means a
+    corrupt or unexpected drop-in classifies as "no overrides" — i.e. as
+    harmless. For a tool that is about to move files on a host, "I could not
+    read this" must never be reported as "this is fine".
+    """
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            continue
+        if "=" not in line:
+            raise DropInParseError(f"{path}:{number}: not a key=value assignment")
+        key, _, _ = line.partition("=")
+        if not key.strip() or any(c in key for c in "\x00\r"):
+            raise DropInParseError(f"{path}:{number}: unusable key")
+    return parse_dropin(path, text)
 
 
 def _environment_names(values: list[str]) -> set[str]:
@@ -379,6 +407,48 @@ def worst(findings: list[Finding]) -> Severity:
     return Severity.OK
 
 
+#: Exit codes for the ``classify`` CLI below. The caller MUST distinguish
+#: "classified, and it contradicts" from "could not classify at all": the
+#: second is a failure to know, and a remediation tool that cannot classify a
+#: drop-in must refuse to touch anything rather than assume it is harmless.
+EXIT_CLEAN = 0
+EXIT_CONTRADICTS = 1
+EXIT_CANNOT_CLASSIFY = 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``systemd_contract.py classify <path>`` — deterministic, importable.
+
+    Exists so the remediation tool can classify a drop-in by invoking this
+    file at an ABSOLUTE path with the pinned interpreter, instead of piping a
+    heredoc into whatever python is nearby. A heredoc has no stable identity:
+    it cannot be reviewed, hashed or version-pinned, and any import problem
+    inside it degrades to text on stdout.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    if len(args) != 2 or args[0] != "classify":
+        print("usage: systemd_contract.py classify <dropin-path>", file=sys.stderr)
+        return EXIT_CANNOT_CLASSIFY
+    path = Path(args[1])
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        print(f"cannot read drop-in: {error}", file=sys.stderr)
+        return EXIT_CANNOT_CLASSIFY
+    try:
+        findings = classify_dropin(parse_dropin_strict(str(path), text))
+    except Exception as error:  # noqa: BLE001 - any failure => cannot classify
+        print(f"cannot classify drop-in: {type(error).__name__}", file=sys.stderr)
+        return EXIT_CANNOT_CLASSIFY
+
+    failed = [f for f in findings if f.severity is Severity.FAIL]
+    if failed:
+        print("; ".join(f.detail for f in failed))
+        return EXIT_CONTRADICTS
+    print("; ".join(f.detail for f in findings) or "no overrides")
+    return EXIT_CLEAN
+
+
 __all__ = [
     "ALLOWED_DROPIN_SETTINGS",
     "CANONICAL_GATEWAY_CONTRACT",
@@ -393,6 +463,7 @@ __all__ = [
     "VENV_PYTHON",
     "WATCHDOG_SCRIPT",
     "DropIn",
+    "DropInParseError",
     "Finding",
     "Severity",
     "check_effective_gateway",
@@ -402,6 +473,15 @@ __all__ = [
     "contradicting_dropins",
     "exec_start_argv",
     "parse_dropin",
+    "parse_dropin_strict",
     "parse_show_properties",
     "worst",
+    "EXIT_CANNOT_CLASSIFY",
+    "EXIT_CLEAN",
+    "EXIT_CONTRADICTS",
+    "main",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

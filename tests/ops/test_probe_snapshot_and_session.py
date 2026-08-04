@@ -355,3 +355,114 @@ def test_the_paper_gate_still_runs_before_any_other_read() -> None:
     assert SafetyReason.ACCOUNT_NOT_PAPER in report.reasons
     assert view.count("get_open_orders") == 0
     assert view.count("disconnect") == 1
+
+
+# =============================================================================
+# Concrete orchestration: count TRANSPORTS, connects, requests and disconnects
+# =============================================================================
+#
+# The earlier deep-status test counted one wrapper callback, which cannot tell
+# "one session" from "two sessions behind one wrapper". These counters sit on
+# the objects the probe actually drives, so an extra transport, an extra
+# connect or a missing disconnect is visible.
+
+
+class InstrumentedBroker:
+    """Counts every orchestration event the probe causes."""
+
+    #: Class-level so a SECOND transport construction is observable.
+    transports_constructed = 0
+
+    def __init__(self, view: Any) -> None:
+        InstrumentedBroker.transports_constructed += 1
+        self._view = view
+        self.connects = 0
+        self.disconnects = 0
+        self.requests: list[str] = []
+
+    def connect(self) -> None:
+        self.connects += 1
+        self._view.connect()
+
+    def disconnect(self) -> None:
+        self.disconnects += 1
+        self._view.disconnect()
+
+    def health_check(self) -> Any:
+        self.requests.append("health_check")
+        return self._view.health_check()
+
+    def get_account_snapshot(self, alias: str) -> Any:
+        self.requests.append("get_account_snapshot")
+        return self._view.get_account_snapshot(alias)
+
+    def get_open_orders(self, alias: str) -> Any:
+        self.requests.append("get_open_orders")
+        return self._view.get_open_orders(alias)
+
+    def get_positions(self, alias: str) -> Any:
+        self.requests.append("get_positions")
+        return self._view.get_positions(alias)
+
+    def order_events(self) -> Any:
+        self.requests.append("order_events")
+        return self._view.order_events()
+
+    def reconcile(self, alias: str) -> Any:
+        self.requests.append("reconcile")
+        return self._view.reconcile(alias)
+
+
+def test_a_clean_deep_probe_uses_one_transport_one_connect_one_disconnect() -> None:
+    InstrumentedBroker.transports_constructed = 0
+    broker = InstrumentedBroker(FakeView())
+    report = probe_account_safety(
+        broker, ProbeConfig(account_alias=ALIAS), now=NOW
+    )
+    assert report.safety is AccountSafety.CLEAN, report.reasons
+
+    assert InstrumentedBroker.transports_constructed == 1, "a second transport was built"
+    assert broker.connects == 1, f"connects={broker.connects}"
+    assert broker.disconnects == 1, f"disconnects={broker.disconnects}"
+
+    # Every broker request, in order, exactly once — no reqCurrentTime session
+    # ahead of the snapshot and no repeated read behind it.
+    assert broker.requests == [
+        "health_check",
+        "get_account_snapshot",
+        "get_open_orders",
+        "get_positions",
+        "order_events",
+        "reconcile",
+    ], broker.requests
+    assert len(broker.requests) == len(set(broker.requests)), "a request repeated"
+
+
+def test_a_failed_read_still_uses_one_connect_and_one_disconnect() -> None:
+    InstrumentedBroker.transports_constructed = 0
+    broker = InstrumentedBroker(FakeView(fail_on="get_positions"))
+    report = probe_account_safety(broker, ProbeConfig(account_alias=ALIAS), now=NOW)
+    assert report.safety is AccountSafety.UNKNOWN
+    assert InstrumentedBroker.transports_constructed == 1
+    assert broker.connects == 1
+    assert broker.disconnects == 1, "a failure path must still close its session once"
+
+
+def test_a_failed_connect_builds_one_transport_and_never_disconnects() -> None:
+    InstrumentedBroker.transports_constructed = 0
+    broker = InstrumentedBroker(FakeView(fail_on="connect"))
+    report = probe_account_safety(broker, ProbeConfig(account_alias=ALIAS), now=NOW)
+    assert report.safety is AccountSafety.UNKNOWN
+    assert InstrumentedBroker.transports_constructed == 1
+    assert broker.connects == 1
+    assert broker.disconnects == 0, "nothing was open; nothing to close"
+    assert broker.requests == [], "no request may be issued without a connection"
+
+
+def test_the_probe_never_reconnects_after_a_disconnect_failure() -> None:
+    InstrumentedBroker.transports_constructed = 0
+    broker = InstrumentedBroker(FakeView(fail_on="disconnect"))
+    report = probe_account_safety(broker, ProbeConfig(account_alias=ALIAS), now=NOW)
+    assert report.safety is AccountSafety.UNKNOWN
+    assert broker.connects == 1, "a failed disconnect must not trigger a retry session"
+    assert broker.disconnects == 1

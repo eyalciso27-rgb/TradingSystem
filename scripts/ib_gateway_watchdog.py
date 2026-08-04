@@ -98,9 +98,15 @@ logger = logging.getLogger("ib_gateway_watchdog")
 #: ``managedAccounts`` callback, so containment cannot rely on our own call
 #: sites being careful: every record on every handler is filtered.
 #:
-#: Matches IBKR-shaped ids (DU1234567, U1234567) and partial forms, so a
-#: truncated id cannot leak either.
-_ACCOUNT_ID_PATTERN = re.compile(r"\b[A-Z]{1,2}\d{5,}\b")
+#: Matches account-shaped ids with a ONE to FOUR letter prefix, and partial
+#: forms, so a truncated id cannot leak either.
+#:
+#: The previous ``[A-Z]{1,2}`` covered only the two shapes that happened to be
+#: in front of us. Broker and sub-account identifiers are not limited to those:
+#: a three- or four-letter prefix would have passed straight through the
+#: filter. The bound is widened rather than guessed narrow — over-redacting a
+#: log line costs nothing; under-redacting one is permanent.
+_ACCOUNT_ID_PATTERN = re.compile(r"\b[A-Z]{1,4}\d{5,}\b")
 ACCOUNT_ID_PLACEHOLDER = "<redacted-account-id>"
 
 #: Dependency loggers that must never be raised to INFO/DEBUG by us. ibapi
