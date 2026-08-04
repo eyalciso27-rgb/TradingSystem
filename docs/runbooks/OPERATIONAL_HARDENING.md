@@ -148,6 +148,118 @@ connect/disconnect results.
 
 ### JSON for evidence capture
 
+
+---
+
+## 3b. What each status command actually does
+
+| Command | Broker sessions | Proof ceiling | What it reports |
+|---|---|---|---|
+| `--status` | **none** | `TCP_OPEN` | process, raw TCP-open, sanitized IBC login marker, lifecycle/state metadata |
+| `--deep-probe --status` | **exactly one** | `FULL_ACCOUNT_SNAPSHOT` | everything above plus one complete read-only account snapshot |
+
+**Plain `--status` opens no IBKR session.** It constructs no transport, sends
+no `startApi`, requests no current time, receives no `managedAccounts`, builds
+no account-safety adapter, creates no launcher, takes no lock and writes no
+state. This is structural: the status path is handed a `StatusProbes` that
+defines no round-trip probe at all.
+
+It previously *did* connect — it called a round-trip probe that connected, sent
+`startApi`, requested the current time and disconnected, while being documented
+as doing none of that. A read-only status that attaches an API client changes
+the thing it is observing.
+
+**Honest vocabulary.** Observation cannot establish API readiness, so plain
+status cannot say `API_READY` — the observation vocabulary does not contain it.
+It reports `observed_state: API_PORT_OPEN_UNVERIFIED`, `state: null` and
+`api_round_trip_ok: null`. *Null means not tested, which is not the same fact
+as tested-and-failed.*
+
+**`--deep-probe --status` uses exactly one session.** Connectivity, round trip,
+Paper validation, orders, positions, unresolved states, reconciliation,
+disconnect and the verdict all come from that single captured snapshot.
+
+### Account identifiers are contained
+
+A broker account id is sensitive **operational data** — not a credential; it
+cannot be used to log in. It must still never reach a terminal, a journal or an
+evidence file.
+
+`configure_logging()` runs before any connection: one handler, **root at
+WARNING**, `ibapi` loggers pinned to WARNING, and a redaction filter on every
+handler and dependency logger that scrubs account-shaped tokens from the
+message, the formatted arguments and the exception text. Status output is
+scrubbed once more immediately before printing.
+
+The previous code called `logging.basicConfig(level=INFO)`, which raises the
+**root** level and therefore enables INFO for every library in the process.
+ibapi's `managedAccounts` callback then wrote the complete Paper account id to
+stderr — around the sanitized JSON model, which was the only containment that
+existed. Containment never depends on shell redirection.
+
+### The canonical watchdog runtime
+
+```
+WorkingDirectory=/home/opc/projects/TradingSystem
+ExecStart=/home/opc/projects/TradingSystem/.venv/bin/python   /home/opc/projects/TradingSystem/scripts/ib_gateway_watchdog.py …
+```
+
+Absolute interpreter, absolute script, both inside the reviewed repository. No
+`/usr/bin/env`, no system Python, no `uv sync`, no copy under `/opt`. The host
+previously ran a **stale** `/opt` copy with an interpreter that could not
+import `trading_broker_ibkr` at all, so the deep probe could never have worked.
+
+### Drop-in policy
+
+Installed **files** matching the repository proves nothing — on the owner host
+they matched byte-for-byte while drop-ins rewrote `Type`, `RemainAfterExit`,
+`KillMode` and every confinement directive, leaving systemd reporting
+`active (exited)` with `MainPID=0` while the live Gateway ran in a user session
+scope it did not own. Only **effective** properties and the drop-in set can
+establish the contract.
+
+Drop-ins are judged by **content, not filename**. Any override of `Type`,
+`RemainAfterExit`, `KillMode`, `Restart`, `ExecStart`, `User`, `Group`,
+`WorkingDirectory`, `PrivateTmp`, `ProtectSystem`, `ProtectHome`,
+`ReadWritePaths` or `RuntimeDirectory` fails closed. `DISPLAY` and
+`XAUTHORITY` are the only permitted host-specific settings, and an allowed
+setting does not launder the file it travels in.
+
+### One remediation tool
+
+```bash
+scripts/remediate_owner_host_runtime.sh            # --check (default), read-only
+scripts/remediate_owner_host_runtime.sh --apply
+scripts/remediate_owner_host_runtime.sh --verify
+```
+
+It never starts, stops, restarts or relogins the Gateway, never enables the
+timer, never touches firewall/OCI/SSH/VNC, and never prints Java command-line
+arguments, an account id or IBC config content. `--apply` quarantines
+contradicting drop-ins after a private `0600` backup and renames the stale
+`/opt` copy only once the canonical one is verified. `--verify` proves the
+Gateway PID and start time did not change.
+
+> **Correcting the Gateway's process ownership requires a restart**, which is
+> an owner-authorized action under `docs/runbooks/CHAOS_RECOVERY_DRILLS.md`.
+> The tool makes the next start correct and proves the current one untouched.
+
+### Owner-host activation status
+
+**NOT complete.** Installation succeeded and was idempotent, `/run/ibgateway`
+is correct, and the timer is still disabled — but the runtime contract was
+wrong in the ways above. **B-02/B-03/B-04 remain OPEN, DEF-12/DEF-13 remain
+`NOT_RUN`, IMP-1303/IMP-1304 remain incomplete, POI-IBKR-001 and POI-MD-001
+remain BLOCKED, PAPER_AUTO and LIVE remain DISABLED** until this bundle is
+merged and the remediation tool has been run.
+
+Ports 4002 and 5901 listen on all interfaces; firewalld currently permits only
+22, 80, 81 and 443 publicly; OCI remains UNKNOWN. Three separate facts, never
+merged: a revocable firewall rule does not make an all-interfaces bind
+acceptable. **No firewall, VNC or OCI change is made here.**
+
+---
+
 ```bash
 uv run --no-sync python scripts/ib_gateway_watchdog.py --status --json \
   > /tmp/watchdog-status-$(date -u +%Y%m%dT%H%M%SZ).json

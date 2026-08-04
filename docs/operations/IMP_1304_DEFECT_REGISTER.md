@@ -1224,3 +1224,137 @@ No IBKR connection; no `systemctl` or `systemd-tmpfiles` against the owner
 host; nothing installed on the owner host; no Gateway start/stop/restart/
 relogin; no order; no firewall/OCI change; no credential; no PAPER_AUTO; no
 LIVE.
+
+---
+
+## 14. Operational-runtime defects found during ARM64 activation (D-WATCHDOG-13 … D-WATCHDOG-17)
+
+The first real owner-host activation surfaced five defects that every previous
+test had missed, because every previous test used fakes that were kinder than
+the host. Installation itself was clean and idempotent, `/run/ibgateway` was
+correct at `0700 opc:opc`, and the timer remained disabled — the failures were
+all in what the runtime *actually did*.
+
+| ID | Defect | Sev | Why it mattered | Status |
+|---|---|---|---|---|
+| D-WATCHDOG-13 | Plain `--status` opened a real IBKR session: connect, `startApi`, `reqCurrentTime`, disconnect | **P1** | The command was documented as opening no broker session, and is the one an operator reaches for first. A "read-only status" that attaches an API client changes the thing it is observing | ✅ fixed |
+| D-WATCHDOG-14 | `--deep-probe --status` used **two** sessions — the round-trip probe, then the account-safety adapter | **P1** | The "one complete coherent snapshot" guarantee spanned two connections, so the round trip and the account facts described different instants | ✅ fixed |
+| D-WATCHDOG-15 | `logging.basicConfig(level=INFO)` raised the **root** level, enabling ibapi INFO; the `managedAccounts` callback emitted the complete Paper account id to stderr | **P1** | The JSON model was sanitized, so the leak bypassed the only containment that existed. Account ids are sensitive **operational data** — not credentials — and belong in no journal, terminal or evidence file | ✅ fixed |
+| D-WATCHDOG-16 | The installed unit executed `/usr/bin/env python3 /opt/trading/scripts/ib_gateway_watchdog.py` | **P1** | `/opt` held a **stale** copy that had drifted from the reviewed source, and the system python cannot import `trading_broker_ibkr` at all — so the deep probe could never have worked, and the timer would have run unreviewed code | ✅ fixed |
+| D-WATCHDOG-17 | Local drop-ins silently rewrote the canonical Gateway contract | **P1** | `Type=oneshot` + `RemainAfterExit=yes` made systemd report `active (exited)` with `MainPID=0` while the live Java process ran in `/user.slice/.../session-2.scope`. systemd claimed the Gateway was fine **while owning no process**, and `PrivateTmp` / `ProtectSystem` / `ProtectHome` / `ReadWritePaths` had all been switched off | ✅ detected, fail-closed |
+
+### 14.1 Plain status is broker-connection-free
+
+Plain `--status` is now strictly OS/TCP/log: process inspection, a raw TCP-open
+check, the sanitized IBC login marker, and lifecycle/state-file metadata. It
+constructs no IBKR transport, sends no `startApi`, requests no current time,
+receives no `managedAccounts`, builds no account-safety adapter, creates no
+launcher, takes no lock and writes no state. Its proof level cannot exceed
+`TCP_OPEN`.
+
+The guarantee is structural: `--status` is handed a `StatusProbes` that
+**defines no round-trip probe at all**. Merely removing the call would have
+left the next edit one attribute away from reopening a session.
+
+**Honest vocabulary.** Observation cannot establish API readiness, so the
+observation classifier cannot spell `API_READY`. A new `ObservedState` reports
+`API_PORT_OPEN_UNVERIFIED`, and the action-state field is `null` unless the API
+was genuinely exercised. `api_round_trip_ok` is `null` when untested —
+deliberately not `false`, because "not tested" and "tested and failed" are
+different facts.
+
+### 14.2 Deep status uses one session
+
+`--deep-probe --status` opens exactly one read-only broker session, and every
+fact — connectivity, round trip, Paper validation, orders, positions,
+unresolved states, reconciliation, disconnect and the CLEAN / NOT_CLEAN /
+UNKNOWN verdict — is derived from that single captured snapshot. The separate
+`reqCurrentTime` session is gone; the round trip is read from the same
+snapshot. Exactly one connect and one disconnect attempt, and no order surface
+is reachable.
+
+### 14.3 Account-id containment
+
+`logging.basicConfig(level=INFO)` is replaced by `configure_logging()`, which
+installs one handler, keeps the **root** at WARNING, pins the `ibapi` loggers
+to WARNING, and attaches a redaction filter to every handler and dependency
+logger. The filter scrubs account-shaped tokens from the message, the formatted
+arguments and the exception text, so a leak cannot arrive through a traceback
+either. Status output is scrubbed once more immediately before printing.
+Containment does not depend on shell redirection.
+
+### 14.4 Canonical watchdog runtime
+
+```
+WorkingDirectory=/home/opc/projects/TradingSystem
+ExecStart=/home/opc/projects/TradingSystem/.venv/bin/python \
+  /home/opc/projects/TradingSystem/scripts/ib_gateway_watchdog.py …
+```
+
+Absolute interpreter, absolute script, both inside the reviewed repository. No
+`/usr/bin/env`, no system Python, no `uv sync`, no executable copy under
+`/opt`, no PATH-dependent resolution. The installer refuses to report COMPLETE
+until it has verified the installed unit's `WorkingDirectory`, interpreter and
+script, that no unit references the stale `/opt` copy, and that the pinned
+interpreter can actually import `trading_broker_ibkr` and
+`trading_execution_agent.account_safety`.
+
+### 14.5 Drop-in policy
+
+Comparing installed **files** proves nothing: the installed unit matched the
+repository byte-for-byte while drop-ins rewrote the contract. Only the
+**effective** properties and the drop-in set can.
+
+`scripts/systemd_contract.py` judges drop-ins by **content, not filename** —
+the three observed names are examples, not the rule. Any override of `Type`,
+`RemainAfterExit`, `KillMode`, `Restart`, `ExecStart`, `User`, `Group`,
+`WorkingDirectory`, `PrivateTmp`, `ProtectSystem`, `ProtectHome`,
+`ReadWritePaths` or `RuntimeDirectory` is a failure.
+
+`DISPLAY` and `XAUTHORITY` are the **only** permitted host-specific settings:
+non-secret X11 addressing that genuinely varies per host and changes neither
+ownership, lifetime nor confinement. An allowed setting does **not** launder
+the file it travels in — a `display.conf` that also sets `Type` fails, and so
+does one that sets any other environment variable.
+
+A service reported `active (exited)` with `MainPID=0` is **not** treated as
+owning the Gateway; real ownership requires the live process to sit in the
+service's own cgroup.
+
+### 14.6 One remediation tool
+
+`scripts/remediate_owner_host_runtime.sh` (`--check` default, `--apply`,
+`--verify`) replaces the ad-hoc host sequence. It never starts, stops, restarts
+or relogins the Gateway, never enables the timer, never touches
+firewall/OCI/SSH/VNC, and never prints Java command-line arguments, an account
+id or IBC config content. `--apply` quarantines contradicting drop-ins after a
+private `0600` root-owned backup, renames the stale `/opt` copy only once the
+canonical replacement is verified, and installs units through the one
+installer. `--verify` proves the Gateway PID and start time did not change.
+
+**Correcting the Gateway's process ownership requires a restart, which is an
+owner-authorized action under the canonical runbook. This tool makes the next
+start correct and proves the current one untouched.**
+
+### 14.7 Status truth
+
+Owner-host activation is **NOT complete**. The install succeeded, but the
+runtime contract was wrong in the four ways above, so:
+
+**B-02, B-03 and B-04 remain OPEN. DEF-12 and DEF-13 remain `NOT_RUN`.
+IMP-1303 and IMP-1304 remain incomplete. POI-IBKR-001 and POI-MD-001 remain
+BLOCKED. PAPER_AUTO and LIVE remain DISABLED.**
+
+Ports 4002 and 5901 listen on all interfaces; firewalld currently permits only
+22, 80, 81 and 443 on the public zone; OCI NSG / Security List state remains
+UNKNOWN. Those are three separate facts and are never combined into one
+verdict — a revocable firewall rule does not make an all-interfaces bind
+acceptable, and neither establishes the cloud layer. **No firewall, VNC or OCI
+change is made in this bundle.**
+
+### 14.8 NOT EXECUTED
+
+No IBKR connection from this bundle; no owner-host modification; no
+`systemctl`; no Gateway start/stop/restart/relogin; no timer enable; no order,
+cancel, modify or flatten; no firewall/OCI/SSH/VNC change; no credential or
+account id recorded.

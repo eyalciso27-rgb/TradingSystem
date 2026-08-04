@@ -60,6 +60,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -90,6 +91,85 @@ DEFAULT_PROCESS_PATTERN = "ibgateway"
 
 logger = logging.getLogger("ib_gateway_watchdog")
 
+#: Broker account identifiers are SENSITIVE OPERATIONAL DATA — not credentials.
+#: They cannot be used to log in, but they identify the account under
+#: management, so they must not reach a journal, a terminal or an evidence
+#: file. IBKR's own client library logs them at INFO through the
+#: ``managedAccounts`` callback, so containment cannot rely on our own call
+#: sites being careful: every record on every handler is filtered.
+#:
+#: Matches IBKR-shaped ids (DU1234567, U1234567) and partial forms, so a
+#: truncated id cannot leak either.
+_ACCOUNT_ID_PATTERN = re.compile(r"\b[A-Z]{1,2}\d{5,}\b")
+ACCOUNT_ID_PLACEHOLDER = "<redacted-account-id>"
+
+#: Dependency loggers that must never be raised to INFO/DEBUG by us. ibapi
+#: emits full account identifiers at INFO.
+_DEPENDENCY_LOGGERS = ("ibapi", "ibapi.client", "ibapi.wrapper", "ibapi.decoder")
+
+
+def redact_account_ids(text: object) -> str:
+    """Replace anything account-id shaped. Safe to apply to arbitrary text."""
+    return _ACCOUNT_ID_PATTERN.sub(ACCOUNT_ID_PLACEHOLDER, str(text))
+
+
+class AccountIdRedactingFilter(logging.Filter):
+    """Scrub account-shaped tokens from every record, whatever emitted it.
+
+    Applied to handlers rather than to a logger, so records propagated from
+    dependency loggers are filtered too.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.args:
+            try:
+                record.msg = record.getMessage()
+                record.args = ()
+            except Exception:  # noqa: BLE001 - never let logging break the run
+                record.args = ()
+        record.msg = redact_account_ids(record.msg)
+        if record.exc_info:
+            # Exception TEXT can carry an id just as easily as a log message.
+            record.exc_text = redact_account_ids(
+                logging.Formatter().formatException(record.exc_info)
+            )
+            record.exc_info = None
+        return True
+
+
+def configure_logging(*, verbose: bool = False) -> None:
+    """Install our own handler and pin dependency levels.
+
+    Deliberately NOT ``logging.basicConfig(level=logging.INFO)``: that raises
+    the ROOT level, which turns on INFO for every library in the process —
+    including ibapi, whose ``managedAccounts`` callback logs the complete
+    account identifier. This is the defect that leaked an id to stderr.
+
+    Must be called before any IBKR connection is attempted.
+    """
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    handler.addFilter(AccountIdRedactingFilter())
+
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+    # Root stays at WARNING: third-party INFO is never wanted here.
+    root.setLevel(logging.WARNING)
+
+    # Our own diagnostics remain useful.
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+    # Belt and braces: pin the dependency loggers explicitly, so raising the
+    # root level later cannot re-enable their INFO output.
+    for name in _DEPENDENCY_LOGGERS:
+        dependency = logging.getLogger(name)
+        dependency.setLevel(logging.WARNING)
+        dependency.addFilter(AccountIdRedactingFilter())
+
 
 class WatchdogState(StrEnum):
     PROCESS_DOWN = "PROCESS_DOWN"
@@ -98,6 +178,25 @@ class WatchdogState(StrEnum):
     API_DOWN = "API_DOWN"
     API_READY = "API_READY"
     UNKNOWN = "UNKNOWN"
+
+
+class ObservedState(StrEnum):
+    """What OS / TCP / log observation ALONE can support.
+
+    Deliberately a separate vocabulary from :class:`WatchdogState`, which is
+    the ACTION state machine and includes ``API_READY``. Plain ``--status``
+    never exercises the API, so it must not be able to say API_READY at all —
+    not "says it carefully", but *cannot spell it*. A listening socket is not
+    a working API and is never evidence about the account.
+    """
+
+    PROCESS_DOWN = "PROCESS_DOWN"
+    TWO_FA_PENDING = "TWO_FA_PENDING"
+    LOGIN_REQUIRED = "LOGIN_REQUIRED"
+    API_PORT_CLOSED = "API_PORT_CLOSED"
+    #: Process up, port accepting connections, no login problem in the log —
+    #: and the API itself was NOT exercised. The honest ceiling of plain status.
+    API_PORT_OPEN_UNVERIFIED = "API_PORT_OPEN_UNVERIFIED"
 
 
 class LoginMarker(StrEnum):
@@ -214,6 +313,26 @@ def classify_state(signals: Signals) -> WatchdogState:
     # Port open but reqCurrentTime fails and there is no login evidence:
     # an inconsistent state — fail closed.
     return WatchdogState.UNKNOWN
+
+
+def classify_observation(
+    *, process_running: bool, api_tcp_open: bool, login_marker: LoginMarker
+) -> ObservedState:
+    """Classify from OS/TCP/log signals only — no API round trip involved.
+
+    Same priority order as :func:`classify_state`, minus every branch that
+    needs the API to have answered. There is no ``API_READY`` outcome here by
+    construction.
+    """
+    if not process_running:
+        return ObservedState.PROCESS_DOWN
+    if login_marker in (LoginMarker.TWO_FA_PROMPT, LoginMarker.TWO_FA_TIMEOUT):
+        return ObservedState.TWO_FA_PENDING
+    if login_marker is LoginMarker.LOGIN_FAILED:
+        return ObservedState.LOGIN_REQUIRED
+    if not api_tcp_open:
+        return ObservedState.API_PORT_CLOSED
+    return ObservedState.API_PORT_OPEN_UNVERIFIED
 
 
 def decide_action(
@@ -613,6 +732,33 @@ class Probes:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class StatusProbes:
+    """The ONLY probe surface `--status` may touch.
+
+    It defines **no** API round-trip probe. That is structural, not a
+    convention: plain status previously called ``Probes.current_time``, whose
+    real implementation opened an IBKR session, sent ``startApi``, requested
+    the current time and disconnected — while the command was documented as
+    opening no broker session. Removing the call would have left the next
+    edit one attribute away from reintroducing it, so the attribute is gone.
+
+    ``account_safety`` is wired ONLY for ``--deep-probe`` and defaults to a
+    fail-closed UNKNOWN, so plain status cannot construct a broker adapter.
+    """
+
+    process: Callable[[], bool]
+    tcp: Callable[[], bool]
+    login: Callable[[], LoginMarker]
+    restart_inhibited: Callable[[], bool]
+    account_safety: Callable[[], dict[str, Any]] = field(
+        default=lambda: {
+            "safety": SAFETY_UNKNOWN,
+            "reasons": ["NOT_PROBED"],
+        }
+    )
+
+
 def run_cycle(
     probes: Probes,
     launcher: Launcher,
@@ -751,7 +897,9 @@ class StatusReport:
     observed_at: str
     process_running: bool
     api_tcp_open: bool
-    api_round_trip_ok: bool
+    #: None when the API was NOT exercised (plain status). Deliberately not
+    #: False: "not tested" and "tested and failed" are different facts.
+    api_round_trip_ok: bool | None
     login_marker: str
     lifecycle_marker_present: bool
     configured_unit: str
@@ -759,7 +907,11 @@ class StatusReport:
     max_restarts: int
     relogin_count: int
     max_relogins: int
-    state: str
+    #: Always present: what OS/TCP/log observation alone supports.
+    observed_state: str
+    #: The ACTION state machine's verdict. None unless the API was actually
+    #: exercised, because API_READY is not observable from a socket.
+    state: str | None
     proof_level: str
     account_safety: str
     action_permitted: bool
@@ -782,6 +934,7 @@ class StatusReport:
                 "relogins_used": self.relogin_count,
                 "max_relogins": self.max_relogins,
             },
+            "observed_state": self.observed_state,
             "state": self.state,
             "proof_level": self.proof_level,
             "account_safety": self.account_safety,
@@ -805,6 +958,7 @@ class StatusReport:
             f"  configured_unit          : {self.configured_unit}",
             f"  restart_budget           : {self.restart_count}/{self.max_restarts}"
             f" restarts, {self.relogin_count}/{self.max_relogins} relogins",
+            f"  observed_state           : {self.observed_state}",
             f"  state                    : {self.state}",
             f"  proof_level              : {self.proof_level}",
             f"  account_safety           : {self.account_safety}",
@@ -852,7 +1006,7 @@ def _proof_level(
 
 
 def build_status_report(
-    probes: Probes,
+    probes: StatusProbes,
     store: StateStore,
     *,
     policy: Policy,
@@ -861,18 +1015,37 @@ def build_status_report(
     observed_at: str,
     deep: bool = False,
 ) -> StatusReport:
-    """Observe and classify WITHOUT taking any action. Never calls a launcher."""
-    signals = Signals(
-        process_running=probes.process(),
-        api_tcp_open=probes.tcp(),
-        current_time_ok=probes.current_time(),
-        login_marker=probes.login(),
-    )
-    state = classify_state(signals)
+    """Observe and classify WITHOUT taking any action, and — in plain mode —
+    WITHOUT touching the broker protocol at all.
+
+    Plain status is OS/TCP/log only: process inspection, a raw TCP-open check,
+    the sanitized IBC login marker, and lifecycle/state-file metadata. It
+    constructs no IBKR transport, sends no ``startApi``, requests no current
+    time, receives no ``managedAccounts``, builds no account-safety adapter,
+    creates no launcher, takes no lock and writes no state.
+
+    Deep status adds exactly ONE read-only broker session, and every fact it
+    reports — connectivity, round trip, Paper validation, orders, positions,
+    unresolved states, reconciliation, disconnect and the CLEAN/NOT_CLEAN/
+    UNKNOWN verdict — is derived from that single captured snapshot.
+    """
+    process_running = probes.process()
+    api_tcp_open = probes.tcp()
+    login_marker = probes.login()
     inhibited = probes.restart_inhibited()
+
+    observed = classify_observation(
+        process_running=process_running,
+        api_tcp_open=api_tcp_open,
+        login_marker=login_marker,
+    )
 
     deep_report: dict[str, Any] | None = None
     safety = SAFETY_UNKNOWN
+    #: None means "not tested", which is not the same fact as False.
+    round_trip: bool | None = None
+    action_state: WatchdogState | None = None
+
     if deep:
         try:
             deep_report = dict(probes.account_safety())
@@ -884,49 +1057,69 @@ def build_status_report(
                 "detail": type(error).__name__,
             }
             safety = SAFETY_UNKNOWN
+        # The round trip is a FACT OF THE SAME SESSION, not a second probe.
+        observed_round_trip = deep_report.get("api_round_trip_ok")
+        round_trip = bool(observed_round_trip) if observed_round_trip is not None else False
+        action_state = classify_state(
+            Signals(
+                process_running=process_running,
+                api_tcp_open=api_tcp_open,
+                current_time_ok=round_trip,
+                login_marker=login_marker,
+            )
+        )
 
     restart_count = _within_window(store.restart_times, now, policy.restart_window_seconds)
     relogin_count = _within_window(store.relogin_times, now, policy.relogin_window_seconds)
 
-    # Would an unattended process action be permitted right now? Answer it the
-    # same way run_cycle does, without doing it.
-    plan = decide_action(
-        state,
-        signals.login_marker,
-        restart_count=restart_count,
-        relogin_count=relogin_count,
-        policy=policy,
-        restart_inhibited=inhibited,
-    )
-    gated = apply_account_safety_gate(plan, safety)
-    permitted = gated.action in MUTATING_ACTIONS
-    if permitted:
-        reason = f"{gated.action.value} would be permitted: account proven CLEAN"
-    elif plan.action in MUTATING_ACTIONS:
-        reason = gated.reason
-    elif inhibited:
-        reason = "no process action indicated; lifecycle marker present (inhibited)"
+    # Would an unattended process action be permitted right now? Deep mode can
+    # answer it the same way run_cycle does, without doing it. Plain mode
+    # cannot answer it at all, and says so rather than guessing.
+    permitted = False
+    if action_state is None:
+        reason = (
+            "not evaluated: plain status observes the process, the TCP port and"
+            " the IBC log only; it never tests the API or the account"
+        )
     else:
-        reason = f"no process action indicated in state {state.value}"
+        plan = decide_action(
+            action_state,
+            login_marker,
+            restart_count=restart_count,
+            relogin_count=relogin_count,
+            policy=policy,
+            restart_inhibited=inhibited,
+        )
+        gated = apply_account_safety_gate(plan, safety)
+        permitted = gated.action in MUTATING_ACTIONS
+        if permitted:
+            reason = f"{gated.action.value} would be permitted: account proven CLEAN"
+        elif plan.action in MUTATING_ACTIONS:
+            reason = gated.reason
+        elif inhibited:
+            reason = "no process action indicated; lifecycle marker present (inhibited)"
+        else:
+            reason = f"no process action indicated in state {action_state.value}"
 
     return StatusReport(
         watchdog_version=WATCHDOG_VERSION,
         observed_at=observed_at,
-        process_running=signals.process_running,
-        api_tcp_open=signals.api_tcp_open,
-        api_round_trip_ok=signals.current_time_ok,
-        login_marker=signals.login_marker.value,
+        process_running=process_running,
+        api_tcp_open=api_tcp_open,
+        api_round_trip_ok=round_trip,
+        login_marker=login_marker.value,
         lifecycle_marker_present=inhibited,
         configured_unit=unit,
         restart_count=restart_count,
         max_restarts=policy.max_restarts,
         relogin_count=relogin_count,
         max_relogins=policy.max_relogins,
-        state=state.value,
+        observed_state=observed.value,
+        state=None if action_state is None else action_state.value,
         proof_level=_proof_level(
-            process=signals.process_running,
-            tcp=signals.api_tcp_open,
-            round_trip=signals.current_time_ok,
+            process=process_running,
+            tcp=api_tcp_open,
+            round_trip=bool(round_trip),
             deep=deep and safety != SAFETY_UNKNOWN,
         ).value,
         account_safety=safety,
@@ -1043,7 +1236,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # BEFORE anything else, and specifically before any IBKR connection: pin
+    # dependency log levels and install the account-id redaction filter.
+    configure_logging()
 
     policy = Policy(
         max_restarts=args.max_restarts,
@@ -1052,6 +1247,54 @@ def main(argv: list[str] | None = None) -> int:
         relogin_window_seconds=args.relogin_window,
     )
     log_path = Path(args.log_path)
+    store = StateStore.load(Path(args.state_file))
+
+    if args.status:
+        # READ-ONLY path. No launcher is constructed, no lock is taken, no
+        # state is written — and StatusProbes defines no API round-trip probe,
+        # so plain status cannot reach the broker protocol at all.
+        #
+        # The account-safety probe (the only thing that opens a session) is
+        # wired ONLY for --deep-probe; otherwise the fail-closed default
+        # stands and no adapter is ever constructed.
+        status_probes = StatusProbes(
+            process=lambda: default_process_probe(args.process_pattern),
+            tcp=lambda: default_tcp_probe(args.host, args.port),
+            login=lambda: default_login_probe(log_path),
+            restart_inhibited=_default_restart_inhibited(Path(args.reconciliation_marker)),
+            **(
+                {
+                    "account_safety": _build_account_safety_probe(
+                        host=args.host,
+                        port=args.port,
+                        account_alias=args.account_alias,
+                        account_secret=args.account_secret,
+                        secrets_root=args.secrets_root,
+                    )
+                }
+                if args.deep_probe
+                else {}
+            ),
+        )
+        report = build_status_report(
+            status_probes,
+            store,
+            policy=policy,
+            unit=args.unit,
+            now=time.time(),
+            observed_at=datetime.now(tz=UTC).isoformat(),
+            deep=args.deep_probe,
+        )
+        rendered = (
+            json.dumps(report.as_dict(), indent=2, sort_keys=True)
+            if args.json
+            else report.render()
+        )
+        # Last-resort scrub: the model is already sanitized, but printing is
+        # the one place an id could reach a terminal or an evidence file.
+        print(redact_account_ids(rendered))
+        return ExitCode.OK
+
     probes = Probes(
         process=lambda: default_process_probe(args.process_pattern),
         tcp=lambda: default_tcp_probe(args.host, args.port),
@@ -1066,26 +1309,6 @@ def main(argv: list[str] | None = None) -> int:
             secrets_root=args.secrets_root,
         ),
     )
-    store = StateStore.load(Path(args.state_file))
-
-    if args.status:
-        # READ-ONLY path: no launcher is constructed, no lock is taken, no
-        # state is written. Observation only.
-        report = build_status_report(
-            probes,
-            store,
-            policy=policy,
-            unit=args.unit,
-            now=time.time(),
-            observed_at=datetime.now(tz=UTC).isoformat(),
-            deep=args.deep_probe,
-        )
-        if args.json:
-            print(json.dumps(report.as_dict(), indent=2, sort_keys=True))
-        else:
-            print(report.render())
-        return ExitCode.OK
-
     launcher = SystemdLauncher(args.unit)
     try:
         with FileLock(Path(args.lock_file)):
