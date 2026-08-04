@@ -320,10 +320,17 @@ def test_tcp_open_alone_never_proves_clean(tmp_path: Path) -> None:
     assert plan.action is wd.Action.ALERT
 
 
-def test_req_current_time_alone_never_proves_clean() -> None:
-    """API_READY means the API answered — not that the account is clean."""
+def test_plain_status_never_claims_api_ready_or_a_round_trip() -> None:
+    """Plain status is OS/TCP/log only, so API_READY is not available to it.
+
+    This test previously asserted `state == "API_READY"` from plain status —
+    which was only reachable because plain status called a round-trip probe
+    that opened a real IBKR session. The API is no longer exercised here, so
+    the honest answer is "not tested": a listening socket is not a working
+    API, and neither is evidence about the account.
+    """
     report = wd.build_status_report(
-        probes(),  # process + tcp + current_time all true
+        probes(),  # process + tcp true; any round-trip probe is unreachable
         wd.StateStore(path=Path("unused")),
         policy=wd.Policy(),
         unit="ibgateway-ibc.service",
@@ -331,10 +338,13 @@ def test_req_current_time_alone_never_proves_clean() -> None:
         observed_at="2026-08-03T12:00:00+00:00",
         deep=False,
     )
-    assert report.state == "API_READY"
-    assert report.proof_level == wd.ProofLevel.API_ROUND_TRIP.value
+    assert report.state is None, "the action state machine was not evaluated"
+    assert report.observed_state == wd.ObservedState.API_PORT_OPEN_UNVERIFIED.value
+    assert report.api_round_trip_ok is None, "not tested is not the same as failed"
+    assert report.proof_level == wd.ProofLevel.TCP_OPEN.value
     assert report.account_safety == wd.SAFETY_UNKNOWN
     assert report.action_permitted is False
+    assert "never tests the API" in report.action_permitted_reason
 
 
 # -- read-only status CLI -----------------------------------------------------

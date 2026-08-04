@@ -27,7 +27,19 @@ After=systemd-tmpfiles-setup.service
 Type=oneshot
 User=opc
 Group=opc
-ExecStart=/usr/bin/env python3 /opt/trading/scripts/ib_gateway_watchdog.py \
+#
+# CANONICAL RUNTIME. Absolute interpreter, absolute script, both inside the
+# reviewed repository. DO NOT change any of the three lines below to
+# /usr/bin/env, to the system python, or to a copy under /opt.
+#
+# The host previously ran `/usr/bin/env python3 /opt/trading/scripts/...`,
+# which is wrong twice over: /opt held a STALE copy that had drifted from the
+# reviewed source, and the system python cannot import trading_broker_ibkr at
+# all, so the deep probe could never have worked. PATH-resolved interpreters
+# also mean the timer runs whatever python happens to be first today.
+WorkingDirectory=/home/opc/projects/TradingSystem
+ExecStart=/home/opc/projects/TradingSystem/.venv/bin/python \
+  /home/opc/projects/TradingSystem/scripts/ib_gateway_watchdog.py \
   --host 127.0.0.1 --port 4002 \
   --log-path /home/opc/ibc/logs/ibc.log \
   --state-file /run/ibgateway/watchdog-state.json \

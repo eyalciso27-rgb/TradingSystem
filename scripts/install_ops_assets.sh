@@ -280,6 +280,61 @@ assert_within_root() {
   esac
 }
 
+# -- runtime contract preflight (WP5) -----------------------------------------
+#
+# Installing correct FILES is not the same as having a correct RUNTIME. On the
+# owner host the installed unit matched the repository byte-for-byte while the
+# timer executed a STALE copy under /opt with an interpreter that could not
+# import the broker package at all — so the deep probe could never have run.
+# APPLY therefore refuses to report COMPLETE until the entrypoint it just
+# installed is actually executable and importable.
+
+RUNTIME_REPO_ROOT="/home/opc/projects/TradingSystem"
+RUNTIME_VENV_PYTHON="${RUNTIME_REPO_ROOT}/.venv/bin/python"
+RUNTIME_WATCHDOG="${RUNTIME_REPO_ROOT}/scripts/ib_gateway_watchdog.py"
+STALE_WATCHDOG_PATH="/opt/trading/scripts/ib_gateway_watchdog.py"
+RUNTIME_REQUIRED_IMPORTS="trading_broker_ibkr trading_execution_agent.account_safety"
+
+# Read-only: reports what a real apply WOULD verify, without executing it.
+describe_runtime_contract() {
+  echo "  runtime contract  : WorkingDirectory=${RUNTIME_REPO_ROOT}"
+  echo "                      interpreter=${RUNTIME_VENV_PYTHON}"
+  echo "                      script=${RUNTIME_WATCHDOG}"
+}
+
+# Verifies the INSTALLED unit text, then the interpreter and its imports.
+verify_runtime_contract() {
+  local unit_file="$1"
+  [[ -f "${unit_file}" ]] || fail "installed watchdog unit not found: ${unit_file}"
+
+  grep -q "^WorkingDirectory=${RUNTIME_REPO_ROOT}$" "${unit_file}"     || fail "installed unit WorkingDirectory is not exactly ${RUNTIME_REPO_ROOT}"
+  grep -q "${RUNTIME_VENV_PYTHON}" "${unit_file}"     || fail "installed unit does not use the pinned interpreter ${RUNTIME_VENV_PYTHON}"
+  grep -q "${RUNTIME_WATCHDOG}" "${unit_file}"     || fail "installed unit does not execute ${RUNTIME_WATCHDOG}"
+  if grep -q "${STALE_WATCHDOG_PATH}" "${unit_file}"; then
+    fail "installed unit still references the stale copy ${STALE_WATCHDOG_PATH}"
+  fi
+  if grep -qE "^ExecStart=.*(/usr/bin/env|[^/]python3?( |$))" "${unit_file}"; then
+    fail "installed unit resolves its interpreter through PATH; use an absolute path"
+  fi
+  echo "  unit contract     : VERIFIED (WorkingDirectory, interpreter, script)"
+
+  # A rehearsal must not execute the real venv, so the runtime half is only
+  # exercised by a real apply.
+  if [[ "${REHEARSAL:-0}" -eq 1 ]]; then
+    echo "  runtime imports   : SKIPPED (rehearsal never executes the real venv)"
+    return 0
+  fi
+  [[ -d "${RUNTIME_REPO_ROOT}" ]] || fail "repository root missing: ${RUNTIME_REPO_ROOT}"
+  [[ -x "${RUNTIME_VENV_PYTHON}" ]]     || fail "venv interpreter missing or not executable: ${RUNTIME_VENV_PYTHON}"
+  [[ -r "${RUNTIME_WATCHDOG}" ]]     || fail "canonical watchdog script missing: ${RUNTIME_WATCHDOG}"
+
+  local module
+  for module in ${RUNTIME_REQUIRED_IMPORTS}; do
+    "${RUNTIME_VENV_PYTHON}" -c "import ${module}" >/dev/null 2>&1       || fail "the pinned interpreter cannot import ${module}; the deep probe would never work"
+  done
+  echo "  runtime imports   : VERIFIED with ${RUNTIME_VENV_PYTHON}"
+}
+
 # Test seam: source this file with OPS_INSTALL_LIB_ONLY=1 to get the helpers
 # above without running an install. Nothing below this line has executed yet,
 # so sourcing is side-effect free. It changes no behaviour of a normal run.
@@ -427,6 +482,9 @@ if [[ "${APPLY}" -eq 0 ]]; then
   echo "  * systemctl daemon-reload            (only if a unit file changed)"
   echo "  * systemd-tmpfiles --create /etc/tmpfiles.d/ibgateway.conf"
   echo "  * verify /run/ibgateway is a directory, 0700, owned opc:opc"
+  echo "  * verify the installed watchdog unit's runtime contract:"
+  describe_runtime_contract
+  echo "  * verify the pinned interpreter can import: ${RUNTIME_REQUIRED_IMPORTS}"
   echo
   cat <<'CHECKNEXT'
 NEXT STEPS (owner decisions, performed by hand — deliberately not automated):
@@ -537,6 +595,7 @@ echo "  daemon reload     : ${STATE_RELOAD}"
 echo "  tmpfiles config   : ${STATE_TMPFILES}"
 echo "  runtime directory : ${STATE_RUNTIME_DIR}"
 if [[ "${REHEARSAL}" -eq 1 ]]; then
+  verify_runtime_contract "${DEST_ROOT}/etc/systemd/system/ibgateway-watchdog.service"
   echo "  install           : REHEARSAL COMPLETE — the real host is unchanged"
   echo
   cat <<'REHEARSALNEXT'
@@ -551,6 +610,9 @@ is never started for you.
 REHEARSALNEXT
   exit 0
 fi
+
+# The runtime contract is verified BEFORE any success is claimed.
+verify_runtime_contract "${DEST_ROOT}/etc/systemd/system/ibgateway-watchdog.service"
 
 echo "  install           : COMPLETE — NOTHING was enabled or started"
 echo

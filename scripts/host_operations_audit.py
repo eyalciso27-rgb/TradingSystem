@@ -375,7 +375,26 @@ def audit_firewall(audit: Audit) -> None:
             "" if rules else "no local packet filter is configured",
         )
     else:
-        audit.add("firewall", "nftables_ruleset", Level.UNKNOWN, "unreadable", nft.detail)
+        # A permission failure is NOT evidence that no rules exist. Reporting
+        # "unreadable" identically for both cases let an unprivileged run look
+        # like a host with no packet filter.
+        combined = f"{nft.stdout} {nft.detail}".lower()
+        denied = any(
+            token in combined
+            for token in ("permission denied", "operation not permitted", "must be root")
+        )
+        audit.add(
+            "firewall",
+            "nftables_ruleset",
+            Level.UNKNOWN,
+            "not readable without privilege" if denied else "unreadable",
+            (
+                "run as root to determine the ruleset; absence of output here is"
+                " NOT absence of rules"
+                if denied
+                else nft.detail
+            ),
+        )
 
     # The honest limit of host-local evidence.
     audit.add(
@@ -385,6 +404,32 @@ def audit_firewall(audit: Audit) -> None:
         "not determinable from the host",
         "OCI NSG / Security List state cannot be verified from repository or"
         " host-local firewall evidence; confirm it in the OCI console",
+    )
+
+
+def audit_exposure_separation(audit: Audit) -> None:
+    """Binding scope and ingress policy are DIFFERENT facts. Never merged.
+
+    A socket bound to 0.0.0.0 stays a finding even when firewalld currently
+    drops the port: a firewall rule is revocable runtime state, the bind is
+    what the process actually offers, and the cloud-provider layer is a third
+    fact this host cannot see at all.
+    """
+    audit.add(
+        "network",
+        "binding_vs_ingress",
+        Level.INFO,
+        "listener binding, local firewall policy and cloud ingress are three"
+        " separate facts and are never combined into one verdict",
+        "a blocked port does not make an all-interfaces bind acceptable",
+    )
+    audit.add(
+        "network",
+        "oci_network_security",
+        Level.UNKNOWN,
+        "UNKNOWN — not determinable from this host",
+        "OCI Security Lists / NSGs must be confirmed in the OCI console;"
+        " host-local evidence can never establish them",
     )
 
 
@@ -490,6 +535,135 @@ def audit_deep_probe_dependency(audit: Audit) -> None:
     )
 
 
+def audit_systemd_contract(audit: Audit, *, root: Path | None = None) -> None:
+    """Effective properties, drop-ins and real process ownership.
+
+    Comparing installed FILES proves nothing: on the owner host the installed
+    unit matched the repository byte-for-byte while drop-ins rewrote Type,
+    RemainAfterExit, KillMode and every confinement directive, and the live
+    Gateway ran in a user session scope that the unit did not own.
+    """
+    # The audit is run both as a script and loaded by path, so make the
+    # sibling module resolvable either way before importing it.
+    module_dir = str(Path(__file__).resolve().parent)
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
+    from systemd_contract import (  # noqa: PLC0415 - keeps the audit standalone
+        CANONICAL_GATEWAY_UNIT,
+        CANONICAL_WATCHDOG_UNIT,
+        Severity,
+        check_effective_gateway,
+        check_process_ownership,
+        check_watchdog_entrypoint,
+        classify_dropin,
+        parse_dropin,
+        parse_show_properties,
+    )
+
+    level_of = {
+        Severity.OK: Level.PASS,
+        Severity.WARN: Level.WARN,
+        Severity.FAIL: Level.FAIL,
+        Severity.UNKNOWN: Level.UNKNOWN,
+    }
+
+    base = root or Path("/")
+
+    # -- drop-ins, judged by CONTENT and not by filename ---------------------
+    for unit in (CANONICAL_GATEWAY_UNIT, CANONICAL_WATCHDOG_UNIT):
+        dropin_dir = base / f"etc/systemd/system/{unit}.d"
+        if not dropin_dir.is_dir():
+            audit.add("systemd", f"{unit}:dropins", Level.PASS, "none")
+            continue
+        files = sorted(dropin_dir.glob("*.conf"))
+        if not files:
+            audit.add("systemd", f"{unit}:dropins", Level.PASS, "none")
+            continue
+        for path in files:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as error:  # pragma: no cover - unreadable drop-in
+                audit.add(
+                    "systemd", f"{unit}:dropin:{path.name}", Level.UNKNOWN, str(error)
+                )
+                continue
+            for finding in classify_dropin(parse_dropin(str(path), text)):
+                audit.add(
+                    "systemd",
+                    f"{unit}:{finding.check}",
+                    level_of[finding.severity],
+                    redact(finding.detail),
+                    finding.remedy,
+                )
+
+    # -- effective properties + real ownership -------------------------------
+    shown = run_readonly(
+        [
+            "systemctl", "show", CANONICAL_GATEWAY_UNIT,
+            "-p", "Type", "-p", "Restart", "-p", "RemainAfterExit",
+            "-p", "ActiveState", "-p", "SubState", "-p", "MainPID",
+        ]
+    )
+    if not shown.ok:
+        audit.add("systemd", "effective_gateway", Level.UNKNOWN, "unreadable", shown.detail)
+    else:
+        properties = parse_show_properties(shown.stdout)
+        for finding in check_effective_gateway(properties):
+            audit.add(
+                "systemd",
+                f"gateway:{finding.check}",
+                level_of[finding.severity],
+                redact(finding.detail),
+                finding.remedy,
+            )
+        cgroup = _gateway_process_cgroup()
+        ownership = check_process_ownership(properties, cgroup)
+        audit.add(
+            "systemd",
+            ownership.check,
+            level_of[ownership.severity],
+            redact(ownership.detail),
+            ownership.remedy,
+        )
+
+    watchdog = run_readonly(
+        ["systemctl", "show", CANONICAL_WATCHDOG_UNIT, "-p", "WorkingDirectory", "-p", "ExecStart"]
+    )
+    if not watchdog.ok:
+        audit.add("systemd", "watchdog_entrypoint", Level.UNKNOWN, "unreadable", watchdog.detail)
+        return
+    for finding in check_watchdog_entrypoint(parse_show_properties(watchdog.stdout)):
+        audit.add(
+            "systemd",
+            finding.check,
+            level_of[finding.severity],
+            redact(finding.detail),
+            finding.remedy,
+        )
+
+
+def _gateway_process_cgroup() -> str | None:
+    """The cgroup of the live Gateway process, or None.
+
+    Never returns or logs the process command line: it carries host detail and
+    can carry an account identifier.
+    """
+    found = run_readonly(["pgrep", "-f", "ibgateway"])
+    if not found.ok or not found.stdout.strip():
+        return None
+    pid = found.stdout.split()[0]
+    cgroup = Path(f"/proc/{pid}/cgroup")
+    try:
+        text = cgroup.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        _, _, path = line.partition("::")
+        if path:
+            return path.strip()
+    return text.strip() or None
+
+
 def collect(*, root: Path | None = None) -> Audit:
     """Run every read-only section. Changes nothing."""
     audit = Audit()
@@ -498,9 +672,11 @@ def collect(*, root: Path | None = None) -> Audit:
     audit_processes(audit)
     audit_listeners(audit)
     audit_firewall(audit)
+    audit_exposure_separation(audit)
     audit_time_sync(audit)
     audit_permissions(audit, root=root)
     audit_logrotate(audit, root=root)
+    audit_systemd_contract(audit, root=root)
     audit_deep_probe_dependency(audit)
     return audit
 
