@@ -1132,3 +1132,95 @@ No IBKR connection; no `systemctl` or `systemd-tmpfiles` against the owner
 host; nothing installed on the owner host; no Gateway start/stop/restart/
 relogin; no order; no firewall/OCI change; no credential; no PAPER_AUTO; no
 LIVE.
+
+---
+
+## 14. Public rehearsal base and CHECK purity (D-WATCHDOG-11, D-WATCHDOG-12)
+
+| ID | Defect | Sev | Why it mattered | Status |
+|---|---|---|---|---|
+| D-WATCHDOG-11 | The public `--rehearsal` mode created its root with `mktemp -d "${TMPDIR:-/tmp}/…"` | **P1** | `TMPDIR` is caller-controlled environment input. `TMPDIR=/etc`, `/run`, `/`, a symlink to one, or a relative path resolving into one made a **public** rehearsal create a directory inside a real system tree. The generated leaf name is unique, so this is narrower than the former `--dest-root=/` overwrite — but it still broke the plain claim that a public rehearsal cannot touch the real `/etc` or `/run` | ✅ fixed |
+| D-WATCHDOG-12 | CHECK mode created the rehearsal root **and its marker** before reaching the CHECK exit | **P1** | A dry run that writes a file is not a dry run. CHECK is the mode an operator uses precisely because it is supposed to be safe to run anywhere, including against a path they are still deciding about | ✅ fixed |
+
+### 14.1 D-WATCHDOG-11 — a fixed public base
+
+The public rehearsal base is now the literal `PUBLIC_REHEARSAL_BASE="/tmp"`.
+**No environment variable feeds the decision** — not `TMPDIR`, `HOME`, `PWD`,
+`XDG_RUNTIME_DIR` or any other. A safety property must not be selectable by
+the caller's environment.
+
+Before creating anything, the fixed base is itself validated: rejected if any
+component is a symlink, if it canonicalizes to `/`, or if it resolves into a
+system tree. The root is then created with an **absolute** `mktemp -d`
+template — `mktemp` consults `TMPDIR` only for `-t` or for a template with no
+directory part, so the validated base is the one used. Afterwards the
+generated root must canonicalize to a **direct child** of the canonical base,
+and is re-checked against the system-tree list.
+
+Everything else is unchanged: `0700`, owned by the caller, proven empty,
+marker written, printed, and never deleted.
+
+The test-only `OPS_INSTALL_TEST_MODE=1` / `--dest-root` seam keeps its own
+strict validation and remains the only way to supply a deterministic
+destination.
+
+### 14.2 D-WATCHDOG-12 — CHECK writes nothing
+
+Root handling is split in two:
+
+- **`resolve_rehearsal_root`** — strictly read-only. Rejects empty, `/`,
+  system trees and symlinked components, canonicalizes, and refuses a tree
+  containing symlinks. It creates nothing, so CHECK can call it.
+- **`establish_rehearsal_root`** — the writing half. Creates the directory,
+  sets `0700`, writes the marker and enforces ownership. Called **only** when
+  `APPLY == 1`.
+
+CHECK therefore performs read-only path validation and diffs, and puts not one
+byte on disk — including the marker. It also still invokes no system command.
+
+### 14.3 How these were found
+
+D-WATCHDOG-12 was caught by CI (run #180, `python-quality` and
+`arm64-emulated`), not locally: the test that proves it is POSIX-gated and
+skips on a Windows developer machine. The same run failed a second test
+because a successful rehearsal legitimately contains `.ops-rehearsal-root`
+while the assertion still expected only the five operational assets. The
+marker was **not** removed to satisfy the test — it is the evidence that a
+directory belongs to this installer. The test now asserts the marker
+explicitly (regular file, not a symlink, content naming the installer, at the
+root) **in addition to** the five assets, with nothing unexpected present.
+
+### 14.4 Safety truth unchanged
+
+Public interface remains `--rehearsal`; `--dest-root` remains test-only;
+rehearsal invokes no `systemctl` and no `systemd-tmpfiles`; every write is
+containment-checked; the rehearsal root is printed and retained; real APPLY
+behaviour is unchanged and never enables or starts anything; runtime-directory
+creation and verification remain mandatory on every real apply; tmpfiles.d
+remains the only owner of `/run/ibgateway`; no watchdog or account-safety
+change.
+
+**B-02, B-03 and B-04 remain OPEN. DEF-12 and DEF-13 remain `NOT_RUN`.
+POI-IBKR-001 and POI-MD-001 remain BLOCKED. PAPER_AUTO and LIVE remain
+DISABLED.**
+
+### 14.5 Mutation testing
+
+Eight further mutations, **all caught**: `TMPDIR` restored in the public
+template · the base taken from the environment · `/` allowed as the base ·
+`/etc` or `/run` allowed as the base · the direct-descendant check removed ·
+a symlinked base accepted · CHECK creating the root and marker again · the
+read-only resolver writing the marker. The eleven containment mutations from
+§13 were re-run and all remain caught.
+
+Two of the eight initially survived: removing the base's system-tree check and
+its symlink check is invisible on a host where `/tmp` is ordinary. Rather than
+accept an unguarded defence-in-depth check, both call sites are now pinned
+structurally.
+
+### 14.6 NOT EXECUTED
+
+No IBKR connection; no `systemctl` or `systemd-tmpfiles` against the owner
+host; nothing installed on the owner host; no Gateway start/stop/restart/
+relogin; no order; no firewall/OCI change; no credential; no PAPER_AUTO; no
+LIVE.

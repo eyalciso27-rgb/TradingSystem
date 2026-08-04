@@ -243,15 +243,36 @@ arbitrary path, concatenated straight onto the absolute destinations; with
 and chmod'ed the real `/run/ibgateway`.
 
 So `--dest-root` is gone from the public interface. `--rehearsal` creates its
-own root with `mktemp -d`, and that root is:
+own root with `mktemp -d` under a **fixed base**, and that root is:
 
 - **newly created** by this invocation, and proven empty before use;
 - **`0700`** and owned by the caller, both verified after creation;
 - **not a symlink**, and canonically **not `/`**;
+- a canonical **direct child of the approved base**;
 - **printed**, and deliberately **never deleted** — the point is to inspect it.
 
 Every single write then re-resolves its destination and proves it is still
 beneath that root, so a symlink planted *after* validation cannot redirect it.
+
+**The base is the literal `/tmp`, and no environment variable feeds it.** It
+was `${TMPDIR:-/tmp}`, and `TMPDIR` is caller-controlled: `TMPDIR=/etc` (or
+`/run`, or a symlink to one, or a relative path resolving into one) made a
+*public* rehearsal create its directory inside a real system tree. The unique
+leaf name made that narrower than the old `--dest-root=/` overwrite, but it
+still contradicted the claim above — so **saying "there is no caller-supplied
+destination" was only true once `TMPDIR` was removed from the decision.**
+Before anything is created the fixed base is itself checked for symlinked
+components, for being `/`, and for resolving into a system tree; the generated
+root is then re-checked and must be a direct child of it.
+
+### CHECK creates nothing
+
+CHECK performs read-only path validation and diffs and puts **not one byte on
+disk** — including the marker. Root handling is split: `resolve_rehearsal_root`
+is read-only and always runs, while `establish_rehearsal_root` (which creates
+the directory, sets `0700` and writes the marker) runs **only** under
+`--apply`. Previously the root and its marker were created while establishing
+the root, which happened before the CHECK exit — so a dry run wrote a file.
 
 Rehearsal still validates the tmpfiles rule, creates and verifies
 `<scratch>/run/ibgateway`, and reports what a real apply *would* do about the

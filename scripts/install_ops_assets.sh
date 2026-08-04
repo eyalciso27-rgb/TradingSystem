@@ -163,8 +163,28 @@ require_private_dir() {
 
 # Sets REHEARSAL_ROOT. Deliberately NOT a command substitution: `fail` must
 # exit the script, and inside $(...) it would only exit a subshell.
-validate_rehearsal_root() {
-  local supplied="$1" absolute canonical tree
+reject_system_tree() {
+  local canonical="$1" tree
+  [[ "${canonical}" != "/" ]] || fail "rehearsal root must not be /"
+  for tree in "${SYSTEM_TREES[@]}"; do
+    if [[ "${canonical}" == "${tree}" || "${canonical}" == "${tree}"/* ]]; then
+      fail "rehearsal root must not be inside a system tree: ${canonical}"
+    fi
+  done
+}
+
+write_marker() {
+  printf 'created by scripts/install_ops_assets.sh\n' > "$1/${REHEARSAL_MARKER}"
+}
+
+# STRICTLY READ-ONLY. Sets REHEARSAL_ROOT to the canonical path and proves the
+# path is safe to write to — but writes nothing, so CHECK mode can call it.
+#
+# This split exists because the previous version created the directory and its
+# marker while establishing the root, which happened BEFORE the CHECK exit. A
+# dry run that creates a file is not a dry run.
+resolve_rehearsal_root() {
+  local supplied="$1" absolute canonical
   [[ -n "${supplied}" ]] || fail "rehearsal root must not be empty"
   absolute="$(absolute_path "${supplied}")"
   reject_symlinked_components "${absolute}"
@@ -174,47 +194,75 @@ validate_rehearsal_root() {
   [[ -n "${canonical}" ]] || fail "rehearsal root canonicalizes to nothing: ${supplied}"
   # Traversal is handled here: whatever ../.. spelled, the canonical form is
   # what every containment check below is measured against.
-  [[ "${canonical}" != "/" ]] || fail "rehearsal root must not be /"
-  for tree in "${SYSTEM_TREES[@]}"; do
-    if [[ "${canonical}" == "${tree}" || "${canonical}" == "${tree}"/* ]]; then
-      fail "rehearsal root must not be inside a system tree: ${canonical}"
-    fi
-  done
+  reject_system_tree "${canonical}"
 
   if [[ -e "${canonical}" ]]; then
     [[ -d "${canonical}" ]] \
       || fail "rehearsal root exists and is not a directory: ${canonical}"
-    # Structure first, ownership second: a hostile tree is rejected even on a
-    # filesystem that cannot represent 0700.
+    # Structure is rejected even in CHECK: a tree we would refuse to write to
+    # is a tree we should refuse to report on as a plausible destination.
     reject_symlinks_inside "${canonical}"
+  fi
+  REHEARSAL_ROOT="${canonical}"
+}
+
+# WRITES. Only ever called when APPLY == 1. Ownership, mode and the marker are
+# enforced here, not during resolution, so CHECK stays read-only.
+establish_rehearsal_root() {
+  local canonical="${REHEARSAL_ROOT}"
+  if [[ -e "${canonical}" ]]; then
     [[ -f "${canonical}/${REHEARSAL_MARKER}" ]] \
       || fail "refusing to write into an existing directory with no ${REHEARSAL_MARKER}: ${canonical}"
     require_private_dir "${canonical}"
   else
     mkdir -p -- "${canonical}"
     chmod 0700 -- "${canonical}"
-    printf 'created by scripts/install_ops_assets.sh\n' \
-      > "${canonical}/${REHEARSAL_MARKER}"
+    write_marker "${canonical}"
     require_private_dir "${canonical}"
   fi
-  REHEARSAL_ROOT="${canonical}"
 }
 
-# The owner-facing mode: the installer picks its own private directory, so
-# there is no root to get wrong. Never deleted — the point is to inspect it.
+#: The ONE base a public rehearsal may be created under. A LITERAL, on purpose.
+#:
+#: This used to be `${TMPDIR:-/tmp}`. TMPDIR is caller-controlled environment
+#: input, so `TMPDIR=/etc` (or /run, or a symlink to one, or a relative path
+#: resolving into one) made a PUBLIC rehearsal create a directory inside a real
+#: system tree. The generated leaf name is unique, so it was narrower than the
+#: old `--dest-root=/` overwrite — but it still broke the plain claim that a
+#: public rehearsal cannot touch the real /etc or /run. A safety property must
+#: not be selectable by the environment, so no variable feeds this decision.
+PUBLIC_REHEARSAL_BASE="/tmp"
+
+# The owner-facing mode: the installer picks its own private directory under
+# the fixed base above, so there is no root to get wrong and nothing the caller
+# can point elsewhere. Never deleted — the point is to inspect it.
 create_private_rehearsal_root() {
-  local root canonical
-  root="$(mktemp -d "${TMPDIR:-/tmp}/ops-rehearsal-XXXXXXXX")" \
-    || fail "could not create a private rehearsal directory"
+  local base root canonical parent
+  # Validate the FIXED base before creating anything beneath it.
+  reject_symlinked_components "${PUBLIC_REHEARSAL_BASE}"
+  base="$(canonicalize "${PUBLIC_REHEARSAL_BASE}")" \
+    || fail "cannot canonicalize the rehearsal base ${PUBLIC_REHEARSAL_BASE}"
+  [[ -n "${base}" ]] || fail "the rehearsal base canonicalizes to nothing"
+  reject_system_tree "${base}"
+  [[ -d "${base}" ]] || fail "the rehearsal base is not a directory: ${base}"
+
+  # An ABSOLUTE template: mktemp consults TMPDIR only for -t or for a template
+  # with no directory part, so the base above is the one that is used.
+  root="$(mktemp -d "${base}/ops-rehearsal-XXXXXXXX")" \
+    || fail "could not create a private rehearsal directory under ${base}"
   [[ ! -L "${root}" ]] || fail "mktemp returned a symlink: ${root}"
   chmod 0700 -- "${root}"
   canonical="$(canonicalize "${root}")" || fail "cannot canonicalize ${root}"
-  [[ "${canonical}" != "/" ]] || fail "refusing to rehearse into /"
+  reject_system_tree "${canonical}"
+  # The generated root must be a DIRECT child of the canonical base: anything
+  # else means the path resolved somewhere other than where we asked.
+  parent="$(dirname -- "${canonical}")"
+  [[ "${parent}" == "${base}" ]] \
+    || fail "rehearsal root is not a direct descendant of ${base}: ${canonical}"
   if [[ -n "$(ls -A -- "${canonical}" 2>/dev/null || true)" ]]; then
     fail "a fresh rehearsal root must be empty: ${canonical}"
   fi
-  printf 'created by scripts/install_ops_assets.sh\n' \
-    > "${canonical}/${REHEARSAL_MARKER}"
+  write_marker "${canonical}"
   require_private_dir "${canonical}"
   REHEARSAL_ROOT="${canonical}"
 }
@@ -274,15 +322,29 @@ for arg in "$@"; do
 done
 
 # Establish and validate the rehearsal root BEFORE anything is written.
+#
+# Resolution is read-only and always runs; CREATION happens only under
+# --apply. CHECK must not put a single byte on disk, including the marker.
 if [[ "${REHEARSAL}" -eq 1 ]]; then
   if [[ "${DEST_ROOT_GIVEN}" -eq 1 ]]; then
-    validate_rehearsal_root "${SUPPLIED_ROOT}"
-  else
+    resolve_rehearsal_root "${SUPPLIED_ROOT}"
+    if [[ "${APPLY}" -eq 1 ]]; then
+      establish_rehearsal_root
+    fi
+  elif [[ "${APPLY}" -eq 1 ]]; then
+    # --rehearsal implies --apply, so this is the only way here; the guard
+    # keeps CHECK read-only even if that ever changes.
     create_private_rehearsal_root
+  else
+    fail "--rehearsal requires an apply; CHECK mode creates nothing"
   fi
   DEST_ROOT="${REHEARSAL_ROOT}"
   echo ">>> REHEARSAL ROOT: ${REHEARSAL_ROOT}"
-  echo ">>> It is kept for inspection and is NOT deleted on exit."
+  if [[ "${APPLY}" -eq 1 ]]; then
+    echo ">>> It is kept for inspection and is NOT deleted on exit."
+  else
+    echo ">>> CHECK mode: this path was validated but NOT created."
+  fi
 fi
 
 # Reported state, so the final summary can never overstate what happened.
