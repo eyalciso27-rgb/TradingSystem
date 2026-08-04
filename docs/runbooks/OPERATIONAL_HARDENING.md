@@ -194,11 +194,14 @@ failure.
 ## 4. Installing the assets
 
 ```bash
-scripts/install_ops_assets.sh                        # CHECK / DRY-RUN (default)
-scripts/install_ops_assets.sh --apply                # real install
-scripts/install_ops_assets.sh --apply --no-reload    # skip the reload only
-scripts/install_ops_assets.sh --apply --dest-root=DIR  # isolated REHEARSAL
+scripts/install_ops_assets.sh                      # CHECK / DRY-RUN (default)
+scripts/install_ops_assets.sh --apply              # real install
+scripts/install_ops_assets.sh --apply --no-reload  # skip the reload only
+scripts/install_ops_assets.sh --rehearsal          # isolated REHEARSAL
 ```
+
+That is the **whole** public interface. There is no destination-root option:
+the rehearsal picks its own directory (see below).
 
 Installs `ibgateway-ibc.service`, `ibgateway-watchdog.service`,
 `ibgateway-watchdog.timer`, `/etc/tmpfiles.d/ibgateway.conf` and
@@ -215,27 +218,74 @@ never reads a credential.
 | **APPLY**, a unit changed | yes | **once** | `--create /etc/tmpfiles.d/ibgateway.conf` | create + verify `/run/ibgateway` |
 | **APPLY**, nothing changed | no writes needed | no (nothing stale) | `--create …` | **create + verify** |
 | **APPLY --no-reload** | yes | no | `--create …` | **create + verify** |
-| **APPLY --dest-root=DIR** | into `DIR` | **never** | **never** | validate rule + create + verify `DIR/run/ibgateway` |
+| **`--rehearsal`** | into a private scratch dir | **never** | **never** | validate rule + create + verify `<scratch>/run/ibgateway` |
 
 CHECK mode runs **no system command at all** — it only diffs.
 
-### Rehearsal is structurally isolated
+### Rehearsal is isolated in two independent ways
 
-`--dest-root=DIR` invokes neither `systemctl` nor `systemd-tmpfiles`. Not
-"invokes them harmlessly" — the calls are not written in that branch, and a
-test parses the script to prove it.
+**1. It invokes no privileged command.** Neither `systemctl` nor
+`systemd-tmpfiles` — not "invokes them harmlessly"; the calls are not written
+in that branch, and a test parses the script to prove it.
 
-This matters because staging the config elsewhere **isolates nothing**. The
+That matters because staging the config elsewhere **isolates nothing**. The
 rule is `d /run/ibgateway 0700 opc opc`: an **absolute** path. Running
 `systemd-tmpfiles --create <scratch>/etc/tmpfiles.d/ibgateway.conf` would have
-created and chowned the **real** `/run/ibgateway` on the host. A rehearsal that
-mutates the thing it is rehearsing is not a rehearsal.
+created and chowned the **real** `/run/ibgateway`. A rehearsal that mutates the
+thing it is rehearsing is not a rehearsal.
 
-Instead the rehearsal validates the staged rule and materialises the directory
-inside `DIR`, then verifies it exactly as a real apply would. It reports what a
-real apply *would* do about the reload, so that decision is observable without
-a privileged run. It cannot `chown` to `opc:opc`, and it says so rather than
-implying the ownership was established.
+**2. It writes only beneath a directory it creates itself.** The rehearsal ran
+`install -D`, `mkdir -p` and `chmod` — and those three alone are enough to
+overwrite a host given a bad destination. **Absence of privileged commands is
+not containment.** There used to be a `--dest-root=DIR` option taking an
+arbitrary path, concatenated straight onto the absolute destinations; with
+`--dest-root=/` the "rehearsal" installed into the real `/etc/systemd/system`
+and chmod'ed the real `/run/ibgateway`.
+
+So `--dest-root` is gone from the public interface. `--rehearsal` creates its
+own root with `mktemp -d` under a **fixed base**, and that root is:
+
+- **newly created** by this invocation, and proven empty before use;
+- **`0700`** and owned by the caller, both verified after creation;
+- **not a symlink**, and canonically **not `/`**;
+- a canonical **direct child of the approved base**;
+- **printed**, and deliberately **never deleted** — the point is to inspect it.
+
+Every single write then re-resolves its destination and proves it is still
+beneath that root, so a symlink planted *after* validation cannot redirect it.
+
+**The base is the literal `/tmp`, and no environment variable feeds it.** It
+was `${TMPDIR:-/tmp}`, and `TMPDIR` is caller-controlled: `TMPDIR=/etc` (or
+`/run`, or a symlink to one, or a relative path resolving into one) made a
+*public* rehearsal create its directory inside a real system tree. The unique
+leaf name made that narrower than the old `--dest-root=/` overwrite, but it
+still contradicted the claim above — so **saying "there is no caller-supplied
+destination" was only true once `TMPDIR` was removed from the decision.**
+Before anything is created the fixed base is itself checked for symlinked
+components, for being `/`, and for resolving into a system tree; the generated
+root is then re-checked and must be a direct child of it.
+
+### CHECK creates nothing
+
+CHECK performs read-only path validation and diffs and puts **not one byte on
+disk** — including the marker. Root handling is split: `resolve_rehearsal_root`
+is read-only and always runs, while `establish_rehearsal_root` (which creates
+the directory, sets `0700` and writes the marker) runs **only** under
+`--apply`. Previously the root and its marker were created while establishing
+the root, which happened before the CHECK exit — so a dry run wrote a file.
+
+Rehearsal still validates the tmpfiles rule, creates and verifies
+`<scratch>/run/ibgateway`, and reports what a real apply *would* do about the
+reload, so that decision is observable without a privileged run. It cannot
+`chown` to `opc:opc`, and it says so rather than implying otherwise.
+
+> A deterministic destination is still needed by the test suite, so
+> `--dest-root=` exists **only** when `OPS_INSTALL_TEST_MODE=1`; without it the
+> script exits 2 and points at `--rehearsal`. Even in test mode the supplied
+> path is canonicalized and rejected if it is empty, `/`, a symlink, reached
+> through a symlinked parent, inside a system tree, an existing directory
+> without this installer's `.ops-rehearsal-root` marker, not owned by the
+> caller, or not `0700`.
 
 ### The runtime directory step is mandatory
 

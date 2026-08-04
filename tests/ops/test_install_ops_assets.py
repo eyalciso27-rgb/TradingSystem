@@ -200,8 +200,11 @@ def test_the_runtime_directory_step_is_not_conditional_on_changes() -> None:
 
     Checking only for the old literal guard was too weak — ANY new early exit
     or `changed`/`RELOAD` condition ahead of the verification reintroduces the
-    defect. So the whole region from the start of phase 3 to the verification
-    call is required to contain neither.
+    defect.
+
+    The region deliberately starts at the END OF PHASE 2, not at the phase-3
+    anchor: a guard inserted in the gap between them would otherwise sit just
+    outside the scanned window and skip the whole phase unnoticed.
     """
     assert 'RELOAD}" -eq 1 && "${changed}" -gt 0' not in SOURCE
     assert "verify_runtime_dir() {" in SOURCE
@@ -209,9 +212,10 @@ def test_the_runtime_directory_step_is_not_conditional_on_changes() -> None:
     # Raw code lines here: command_lines() blanks string literals, which would
     # erase the very anchors that delimit the phase.
     body = "\n".join(code_lines())
-    start = body.index('[[ -f "${TMPFILES_CONF}" ]]')
+    start = body.index('STATE_RELOAD="DONE')
     end = body.index("verify_runtime_dir ", start)
     phase = body[start:end]
+    assert '[[ -f "${TMPFILES_CONF}" ]]' in phase, "region must span all of phase 3"
 
     assert "exit 0" not in phase, "an early exit would skip the runtime directory"
     assert "${changed}" not in phase, "the runtime directory must not depend on changes"
@@ -247,10 +251,20 @@ def _stub_bin(tmp_path: Path, *, tmpfiles_exit: int = 0, systemctl_exit: int = 0
 
 
 def _run(
-    tmp_path: Path, *args: str, tmpfiles_exit: int = 0, systemctl_exit: int = 0
+    tmp_path: Path,
+    *args: str,
+    tmpfiles_exit: int = 0,
+    systemctl_exit: int = 0,
+    cwd: Path | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     stub_dir = _stub_bin(tmp_path, tmpfiles_exit=tmpfiles_exit, systemctl_exit=systemctl_exit)
-    env = dict(os.environ, PATH=f"{sh(stub_dir)}:{os.environ.get('PATH', '')}")
+    env = dict(
+        os.environ,
+        PATH=f"{sh(stub_dir)}:{os.environ.get('PATH', '')}",
+        OPS_INSTALL_TEST_MODE="1",
+        **(extra_env or {}),
+    )
     return subprocess.run(  # noqa: S603
         ["bash", str(INSTALLER), *args],
         capture_output=True,
@@ -258,6 +272,8 @@ def _run(
         encoding="utf-8",
         errors="replace",
         env=env,
+        timeout=120,
+        cwd=None if cwd is None else str(cwd),
         check=False,
     )
 
@@ -284,6 +300,7 @@ def _lib(script: str, tmp_path: Path, **stub: int) -> subprocess.CompletedProces
         encoding="utf-8",
         errors="replace",
         env=env,
+        timeout=120,
         check=False,
     )
 
@@ -301,11 +318,10 @@ def _assert_failed_cleanly(result: subprocess.CompletedProcess[str]) -> None:
 # -- 1. CHECK mode ------------------------------------------------------------
 
 
-@POSIX_ONLY
+@BASH_ONLY
 def test_check_mode_writes_nothing_and_runs_no_system_command(tmp_path: Path) -> None:
     root = tmp_path / "root"
-    root.mkdir()
-    result = _run(tmp_path, f"--dest-root={root}")
+    result = _run(tmp_path, f"--dest-root={sh(root)}")
     assert result.returncode == 0, result.stderr
     assert "CHECK / DRY-RUN" in result.stdout
     assert list(root.rglob("*")) == []
@@ -320,13 +336,13 @@ def test_changed_files_would_reload_and_the_runtime_directory_is_verified(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "root"
-    result = _run(tmp_path, "--apply", f"--dest-root={root}")
+    result = _run(tmp_path, "--apply", f"--dest-root={sh(root)}")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "a real apply would: RELOAD (3 unit file(s) changed)" in result.stdout
     assert "runtime dir    : VERIFIED" in result.stdout
 
 
-@BASH_ONLY
+@POSIX_ONLY
 def test_an_unchanged_apply_still_creates_the_vanished_runtime_directory(
     tmp_path: Path,
 ) -> None:
@@ -337,22 +353,22 @@ def test_an_unchanged_apply_still_creates_the_vanished_runtime_directory(
     skipped the whole phase and reported success.
     """
     root = tmp_path / "root"
-    first = _run(tmp_path, "--apply", f"--dest-root={root}")
+    first = _run(tmp_path, "--apply", f"--dest-root={sh(root)}")
     runtime = root / "run" / "ibgateway"
     assert runtime.is_dir(), first.stdout + first.stderr
 
     shutil.rmtree(runtime)
-    second = _run(tmp_path, "--apply", f"--dest-root={root}")
+    second = _run(tmp_path, "--apply", f"--dest-root={sh(root)}")
     assert "unchanged :" in second.stdout, "the fixture must exercise the no-change path"
     assert "a real apply would: SKIP (no unit file changed)" in second.stdout
     assert runtime.is_dir(), "the vanished runtime directory was not recreated"
 
 
-@BASH_ONLY
+@POSIX_ONLY
 def test_no_reload_still_creates_the_runtime_directory(tmp_path: Path) -> None:
     """--no-reload suppresses the reload ONLY."""
     root = tmp_path / "root"
-    result = _run(tmp_path, "--apply", "--no-reload", f"--dest-root={root}")
+    result = _run(tmp_path, "--apply", "--no-reload", f"--dest-root={sh(root)}")
     assert "a real apply would: SKIP (--no-reload)" in result.stdout
     assert (root / "run" / "ibgateway").is_dir(), "--no-reload suppressed the runtime dir"
 
@@ -363,14 +379,14 @@ def test_unchanged_files_do_not_reload_but_still_verify_the_runtime_directory(
 ) -> None:
     """Defect B, the core case: nothing changed, yet the directory is still made."""
     root = tmp_path / "root"
-    first = _run(tmp_path, "--apply", f"--dest-root={root}")
+    first = _run(tmp_path, "--apply", f"--dest-root={sh(root)}")
     assert first.returncode == 0, first.stderr
 
     # Simulate the reboot that empties /run while every config file survives.
     shutil.rmtree(root / "run" / "ibgateway")
     assert not (root / "run" / "ibgateway").exists()
 
-    second = _run(tmp_path, "--apply", f"--dest-root={root}")
+    second = _run(tmp_path, "--apply", f"--dest-root={sh(root)}")
     assert second.returncode == 0, second.stdout + second.stderr
     assert "a real apply would: SKIP (no unit file changed)" in second.stdout
     assert "runtime dir    : VERIFIED" in second.stdout
@@ -380,7 +396,7 @@ def test_unchanged_files_do_not_reload_but_still_verify_the_runtime_directory(
 @POSIX_ONLY
 def test_no_reload_suppresses_only_the_reload(tmp_path: Path) -> None:
     root = tmp_path / "root"
-    result = _run(tmp_path, "--apply", "--no-reload", f"--dest-root={root}")
+    result = _run(tmp_path, "--apply", "--no-reload", f"--dest-root={sh(root)}")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "a real apply would: SKIP (--no-reload)" in result.stdout
     assert "runtime dir    : VERIFIED" in result.stdout
@@ -394,7 +410,7 @@ def test_no_reload_suppresses_only_the_reload(tmp_path: Path) -> None:
 def test_rehearsal_invokes_no_privileged_command_at_all(tmp_path: Path) -> None:
     """Exact argv inspection: the stubs recorded nothing, because nothing ran."""
     root = tmp_path / "root"
-    result = _run(tmp_path, "--apply", f"--dest-root={root}")
+    result = _run(tmp_path, "--apply", f"--dest-root={sh(root)}")
     assert result.returncode == 0, result.stderr
     assert _calls(tmp_path) == [], f"rehearsal invoked: {_calls(tmp_path)}"
     assert "systemd-tmpfiles NOT invoked" in result.stdout
@@ -408,24 +424,42 @@ def test_rehearsal_does_not_create_or_modify_the_real_runtime_directory(
     real = Path("/run/ibgateway")
     existed = real.exists()
     root = tmp_path / "root"
-    result = _run(tmp_path, "--apply", f"--dest-root={root}")
+    result = _run(tmp_path, "--apply", f"--dest-root={sh(root)}")
     assert result.returncode == 0, result.stderr
     assert real.exists() == existed, "the rehearsal touched the REAL /run/ibgateway"
 
 
 @POSIX_ONLY
 def test_rehearsal_stages_everything_inside_the_scratch_root(tmp_path: Path) -> None:
+    """The marker is an INTENDED artifact and is asserted, not filtered away.
+
+    This test used to expect exactly the five operational assets, so a
+    successful rehearsal failed it. Excluding `.ops-rehearsal-root` from the
+    comparison would have hidden the very file that proves the directory
+    belongs to this installer — so it is asserted explicitly instead.
+    """
     root = tmp_path / "root"
-    result = _run(tmp_path, "--apply", f"--dest-root={root}")
+    result = _run(tmp_path, "--apply", f"--dest-root={sh(root)}")
     assert result.returncode == 0, result.stderr
+
+    marker = root / ".ops-rehearsal-root"
+    assert marker.is_file(), "the rehearsal marker must exist"
+    assert not marker.is_symlink(), "the marker must be a regular file"
+    assert "scripts/install_ops_assets.sh" in marker.read_text(encoding="utf-8")
+    assert marker.parent == root, "the marker belongs at the root itself"
+
+    # The five operational assets exist IN ADDITION to the marker, and nothing
+    # unexpected is present.
     staged = sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
     assert staged == [
+        ".ops-rehearsal-root",
         "etc/logrotate.d/ibgateway",
         "etc/systemd/system/ibgateway-ibc.service",
         "etc/systemd/system/ibgateway-watchdog.service",
         "etc/systemd/system/ibgateway-watchdog.timer",
         "etc/tmpfiles.d/ibgateway.conf",
     ], staged
+
     runtime = root / "run" / "ibgateway"
     assert runtime.is_dir()
     assert oct(runtime.stat().st_mode & 0o777) == "0o700"
@@ -435,7 +469,7 @@ def test_rehearsal_stages_everything_inside_the_scratch_root(tmp_path: Path) -> 
 def test_rehearsal_never_claims_to_have_established_ownership(tmp_path: Path) -> None:
     """It cannot chown without privilege, and it must not pretend otherwise."""
     root = tmp_path / "root"
-    result = _run(tmp_path, "--apply", f"--dest-root={root}")
+    result = _run(tmp_path, "--apply", f"--dest-root={sh(root)}")
     assert "ownership opc:opc is NOT established by a" in result.stdout
     assert "REHEARSAL COMPLETE — the real host is unchanged" in result.stdout
     assert "systemctl enable --now" not in result.stdout, "no timer advice after a rehearsal"
@@ -549,3 +583,522 @@ def test_verification_failure_after_tmpfiles_is_still_an_incomplete_install(
     )
     _assert_failed_cleanly(result)
     assert "does not exist" in result.stderr
+
+
+# -- rehearsal root containment (arbitrary destination root) ------------------
+#
+# The rehearsal avoids systemctl and systemd-tmpfiles, but it still runs
+# `install -D`, `mkdir -p` and `chmod`. With an unconstrained destination root
+# those three alone overwrite the real host: `--dest-root=/` wrote straight
+# into /etc/systemd/system and chmod'ed the real /run/ibgateway. Absence of
+# privileged COMMANDS is not containment.
+
+SYMLINK_CAPABLE = pytest.mark.skipif(
+    os.name != "posix",
+    reason="creating symlinks (and to non-existent targets) needs POSIX",
+)
+
+
+def _assert_rejected_without_touching_anything(
+    result: subprocess.CompletedProcess[str], tmp_path: Path
+) -> None:
+    """Non-zero, nothing executed, nothing claimed, no invitation to proceed."""
+    assert result.returncode != 0, result.stdout
+    assert _calls(tmp_path) == [], f"a rejected run executed: {_calls(tmp_path)}"
+    assert "REHEARSAL COMPLETE" not in result.stdout
+    assert "install           : COMPLETE" not in result.stdout
+    assert "tmpfiles config: APPLIED" not in result.stdout
+    assert "systemctl enable --now" not in result.stdout
+
+
+@BASH_ONLY
+def test_dest_root_is_not_a_public_interface(tmp_path: Path) -> None:
+    """Owners get --rehearsal; a caller-supplied root is the attack surface."""
+    stub_dir = _stub_bin(tmp_path)
+    env = dict(os.environ, PATH=f"{sh(stub_dir)}:{os.environ.get('PATH', '')}")
+    env.pop("OPS_INSTALL_TEST_MODE", None)
+    result = subprocess.run(  # noqa: S603
+        ["bash", str(INSTALLER), "--apply", "--dest-root=/"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 2, result.stdout
+    assert "test-only interface" in result.stderr
+    assert "--rehearsal" in result.stderr
+    assert _calls(tmp_path) == []
+
+
+@BASH_ONLY
+def test_the_root_filesystem_is_rejected(tmp_path: Path) -> None:
+    """The headline escape: / would install into the real /etc."""
+    result = _run(tmp_path, "--apply", "--dest-root=/")
+    _assert_rejected_without_touching_anything(result, tmp_path)
+    assert "must not be /" in result.stderr
+
+
+@BASH_ONLY
+def test_an_empty_root_is_rejected(tmp_path: Path) -> None:
+    """It must not silently upgrade into a private root."""
+    result = _run(tmp_path, "--apply", "--dest-root=")
+    _assert_rejected_without_touching_anything(result, tmp_path)
+    assert "must not be empty" in result.stderr
+
+
+@BASH_ONLY
+def test_traversal_resolving_to_the_root_filesystem_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Relative + cwd: the shell resolves it, so this works on any platform."""
+    work = tmp_path / "work"
+    work.mkdir()
+    result = _run(
+        tmp_path, "--apply", "--dest-root=../../../../../../../../../..", cwd=work
+    )
+    _assert_rejected_without_touching_anything(result, tmp_path)
+    assert "must not be /" in result.stderr
+
+
+@BASH_ONLY
+def test_traversal_resolving_into_a_system_tree_is_rejected(tmp_path: Path) -> None:
+    """Canonicalization is what the containment check is measured against."""
+    work = tmp_path / "work"
+    work.mkdir()
+    result = _run(
+        tmp_path, "--apply", "--dest-root=../../../../../../../../../../etc", cwd=work
+    )
+    _assert_rejected_without_touching_anything(result, tmp_path)
+    assert "system tree" in result.stderr
+
+
+@BASH_ONLY
+def test_an_existing_directory_without_the_marker_is_rejected(tmp_path: Path) -> None:
+    """A mistyped root must never become "install into someone else's directory"."""
+    victim = tmp_path / "someone-elses-data"
+    victim.mkdir()
+    (victim / "important.txt").write_text("keep me", encoding="utf-8")
+    result = _run(
+        tmp_path, "--apply", "--dest-root=./someone-elses-data", cwd=tmp_path
+    )
+    _assert_rejected_without_touching_anything(result, tmp_path)
+    assert ".ops-rehearsal-root" in result.stderr
+    assert (victim / "important.txt").read_text(encoding="utf-8") == "keep me"
+    assert not (victim / "etc").exists(), "a rejected run still wrote into the tree"
+
+
+@SYMLINK_CAPABLE
+@BASH_ONLY
+def test_a_root_that_is_a_symlink_to_slash_is_rejected(tmp_path: Path) -> None:
+    link = tmp_path / "link"
+    link.symlink_to("/")
+    result = _run(tmp_path, "--apply", f"--dest-root={sh(link)}")
+    _assert_rejected_without_touching_anything(result, tmp_path)
+    assert "symlink" in result.stderr
+
+
+@SYMLINK_CAPABLE
+@BASH_ONLY
+def test_a_root_containing_an_etc_symlink_is_rejected(tmp_path: Path) -> None:
+    """`etc -> /etc` would make `install -D` write through to the real /etc."""
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    (root / ".ops-rehearsal-root").write_text("x", encoding="utf-8")
+    (root / "etc").symlink_to("/etc")
+    result = _run(tmp_path, "--apply", f"--dest-root={sh(root)}")
+    _assert_rejected_without_touching_anything(result, tmp_path)
+    assert "symlink inside the rehearsal root" in result.stderr
+
+
+@SYMLINK_CAPABLE
+@BASH_ONLY
+def test_a_root_containing_a_run_symlink_is_rejected(tmp_path: Path) -> None:
+    """`run -> /run` would make mkdir/chmod hit the real /run/ibgateway."""
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    (root / ".ops-rehearsal-root").write_text("x", encoding="utf-8")
+    (root / "run").symlink_to("/run")
+    result = _run(tmp_path, "--apply", f"--dest-root={sh(root)}")
+    _assert_rejected_without_touching_anything(result, tmp_path)
+    assert "symlink inside the rehearsal root" in result.stderr
+
+
+# -- the public --rehearsal mode ----------------------------------------------
+
+
+@POSIX_ONLY
+def test_rehearsal_creates_a_fresh_private_root_and_writes_only_beneath_it(
+    tmp_path: Path,
+) -> None:
+    result = _run(tmp_path, "--rehearsal")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    prefix = ">>> REHEARSAL ROOT: "
+    line = next(x for x in result.stdout.splitlines() if x.startswith(prefix))
+    root = Path(line[len(prefix):].strip())
+
+    assert root.is_dir(), "the rehearsal root must be kept for inspection"
+    assert str(root) != "/"
+    assert not root.is_symlink()
+    assert root.resolve() == root
+    assert oct(root.stat().st_mode & 0o777) == "0o700"
+    assert (root / ".ops-rehearsal-root").is_file()
+
+    staged = sorted(
+        str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()
+    )
+    assert staged == [
+        ".ops-rehearsal-root",
+        "etc/logrotate.d/ibgateway",
+        "etc/systemd/system/ibgateway-ibc.service",
+        "etc/systemd/system/ibgateway-watchdog.service",
+        "etc/systemd/system/ibgateway-watchdog.timer",
+        "etc/tmpfiles.d/ibgateway.conf",
+    ], staged
+    assert (root / "run" / "ibgateway").is_dir()
+    assert _calls(tmp_path) == [], "rehearsal invoked a privileged command"
+    assert "is NOT deleted on exit" in result.stdout
+    shutil.rmtree(root, ignore_errors=True)
+
+
+@POSIX_ONLY
+def test_rehearsal_needs_no_destination_argument(tmp_path: Path) -> None:
+    """--rehearsal implies apply-into-scratch; there is no root to get wrong."""
+    result = _run(tmp_path, "--rehearsal")
+    assert result.returncode == 0, result.stderr
+    assert "ownership opc:opc is NOT established by a" in result.stdout
+    prefix = ">>> REHEARSAL ROOT: "
+    line = next(x for x in result.stdout.splitlines() if x.startswith(prefix))
+    shutil.rmtree(Path(line[len(prefix):].strip()), ignore_errors=True)
+
+
+# -- the containment pipeline, asserted structurally --------------------------
+
+
+def _function_body(name: str) -> str:
+    return SOURCE.split(f"{name}() {{", 1)[1].split("\n}", 1)[0]
+
+
+def test_the_rehearsal_root_validation_pipeline_is_complete() -> None:
+    """Every containment step must be present, and structure before ownership.
+
+    Behavioural proof of the symlink cases needs a POSIX host (you cannot
+    reliably create a symlink to a non-existent target on Windows), so the
+    pipeline itself is pinned here where it can be checked anywhere.
+    """
+    resolve = _function_body("resolve_rehearsal_root")
+    for step in (
+        "must not be empty",
+        "reject_symlinked_components",
+        "canonicalize",
+        "reject_system_tree",
+        "reject_symlinks_inside",
+    ):
+        assert step in resolve, f"missing containment step: {step}"
+
+    # The supplied path is checked for symlinks BEFORE canonicalization,
+    # because realpath would resolve them silently.
+    assert resolve.index("reject_symlinked_components") < resolve.index("canonicalize")
+
+    # Ownership, mode and the marker belong to the WRITING half only, so that
+    # CHECK can run the resolver without touching disk.
+    establish = _function_body("establish_rehearsal_root")
+    for step in ("REHEARSAL_MARKER", "require_private_dir"):
+        assert step in establish, f"missing enforcement step: {step}"
+    # A hostile structure is rejected before ownership/mode ever runs, so the
+    # rejection does not depend on a filesystem that can represent 0700.
+    assert "reject_symlinks_inside" in resolve
+    assert "require_private_dir" not in resolve
+
+    tree = _function_body("reject_system_tree")
+    assert 'must not be /' in tree
+    assert "SYSTEM_TREES" in tree
+
+
+def test_the_private_rehearsal_root_is_fresh_and_restrictive() -> None:
+    body = _function_body("create_private_rehearsal_root")
+    assert "mktemp -d" in body
+    assert "chmod 0700" in body
+    assert "-L" in body, "must reject a symlink returned by mktemp"
+    assert "reject_system_tree" in body, "the base and the root must both be checked"
+    assert "ls -A" in body, "a fresh root must be proven empty"
+    assert "require_private_dir" in body
+    # Never deleted: the owner has to be able to inspect it.
+    assert "rm -rf" not in SOURCE
+    assert "trap " not in SOURCE, "no cleanup trap may remove the rehearsal root"
+
+
+def test_every_rehearsal_write_is_containment_checked() -> None:
+    """install / mkdir / chmod each get a fresh resolve-and-compare."""
+    assert "assert_within_root() {" in SOURCE
+    body = _function_body("assert_within_root")
+    assert "canonicalize" in body
+    assert "REHEARSAL_ROOT" in body
+    assert "escapes the rehearsal root" in body
+
+    calls = [
+        line
+        for line in command_lines()
+        if "assert_within_root " in line and "()" not in line
+    ]
+    assert len(calls) >= 3, f"expected a check before each write, found {calls}"
+
+    # The check precedes the write it guards.
+    flat = "\n".join(code_lines())
+    assert flat.index("assert_within_root") < flat.index("install -D")
+    runtime = flat.split("runtime_dir=", 1)[1]
+    assert runtime.index("assert_within_root") < runtime.index("mkdir -p")
+
+
+def test_dest_root_is_gated_behind_test_mode() -> None:
+    assert "OPS_INSTALL_TEST_MODE" in SOURCE
+    assert "test-only interface" in SOURCE
+    assert "--rehearsal) REHEARSAL=1" in SOURCE
+
+
+@BASH_ONLY
+def test_a_rehearsal_root_that_is_not_private_is_rejected(tmp_path: Path) -> None:
+    """0700 is required of the ROOT itself, not only of run/ibgateway.
+
+    Behavioural and portable: a default-umask mkdir gives 0755 on every
+    platform, so this guards the check even where 0700 cannot be set.
+    """
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    result = _lib(f'require_private_dir "{sh(loose)}"', tmp_path)
+    _assert_failed_cleanly(result)
+    assert "must be 0700" in result.stderr
+
+
+def test_the_rehearsal_root_privacy_check_covers_mode_and_owner() -> None:
+    """Ownership cannot be faked in a test, so it is pinned structurally."""
+    body = _function_body("require_private_dir")
+    assert "stat -c '%a'" in body, "mode must be read"
+    assert "stat -c '%U'" in body, "owner must be read"
+    assert "must be 0700" in body
+    assert "must be owned by" in body
+    assert "id -un" in body
+
+    calls = [
+        line
+        for line in command_lines()
+        if line.strip().startswith("require_private_dir ")
+    ]
+    assert len(calls) >= 3, (
+        f"every path that establishes a root must check it, found {calls}"
+    )
+
+
+def test_the_rehearsal_completion_notice_points_at_the_manual_apply() -> None:
+    """It used to say "re-run without --dest-root", which no longer exists.
+
+    Telling an owner to re-run with a flag that has been removed from the
+    public interface is a dead end at exactly the moment they are deciding
+    whether to touch the host.
+    """
+    notice = SOURCE.split("cat <<'REHEARSALNEXT'", 1)[1].split("REHEARSALNEXT", 1)[0]
+    assert "--dest-root" not in notice, "the notice must not name a removed flag"
+    assert "WITHOUT --rehearsal" in notice
+    assert "OPERATIONAL_HARDENING.md" in notice, "point at the documented step"
+    assert "Do NOT" in notice and "enable any timer" in notice
+    # The manual step stays manual: nothing here starts a privileged action.
+    for command in PRIVILEGED:
+        assert command not in notice
+
+
+# -- CHECK is read-only, including with the test-only seam --------------------
+#
+# CI caught this: the script established the rehearsal root — creating the
+# directory AND its marker — before reaching the CHECK exit, so a dry run put a
+# file on disk. Resolution is now read-only and creation happens only under
+# --apply.
+
+
+@BASH_ONLY
+def test_check_with_no_arguments_writes_nothing(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    before = sorted(p.name for p in work.iterdir())
+    result = _run(tmp_path, cwd=work)
+    assert result.returncode == 0, result.stderr
+    assert "CHECK / DRY-RUN" in result.stdout
+    assert sorted(p.name for p in work.iterdir()) == before
+    assert _calls(tmp_path) == []
+
+
+@BASH_ONLY
+def test_check_with_a_nonexistent_dest_root_creates_nothing(tmp_path: Path) -> None:
+    """Not even the marker. A dry run that creates a file is not a dry run."""
+    root = tmp_path / "does-not-exist"
+    result = _run(tmp_path, f"--dest-root={sh(root)}")
+    assert result.returncode == 0, result.stderr
+    assert not root.exists(), "CHECK created the destination"
+    assert "CHECK mode: this path was validated but NOT created" in result.stdout
+    assert _calls(tmp_path) == []
+
+
+@BASH_ONLY
+def test_check_with_an_existing_marked_dest_root_writes_nothing(tmp_path: Path) -> None:
+    root = tmp_path / "marked"
+    root.mkdir()
+    (root / ".ops-rehearsal-root").write_text(
+        "created by scripts/install_ops_assets.sh\n", encoding="utf-8"
+    )
+    before = sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+    result = _run(tmp_path, f"--dest-root={sh(root)}")
+    assert result.returncode == 0, result.stderr
+    assert sorted(str(p.relative_to(root)) for p in root.rglob("*")) == before
+    assert _calls(tmp_path) == []
+
+
+def test_creation_happens_only_under_apply() -> None:
+    """Structural: the writing helper is called only inside an APPLY guard."""
+    assert "resolve_rehearsal_root() {" in SOURCE
+    assert "establish_rehearsal_root() {" in SOURCE
+    resolve = _function_body("resolve_rehearsal_root")
+    for writer in ("mkdir", "chmod", "write_marker", "install "):
+        assert writer not in resolve, f"{writer} in the read-only resolver"
+
+    body = "\n".join(code_lines())
+    call = body.index("establish_rehearsal_root\n")
+    guard = body.rindex('if [[ "${APPLY}" -eq 1 ]]; then', 0, call)
+    between = body[guard:call]
+    assert "fi" not in between, "establish_rehearsal_root must sit inside the APPLY guard"
+
+
+# -- D-WATCHDOG-11: the public rehearsal base is fixed, not inherited ---------
+#
+# `${TMPDIR:-/tmp}` let caller-controlled environment input choose where a
+# PUBLIC rehearsal created its directory: TMPDIR=/etc put it inside a real
+# system tree. Narrower than the old --dest-root=/ overwrite, because the leaf
+# name is unique — but it still broke the claim that a public rehearsal cannot
+# touch the real /etc or /run.
+
+HOSTILE_TMPDIRS = ["/", "/etc", "/run", "relative-dir"]
+
+
+def _rehearsal_root_from(result: subprocess.CompletedProcess[str]) -> str | None:
+    prefix = ">>> REHEARSAL ROOT: "
+    for line in result.stdout.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+    return None
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize("hostile", HOSTILE_TMPDIRS)
+def test_a_hostile_tmpdir_cannot_move_the_public_rehearsal(
+    tmp_path: Path, hostile: str
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    result = _run(tmp_path, "--rehearsal", cwd=work, extra_env={"TMPDIR": hostile})
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    root = _rehearsal_root_from(result)
+    assert root is not None, result.stdout
+    assert root.startswith("/tmp/"), f"TMPDIR={hostile} moved the root to {root}"
+    assert root != "/"
+    assert Path(root).resolve() == Path(root), "the printed root must be canonical"
+    # A relative TMPDIR must not have produced anything in the working dir.
+    assert sorted(p.name for p in work.iterdir()) == []
+    assert _calls(tmp_path) == []
+    shutil.rmtree(root, ignore_errors=True)
+
+
+@POSIX_ONLY
+def test_a_symlinked_tmpdir_cannot_redirect_the_public_rehearsal(
+    tmp_path: Path,
+) -> None:
+    """`TMPDIR=<dir>/link` where link -> /etc must change nothing."""
+    link = tmp_path / "link"
+    link.symlink_to("/etc")
+    result = _run(tmp_path, "--rehearsal", extra_env={"TMPDIR": str(link)})
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    root = _rehearsal_root_from(result)
+    assert root is not None
+    assert root.startswith("/tmp/"), f"a symlinked TMPDIR redirected to {root}"
+    assert not Path("/etc/ops-rehearsal-root").exists()
+    shutil.rmtree(root, ignore_errors=True)
+
+
+@POSIX_ONLY
+def test_nothing_is_created_inside_a_hostile_tmpdir(tmp_path: Path) -> None:
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    result = _run(tmp_path, "--rehearsal", extra_env={"TMPDIR": str(hostile)})
+    assert result.returncode == 0, result.stderr
+    assert sorted(p.name for p in hostile.iterdir()) == [], "TMPDIR was written to"
+    root = _rehearsal_root_from(result)
+    assert root is not None and root.startswith("/tmp/")
+    shutil.rmtree(root, ignore_errors=True)
+
+
+@POSIX_ONLY
+def test_the_public_rehearsal_root_is_private_and_complete(tmp_path: Path) -> None:
+    """The printed root: canonical, under the base, 0700, ours, marker + assets."""
+    result = _run(tmp_path, "--rehearsal", extra_env={"TMPDIR": "/etc"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    root = Path(_rehearsal_root_from(result) or "")
+
+    assert root.is_dir() and not root.is_symlink()
+    assert root.resolve() == root, "canonical"
+    assert str(root) != "/"
+    assert root.parent == Path("/tmp"), "a direct child of the approved base"
+    assert oct(root.stat().st_mode & 0o777) == "0o700"
+    # Owned by us: compare against a directory this process just created.
+    # (st_uid rather than Path.owner()/os.getuid(), which are POSIX-only APIs
+    # and would not type-check on the Windows developer platform.)
+    assert root.stat().st_uid == tmp_path.stat().st_uid
+
+    marker = root / ".ops-rehearsal-root"
+    assert marker.is_file() and not marker.is_symlink()
+    assert "scripts/install_ops_assets.sh" in marker.read_text(encoding="utf-8")
+
+    staged = sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+    assert staged == [
+        ".ops-rehearsal-root",
+        "etc/logrotate.d/ibgateway",
+        "etc/systemd/system/ibgateway-ibc.service",
+        "etc/systemd/system/ibgateway-watchdog.service",
+        "etc/systemd/system/ibgateway-watchdog.timer",
+        "etc/tmpfiles.d/ibgateway.conf",
+    ], staged
+    assert (root / "run" / "ibgateway").is_dir()
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def test_the_public_base_is_a_literal_not_an_environment_variable() -> None:
+    """No caller-controlled variable may feed the public rehearsal base."""
+    assert 'PUBLIC_REHEARSAL_BASE="/tmp"' in SOURCE
+    body = _function_body("create_private_rehearsal_root")
+    executable = "\n".join(command_lines(body))
+    for variable in ("TMPDIR", "HOME", "XDG_RUNTIME_DIR", "PWD", "USER", "LOGNAME"):
+        assert variable not in executable, f"{variable} feeds the public base"
+    assert "PUBLIC_REHEARSAL_BASE" in executable
+    assert "reject_system_tree" in executable
+    # `dirname` lives inside a command substitution, which command_lines()
+    # blanks along with every other quoted span, so check the raw code.
+    raw = "\n".join(code_lines(body))
+    assert "dirname" in raw, "the root must be proven a direct child of the base"
+
+    # Defence in depth for the day someone edits the literal: BOTH the base and
+    # the generated root are system-tree checked, and the base is symlink
+    # checked. Removing either is invisible on a host where /tmp is ordinary,
+    # so it has to be pinned structurally rather than behaviourally.
+    assert raw.count("reject_system_tree") == 2, (
+        "the base AND the generated root must each be system-tree checked"
+    )
+    assert "reject_symlinked_components" in raw, (
+        "the base must be rejected if it is reached through a symlink"
+    )
+
+    # And nowhere in the script does TMPDIR reach an executable line. Checked
+    # on RAW code: command_lines() blanks quoted spans, so a reintroduced
+    # "${TMPDIR:-/tmp}" would be erased before the comparison and slip past.
+    for line in code_lines():
+        assert "TMPDIR" not in line, f"TMPDIR is used in: {line}"
