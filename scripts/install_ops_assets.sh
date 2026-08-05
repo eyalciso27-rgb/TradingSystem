@@ -729,7 +729,7 @@ verify_runtime_contract "${DEST_ROOT}/etc/systemd/system/ibgateway-watchdog.serv
 
 echo "  install           : COMPLETE — NOTHING was enabled or started"
 echo
-cat <<'NEXT'
+cat <<'OWNER_STEPS_EOF'
 NEXT STEPS (owner decisions, performed by hand — deliberately not automated):
 
   1. Review the units:      systemctl cat ibgateway-ibc.service
@@ -746,4 +746,4 @@ NEXT STEPS (owner decisions, performed by hand — deliberately not automated):
 
   Port exposure (4002 / 5901) and OCI network security are NOT changed here.
   See docs/runbooks/HOST_PORT_SECURITY.md.
-NEXT
+OWNER_STEPS_EOF

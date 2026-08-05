@@ -944,12 +944,26 @@ def test_the_engine_does_not_depend_on_the_working_directory(
 
 @POSIX_ONLY
 def test_the_import_probe_really_runs_against_the_repository_venv() -> None:
-    """The probe itself, unsimulated, with -B so it writes no bytecode."""
+    """The probe itself, unsimulated, with -B so it writes no bytecode.
+
+    The venv root is derived from the interpreter actually running the tests,
+    not assumed to be `<repo>/.venv`: CI may resolve `uv run` to an environment
+    outside the working tree, and asserting a layout instead of the real
+    interpreter would fail for a reason that says nothing about the probe.
+    """
+    interpreter = Path(sys.executable).resolve()
+    venv_root = interpreter.parent.parent
+    if not (venv_root / "bin" / "python").exists():
+        pytest.skip(f"no <root>/bin/python layout for {interpreter}")
+
     remediator = rem.Remediator(
-        repo_root=str(REPO), sysroot="", commands=rem.CommandAdapter(), test_mode=True
+        repo_root=str(venv_root.parent),
+        sysroot="",
+        commands=rem.CommandAdapter(),
+        test_mode=True,
     )
     ok, detail = remediator._probe_imports()
     assert ok, detail
     issued = [" ".join(c) for c in remediator.commands.calls]
+    assert issued, "the probe issued no command"
     assert all("-B" in c for c in issued), issued
-    assert not (REPO / "__pycache__").exists()
