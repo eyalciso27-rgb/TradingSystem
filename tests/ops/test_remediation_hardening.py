@@ -946,15 +946,26 @@ def test_the_engine_does_not_depend_on_the_working_directory(
 def test_the_import_probe_really_runs_against_a_pinned_interpreter(tmp_path: Path) -> None:
     """The probe itself, unsimulated, through the engine's PINNED path.
 
-    The pinned layout is built here with a symlink to the interpreter actually
-    running the tests, rather than assuming one exists at `<repo>/.venv`: CI
-    resolves `uv run` to a cache environment that is not named `.venv`, so
-    asserting that layout skipped the test exactly where it mattered. Building
-    it means the probe really executes wherever the suite runs.
+    The pinned layout is built here, wrapping the interpreter actually running
+    the tests, rather than assuming one exists at `<repo>/.venv`: CI resolves
+    `uv run` to a cache environment that is not named `.venv`, so asserting
+    that layout skipped the test exactly where it mattered. Building it means
+    the probe really executes wherever the suite runs.
     """
     repo_root = tmp_path / "repo"
     (repo_root / ".venv" / "bin").mkdir(parents=True)
-    (repo_root / ".venv" / "bin" / "python").symlink_to(Path(sys.executable).resolve())
+    pinned = repo_root / ".venv" / "bin" / "python"
+    # An exec wrapper, not a symlink. A symlinked interpreter resolves its
+    # venv prefix from the SYMLINK's directory, finds no pyvenv.cfg there and
+    # falls back to the base environment — so the project packages vanish and
+    # the probe fails for a reason that has nothing to do with the probe.
+    # Exec'ing keeps the real interpreter's own prefix and site-packages.
+    real = Path(sys.executable).resolve().as_posix()
+    pinned.write_text(
+        "#!/bin/sh\n" + 'exec "' + real + '" "$@"\n',
+        encoding="utf-8",
+    )
+    pinned.chmod(0o755)
 
     remediator = rem.Remediator(
         repo_root=str(repo_root),
