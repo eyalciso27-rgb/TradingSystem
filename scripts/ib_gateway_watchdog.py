@@ -98,15 +98,28 @@ logger = logging.getLogger("ib_gateway_watchdog")
 #: ``managedAccounts`` callback, so containment cannot rely on our own call
 #: sites being careful: every record on every handler is filtered.
 #:
-#: Matches account-shaped ids with a ONE to FOUR letter prefix, and partial
-#: forms, so a truncated id cannot leak either.
+#: Account-shaped identifiers, in every spelling that still identifies the
+#: account. A single uppercase-only pattern covered just the two shapes that
+#: happened to be in front of us; a lowercased log line, a dash- or
+#: dot-separated form, or a mask that leaves the digit run intact all went
+#: straight through. Over-redacting a log line costs a diagnostic; failing to
+#: redact one is permanent.
 #:
-#: The previous ``[A-Z]{1,2}`` covered only the two shapes that happened to be
-#: in front of us. Broker and sub-account identifiers are not limited to those:
-#: a three- or four-letter prefix would have passed straight through the
-#: filter. The bound is widened rather than guessed narrow — over-redacting a
-#: log line costs nothing; under-redacting one is permanent.
-_ACCOUNT_ID_PATTERN = re.compile(r"\b[A-Z]{1,4}\d{5,}\b")
+#: Every pattern is ``\b``-anchored, which is what keeps a 64-character sha256
+#: digest intact: there is no word boundary inside it, so no interior run can
+#: match and no hash in an evidence file is ever mangled.
+_ACCOUNT_ID_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # A run of 1-4 letters, each optionally followed by a dot or dash, then
+    # the digit run. Covers attached (DU1234567, du7654321), trailing-separator
+    # (DU-7654321) and interleaved (D.U.7654321) spellings in one rule.
+    re.compile(r"\b(?:[A-Za-z][.\-]?){1,4}\d{5,}\b"),
+    # Space-separated, UPPERCASE prefix only. Restricting the space form to
+    # uppercase is deliberate: "DU 7654321" is account-shaped, while
+    # "took 123456 ms" is ordinary prose that must stay readable.
+    re.compile(r"\b[A-Z]{1,4} \d{5,}\b"),
+    # Masked prefix that still exposes the identifying digit run: **7654321.
+    re.compile(r"[*#]{2,}\d{5,}\b"),
+)
 ACCOUNT_ID_PLACEHOLDER = "<redacted-account-id>"
 
 #: Dependency loggers that must never be raised to INFO/DEBUG by us. ibapi
@@ -116,7 +129,10 @@ _DEPENDENCY_LOGGERS = ("ibapi", "ibapi.client", "ibapi.wrapper", "ibapi.decoder"
 
 def redact_account_ids(text: object) -> str:
     """Replace anything account-id shaped. Safe to apply to arbitrary text."""
-    return _ACCOUNT_ID_PATTERN.sub(ACCOUNT_ID_PLACEHOLDER, str(text))
+    scrubbed = str(text)
+    for pattern in _ACCOUNT_ID_PATTERNS:
+        scrubbed = pattern.sub(ACCOUNT_ID_PLACEHOLDER, scrubbed)
+    return scrubbed
 
 
 class AccountIdRedactingFilter(logging.Filter):

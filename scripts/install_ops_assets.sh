@@ -360,27 +360,86 @@ probe_runtime_imports() {
 #: never mutates and never fails the run, because "this host is not ready yet"
 #: is information a dry run exists to give, not a dry-run failure.
 report_runtime_readiness() {
+  # Every check is genuinely executed, and every result is emitted BOTH as a
+  # human line and as a machine-readable key, so the remediation preflight can
+  # consume the same verdict instead of re-implementing (and drifting from) it.
   local ready=1
-  if [[ -d "${RUNTIME_REPO_ROOT}" ]]; then
-    echo "  repo root         : PRESENT ${RUNTIME_REPO_ROOT}"
-  else
-    echo "  repo root         : MISSING ${RUNTIME_REPO_ROOT}"; ready=0
-  fi
-  if [[ -r "${RUNTIME_WATCHDOG}" ]]; then
-    echo "  watchdog script   : READABLE"
-  else
-    echo "  watchdog script   : MISSING ${RUNTIME_WATCHDOG}"; ready=0
-  fi
+  READINESS_KEYS=()
+
+  _readiness() {
+    local key="$1" ok="$2" label="$3" detail="$4"
+    READINESS_KEYS+=("${key}=$([[ "${ok}" -eq 1 ]] && echo pass || echo fail)")
+    if [[ "${ok}" -eq 1 ]]; then
+      printf '  %-18s: %s\n' "${label}" "${detail}"
+    else
+      printf '  %-18s: FAIL %s\n' "${label}" "${detail}"
+      ready=0
+    fi
+  }
+
+  [[ -d "${RUNTIME_REPO_ROOT}" ]] \
+    && _readiness repo_root 1 "repo root" "${RUNTIME_REPO_ROOT}" \
+    || _readiness repo_root 0 "repo root" "missing ${RUNTIME_REPO_ROOT}"
+
+  [[ -x "${RUNTIME_VENV_PYTHON}" ]] \
+    && _readiness venv 1 "pinned venv" "${RUNTIME_VENV_PYTHON}" \
+    || _readiness venv 0 "pinned venv" "missing or not executable"
+
+  [[ -r "${RUNTIME_WATCHDOG}" ]] \
+    && _readiness watchdog_script 1 "watchdog script" "readable" \
+    || _readiness watchdog_script 0 "watchdog script" "missing ${RUNTIME_WATCHDOG}"
+
   if probe_runtime_imports; then
-    echo "  runtime imports   : OK via ${RUNTIME_VENV_PYTHON} (-B, no bytecode written)"
+    _readiness imports 1 "runtime imports" "OK via the pinned interpreter (-B, no bytecode)"
   else
-    echo "  runtime imports   : NOT SATISFIED — ${RUNTIME_IMPORT_DETAIL}"; ready=0
+    _readiness imports 0 "runtime imports" "${RUNTIME_IMPORT_DETAIL}"
   fi
+
+  # The UNIT SOURCE is validated here too: a host can have a perfect venv and
+  # still be about to install a unit that points somewhere else entirely.
+  local unit_source="${REPO_ROOT}/systemd/ibgateway-watchdog.service"
+  if [[ ! -r "${unit_source}" ]]; then
+    _readiness unit_source 0 "watchdog unit" "missing ${unit_source}"
+    _readiness unit_workingdir 0 "  WorkingDirectory" "not checked"
+    _readiness unit_interpreter 0 "  interpreter" "not checked"
+    _readiness unit_script 0 "  script" "not checked"
+    _readiness unit_no_env 0 "  no /usr/bin/env" "not checked"
+    _readiness unit_no_stale 0 "  no stale /opt" "not checked"
+  else
+    _readiness unit_source 1 "watchdog unit" "readable"
+    local body
+    body="$(grep -v '^[[:space:]]*#' "${unit_source}" || true)"
+
+    grep -q "^WorkingDirectory=${RUNTIME_REPO_ROOT}$" "${unit_source}" \
+      && _readiness unit_workingdir 1 "  WorkingDirectory" "exact" \
+      || _readiness unit_workingdir 0 "  WorkingDirectory" "not exactly ${RUNTIME_REPO_ROOT}"
+
+    [[ "${body}" == *"${RUNTIME_VENV_PYTHON}"* ]] \
+      && _readiness unit_interpreter 1 "  interpreter" "absolute pinned venv" \
+      || _readiness unit_interpreter 0 "  interpreter" "not the pinned interpreter"
+
+    [[ "${body}" == *"${RUNTIME_WATCHDOG}"* ]] \
+      && _readiness unit_script 1 "  script" "canonical repository script" \
+      || _readiness unit_script 0 "  script" "not the canonical script"
+
+    [[ "${body}" != *"/usr/bin/env"* ]] \
+      && _readiness unit_no_env 1 "  no /usr/bin/env" "absolute" \
+      || _readiness unit_no_env 0 "  no /usr/bin/env" "resolves through PATH"
+
+    [[ "${body}" != *"${STALE_WATCHDOG_PATH}"* ]] \
+      && _readiness unit_no_stale 1 "  no stale /opt" "clean" \
+      || _readiness unit_no_stale 0 "  no stale /opt" "references ${STALE_WATCHDOG_PATH}"
+  fi
+
   if [[ "${ready}" -eq 1 ]]; then
     echo "  runtime readiness : READY — an --apply would satisfy the contract"
   else
     echo "  runtime readiness : NOT READY — an --apply would FAIL here"
   fi
+
+  # Machine-readable. One line, stable key order, easy to parse and to assert.
+  echo "READINESS ready=$([[ "${ready}" -eq 1 ]] && echo yes || echo no) ${READINESS_KEYS[*]}"
+  [[ "${ready}" -eq 1 ]]
 }
 
 # Test seam: source this file with OPS_INSTALL_LIB_ONLY=1 to get the helpers
@@ -535,7 +594,10 @@ if [[ "${APPLY}" -eq 0 ]]; then
   echo "  * verify the pinned interpreter can import: ${RUNTIME_REQUIRED_IMPORTS}"
   echo
   echo "READ-ONLY VALIDATION (executed now; nothing is written):"
-  report_runtime_readiness
+  # `|| true`: a not-ready host is information a dry run exists to GIVE, not a
+  # dry-run failure. The function still RETURNS non-zero so a programmatic
+  # caller (the remediation preflight) can consume the verdict.
+  report_runtime_readiness || true
   echo
   cat <<'CHECKNEXT'
 NEXT STEPS (owner decisions, performed by hand — deliberately not automated):
