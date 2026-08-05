@@ -69,6 +69,9 @@ STALE_WATCHDOG_PATH = "/opt/trading/scripts/ib_gateway_watchdog.py"
 CANONICAL_JAVA_PATH = "/opt/ibc/jre/bin/java"
 CANONICAL_SERVICE_CGROUP = f"/system.slice/{CANONICAL_GATEWAY_UNIT}"
 
+#: What the deep probe genuinely needs, checked with the pinned interpreter.
+REQUIRED_IMPORTS_TUPLE = ("trading_broker_ibkr", "trading_execution_agent.account_safety")
+
 STATE_DIR = "/var/lib/ibgateway-remediation"
 DROPIN_DIR = f"/etc/systemd/system/{CANONICAL_GATEWAY_UNIT}.d"
 
@@ -657,7 +660,7 @@ class Remediator:
     def _probe_imports(self) -> tuple[bool, str]:
         if not self.venv_python.is_file():
             return False, "interpreter missing"
-        for module in ("trading_broker_ibkr", "trading_execution_agent.account_safety"):
+        for module in REQUIRED_IMPORTS_TUPLE:
             result = self.commands.run([str(self.venv_python), "-B", "-c", f"import {module}"])
             if not result.ok:
                 return False, f"cannot import {module}"

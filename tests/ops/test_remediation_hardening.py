@@ -943,27 +943,32 @@ def test_the_engine_does_not_depend_on_the_working_directory(
 
 
 @POSIX_ONLY
-def test_the_import_probe_really_runs_against_the_repository_venv() -> None:
-    """The probe itself, unsimulated, with -B so it writes no bytecode.
+def test_the_import_probe_really_runs_against_a_pinned_interpreter(tmp_path: Path) -> None:
+    """The probe itself, unsimulated, through the engine's PINNED path.
 
-    The venv root is derived from the interpreter actually running the tests,
-    not assumed to be `<repo>/.venv`: CI may resolve `uv run` to an environment
-    outside the working tree, and asserting a layout instead of the real
-    interpreter would fail for a reason that says nothing about the probe.
+    The pinned layout is built here with a symlink to the interpreter actually
+    running the tests, rather than assuming one exists at `<repo>/.venv`: CI
+    resolves `uv run` to a cache environment that is not named `.venv`, so
+    asserting that layout skipped the test exactly where it mattered. Building
+    it means the probe really executes wherever the suite runs.
     """
-    interpreter = Path(sys.executable).resolve()
-    venv_root = interpreter.parent.parent
-    if not (venv_root / "bin" / "python").exists():
-        pytest.skip(f"no <root>/bin/python layout for {interpreter}")
+    repo_root = tmp_path / "repo"
+    (repo_root / ".venv" / "bin").mkdir(parents=True)
+    (repo_root / ".venv" / "bin" / "python").symlink_to(Path(sys.executable).resolve())
 
     remediator = rem.Remediator(
-        repo_root=str(venv_root.parent),
+        repo_root=str(repo_root),
         sysroot="",
         commands=rem.CommandAdapter(),
         test_mode=True,
     )
+    assert remediator.venv_python.exists(), remediator.venv_python
+
     ok, detail = remediator._probe_imports()
     assert ok, detail
+
     issued = [" ".join(c) for c in remediator.commands.calls]
-    assert issued, "the probe issued no command"
+    assert len(issued) == len(rem.REQUIRED_IMPORTS_TUPLE), issued
     assert all("-B" in c for c in issued), issued
+    # -B means no bytecode: the probe leaves nothing behind.
+    assert not list(repo_root.rglob("__pycache__"))
