@@ -955,14 +955,25 @@ def test_the_import_probe_really_runs_against_a_pinned_interpreter(tmp_path: Pat
     repo_root = tmp_path / "repo"
     (repo_root / ".venv" / "bin").mkdir(parents=True)
     pinned = repo_root / ".venv" / "bin" / "python"
-    # An exec wrapper, not a symlink. A symlinked interpreter resolves its
-    # venv prefix from the SYMLINK's directory, finds no pyvenv.cfg there and
-    # falls back to the base environment — so the project packages vanish and
-    # the probe fails for a reason that has nothing to do with the probe.
-    # Exec'ing keeps the real interpreter's own prefix and site-packages.
+    # An exec wrapper that also carries this process's import resolution.
+    #
+    # A symlink is not enough: a symlinked interpreter resolves its venv prefix
+    # from the SYMLINK's directory, finds no pyvenv.cfg and falls back to the
+    # base environment. Exec alone is not enough either — on the owner host the
+    # pinned venv genuinely has the packages installed, but CI resolves the
+    # workspace differently, so a bare subprocess cannot import them and the
+    # probe fails for a reason that says nothing about the probe.
+    #
+    # Exporting the parent's sys.path reproduces the owner-host condition (a
+    # pinned interpreter that CAN import the project) wherever the suite runs,
+    # so what is under test stays the probe rather than the environment.
     real = Path(sys.executable).resolve().as_posix()
+    import_path = os.pathsep.join(p for p in sys.path if p and Path(p).is_dir())
     pinned.write_text(
-        "#!/bin/sh\n" + 'exec "' + real + '" "$@"\n',
+        "#!/bin/sh\n"
+        + f'PYTHONPATH="{import_path}"\n'
+        + "export PYTHONPATH\n"
+        + f'exec "{real}" "$@"\n',
         encoding="utf-8",
     )
     pinned.chmod(0o755)
