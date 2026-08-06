@@ -73,7 +73,7 @@ def _strip_heredocs(text: str) -> list[str]:
             if line.strip() == terminator:
                 terminator = None
             continue
-        match = re.search(r"<<'([A-Z]+)'", line)
+        match = re.search(r"<<'([A-Z_]+)'", line)
         if match:
             terminator = match.group(1)
             continue

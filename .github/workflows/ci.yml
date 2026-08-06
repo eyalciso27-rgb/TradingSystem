@@ -33,6 +33,21 @@ jobs:
         run: uv run python scripts/verify_baseline.py
       - name: Build metadata (records baseline hash and versions)
         run: uv run python scripts/build_metadata.py --output artifacts/generated/build_metadata.json
+      - name: Shell syntax and shellcheck
+        run: |
+          set -euo pipefail
+          for script in $(git ls-files '*.sh'); do
+            bash -n "$script"
+          done
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          # Repo-wide at ERROR: real defects, enforced everywhere.
+          # SC1091: sourced paths resolve on the owner host, not in CI.
+          shellcheck --severity=error --exclude=SC1091 $(git ls-files '*.sh')
+          # The operational scripts are held to WARNING as well. Scoped
+          # deliberately rather than claiming a repo-wide warning-clean tree
+          # that has never been measured; widen it as older scripts are cleaned.
+          shellcheck --severity=warning --exclude=SC1091             scripts/install_ops_assets.sh             scripts/remediate_owner_host_runtime.sh
       - name: Architecture guardrails
         run: uv run python scripts/check_architecture.py
       - name: Contract generation drift check

@@ -1443,3 +1443,141 @@ service inactive.
 Unchanged. **B-02/B-03/B-04 OPEN. DEF-12/DEF-13 NOT_RUN. IMP-1303/IMP-1304
 incomplete. POI-IBKR-001 and POI-MD-001 BLOCKED. PAPER_AUTO and LIVE DISABLED.**
 The owner host has not been modified by this bundle.
+
+
+---
+
+## 16. Transaction hardening (D-WATCHDOG-25 … D-WATCHDOG-36)
+
+The independent review of `c61821a` (merged in #60) found twelve defects. All
+of them survived a green CI, because several were *missing or wrongly
+constructed tests* rather than wrong code.
+
+| ID | Defect | Sev | Status |
+|---|---|---|---|
+| D-WATCHDOG-25 | Backups forced to `0600`, restored with `cp -p`: a `0644` drop-in or `0755` executable could come back as `0600`, and "byte-identical" was claimed on content alone | **P1** | fixed |
+| D-WATCHDOG-26 | Preflight covered a few paths, not privilege, unit sources, process identity or unit states | **P1** | fixed |
+| D-WATCHDOG-27 | The installer was an opaque mutator outside the manifest, counted as a mutation because it exited zero | **P1** | fixed |
+| D-WATCHDOG-28 | The harness skipped the installer and daemon-reload whenever a test root was active | **P1** | fixed |
+| D-WATCHDOG-29 | Rollback never told systemd the files had gone back | **P1** | fixed |
+| D-WATCHDOG-30 | VERIFY checked liveness fields, not the effective contract | **P1** | fixed |
+| D-WATCHDOG-31 | Preserving the user-session cgroup could reach `VERIFIED_COMPLETE` | **P1** | fixed |
+| D-WATCHDOG-32 | Evidence had no schema, no boot id, no hashes and no validation | P2 | fixed |
+| D-WATCHDOG-33 | "APPLY twice" excluded the state directory from the comparison | P2 | fixed |
+| D-WATCHDOG-34 | CHECK returned `REMEDIATED_RESTART_REQUIRED` for a run that changed nothing | P2 | fixed |
+| D-WATCHDOG-35 | Redaction matched only uppercase, attached prefixes | **P1** | fixed |
+| D-WATCHDOG-36 | The deep-probe test never touched the production factory boundary | P2 | fixed |
+
+### 16.1 The engine moved to Python
+
+`scripts/remediate_owner_host_runtime.sh` is now a thin wrapper that runs
+`scripts/owner_host_remediation.py` with the **pinned venv interpreter** under
+`-B` and `PYTHONDONTWRITEBYTECODE=1`. Shell was the wrong tool once the
+contract required recording and restoring ownership and mode, a
+machine-readable plan, an injectable command adapter and proof of the
+*effective* systemd properties: in shell those degrade into string handling
+that cannot be verified.
+
+### 16.2 Metadata is part of the restore
+
+Every backup records **sha256, mode, uid and gid**, and rollback restores all
+four and re-reads them to confirm. Backups keep their **original** mode —
+privacy comes from the `0700` root-owned transaction directory, not from
+flattening every backup to `0600` and destroying the metadata the rollback
+exists to restore. A failure to `chmod`, to `chown`, or to remove a quarantine
+destination is a **rollback failure**, never an ignored warning.
+
+`FAILED_APPLY_ROLLED_BACK` is used only when filesystem, metadata **and**
+effective systemd state are all proven restored; anything else is
+`FAILED_APPLY_PARTIAL_ROLLBACK`.
+
+### 16.3 Complete preflight, zero mutation
+
+Sixteen gates run before a baseline, transaction directory, backup, move or
+write exists: EUID 0 for a real apply (CHECK stays unprivileged), exact
+production `REPO_ROOT`, pinned venv, imports under `-B`, exact unit sources,
+every drop-in readable *and classifiable*, every quarantine destination absent,
+a creatable transaction root, **exactly one** Gateway Java process matching the
+canonical absolute Java path, readable PID/start-ticks/cgroup, timer exactly
+`disabled` **and** `inactive`, watchdog service exactly `inactive`, legacy unit
+exactly `disabled` and `inactive`, systemctl answering, and no competing
+manager. Any failed gate ends the run with **zero** filesystem and systemd
+mutation.
+
+### 16.4 One transaction covers the assets
+
+The plan is machine-readable and names every systemd unit, the tmpfiles and
+logrotate configuration, every contradictory drop-in, the stale `/opt` copy,
+every newly created destination and every existing destination that will be
+replaced — with the metadata of what it overwrites. Newly created files are
+recorded so rollback removes them. **The installer is not delegated to as an
+opaque mutator**; the engine installs each asset inside its own transaction,
+and an asset that is already correct is not counted as a change.
+
+### 16.5 daemon-reload and recovery reload
+
+Exactly one forward reload when the plan is non-empty — a quarantined drop-in
+changes the *effective* unit even when every unit file is byte-identical. If a
+failure occurs **after** that reload, rollback restores the filesystem and then
+performs a **recovery reload** through the same injected adapter, so systemd is
+never left describing files that no longer exist.
+
+### 16.6 VERIFY proves the contract, and stops short of completion
+
+Gateway `Type`, `RemainAfterExit`, `Restart`, `KillMode`, `ProtectSystem`,
+`ProtectHome`, `PrivateTmp` and `ReadWritePaths` are compared **exactly**;
+blank, `unknown`, `static`, `failed`, `activating` or anything else fails. The
+watchdog unit's `WorkingDirectory`, absolute venv interpreter and canonical
+script are checked, with no `/usr/bin/env` and no `/opt` reference. Timer must
+be `disabled` and `inactive`, the watchdog service `inactive`.
+
+**Preserving the current user-session cgroup proves only that remediation did
+not restart the Gateway**, so a successful apply returns
+`REMEDIATED_RESTART_REQUIRED`. `VERIFIED_COMPLETE` is reachable **only** from
+`--verify-post-restart`, after the separately owner-authorized restart places
+the Gateway under `/system.slice/ibgateway-ibc.service`. That mode proves the
+new canonical ownership and deliberately does **not** demand the old
+pre-restart PID, which the restart necessarily changed.
+
+### 16.7 Evidence
+
+Written atomically at `0600` with `schema`, `transaction_id`, `timestamp`,
+`boot_id`, `captured_phase`, Gateway PID / start ticks / cgroup, canonical and
+legacy unit states, watchdog service and timer states, and planned, installed
+and quarantined hashes. `validate_evidence()` rejects a wrong schema, a missing
+key, a malformed timestamp, non-numeric start ticks, a mismatched transaction
+and — importantly — a **different boot id**, which is what makes stale evidence
+detectable.
+
+### 16.8 CHECK vocabulary
+
+CHECK changed nothing, so it no longer borrows an execution word. It returns
+`CHANGES_REQUIRED` or `NO_CHANGES_REQUIRED`; the execution states are separate.
+
+### 16.9 Redaction
+
+Four patterns now cover attached (`DU1234567`), lowercase (`du7654321`),
+1–4 letter prefixes, dot/dash separated (`D.U.7654321`, `DU-7654321`),
+uppercase space-separated (`DU 7654321`) and masked-but-identifying
+(`**7654321`) forms. The space form is restricted to uppercase on purpose:
+`DU 7654321` is account-shaped, `took 123456 ms` is prose that must stay
+readable. Every pattern is `\\b`-anchored, which is what keeps a 64-character
+sha256 digest intact — no interior run can match, so no hash in an evidence
+file is ever mangled. Verified against **synthetic identifiers only**; the real
+owner-host identifier appears nowhere in this repository.
+
+### 16.10 Production factory boundary
+
+The deep-probe test now patches the real boundary `_build_account_safety_probe`
+uses — the adapter factory and the secret store — and asserts one factory call,
+one transport construction, one connect, one coherent request sequence, one
+disconnect, no retry transport on failure, no separate `reqCurrentTime`
+session, and no order surface. It also asserts the account id reaches the
+adapter but never the report.
+
+### 16.11 Status truth
+
+**B-02, B-03 and B-04 remain OPEN. DEF-12 and DEF-13 remain `NOT_RUN`.
+IMP-1303 and IMP-1304 remain incomplete. POI-IBKR-001 and POI-MD-001 remain
+BLOCKED. PAPER_AUTO and LIVE remain DISABLED.** The owner host was not
+modified by this bundle.
