@@ -66,7 +66,7 @@ STALE_WATCHDOG_PATH = "/opt/trading/scripts/ib_gateway_watchdog.py"
 #: The Java the canonical Gateway runs. Matching on this absolute path rather
 #: than on the string "java" is what makes "exactly one Gateway process" mean
 #: something on a host that also runs other JVMs.
-CANONICAL_JAVA_PATH = "/opt/ibc/jre/bin/java"
+CANONICAL_JAVA_PATH = "/home/opc/Jts/ibgateway/1048/jre/bin/java"
 CANONICAL_SERVICE_CGROUP = f"/system.slice/{CANONICAL_GATEWAY_UNIT}"
 
 #: What the deep probe genuinely needs, checked with the pinned interpreter.
