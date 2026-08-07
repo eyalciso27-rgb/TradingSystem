@@ -59,7 +59,22 @@ Restart=no
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/opc/ibc /home/opc/.config/ibc /run/ibgateway
+#
+# ProtectHome=read-only STAYS. It is not weakened here and must not be: the
+# rest of /home/opc — the repository, the SSH keys, the owner's files — stays
+# unwritable to the Gateway. ReadWritePaths= re-opens ONLY the four trees the
+# Gateway genuinely writes, and is applied after ProtectHome, so this is a
+# narrow exception rather than a relaxation.
+#
+# /home/opc/Jts is the IB Gateway INSTALLATION AND ITS SETTINGS TREE. IBC's
+# ibcstart.sh uses ~/Jts as the TWS/Gateway path and writes there during
+# startup (the Gateway startup/settings/runtime files), and the Java the
+# service executes lives under it. Without this entry the Gateway's own
+# working tree is read-only: the service starts, the launch fails, and the
+# unit goes straight to `inactive (dead)` with `Deactivated successfully.` —
+# a clean-looking exit for a sandbox conflict. Do not remove this path
+# without moving the Gateway installation somewhere already writable.
+ReadWritePaths=/home/opc/Jts /home/opc/ibc /home/opc/.config/ibc /run/ibgateway
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

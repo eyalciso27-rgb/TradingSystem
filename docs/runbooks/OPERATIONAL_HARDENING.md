@@ -225,6 +225,30 @@ Drop-ins are judged by **content, not filename**. Any override of `Type`,
 `XAUTHORITY` are the only permitted host-specific settings, and an allowed
 setting does not launder the file it travels in.
 
+### The Gateway sandbox exception list
+
+`ProtectHome=read-only` and `ProtectSystem=strict` stay on, so every tree the
+Gateway writes has to be named. The required set is
+`systemd_contract.CANONICAL_GATEWAY_WRITABLE_PATHS`:
+
+```
+/home/opc/Jts  /home/opc/ibc  /home/opc/.config/ibc  /run/ibgateway
+```
+
+`/home/opc/Jts` is the IB Gateway installation **and** its settings tree — IBC's
+`ibcstart.sh` uses `~/Jts` as the TWS/Gateway path and writes there during
+startup, and the Java the unit executes lives under it.
+
+Read this as an exception list, not a relaxation: the rest of `/home/opc` — the
+repository, the SSH keys, the owner's files — remains unwritable to the
+Gateway, and `/home`, `/home/opc` and `/` are rejected outright.
+
+**A missing entry does not look like a permission error.** The unit starts, the
+launch fails, and systemd reports `inactive (dead)` /
+`Deactivated successfully.` — output that reads like an orderly shutdown. That
+is why the check is positive (every required path must be granted) and why a
+blank `ReadWritePaths=` is a FAIL rather than an UNKNOWN.
+
 ### One remediation tool
 
 ```bash
@@ -459,7 +483,7 @@ Consequences, all deliberate:
 
 - both units are ordered `After=systemd-tmpfiles-setup.service`, so reboot-time
   recreation is deterministic rather than a race;
-- both declare `ReadWritePaths=/run/ibgateway` with **no leading `-`** — a
+- both grant `/run/ibgateway` in `ReadWritePaths=` with **no leading `-`** — a
   missing directory *fails the unit* instead of being ignored, because running
   the watchdog without its budget, lock and marker is the dangerous case;
 - the CLI's last-resort `mkdir` sets `0700` explicitly (`mkdir(mode=…)` is

@@ -40,7 +40,8 @@ LEGACY_GATEWAY_UNIT = "ibgateway.service"
 #: The reviewed repository, its pinned interpreter and the canonical script.
 #: Absolute on purpose: a PATH-resolved interpreter means the timer runs
 #: whatever python happens to be first today.
-REPO_ROOT = "/home/opc/projects/TradingSystem"
+HOME_ROOT = "/home/opc"
+REPO_ROOT = f"{HOME_ROOT}/projects/TradingSystem"
 VENV_PYTHON = f"{REPO_ROOT}/.venv/bin/python"
 WATCHDOG_SCRIPT = f"{REPO_ROOT}/scripts/ib_gateway_watchdog.py"
 
@@ -83,6 +84,26 @@ CANONICAL_GATEWAY_CONTRACT: dict[str, str] = {
     "Restart": "no",
     "RemainAfterExit": "no",
 }
+
+#: The IB Gateway installation and settings tree. IBC's ``ibcstart.sh`` uses
+#: ``~/Jts`` as the TWS/Gateway path and writes there during startup, and the
+#: Java the service executes lives under it.
+GATEWAY_INSTALL_ROOT = f"{HOME_ROOT}/Jts"
+
+#: Absolute paths the canonical Gateway service MUST be able to write.
+#:
+#: ``ProtectHome=read-only`` and ``ProtectSystem=strict`` are not negotiable,
+#: so every writable tree has to be named here explicitly. Omitting one does
+#: not produce a permission error in the journal: the launch fails and the
+#: unit reports ``inactive (dead)`` / ``Deactivated successfully.`` — which
+#: reads like a clean shutdown. That is exactly how the missing
+#: ``/home/opc/Jts`` entry presented on the owner host.
+CANONICAL_GATEWAY_WRITABLE_PATHS: tuple[str, ...] = (
+    GATEWAY_INSTALL_ROOT,
+    f"{HOME_ROOT}/ibc",
+    f"{HOME_ROOT}/.config/ibc",
+    "/run/ibgateway",
+)
 
 
 class Severity(StrEnum):
@@ -272,6 +293,65 @@ def check_effective_gateway(properties: dict[str, str]) -> list[Finding]:
     return findings
 
 
+def read_write_paths(value: str) -> list[str]:
+    """The paths a ``ReadWritePaths=`` value actually grants.
+
+    systemd allows a leading ``-`` (tolerate a missing path) and ``+`` (root
+    relative). Both still grant the write, so both are stripped here. The unit
+    file separately forbids the ``-`` form, because a Gateway that starts
+    without its runtime directory is the failure mode we fail closed on.
+    """
+    granted: list[str] = []
+    for entry in value.split():
+        path = entry.lstrip("-+")
+        if path:
+            granted.append(path)
+    return granted
+
+
+def missing_writable_paths(value: str) -> list[str]:
+    """Which required writable paths a ``ReadWritePaths=`` value omits."""
+    granted = set(read_write_paths(value))
+    return [path for path in CANONICAL_GATEWAY_WRITABLE_PATHS if path not in granted]
+
+
+def check_gateway_writable_paths(properties: dict[str, str]) -> Finding:
+    """Does the effective sandbox leave the Gateway's own tree writable?
+
+    A blank value is a FAIL, not UNKNOWN: ``ReadWritePaths=`` with nothing
+    after it is precisely how the observed ``zz-bringup.conf`` drop-in wiped
+    the grants, and an empty sandbox exception is a confinement that the
+    Gateway cannot start under.
+    """
+    raw = properties.get("ReadWritePaths", "")
+    if "ReadWritePaths" not in properties:
+        return Finding(
+            check="effective:ReadWritePaths",
+            severity=Severity.UNKNOWN,
+            detail="ReadWritePaths not reported",
+        )
+    missing = missing_writable_paths(raw)
+    if missing:
+        return Finding(
+            check="effective:ReadWritePaths",
+            severity=Severity.FAIL,
+            detail=(
+                f"sandbox makes required Gateway path(s) read-only: {' '.join(missing)}"
+                f" (effective: {raw or '(blank)'})"
+            ),
+            remedy=(
+                "reinstall the canonical unit so ReadWritePaths grants "
+                f"{' '.join(CANONICAL_GATEWAY_WRITABLE_PATHS)}, and remove any "
+                "drop-in that overrides ReadWritePaths"
+            ),
+        )
+    return Finding(
+        check="effective:ReadWritePaths",
+        severity=Severity.OK,
+        detail=raw,
+    )
+
+
 def check_process_ownership(
     properties: dict[str, str], process_cgroup: str | None
 ) -> Finding:
@@ -453,8 +533,11 @@ __all__ = [
     "ALLOWED_DROPIN_SETTINGS",
     "CANONICAL_GATEWAY_CONTRACT",
     "CANONICAL_GATEWAY_UNIT",
+    "CANONICAL_GATEWAY_WRITABLE_PATHS",
     "CANONICAL_WATCHDOG_TIMER",
     "CANONICAL_WATCHDOG_UNIT",
+    "GATEWAY_INSTALL_ROOT",
+    "HOME_ROOT",
     "LEGACY_GATEWAY_UNIT",
     "REPO_ROOT",
     "REQUIRED_IMPORTS",
@@ -467,12 +550,15 @@ __all__ = [
     "Finding",
     "Severity",
     "check_effective_gateway",
+    "check_gateway_writable_paths",
     "check_process_ownership",
     "check_watchdog_entrypoint",
     "classify_dropin",
     "contradicting_dropins",
     "exec_start_argv",
+    "missing_writable_paths",
     "parse_dropin",
+    "read_write_paths",
     "parse_dropin_strict",
     "parse_show_properties",
     "worst",

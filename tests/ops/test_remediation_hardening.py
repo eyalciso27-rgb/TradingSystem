@@ -59,7 +59,9 @@ HEALTHY_UNITS: dict[str, dict[str, str]] = {
         "ProtectSystem": "strict",
         "ProtectHome": "read-only",
         "PrivateTmp": "yes",
-        "ReadWritePaths": "/run/ibgateway",
+        # Literal on purpose: a healthy host grants every required tree,
+        # including the Gateway's own /home/opc/Jts installation.
+        "ReadWritePaths": "/home/opc/Jts /home/opc/ibc /home/opc/.config/ibc /run/ibgateway",
         "ActiveState": "active",
         "SubState": "running",
         "MainPID": "4242",

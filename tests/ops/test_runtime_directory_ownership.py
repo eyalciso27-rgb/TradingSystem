@@ -161,7 +161,8 @@ def test_units_can_write_the_directory_but_fail_closed_without_it(unit: Path) ->
     """
     paths = " ".join(directives(unit, "ReadWritePaths"))
     assert "/run/ibgateway" in paths
-    assert "-/run/ibgateway" not in paths, "'-' would make a missing dir non-fatal"
+    for entry in paths.split():
+        assert not entry.startswith("-"), f"'-' would make {entry} non-fatal when missing"
 
 
 def test_the_directory_is_never_world_writable_anywhere() -> None:
