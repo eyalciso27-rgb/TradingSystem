@@ -151,6 +151,28 @@ recovery_exit_code() {
   echo "${child_rc}"
 }
 
+# rotate_session_token — replace /run/ibgateway/gateway-session with a FRESH
+# token via an atomic write+rename, fail closed on any problem. A stale token
+# must never survive: if rotation cannot complete, the old token is removed and
+# the launcher exits 78 (RestartPreventExitStatus) BEFORE IBC is started, so an
+# old cleared session can never permit an entry into a Gateway that did not
+# actually come up cleanly.
+rotate_session_token() {
+  [ -d "${RUN_DIR}" ] \
+    || die "runtime dir ${RUN_DIR} missing (tmpfiles.d must create it); refusing to start"
+  local token tmp
+  token="gw-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  tmp="${GATEWAY_SESSION_FILE}.tmp.$$"
+  if ! { printf '%s\n' "${token}" > "${tmp}" 2>/dev/null \
+      && mv -f "${tmp}" "${GATEWAY_SESSION_FILE}" 2>/dev/null \
+      && [ -s "${GATEWAY_SESSION_FILE}" ]; }; then
+    # Remove any partial temp AND any stale token, then fail closed.
+    rm -f "${tmp}" "${GATEWAY_SESSION_FILE}" 2>/dev/null || true
+    die "gateway session-token rotation failed; removed any stale token (fail closed)"
+  fi
+  log "broker session rotated: ${GATEWAY_SESSION_FILE} (reconciliation required)"
+}
+
 validate_config() {
   [ -f "${IBC_INI}" ] || die "IBC config not found: ${IBC_INI} (see runbook)"
 
@@ -202,16 +224,12 @@ main() {
   # Snapshot the logs NOW so fail-closed classification sees only this run.
   capture_log_baseline
 
-  # Rewrite the broker-session token: a NEW session invalidates any pre-restart
-  # account-safety CLEAN, so the ExecutionAgent's reconciliation latch blocks
-  # new entries until a fresh CLEAN for this session. Best-effort: only if the
-  # tmpfiles.d-owned runtime dir exists (it is never created here).
-  if [ -d "${RUN_DIR}" ]; then
-    printf 'gw-%s-%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$$" \
-      > "${GATEWAY_SESSION_FILE}" 2>/dev/null \
-      && log "broker session: ${GATEWAY_SESSION_FILE} (reconciliation required)" \
-      || log "WARN: could not write ${GATEWAY_SESSION_FILE}"
-  fi
+  # Rotate the broker-session token BEFORE launching IBC. A new token
+  # invalidates any pre-restart account-safety CLEAN, so the ExecutionAgent's
+  # reconciliation latch blocks new entries until a fresh CLEAN for this
+  # session. This is SAFETY-CRITICAL: a restart must NOT proceed on a stale
+  # token, so a failed rotation is fail-closed (78) and never a warning.
+  rotate_session_token
 
   # Run IBC in the FOREGROUND as a child (deliberately NOT exec) so that when it
   # ends we can classify HOW it ended and choose an exit code that drives

@@ -32,6 +32,7 @@ from trading_execution_agent.agent import (
     ExecutionRequest,
     ExecutionStatus,
 )
+from trading_execution_agent.reconciliation_latch import ALWAYS_PERMIT, EntryGate
 
 AS_OF = datetime(2026, 7, 10, 14, 0, tzinfo=UTC)
 
@@ -111,11 +112,26 @@ def request(
     )
 
 
-def make_agent(broker: Any | None = None, *, entry_gate: Any = None) -> ExecutionAgent:
-    kwargs: dict[str, Any] = {"clock": lambda: AS_OF}
-    if entry_gate is not None:
-        kwargs["entry_gate"] = entry_gate
-    return ExecutionAgent(broker if broker is not None else make_broker(), **kwargs)
+def make_agent(
+    broker: Any | None = None, *, entry_gate: EntryGate = ALWAYS_PERMIT
+) -> ExecutionAgent:
+    return ExecutionAgent(
+        broker if broker is not None else make_broker(),
+        entry_gate=entry_gate,
+        clock=lambda: AS_OF,
+    )
+
+
+def test_entry_gate_is_a_required_constructor_argument() -> None:
+    """The final reconciliation boundary must not be opt-in by accident: a
+    production construction site cannot silently omit the entry gate."""
+    import inspect
+
+    param = inspect.signature(ExecutionAgent.__init__).parameters["entry_gate"]
+    assert param.default is inspect.Parameter.empty  # no implicit ALWAYS_PERMIT
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError):
+        ExecutionAgent(make_broker())  # type: ignore[call-arg]
 
 
 class CountingGate:
@@ -392,6 +408,8 @@ def test_agent_source_has_no_sdk_or_secret_access() -> None:
 
 def test_naive_clock_rejected() -> None:
     broker = make_broker()
-    agent = ExecutionAgent(broker, clock=lambda: datetime(2026, 7, 10, 14, 0))  # noqa: DTZ001
+    agent = ExecutionAgent(
+        broker, entry_gate=ALWAYS_PERMIT, clock=lambda: datetime(2026, 7, 10, 14, 0)  # noqa: DTZ001
+    )
     with pytest.raises(ValueError, match="timezone-aware"):
         agent.process(request("naive-1"))

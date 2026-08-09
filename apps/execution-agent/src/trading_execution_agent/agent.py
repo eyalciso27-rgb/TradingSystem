@@ -61,7 +61,7 @@ from trading_broker_core.port import (
 )
 from trading_contracts.enums import Environment, OrderType
 
-from trading_execution_agent.reconciliation_latch import ALWAYS_PERMIT, EntryGate
+from trading_execution_agent.reconciliation_latch import EntryGate
 
 AGENT_VERSION = "execution-agent-1.0.0"
 
@@ -139,15 +139,18 @@ class ExecutionAgent:
         self,
         broker: BrokerPort,
         *,
+        entry_gate: EntryGate,
         clock: Callable[[], datetime] | None = None,
-        entry_gate: EntryGate = ALWAYS_PERMIT,
     ) -> None:
         self._broker = broker
         self._clock = clock or (lambda: datetime.now(tz=UTC))
-        # Final-boundary reconciliation latch. A frozen pre-crash authorization
-        # must never submit into a freshly recovered broker session; entry is
-        # blocked until a CURRENT-session account-safety CLEAN clears it. Only
-        # NEW entries are gated — cancel() and protective paths are not.
+        # Final-boundary reconciliation latch. REQUIRED — the boundary must not
+        # be opt-in by accident: production/owner-host paths pass
+        # ReconciliationLatch(); tests/non-runtime contexts pass ALWAYS_PERMIT
+        # explicitly. A frozen pre-crash authorization must never submit into a
+        # freshly recovered broker session; entry is blocked until a
+        # CURRENT-session account-safety CLEAN clears it. Only NEW entries are
+        # gated — cancel() and protective paths are not.
         self._entry_gate = entry_gate
         self._outcomes: dict[str, ExecutionOutcome] = {}
 

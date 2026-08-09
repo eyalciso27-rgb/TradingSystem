@@ -94,7 +94,22 @@ watchdog still only supervises and alerts (it does not restart). Three cases:
 
 Process liveness is **not** trading permission: after any recovery, entries
 stay inhibited until canonical broker reconciliation (positions, open orders,
-executions/order state, lifecycle markers) succeeds.
+executions/order state, lifecycle markers) succeeds. This is enforced at the
+final execution boundary by a persistent reconciliation latch keyed on a
+broker-session token the launcher rotates (fail-closed) on every start; the
+ExecutionAgent refuses a new entry — even with a valid pre-crash authorization
+and a healthy broker — until a CURRENT-session account-safety CLEAN clears it.
+
+> **PAPER_AUTO activation blocker (honest limitation).** The watchdog timer is
+> periodic (~60s), so polling alone is **not** a deterministic proof that every
+> very-short native/in-process IB Gateway Auto Restart disconnect was observed.
+> A systemd restart is fully covered (the launcher rotates the session token),
+> and the periodic cycle re-blocks on any observed non-ready state, but before
+> **PAPER_AUTO** may ever be enabled, native/in-process Gateway reconnects must
+> have **deterministic** broker/API-session invalidation (event-driven, not
+> polling-only). This does **not** block Shadow work or IMP-1301, because
+> PAPER_AUTO remains disabled. The watchdog timer is a supervisor/alerting and
+> latch-maintenance mechanism only — it is **never** an order restart manager.
 
 ## 4b. IBKR Python API (`ibapi`) — owner-run host prerequisite
 

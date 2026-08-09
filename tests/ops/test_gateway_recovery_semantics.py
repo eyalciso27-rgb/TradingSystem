@@ -163,5 +163,98 @@ def test_no_current_marker_nonzero_failure_is_recoverable(tmp_path: Path) -> Non
     assert _decide(tmp_path, stopped=0, child_rc=7, setup=setup) == "7"
 
 
+# -- session-token rotation is fail-closed -------------------------------------------
+
+
+def _rotate(
+    run_dir: Path, *, session_file: Path, inject: str = ""
+) -> subprocess.CompletedProcess[str]:
+    script = (
+        "set -uo pipefail\n"
+        f'export IBGATEWAY_RUN_DIR="{run_dir.as_posix()}"\n'
+        f'export GATEWAY_SESSION_FILE="{session_file.as_posix()}"\n'
+        f'export IBC_LOG_PATH="{run_dir.as_posix()}/logs"\n'
+        f'source "{START_SH}"\n'
+        f'RUN_DIR="{run_dir.as_posix()}"\n'
+        f"{inject}\n"
+        "rotate_session_token\n"
+    )
+    return subprocess.run(  # noqa: S603
+        ["bash", "-c", script],  # noqa: S607
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=60, check=False,
+    )
+
+
+@POSIX_ONLY
+def test_session_rotation_writes_a_fresh_token(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    session = run / "gateway-session"
+    result = _rotate(run, session_file=session)
+    assert result.returncode == 0
+    assert session.read_text(encoding="utf-8").strip().startswith("gw-")
+
+
+@POSIX_ONLY
+def test_missing_run_dir_fails_closed_78(tmp_path: Path) -> None:
+    missing = tmp_path / "nope"
+    result = _rotate(missing, session_file=missing / "gateway-session")
+    assert result.returncode == 78  # EXIT_FAIL_CLOSED
+
+
+@POSIX_ONLY
+def test_failed_rotation_removes_stale_token_and_exits_78(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    session = run / "gateway-session"
+    session.write_text("gw-OLD\n", encoding="utf-8")  # an old cleared session
+    result = _rotate(run, session_file=session, inject="mv() { return 1; }")
+    assert result.returncode == 78
+    # The stale token must NOT survive a failed rotation.
+    assert not session.exists()
+
+
+@POSIX_ONLY
+def test_failed_rotation_never_launches_the_gateway(tmp_path: Path) -> None:
+    # A full main() run: rotation fails BEFORE IBC is launched, so the stubbed
+    # entrypoint marker must never be created and the exit is fail-closed 78.
+    ibc = tmp_path / "ibc"
+    (ibc / "scripts").mkdir(parents=True)
+    entry = ibc / "scripts" / "ibcstart.sh"
+    marker = tmp_path / "LAUNCHED"
+    entry.write_text(f'#!/usr/bin/env bash\ntouch "{marker.as_posix()}"\n', encoding="utf-8")
+    entry.chmod(0o755)
+    jre = tmp_path / "jre" / "bin"
+    jre.mkdir(parents=True)
+    (jre / "java").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (jre / "java").chmod(0o755)
+    ini = tmp_path / "config.ini"
+    ini.write_text("TradingMode=paper\nIbLoginId=abc123\n", encoding="utf-8")
+    ini.chmod(0o600)
+    run = tmp_path / "run"
+    run.mkdir()
+    script = (
+        "set -uo pipefail\n"
+        f'export IBC_PATH="{ibc.as_posix()}"\n'
+        f'export IBC_INI="{ini.as_posix()}"\n'
+        f'export JAVA_PATH="{jre.as_posix()}"\n'
+        f'export TWS_PATH="{tmp_path.as_posix()}"\n'
+        f'export IBGATEWAY_RUN_DIR="{run.as_posix()}"\n'
+        f'export GATEWAY_SESSION_FILE="{(run / "gateway-session").as_posix()}"\n'
+        f'export IBC_LOG_PATH="{(tmp_path / "logs").as_posix()}"\n'
+        f'source "{START_SH}"\n'
+        "mv() { return 1; }\n"  # force the atomic rename to fail
+        "main\n"
+    )
+    result = subprocess.run(  # noqa: S603
+        ["bash", "-c", script],  # noqa: S607
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=60, check=False,
+    )
+    assert result.returncode == 78
+    assert not marker.exists()  # the Gateway entrypoint was never launched
+
+
 def _classify(log_dir: Path, setup: str) -> str:
     return _bash(log_dir, f"{setup}\nclassify_ibc_log")
