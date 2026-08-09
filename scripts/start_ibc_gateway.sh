@@ -23,6 +23,11 @@ IBC_INI="${IBC_INI:-/home/opc/.config/ibc/config.ini}"
 TWS_MAJOR_VRSN="${TWS_MAJOR_VRSN:-1048}"
 # IB Gateway installation + settings tree (IBC --tws-path / --tws-settings-path).
 TWS_PATH="${TWS_PATH:-/home/opc/Jts}"
+# Directory holding the bundled Gateway Java (IBC --java-path). Derived from the
+# canonical install tree + major version so there is no second, independently
+# pinned Java path to drift: ~/Jts/ibgateway/<vrsn>/jre/bin. IBC otherwise
+# probes a stale unpack dir and fails with "Can't find suitable Java".
+JAVA_PATH="${JAVA_PATH:-${TWS_PATH}/ibgateway/${TWS_MAJOR_VRSN}/jre/bin}"
 LOG_PATH="${IBC_LOG_PATH:-/home/opc/ibc/logs}"
 
 log() { printf '[start-ibc] %s\n' "$*"; }
@@ -66,10 +71,17 @@ main() {
   local entry="${IBC_PATH}/scripts/ibcstart.sh"
   [ -x "${entry}" ] || die "IBC entrypoint not found/executable: ${entry}"
 
+  # Fail closed BEFORE launching IBC if the bundled Gateway Java is missing —
+  # otherwise IBC probes a stale unpack directory and dies with "Can't find
+  # suitable Java installation", leaving the unit failed.
+  [ -x "${JAVA_PATH}/java" ] || \
+    die "Gateway Java not found/executable: ${JAVA_PATH}/java"
+
   validate_config
   mkdir -p "${LOG_PATH}"
   log "starting IB Gateway (PAPER) via IBC ${TWS_MAJOR_VRSN}; credentials read"
   log "from ${IBC_INI} (chmod 600); never shown, never on the command line."
+  log "Gateway Java: ${JAVA_PATH}/java"
 
   # Credentials come from the config (--user/--pw are deliberately NOT passed).
   # exec so systemd tracks the real process; IBC handles login + 2FA itself.
@@ -83,6 +95,7 @@ main() {
     "--tws-settings-path=${TWS_PATH}" \
     "--ibc-path=${IBC_PATH}" \
     "--ibc-ini=${IBC_INI}" \
+    "--java-path=${JAVA_PATH}" \
     --mode=paper \
     --on2fatimeout=exit
 }
