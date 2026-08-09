@@ -60,6 +60,37 @@ def test_start_script_is_paper_only_and_never_leaks_credentials() -> None:
         assert fragment not in text
 
 
+def test_start_script_execs_foreground_ibcstart_not_gatewaystart() -> None:
+    """Regression (systemd Type=simple): the launcher must exec the FOREGROUND
+    IBC service script (scripts/ibcstart.sh) directly. IBC's gatewaystart.sh
+    stays foreground only with a leading '-inline'; otherwise it backgrounds an
+    xterm and returns, so the unit's main process exited immediately and the
+    service reported 'Deactivated successfully.' while nothing ran."""
+    text = read(START_SH)
+    # Inspect CODE only — a comment may legitimately name gatewaystart.sh to
+    # explain why it is avoided.
+    code = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    # The backgrounding wrapper must NOT be invoked anywhere in the code.
+    assert "gatewaystart.sh" not in code
+    # The foreground service script is the entrypoint, exec'd so systemd tracks
+    # the real Gateway process, with the major version as its first argument.
+    assert 'entry="${IBC_PATH}/scripts/ibcstart.sh"' in code
+    assert 'exec "${entry}" "${TWS_MAJOR_VRSN}"' in code
+    # The Gateway is not re-backgrounded: the exec is not detached.
+    assert "exec ${entry} &" not in code and 'exec "${entry}" &' not in code
+    # Paper-only + IBC ini wiring preserved; still no credentials on argv.
+    assert "--mode=paper" in code
+    assert "--ibc-ini=${IBC_INI}" in code
+    assert "--pw=" not in code and "--user=" not in code
+    # Fail-closed: on a 2FA timeout IBC must EXIT, never self-restart. Blind
+    # Gateway recovery is forbidden (unit is Restart=no); recovery is
+    # owner-authorized only.
+    assert "--on2fatimeout=exit" in code
+    assert "--on2fatimeout=restart" not in code
+
+
 def test_no_hardcoded_credentials_in_scripts() -> None:
     for path in (INSTALL_SH, START_SH):
         text = read(path).lower()
