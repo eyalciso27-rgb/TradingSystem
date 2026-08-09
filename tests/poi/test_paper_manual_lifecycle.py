@@ -78,7 +78,11 @@ from trading_execution_agent.reconciliation import (
     ReconciliationPolicy,
     ReconciliationTrigger,
 )
-from trading_execution_agent.reconciliation_latch import ALWAYS_PERMIT
+from trading_execution_agent.reconciliation_latch import (
+    ALWAYS_PERMIT,
+    CLEAN,
+    ReconciliationLatch,
+)
 
 AS_OF = datetime(2026, 7, 20, 14, 0, tzinfo=UTC)
 
@@ -479,6 +483,56 @@ def test_scenario_16b_state_rebuild_after_restart_via_reconciliation() -> None:
             Recommendation.BLOCK_NEW_ENTRIES,
         )
     assert len(drill.broker.get_open_orders("paper-main")) == 1  # untouched
+
+
+# -- 17: entry-reconciliation latch (no new orders after restart until CLEAN) ----------
+
+
+def test_scenario_17_entry_latch_blocks_new_orders_after_restart_until_clean(
+    tmp_path: Path,
+) -> None:
+    """IMP-1302 execution/reconciliation DoD, with the merged final-boundary
+    reconciliation latch: after a Gateway restart (a new broker-session token) a
+    new Paper-Manual entry is REFUSED until a CURRENT-session account-safety
+    CLEAN clears the latch — so no new/duplicate order is ever submitted into a
+    freshly recovered session. cancel()/protective paths are never gated."""
+    drill = LifecycleDrill()  # supplies the FakeBroker + request builder
+    session = tmp_path / "gateway-session"
+    session.write_text("gw-1\n", encoding="utf-8")
+    latch = ReconciliationLatch(
+        session_path=session, latch_path=tmp_path / "reconciliation-required.json"
+    )
+    agent = ExecutionAgent(drill.broker, entry_gate=latch, clock=lambda: AS_OF)
+
+    # (a) latch not yet cleared for the current session -> entry REFUSED, no order
+    blocked = agent.process(drill.request("ord-17a"))
+    assert blocked.status is ExecutionStatus.NEEDS_REVIEW
+    assert any(code.startswith("RECONCILIATION_REQUIRED") for code in blocked.reason_codes)
+    assert "RECONCILE_BEFORE_ANY_SUBMIT" in blocked.reason_codes
+    assert drill.broker.get_open_orders("paper-main") == ()
+
+    # (b) a CURRENT-session account-safety CLEAN clears the latch -> entry proceeds
+    assert latch.try_clear(CLEAN, "gw-1") is True
+    ok = agent.process(drill.request("ord-17b"))
+    assert ok.status is ExecutionStatus.SUBMITTED
+    assert len(drill.broker.get_open_orders("paper-main")) == 1
+
+    # (c) a restart rotates the session token -> latch blocks again; ZERO new orders
+    session.write_text("gw-2\n", encoding="utf-8")
+    after_restart = agent.process(drill.request("ord-17c"))
+    assert after_restart.status is ExecutionStatus.NEEDS_REVIEW
+    assert len(drill.broker.get_open_orders("paper-main")) == 1  # still only ord-17b
+
+    # (d) a stale pre-restart CLEAN cannot clear the new session; a fresh one does
+    assert latch.try_clear(CLEAN, "gw-1") is False  # old-session proof rejected
+    assert latch.try_clear(CLEAN, "gw-2") is True
+    resumed = agent.process(drill.request("ord-17d"))
+    assert resumed.status is ExecutionStatus.SUBMITTED
+    assert len(drill.broker.get_open_orders("paper-main")) == 2
+
+    # (e) the entry latch never gates a protective cancel.
+    cancel = agent.cancel("ord-17b", correlation_id="corr-17")
+    assert cancel.status is ExecutionStatus.CANCEL_SENT
 
 
 # -- cross-cutting safety -----------------------------------------------------------------------

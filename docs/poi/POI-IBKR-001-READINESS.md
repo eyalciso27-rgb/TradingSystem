@@ -29,6 +29,7 @@ of IBKR fields.
 | Broker rejection | Scenario 14: terminal, never retried |
 | Protection capability failure | Scenario 15: loud `NEEDS_REVIEW` + `POSITION_WOULD_BE_UNPROTECTED` + entry block via reconciliation |
 | Restart during lifecycle | Scenario 16: watchdog restart gate honors `order-lifecycle.active`; state rebuild via startup reconciliation |
+| No new entry after restart until reconciliation (entry latch) | Scenario 17: the ExecutionAgent's required `ReconciliationLatch` refuses a new entry after a broker-session rotation until a CURRENT-session account-safety CLEAN clears it; a stale pre-restart CLEAN cannot clear it; zero new/duplicate orders across restart; cancel/protective paths are never gated |
 | Single-use authorization | Cross-cutting test: a consumed `SubmitAuthorization` cannot be spent twice |
 | No IBKR leakage in domain | Architecture guardrails (ibapi only inside `broker-ibkr`) — green in CI |
 
@@ -57,6 +58,17 @@ of IBKR fields.
 4. Evidence recorded to `docs/poi/evidence/POI-IBKR-001.md`; owner marks PASS.
 
 Until step 3 produces real evidence, POI-IBKR-001 is **BLOCKED / NOT RUN**.
+
+> **Entry-reconciliation latch (post the bounded-recovery merge).** On the
+> owner host the running Gateway rotates a broker-session token on each start,
+> and `poi_ibkr_lifecycle.py` wires the ExecutionAgent's required
+> `ReconciliationLatch`. A fill/cancel **execute** run is therefore refused
+> (`RECONCILIATION_REQUIRED`) until the owner obtains a CURRENT-session
+> account-safety **CLEAN** — the read-only
+> `scripts/ib_gateway_watchdog.py --status --deep-probe` from the same
+> deferred-run manifest — which clears the latch for that session. This is the
+> intended "no new orders after restart until reconciliation" behavior; it
+> sends and changes nothing.
 
 ## 3. Required evidence
 
