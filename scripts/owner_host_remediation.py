@@ -94,7 +94,22 @@ EXPECTED_GATEWAY_PROPERTIES: dict[str, str] = {
     "ProtectHome": "read-only",
     "PrivateTmp": "yes",
 }
-EXPECTED_GATEWAY_READWRITEPATHS = "/run/ibgateway"
+#: Every path the canonical Gateway must be able to write, under
+#: ``ProtectHome=read-only`` and ``ProtectSystem=strict``. Kept in step with
+#: ``systemd_contract.CANONICAL_GATEWAY_WRITABLE_PATHS`` by a test — this
+#: engine deliberately carries its own constants so it can run against a
+#: ``--sysroot`` without importing host modules.
+#:
+#: ``/home/opc/Jts`` is the Gateway installation and settings tree. Omitting
+#: it does not surface as a permission error: the unit starts, the launch
+#: fails, and systemd reports ``inactive (dead)`` / ``Deactivated
+#: successfully.``, so the sandbox conflict looks like a clean exit.
+EXPECTED_GATEWAY_READWRITEPATHS: tuple[str, ...] = (
+    "/home/opc/Jts",
+    "/home/opc/ibc",
+    "/home/opc/.config/ibc",
+    "/run/ibgateway",
+)
 
 
 class State(StrEnum):
@@ -908,11 +923,15 @@ class Remediator:
                 )
             )
         rwp = gateway.get("ReadWritePaths", "")
+        # A leading '-' (tolerate if missing) or '+' (root relative) still
+        # grants the write; the unit file separately forbids the '-' form.
+        granted = {entry.lstrip("-+") for entry in rwp.split()}
+        missing = [p for p in EXPECTED_GATEWAY_READWRITEPATHS if p not in granted]
         gates.append(
             Gate(
                 "gateway:ReadWritePaths",
-                EXPECTED_GATEWAY_READWRITEPATHS in rwp,
-                rwp or "(blank)",
+                not missing,
+                f"read-only: {' '.join(missing)}" if missing else (rwp or "(blank)"),
             )
         )
         gates.append(

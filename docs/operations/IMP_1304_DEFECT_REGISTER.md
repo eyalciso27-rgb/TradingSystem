@@ -1581,3 +1581,100 @@ adapter but never the report.
 IMP-1303 and IMP-1304 remain incomplete. POI-IBKR-001 and POI-MD-001 remain
 BLOCKED. PAPER_AUTO and LIVE remain DISABLED.** The owner host was not
 modified by this bundle.
+
+---
+
+## 17. The sandbox made the Gateway's own tree read-only (D-WATCHDOG-37)
+
+| ID | Defect | Sev | Status |
+|---|---|---|---|
+| D-WATCHDOG-37 | `ProtectHome=read-only` with a `ReadWritePaths=` set that omitted `/home/opc/Jts` — the IB Gateway installation and settings tree | **P1** | fixed |
+
+### 17.1 What happened
+
+Remediation completed cleanly (`REMEDIATED_RESTART_REQUIRED`, 4 mutations, 1
+daemon-reload), pre-restart account safety was proven
+(`FULL_ACCOUNT_SNAPSHOT`, `CLEAN`, 0 working orders, 0 positions, reconciled),
+and the old Gateway process was terminated. The canonical service was then
+started once and immediately reported:
+
+```
+Active: inactive (dead)
+ibgateway-ibc.service: Deactivated successfully.
+```
+
+`--verify-post-restart` therefore failed on exactly one gate:
+`FAIL gateway_canonically_owned none`.
+
+### 17.2 What it was not
+
+The obvious hypothesis — the launch script backgrounds the Gateway, so
+`Type=simple` is wrong — is false. `/opt/trading/scripts/start_ibc_gateway.sh`
+ends with
+
+```
+exec "${entry}" "${TWS_MAJOR_VRSN}" --gateway --mode=paper "--config=${IBC_INI}"
+```
+
+so the service's main process really is the Gateway. `Type=simple` is correct
+and was **not** changed.
+
+### 17.3 What it was
+
+IBC's `ibcstart.sh` uses `~/Jts` as the TWS/Gateway path and writes there
+during startup (Gateway startup-file handling, settings and runtime files), and
+the Java the unit executes — `/home/opc/Jts/ibgateway/1048/jre/bin/java` — lives
+under it. The unit declared `ProtectHome=read-only` and granted write access to
+`/home/opc/ibc`, `/home/opc/.config/ibc` and `/run/ibgateway` only. The
+Gateway's own installation and settings tree was read-only, the launch failed,
+and systemd reported the failure as a clean deactivation.
+
+**That is the property that makes this class of defect dangerous: a missing
+sandbox exception does not surface as a permission error.** It surfaces as
+`inactive (dead)` / `Deactivated successfully.` — output that reads like an
+orderly shutdown.
+
+### 17.4 The fix
+
+`ReadWritePaths=` on the canonical Gateway unit is now
+
+```
+/home/opc/Jts /home/opc/ibc /home/opc/.config/ibc /run/ibgateway
+```
+
+`ProtectHome=read-only` and `ProtectSystem=strict` are **retained**. The grant
+is an exception list, not a relaxation: the rest of `/home/opc` — the
+repository, the SSH keys, the owner's files — stays unwritable to the Gateway,
+and a test refuses `/home`, `/home/opc` or `/` appearing in the grant.
+`Restart=no`, `Type=simple`, the one-Gateway policy and the Java path are
+unchanged.
+
+The required set is now a single named contract,
+`systemd_contract.CANONICAL_GATEWAY_WRITABLE_PATHS`, consumed by:
+
+* `check_gateway_writable_paths()`, a FAIL — not a WARN, and not UNKNOWN for a
+  blank value — naming each missing path;
+* the read-only host audit, which now also requests `-p ReadWritePaths` (it
+  previously could not see this defect at all);
+* the remediation VERIFY gate `gateway:ReadWritePaths`, which now requires
+  **every** path rather than substring-matching `/run/ibgateway`, so
+  `VERIFIED_COMPLETE` is unreachable while the Gateway tree is read-only.
+
+### 17.5 Regression cover
+
+`tests/ops/test_gateway_writable_paths.py` asserts the required set
+**positively** — every path in the contract must be granted — rather than
+spot-checking the one path that was missing, so adding a fifth required tree
+later without granting it is caught too. It also ties
+`CANONICAL_JAVA_PATH` to the writable contract (moving the installation without
+moving the grant reproduces the defect), pins `ProtectHome`, `ProtectSystem`,
+`Restart` and the single-manager rule against the tempting wrong fixes, proves
+the unit file and the engine constant agree, and parametrises VERIFY failure
+over each required path. `ReadWritePaths` remains a safety-critical drop-in
+property, so a drop-in cannot re-impose the read-only tree.
+
+### 17.6 Status truth
+
+**B-02, B-03 and B-04 remain OPEN. DEF-12 and DEF-13 remain `NOT_RUN`.
+IMP-1303 and IMP-1304 remain incomplete. POI-IBKR-001 and POI-MD-001 remain
+BLOCKED. PAPER_AUTO and LIVE remain DISABLED.**

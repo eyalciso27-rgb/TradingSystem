@@ -553,6 +553,7 @@ def audit_systemd_contract(audit: Audit, *, root: Path | None = None) -> None:
         CANONICAL_WATCHDOG_UNIT,
         Severity,
         check_effective_gateway,
+        check_gateway_writable_paths,
         check_process_ownership,
         check_watchdog_entrypoint,
         classify_dropin,
@@ -602,13 +603,19 @@ def audit_systemd_contract(audit: Audit, *, root: Path | None = None) -> None:
             "systemctl", "show", CANONICAL_GATEWAY_UNIT,
             "-p", "Type", "-p", "Restart", "-p", "RemainAfterExit",
             "-p", "ActiveState", "-p", "SubState", "-p", "MainPID",
+            # Without this the audit cannot see a sandbox that has made the
+            # Gateway's own tree read-only, and would report "not reported".
+            "-p", "ReadWritePaths",
         ]
     )
     if not shown.ok:
         audit.add("systemd", "effective_gateway", Level.UNKNOWN, "unreadable", shown.detail)
     else:
         properties = parse_show_properties(shown.stdout)
-        for finding in check_effective_gateway(properties):
+        for finding in (
+            *check_effective_gateway(properties),
+            check_gateway_writable_paths(properties),
+        ):
             audit.add(
                 "systemd",
                 f"gateway:{finding.check}",
