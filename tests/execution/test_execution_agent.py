@@ -111,11 +111,84 @@ def request(
     )
 
 
-def make_agent(broker: Any | None = None) -> ExecutionAgent:
-    return ExecutionAgent(
-        broker if broker is not None else make_broker(),
-        clock=lambda: AS_OF,
-    )
+def make_agent(broker: Any | None = None, *, entry_gate: Any = None) -> ExecutionAgent:
+    kwargs: dict[str, Any] = {"clock": lambda: AS_OF}
+    if entry_gate is not None:
+        kwargs["entry_gate"] = entry_gate
+    return ExecutionAgent(broker if broker is not None else make_broker(), **kwargs)
+
+
+class CountingGate:
+    """A fake entry gate that records how often the agent consulted it."""
+
+    def __init__(self, *, blocked: bool) -> None:
+        self.blocked = blocked
+        self.calls = 0
+
+    def entry_blocked(self) -> tuple[bool, str]:
+        self.calls += 1
+        return (self.blocked, "RECONCILIATION_REQUIRED" if self.blocked else "")
+
+
+# -- final-boundary reconciliation latch ------------------------------------------
+
+
+def test_latched_entry_is_refused_even_with_allow_auth_and_healthy_broker() -> None:  # A
+    broker = make_broker(healthy=True)
+    agent = make_agent(broker, entry_gate=CountingGate(blocked=True))
+    outcome = agent.process(request("ord-1"))
+    assert outcome.status is ExecutionStatus.NEEDS_REVIEW
+    assert "RECONCILIATION_REQUIRED" in outcome.reason_codes
+    assert outcome.receipt is None
+    assert broker.get_open_orders("paper-main") == ()  # nothing was submitted
+
+
+def test_authorization_minted_before_crash_is_refused_after_recovery() -> None:  # B
+    # The request (with a valid single-use authorization) was frozen BEFORE the
+    # Gateway crash; the broker is healthy again after systemd recovery, but the
+    # reconciliation latch is still set -> no submit until a fresh reconciliation.
+    frozen = request("ord-1")
+    broker = make_broker(healthy=True)
+    agent = make_agent(broker, entry_gate=CountingGate(blocked=True))
+    outcome = agent.process(frozen)
+    assert outcome.status is ExecutionStatus.NEEDS_REVIEW
+    assert outcome.receipt is None
+    assert broker.get_open_orders("paper-main") == ()
+
+
+def test_clearing_the_latch_allows_a_fresh_submit() -> None:  # C (agent side)
+    broker = make_broker(healthy=True)
+    gate = CountingGate(blocked=True)
+    agent = make_agent(broker, entry_gate=gate)
+    assert agent.process(request("ord-1")).status is ExecutionStatus.NEEDS_REVIEW
+    gate.blocked = False  # a CURRENT-session CLEAN cleared the latch
+    outcome = agent.process(request("ord-2"))
+    assert outcome.status is ExecutionStatus.SUBMITTED
+    assert outcome.receipt is not None
+
+
+def test_replayed_request_after_restart_never_submits_blindly() -> None:  # G
+    broker = make_broker(healthy=True)
+    agent = make_agent(broker, entry_gate=CountingGate(blocked=True))
+    first = agent.process(request("ord-1"))
+    second = agent.process(request("ord-1"))  # same queue item redelivered
+    assert first.status is ExecutionStatus.NEEDS_REVIEW
+    assert second == first  # idempotent; still refused
+    assert broker.get_open_orders("paper-main") == ()
+
+
+def test_latch_gates_entries_only_not_cancels() -> None:  # H
+    broker = make_broker(healthy=True)
+    gate = CountingGate(blocked=False)
+    agent = make_agent(broker, entry_gate=gate)
+    submitted = agent.process(request("ord-1"))
+    assert submitted.status is ExecutionStatus.SUBMITTED
+    calls_after_submit = gate.calls
+    assert calls_after_submit >= 1  # the entry path consulted the gate
+    # A protective cancel must NOT be routed through the entry latch.
+    cancelled = agent.cancel("ord-1", correlation_id="corr-cancel")
+    assert cancelled.status is ExecutionStatus.CANCEL_SENT
+    assert gate.calls == calls_after_submit  # cancel did not consult the gate
 
 
 # -- happy path -------------------------------------------------------------------

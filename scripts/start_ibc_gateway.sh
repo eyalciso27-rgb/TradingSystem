@@ -24,12 +24,19 @@
 #     config, non-paper, missing Java/files, OR a 2FA-timeout / auth-failure
 #     detected in the IBC log). The unit lists 78 in RestartPreventExitStatus,
 #     so systemd NEVER restarts on it. No 2FA/auth restart loop can form.
-#   * exit 0 = a clean Gateway shutdown or an owner `systemctl stop`; systemd
-#     does not restart.
-#   * any other non-zero = an UNEXPECTED crash; systemd performs bounded
-#     recovery (Restart=on-failure, <=3 starts / 15 min, then fails closed).
+#   * exit 0 = an EXPLICIT owner/systemd stop ONLY (trapped SIGTERM/SIGINT);
+#     systemd treats a requested stop as success and does not restart. A clean
+#     but UNREQUESTED Gateway exit (e.g. an Auto Logoff) is NOT exit 0 — it is
+#     converted to a recoverable code so recovery still happens.
+#   * any other termination, INCLUDING a clean rc=0 that was not an owner stop,
+#     is an UNEXPECTED/unrequested exit; systemd performs bounded recovery
+#     (Restart=on-failure, <=3 starts / 15 min, then fails closed).
 #   Native scheduled IB Gateway Auto Restart is handled INSIDE IBC (the process
 #   does not exit), so it never reaches this contract.
+#
+# On every (re)start the launcher rewrites the broker-session token in
+# /run/ibgateway so the ExecutionAgent's reconciliation latch invalidates any
+# pre-restart CLEAN proof: no new entries until a fresh reconciliation.
 #
 set -euo pipefail
 
@@ -39,6 +46,10 @@ readonly EXIT_FAIL_CLOSED=78
 
 IBC_PATH="${IBC_PATH:-/opt/ibc}"
 IBC_INI="${IBC_INI:-/home/opc/.config/ibc/config.ini}"
+# Runtime dir (tmpfiles.d-owned) that holds cross-restart safety state, incl.
+# the broker-session token the ExecutionAgent's reconciliation latch keys on.
+RUN_DIR="${IBGATEWAY_RUN_DIR:-/run/ibgateway}"
+GATEWAY_SESSION_FILE="${GATEWAY_SESSION_FILE:-${RUN_DIR}/gateway-session}"
 # IB Gateway standalone major-version directory (e.g. ~/Jts/ibgateway/1048).
 TWS_MAJOR_VRSN="${TWS_MAJOR_VRSN:-1048}"
 # IB Gateway installation + settings tree (IBC --tws-path / --tws-settings-path).
@@ -190,6 +201,17 @@ main() {
 
   # Snapshot the logs NOW so fail-closed classification sees only this run.
   capture_log_baseline
+
+  # Rewrite the broker-session token: a NEW session invalidates any pre-restart
+  # account-safety CLEAN, so the ExecutionAgent's reconciliation latch blocks
+  # new entries until a fresh CLEAN for this session. Best-effort: only if the
+  # tmpfiles.d-owned runtime dir exists (it is never created here).
+  if [ -d "${RUN_DIR}" ]; then
+    printf 'gw-%s-%s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$$" \
+      > "${GATEWAY_SESSION_FILE}" 2>/dev/null \
+      && log "broker session: ${GATEWAY_SESSION_FILE} (reconciliation required)" \
+      || log "WARN: could not write ${GATEWAY_SESSION_FILE}"
+  fi
 
   # Run IBC in the FOREGROUND as a child (deliberately NOT exec) so that when it
   # ends we can classify HOW it ended and choose an exit code that drives
