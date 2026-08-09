@@ -8,6 +8,7 @@ or any execution/authorization surface.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -296,6 +297,19 @@ def stages_of(report: E2EShadowReport, candidate: str) -> list[str]:
     return [entry.stage for entry in report.trace if entry.candidate_id == candidate]
 
 
+def grouped(event: ReplayEvent, run_id: str, split_id: str) -> ReplayEvent:
+    """Re-stamp an event with a (run_id, split_id) group."""
+    payload = {**event.payload, "run_id": run_id, "split_id": split_id}
+    return ReplayEvent(
+        event_id=event.event_id,
+        sequence=event.sequence,
+        kind=event.kind,
+        payload=payload,
+        observed_at=event.observed_at,
+        available_at=event.available_at,
+    )
+
+
 # -- TR-001: independent discovery ---------------------------------------------------
 
 
@@ -465,6 +479,32 @@ def test_engine_failure_degrades_explicitly_without_crash() -> None:
     assert history.status.value == "ACTIVE"
     assert history.current_stage.value == "DECIDED"
     assert report.total_candidates == 1
+
+
+def test_engine_failure_on_one_candidate_does_not_stop_later_candidates() -> None:
+    """Item I: a degraded candidate never crashes the replay and never blocks a
+    SUBSEQUENT healthy candidate, which still reaches APPROVED — deterministically."""
+    events = [
+        scan("s1", 0, "c1"),
+        ev("f1", 1, "ENGINE_FAILURE",
+           {"candidate_id": "c1", "engine": "technical-engine",
+            "version": "1.0.0", "reason": "TIMEOUT"}),
+        evaluate("e1", 2, "c1"),  # c1 degrades (missing required) -> ACTIVE
+        scan("s2", 3, "c2", symbol="MSFT"),
+        assessment("a2", 4, "c2", score="90"),
+        evaluate("e2", 5, "c2"),  # c2 is healthy -> APPROVED
+    ]
+    hash_a, report, _ = run_scenario(events)
+    assert report.total_candidates == 2
+    assert report.total_candidates == report.active_candidates + report.terminal_candidates
+    c1 = next(h for h in report.funnel.histories if h.candidate_id == "c1")
+    c2 = next(h for h in report.funnel.histories if h.candidate_id == "c2")
+    assert c1.status.value == "ACTIVE"  # degraded, never vanished
+    assert c2.current_stage.value == "APPROVED"  # the later candidate completed
+    # Deterministic recovery: identical inputs -> identical report + hash.
+    hash_b, report_b, _ = run_scenario(events)
+    assert hash_a == hash_b
+    assert report == report_b
 
 
 def test_risk_veto_attributed_to_risk_engine() -> None:
@@ -777,6 +817,48 @@ def test_source_hygiene_no_connectors_no_execution_no_secrets() -> None:
             "socket", "trading_persistence", "trading_event_bus", "sqlalchemy",
         ):
             assert forbidden not in line, line
+
+
+# -- run_id / split_id isolation (item J) ---------------------------------------------
+
+
+def test_event_from_a_different_run_split_group_fails_closed() -> None:
+    """Item J: an event whose (run_id, split_id) differs from the harness group
+    is rejected fail-closed — replay runs never mix."""
+    config = default_config()  # group ("", "")
+    foreign = grouped(scan("s1", 0, "c1"), "run-B", "s1")
+    harness = E2EShadowHarness(config)
+    with pytest.raises(E2EShadowError, match="never mix"):
+        ReplayRunner(harness.consume).run(
+            ReplayDataset(
+                dataset_id="x", events=(foreign,), versions=config.versions(), seed="seed:1"
+            )
+        )
+
+
+def test_distinct_run_groups_stay_isolated() -> None:
+    """Item J: a run carries its own (run_id, split_id) through the whole trace,
+    and a foreign-group event fed to that harness fails closed — no mixing."""
+    config_a = replace(default_config(), run_id="run-A", split_id="s1")
+    events_a = [grouped(event, "run-A", "s1") for event in HAPPY_PATH]
+    harness_a = E2EShadowHarness(config_a)
+    ReplayRunner(harness_a.consume).run(
+        ReplayDataset(
+            dataset_id="a", events=tuple(events_a), versions=config_a.versions(), seed="seed:1"
+        )
+    )
+    report_a = harness_a.report()
+    assert (report_a.run_id, report_a.split_id) == ("run-A", "s1")
+    assert report_a.trace  # non-empty
+    assert all((e.run_id, e.split_id) == ("run-A", "s1") for e in report_a.trace)
+    # A different group's event fed to the SAME harness is rejected fail-closed.
+    foreign = grouped(scan("sX", 9, "cX"), "run-B", "s1")
+    with pytest.raises(E2EShadowError, match="never mix"):
+        ReplayRunner(harness_a.consume).run(
+            ReplayDataset(
+                dataset_id="b", events=(foreign,), versions=config_a.versions(), seed="seed:1"
+            )
+        )
 
 
 # -- the traceability acceptance report -----------------------------------------------
