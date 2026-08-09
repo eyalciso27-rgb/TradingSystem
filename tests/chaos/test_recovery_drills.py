@@ -103,6 +103,7 @@ from trading_execution_agent.reconciliation import (
     ReconciliationPolicy,
     ReconciliationTrigger,
 )
+from trading_execution_agent.reconciliation_latch import ALWAYS_PERMIT
 
 AS_OF = datetime(2026, 7, 22, 14, 0, tzinfo=UTC)
 RECENT = AS_OF - timedelta(seconds=10)
@@ -139,7 +140,7 @@ class ExecutionDrill:
 
     def __post_init__(self) -> None:
         self.broker.connect()
-        self.agent = ExecutionAgent(self.broker, clock=lambda: AS_OF)
+        self.agent = ExecutionAgent(self.broker, entry_gate=ALWAYS_PERMIT, clock=lambda: AS_OF)
         self.reconciliation = ReconciliationEngine(RECON_POLICY)
 
     def request(self, client_order_id: str, *, owner_approved: bool = True) -> ExecutionRequest:
@@ -252,7 +253,7 @@ def test_service_restart_rebuilds_state_only_via_reconciliation() -> None:
     drill = ExecutionDrill()
     drill.agent.process(drill.request("ord-restart"))
     # Simulated process restart: a fresh agent with empty internal memory.
-    restarted = ExecutionAgent(drill.broker, clock=lambda: AS_OF)
+    restarted = ExecutionAgent(drill.broker, entry_gate=ALWAYS_PERMIT, clock=lambda: AS_OF)
     assert restarted.cancel("ord-restart", correlation_id="c").status is ExecutionStatus.REFUSED
     # Recovery: startup reconciliation detects the broker order the restarted
     # agent knows nothing about — it recommends review, never resubmits.

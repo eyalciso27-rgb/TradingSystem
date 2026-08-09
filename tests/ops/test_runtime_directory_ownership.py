@@ -181,7 +181,8 @@ def test_still_exactly_one_gateway_service() -> None:
     services = sorted(p.name for p in SYSTEMD.glob("*.service"))
     assert services == ["ibgateway-ibc.service", "ibgateway-watchdog.service"]
     assert directives(WATCHDOG_SERVICE, "Restart") == []
-    assert directives(IBC_SERVICE, "Restart") == ["no"]
+    # Bounded, fail-closed recovery — one manager still, just not Restart=no.
+    assert directives(IBC_SERVICE, "Restart") == ["on-failure"]
 
 
 # -- the code side of the same guarantee --------------------------------------

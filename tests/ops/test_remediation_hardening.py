@@ -54,7 +54,11 @@ HEALTHY_UNITS: dict[str, dict[str, str]] = {
     rem.CANONICAL_GATEWAY_UNIT: {
         "Type": "simple",
         "RemainAfterExit": "no",
-        "Restart": "no",
+        "Restart": "on-failure",
+        "RestartUSec": "30s",
+        "StartLimitBurst": "3",
+        "StartLimitIntervalUSec": "15min",
+        "RestartPreventExitStatus": "78",
         "KillMode": "control-group",
         "ProtectSystem": "strict",
         "ProtectHome": "read-only",

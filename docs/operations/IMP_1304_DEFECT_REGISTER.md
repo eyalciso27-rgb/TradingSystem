@@ -1646,8 +1646,9 @@ orderly shutdown.
 is an exception list, not a relaxation: the rest of `/home/opc` — the
 repository, the SSH keys, the owner's files — stays unwritable to the Gateway,
 and a test refuses `/home`, `/home/opc` or `/` appearing in the grant.
-`Restart=no`, `Type=simple`, the one-Gateway policy and the Java path are
-unchanged.
+`Type=simple`, the one-Gateway policy and the Java path are unchanged. (The
+Gateway's recovery policy was later changed from `Restart=no` to bounded,
+fail-closed `Restart=on-failure`; see the IB Gateway auto-login runbook.)
 
 The required set is now a single named contract,
 `systemd_contract.CANONICAL_GATEWAY_WRITABLE_PATHS`, consumed by:

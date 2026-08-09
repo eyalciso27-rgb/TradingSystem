@@ -72,9 +72,44 @@ sudo systemctl start ibgateway-ibc.service
 sudo systemctl enable --now ibgateway-watchdog.timer
 ```
 
-`ibgateway-ibc.service` has `Restart=no` — **the watchdog is the single restart
-manager** (IBC owns only the 2FA relogin). This avoids two mechanisms fighting
-over restarts.
+### Recovery policy — bounded and fail-closed (A / B / C)
+
+`ibgateway-ibc.service` uses **`Restart=on-failure`** with a burst cap
+(`StartLimitBurst=3` / `StartLimitIntervalSec=900`) and
+`RestartPreventExitStatus=78`. systemd is the single restart manager; the
+watchdog still only supervises and alerts (it does not restart). Three cases:
+
+- **A. Native scheduled IB Gateway Auto Restart — ALLOWED.** IBC performs it
+  inside the running process (the same Jts/API/IBC settings return with no
+  manual VNC work), so the unit's main process never exits and systemd is not
+  involved.
+- **B. Bounded recovery after an UNEXPECTED crash — ALLOWED.** `on-failure`
+  restarts at most 3 times per 15 minutes, then the unit stays `failed`.
+- **C. Blind/unbounded recovery, or any resend of trading actions —
+  PROHIBITED.** Known fail-closed conditions (invalid config, non-paper,
+  missing Java/files, **2FA timeout**, **authentication failure**) make the
+  launcher exit `78`, which `RestartPreventExitStatus` exempts — so they are
+  **never** auto-restarted (no 2FA loop). A deliberate `systemctl stop` stays
+  stopped.
+
+Process liveness is **not** trading permission: after any recovery, entries
+stay inhibited until canonical broker reconciliation (positions, open orders,
+executions/order state, lifecycle markers) succeeds. This is enforced at the
+final execution boundary by a persistent reconciliation latch keyed on a
+broker-session token the launcher rotates (fail-closed) on every start; the
+ExecutionAgent refuses a new entry — even with a valid pre-crash authorization
+and a healthy broker — until a CURRENT-session account-safety CLEAN clears it.
+
+> **PAPER_AUTO activation blocker (honest limitation).** The watchdog timer is
+> periodic (~60s), so polling alone is **not** a deterministic proof that every
+> very-short native/in-process IB Gateway Auto Restart disconnect was observed.
+> A systemd restart is fully covered (the launcher rotates the session token),
+> and the periodic cycle re-blocks on any observed non-ready state, but before
+> **PAPER_AUTO** may ever be enabled, native/in-process Gateway reconnects must
+> have **deterministic** broker/API-session invalidation (event-driven, not
+> polling-only). This does **not** block Shadow work or IMP-1301, because
+> PAPER_AUTO remains disabled. The watchdog timer is a supervisor/alerting and
+> latch-maintenance mechanism only — it is **never** an order restart manager.
 
 ## 4b. IBKR Python API (`ibapi`) — owner-run host prerequisite
 

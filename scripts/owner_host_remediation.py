@@ -85,15 +85,50 @@ CANONICAL_ASSETS: tuple[tuple[str, str, int], ...] = (
 )
 
 #: Effective Gateway properties the contract fixes exactly.
+#:
+#: ``Restart=on-failure`` + ``StartLimitBurst=3`` is BOUNDED, FAIL-CLOSED crash
+#: recovery. The fail-closed sentinel that must never restart
+#: (``RestartPreventExitStatus`` contains 78) is verified separately below.
 EXPECTED_GATEWAY_PROPERTIES: dict[str, str] = {
     "Type": "simple",
     "RemainAfterExit": "no",
-    "Restart": "no",
+    "Restart": "on-failure",
+    "StartLimitBurst": "3",
     "KillMode": "control-group",
     "ProtectSystem": "strict",
     "ProtectHome": "read-only",
     "PrivateTmp": "yes",
 }
+
+#: The launcher's fail-closed exit code, which the unit must exempt from the
+#: bounded restart so 2FA/auth/config failures never loop.
+GATEWAY_FAIL_CLOSED_EXIT_CODE = "78"
+
+#: The exact bounded-recovery timings (seconds). systemd renders these as
+#: ``RestartUSec`` / ``StartLimitIntervalUSec`` — microseconds, or ``30s`` /
+#: ``15min``.
+GATEWAY_RESTART_SECONDS = 30.0
+GATEWAY_START_LIMIT_INTERVAL_SECONDS = 900.0
+
+
+def _duration_seconds(value: str) -> float | None:
+    """Parse a systemd duration (bare microseconds, or ``30s`` / ``15min``)."""
+    text = value.strip().lower()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text) / 1_000_000
+    units = {"us": 1e-6, "ms": 1e-3, "s": 1.0, "sec": 1.0, "m": 60.0, "min": 60.0,
+             "h": 3600.0, "hr": 3600.0}
+    total = 0.0
+    matched = False
+    for number, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([a-z]+)", text):
+        factor = units.get(unit)
+        if factor is None:
+            return None
+        total += float(number) * factor
+        matched = True
+    return total if matched else None
 #: Every path the canonical Gateway must be able to write, under
 #: ``ProtectHome=read-only`` and ``ProtectSystem=strict``. Kept in step with
 #: ``systemd_contract.CANONICAL_GATEWAY_WRITABLE_PATHS`` by a test — this
@@ -544,6 +579,10 @@ class Remediator:
             "Type",
             "RemainAfterExit",
             "Restart",
+            "RestartUSec",
+            "RestartPreventExitStatus",
+            "StartLimitBurst",
+            "StartLimitIntervalUSec",
             "KillMode",
             "ProtectSystem",
             "ProtectHome",
@@ -922,6 +961,36 @@ class Remediator:
                     f"gateway:{key}", actual == expected, f"{actual or '(blank)'} (want {expected})"
                 )
             )
+        # Bounded recovery is only safe if the fail-closed sentinel never
+        # restarts: RestartPreventExitStatus MUST exempt exit code 78. A
+        # blank/missing value is a failure — a 2FA/auth failure would otherwise
+        # be eligible for the bounded restart burst.
+        prevent = gateway.get("RestartPreventExitStatus", "")
+        prevent_tokens = prevent.replace(",", " ").split()
+        gates.append(
+            Gate(
+                "gateway:RestartPreventExitStatus",
+                GATEWAY_FAIL_CLOSED_EXIT_CODE in prevent_tokens,
+                f"{prevent or '(blank)'} (want {GATEWAY_FAIL_CLOSED_EXIT_CODE} exempt)",
+            )
+        )
+
+        # The WHOLE bound: the settle delay and the burst window must match too,
+        # so a drop-in cannot silently stretch either. Rendered as *USec.
+        for prop, want in (
+            ("RestartUSec", GATEWAY_RESTART_SECONDS),
+            ("StartLimitIntervalUSec", GATEWAY_START_LIMIT_INTERVAL_SECONDS),
+        ):
+            raw = gateway.get(prop, "")
+            seconds = _duration_seconds(raw)
+            gates.append(
+                Gate(
+                    f"gateway:{prop}",
+                    seconds is not None and abs(seconds - want) <= 0.5,
+                    f"{raw or '(blank)'} (want ~{want:g}s)",
+                )
+            )
+
         rwp = gateway.get("ReadWritePaths", "")
         # A leading '-' (tolerate if missing) or '+' (root relative) still
         # grants the write; the unit file separately forbids the '-' form.

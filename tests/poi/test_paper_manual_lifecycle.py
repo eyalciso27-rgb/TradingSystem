@@ -78,6 +78,7 @@ from trading_execution_agent.reconciliation import (
     ReconciliationPolicy,
     ReconciliationTrigger,
 )
+from trading_execution_agent.reconciliation_latch import ALWAYS_PERMIT
 
 AS_OF = datetime(2026, 7, 20, 14, 0, tzinfo=UTC)
 
@@ -114,7 +115,7 @@ class LifecycleDrill:
 
     def __post_init__(self) -> None:
         self.broker.connect()
-        self.agent = ExecutionAgent(self.broker, clock=lambda: AS_OF)
+        self.agent = ExecutionAgent(self.broker, entry_gate=ALWAYS_PERMIT, clock=lambda: AS_OF)
         self.protection = ProtectionManager(
             ProtectionPolicy(
                 policy_version="prot-1",
@@ -464,7 +465,7 @@ def test_scenario_16b_state_rebuild_after_restart_via_reconciliation() -> None:
     drill = LifecycleDrill()
     drill.agent.process(drill.request("ord-16"))
     # Simulated process restart: a FRESH agent with empty internal state.
-    restarted_agent = ExecutionAgent(drill.broker, clock=lambda: AS_OF)
+    restarted_agent = ExecutionAgent(drill.broker, entry_gate=ALWAYS_PERMIT, clock=lambda: AS_OF)
     del restarted_agent  # its state is empty; recovery goes via reconciliation
     report = drill.reconcile(open_orders=())  # internal lost the open order
     kinds = {finding.kind for finding in report.findings}

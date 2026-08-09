@@ -208,17 +208,21 @@ def audit_units(audit: Audit) -> None:
                 "systemd", f"{unit}:exec_start", Level.INFO, props.get("ExecStart", "unknown")
             )
             restart = props.get("Restart", "unknown")
-            expected_no_restart = unit == CANONICAL_GATEWAY_UNIT
+            is_gateway = unit == CANONICAL_GATEWAY_UNIT
+            # BOUNDED, FAIL-CLOSED recovery: the Gateway uses Restart=on-failure
+            # (bounded by StartLimitBurst, fail-closed exits exempt via
+            # RestartPreventExitStatus). Neither Restart=no (no recovery) nor
+            # Restart=always (blind/unbounded) is acceptable.
             audit.add(
                 "systemd",
                 f"{unit}:restart_policy",
                 Level.PASS
-                if (restart == "no" or not expected_no_restart)
+                if (restart == "on-failure" or not is_gateway)
                 else Level.FAIL,
                 restart,
                 ""
-                if not expected_no_restart
-                else "the Gateway must NOT auto-restart: recovery is owner-authorized",
+                if not is_gateway
+                else "the Gateway must use bounded fail-closed recovery (Restart=on-failure)",
             )
             # INVERTED on purpose. /run/ibgateway is owned by tmpfiles.d alone.
             # A unit declaring RuntimeDirectory takes over the directory's

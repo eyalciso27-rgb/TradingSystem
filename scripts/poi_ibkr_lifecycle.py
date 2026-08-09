@@ -105,6 +105,11 @@ from trading_execution_agent.reconciliation import (
     ReconciliationReport,
     ReconciliationTrigger,
 )
+from trading_execution_agent.reconciliation_latch import (
+    ALWAYS_PERMIT,
+    EntryGate,
+    ReconciliationLatch,
+)
 
 HARNESS_VERSION = "poi-ibkr-lifecycle-1.0.0"
 
@@ -2206,6 +2211,7 @@ def run_lifecycle(
     timeout_seconds: float = 30.0,
     journal: OwnerRunJournal | None = None,
     quote_provider: Callable[[], QuoteObservation] | None = None,
+    entry_gate: EntryGate = ALWAYS_PERMIT,
 ) -> LifecycleReport:
     """Run one scenario end to end, fail-closed, with cleanup on error."""
     now_fn = clock or (lambda: datetime.now(tz=UTC))
@@ -2269,7 +2275,7 @@ def run_lifecycle(
 
     broker = broker_factory()
     connected = False
-    agent = ExecutionAgent(broker, clock=now_fn)
+    agent = ExecutionAgent(broker, clock=now_fn, entry_gate=entry_gate)
     try:
         broker.connect()
         connected = True
@@ -2706,6 +2712,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_ref=args.run_ref,
             timeout_seconds=args.timeout_seconds,
             journal=journal,
+            # Host wiring: the FINAL-boundary reconciliation latch backed by
+            # /run/ibgateway. A pre-crash authorization cannot submit into a
+            # freshly recovered Gateway session until a CURRENT-session CLEAN
+            # clears it (owner-run watchdog --status --deep-probe).
+            entry_gate=ReconciliationLatch(),
         )
     except LifecycleRefused as error:
         # Refusals raised before any broker call (token mismatch, replayed

@@ -1210,6 +1210,39 @@ def _build_account_safety_probe(  # pragma: no cover - host-only wiring
     return probe
 
 
+def _maintain_entry_latch(  # pragma: no cover - host-only wiring
+    *, safety: str, session_file: str, latch_file: str
+) -> None:
+    """Clear the ExecutionAgent entry latch on a CLEAN proof for the CURRENT
+    session; require it otherwise. Best-effort: importable app package + a
+    writable /run/ibgateway. Supervision must never crash the cycle."""
+    try:
+        from trading_execution_agent.reconciliation_latch import ReconciliationLatch
+
+        latch = ReconciliationLatch(session_path=session_file, latch_path=latch_file)
+        latch.maintain(safety, latch.current_session())
+    except Exception:  # noqa: BLE001 - never let latch upkeep break supervision
+        pass
+
+
+def _require_entry_latch_if_not_ready(  # pragma: no cover - host-only wiring
+    state: WatchdogState, *, session_file: str, latch_file: str
+) -> None:
+    """Block new entries whenever the Gateway/API is not fully ready (process
+    down, API down, login incomplete, 2FA pending) — clearing is only ever done
+    by an owner deep-probe CLEAN, never here."""
+    if state is WatchdogState.API_READY:
+        return
+    try:
+        from trading_execution_agent.reconciliation_latch import ReconciliationLatch
+
+        ReconciliationLatch(session_path=session_file, latch_path=latch_file).require(
+            f"gateway not API-ready: {state.value}"
+        )
+    except Exception:  # noqa: BLE001 - never let latch upkeep break supervision
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -1255,6 +1288,16 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="path to the PAPER secret store root used ONLY to resolve the"
         " account id for the read-only probe; without it the probe is UNKNOWN",
+    )
+    parser.add_argument(
+        "--gateway-session-file",
+        default="/run/ibgateway/gateway-session",
+        help="broker-session token the ExecutionAgent reconciliation latch keys on",
+    )
+    parser.add_argument(
+        "--entry-latch-file",
+        default="/run/ibgateway/reconciliation-required.json",
+        help="entry-reconciliation latch state; cleared only by a CURRENT-session CLEAN",
     )
     args = parser.parse_args(argv)
 
@@ -1312,6 +1355,15 @@ def main(argv: list[str] | None = None) -> int:
             if args.json
             else report.render()
         )
+        # Owner-run deep probe is the CLEARING authority for the entry latch:
+        # a CLEAN proof for the CURRENT session clears it; anything else (incl.
+        # UNKNOWN from a native Auto Restart / API disconnect) re-blocks entries.
+        if args.deep_probe and report.deep_probe is not None:  # pragma: no cover - host wiring
+            _maintain_entry_latch(
+                safety=str(report.deep_probe.get("safety", SAFETY_UNKNOWN)),
+                session_file=args.gateway_session_file,
+                latch_file=args.entry_latch_file,
+            )
         # Last-resort scrub: the model is already sanitized, but printing is
         # the one place an id could reach a terminal or an evidence file.
         print(redact_account_ids(rendered))
@@ -1335,6 +1387,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with FileLock(Path(args.lock_file)):
             plan = run_cycle(probes, launcher, store, policy=policy, now=time.time())
+            # Native Auto Restart / API disconnect (no systemd restart) still
+            # invalidates the reconciliation proof: any non-ready state re-blocks
+            # new entries until an owner deep-probe proves CLEAN again.
+            _require_entry_latch_if_not_ready(  # pragma: no cover - host wiring
+                plan.state,
+                session_file=args.gateway_session_file,
+                latch_file=args.entry_latch_file,
+            )
             return plan.exit_code
     except LockBusyError:
         logger.info("another watchdog instance holds the lock; skipping this cycle")

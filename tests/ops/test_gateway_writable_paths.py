@@ -148,7 +148,7 @@ def test_the_rest_of_home_is_not_writable() -> None:
 def test_the_other_hardening_directives_survive() -> None:
     for key, expected in (
         ("Type", "simple"),
-        ("Restart", "no"),
+        ("Restart", "on-failure"),  # bounded, fail-closed recovery
         ("PrivateTmp", "true"),
         ("NoNewPrivileges", "true"),
         ("User", "opc"),

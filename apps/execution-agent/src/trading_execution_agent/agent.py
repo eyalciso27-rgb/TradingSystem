@@ -61,6 +61,8 @@ from trading_broker_core.port import (
 )
 from trading_contracts.enums import Environment, OrderType
 
+from trading_execution_agent.reconciliation_latch import EntryGate
+
 AGENT_VERSION = "execution-agent-1.0.0"
 
 
@@ -137,10 +139,19 @@ class ExecutionAgent:
         self,
         broker: BrokerPort,
         *,
+        entry_gate: EntryGate,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._broker = broker
         self._clock = clock or (lambda: datetime.now(tz=UTC))
+        # Final-boundary reconciliation latch. REQUIRED — the boundary must not
+        # be opt-in by accident: production/owner-host paths pass
+        # ReconciliationLatch(); tests/non-runtime contexts pass ALWAYS_PERMIT
+        # explicitly. A frozen pre-crash authorization must never submit into a
+        # freshly recovered broker session; entry is blocked until a
+        # CURRENT-session account-safety CLEAN clears it. Only NEW entries are
+        # gated — cancel() and protective paths are not.
+        self._entry_gate = entry_gate
         self._outcomes: dict[str, ExecutionOutcome] = {}
 
     def process(
@@ -272,6 +283,22 @@ class ExecutionAgent:
         health = self._broker.health_check()
         if not health.healthy:
             return refuse(ExecutionStatus.FAILED, "BROKER_UNHEALTHY", "NOT_SENT")
+
+        # FINAL-BOUNDARY reconciliation latch — checked immediately before the
+        # single-use authorization is consumed. Even with pre_submit ALLOW, a
+        # valid authorization and a healthy broker, a new entry is REFUSED while
+        # reconciliation is required for the current (possibly just-recovered)
+        # broker session. A frozen pre-crash authorization cannot slip through
+        # after a Gateway restart; UNKNOWN stays reconciliation-only, never a
+        # blind retry. This does NOT gate cancel()/protective paths.
+        entry_blocked, reason = self._entry_gate.entry_blocked()
+        if entry_blocked:
+            return refuse(
+                ExecutionStatus.NEEDS_REVIEW,
+                reason or "RECONCILIATION_REQUIRED",
+                "RECONCILE_BEFORE_ANY_SUBMIT",
+                "NOT_SENT",
+            )
 
         try:
             authorization = request.authorization.consume()
