@@ -73,6 +73,10 @@ main() {
 
   # Credentials come from the config (--user/--pw are deliberately NOT passed).
   # exec so systemd tracks the real process; IBC handles login + 2FA itself.
+  # --on2fatimeout=exit (NOT restart): on a 2FA timeout IBC must exit, never
+  # self-restart. Blind/automatic Gateway recovery is exactly what the
+  # account-safety gate and the unit's Restart=no forbid; recovery is an
+  # owner-authorized action, never IBC's own decision.
   exec "${entry}" "${TWS_MAJOR_VRSN}" \
     --gateway \
     "--tws-path=${TWS_PATH}" \
@@ -80,7 +84,7 @@ main() {
     "--ibc-path=${IBC_PATH}" \
     "--ibc-ini=${IBC_INI}" \
     --mode=paper \
-    --on2fatimeout=restart
+    --on2fatimeout=exit
 }
 
 main "$@"

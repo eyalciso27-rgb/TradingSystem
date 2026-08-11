@@ -84,6 +84,11 @@ def test_start_script_execs_foreground_ibcstart_not_gatewaystart() -> None:
     assert "--mode=paper" in code
     assert "--ibc-ini=${IBC_INI}" in code
     assert "--pw=" not in code and "--user=" not in code
+    # Fail-closed: on a 2FA timeout IBC must EXIT, never self-restart. Blind
+    # Gateway recovery is forbidden (unit is Restart=no); recovery is
+    # owner-authorized only.
+    assert "--on2fatimeout=exit" in code
+    assert "--on2fatimeout=restart" not in code
 
 
 def test_no_hardcoded_credentials_in_scripts() -> None:
