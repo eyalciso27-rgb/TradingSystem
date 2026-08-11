@@ -91,6 +91,28 @@ def test_start_script_execs_foreground_ibcstart_not_gatewaystart() -> None:
     assert "--on2fatimeout=restart" not in code
 
 
+def test_start_script_passes_derived_java_path_and_fails_closed() -> None:
+    """Regression: IBC could not locate Java and died with 'Can't find suitable
+    Java installation'. The launcher must pass --java-path pointing at the
+    bundled Gateway JRE, derive it from the canonical install tree + major
+    version (no second independently pinned path), and fail closed before
+    launch if that java is missing."""
+    text = read(START_SH)
+    code = "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+    # --java-path is passed to the foreground ibcstart invocation.
+    assert "--java-path=${JAVA_PATH}" in code
+    # JAVA_PATH is DERIVED from the canonical variables, not a second hardcoded
+    # version/path that could drift from TWS_PATH / TWS_MAJOR_VRSN.
+    assert 'JAVA_PATH="${JAVA_PATH:-${TWS_PATH}/ibgateway/${TWS_MAJOR_VRSN}/jre/bin}"' in code
+    # Fail closed BEFORE launch if the bundled Gateway java is not executable.
+    assert '[ -x "${JAVA_PATH}/java" ]' in code
+    assert 'die "Gateway Java not found/executable: ${JAVA_PATH}/java"' in code
+    # No independently pinned absolute JRE path is hardcoded into the launcher.
+    assert "/jre/bin/java" not in code.replace("${JAVA_PATH}/java", "")
+
+
 def test_no_hardcoded_credentials_in_scripts() -> None:
     for path in (INSTALL_SH, START_SH):
         text = read(path).lower()
