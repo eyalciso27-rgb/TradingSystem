@@ -15,7 +15,27 @@
 # Run as the owner (opc). Real login (incl. IBKR Mobile 2FA) is performed by
 # IBC/Gateway; this script does not automate or bypass 2FA.
 #
+# RECOVERY EXIT-CODE CONTRACT (paired with the systemd unit):
+#   * The launcher runs ibcstart.sh in the FOREGROUND as a child and waits, so
+#     it can classify how the Gateway ended and pick an exit code that drives
+#     systemd's BOUNDED, FAIL-CLOSED recovery — instead of exec-ing and losing
+#     that control.
+#   * exit 78 (EXIT_FAIL_CLOSED) = a KNOWN fail-closed condition (invalid
+#     config, non-paper, missing Java/files, OR a 2FA-timeout / auth-failure
+#     detected in the IBC log). The unit lists 78 in RestartPreventExitStatus,
+#     so systemd NEVER restarts on it. No 2FA/auth restart loop can form.
+#   * exit 0 = a clean Gateway shutdown or an owner `systemctl stop`; systemd
+#     does not restart.
+#   * any other non-zero = an UNEXPECTED crash; systemd performs bounded
+#     recovery (Restart=on-failure, <=3 starts / 15 min, then fails closed).
+#   Native scheduled IB Gateway Auto Restart is handled INSIDE IBC (the process
+#   does not exit), so it never reaches this contract.
+#
 set -euo pipefail
+
+# Sentinel exit code for every KNOWN fail-closed condition. It MUST match the
+# unit's RestartPreventExitStatus= so these never trigger an automatic restart.
+readonly EXIT_FAIL_CLOSED=78
 
 IBC_PATH="${IBC_PATH:-/opt/ibc}"
 IBC_INI="${IBC_INI:-/home/opc/.config/ibc/config.ini}"
@@ -31,7 +51,33 @@ JAVA_PATH="${JAVA_PATH:-${TWS_PATH}/ibgateway/${TWS_MAJOR_VRSN}/jre/bin}"
 LOG_PATH="${IBC_LOG_PATH:-/home/opc/ibc/logs}"
 
 log() { printf '[start-ibc] %s\n' "$*"; }
-die() { printf '[start-ibc] ERROR: %s\n' "$*" >&2; exit 1; }
+# Every die is a KNOWN fail-closed condition -> sentinel 78 -> no auto-restart.
+die() { printf '[start-ibc] ERROR: %s\n' "$*" >&2; exit "${EXIT_FAIL_CLOSED}"; }
+
+# classify_ibc_log — inspect the most recent IBC log for a TERMINAL fail-closed
+# login condition. Prints FAILCLOSED (2FA timeout or authentication failure) or
+# UNKNOWN. The phrases mirror the watchdog's parse_login_marker
+# (TWO_FA_TIMEOUT / LOGIN_FAILED) so the two never drift; a regression test
+# cross-checks them. Read-only; never prints credentials.
+classify_ibc_log() {
+  local newest lowered
+  newest="$(ls -1t "${LOG_PATH}"/*.log 2>/dev/null | head -n 1 || true)"
+  if [ -z "${newest}" ] || [ ! -r "${newest}" ]; then
+    echo "UNKNOWN"
+    return 0
+  fi
+  lowered="$(tail -n 400 "${newest}" | tr '[:upper:]' '[:lower:]')"
+  if printf '%s' "${lowered}" | grep -q 'second factor authentication' \
+    && printf '%s' "${lowered}" | grep -Eq 'timed out|timeout'; then
+    echo "FAILCLOSED"
+    return 0
+  fi
+  if printf '%s' "${lowered}" | grep -Eq 'login failed|invalid username or password'; then
+    echo "FAILCLOSED"
+    return 0
+  fi
+  echo "UNKNOWN"
+}
 
 validate_config() {
   [ -f "${IBC_INI}" ] || die "IBC config not found: ${IBC_INI} (see runbook)"
@@ -61,13 +107,11 @@ validate_config() {
 main() {
   [ -d "${IBC_PATH}" ] || die "IBC not installed at ${IBC_PATH} (run install_ibc_gateway.sh)"
 
-  # Launch the REAL foreground IBC service script directly. IBC's
+  # Run the REAL foreground IBC service script, scripts/ibcstart.sh. IBC's
   # gatewaystart.sh stays in the foreground ONLY when its first argument is
-  # "-inline"; otherwise it spawns an xterm in the background and returns,
-  # so under systemd Type=simple the unit's main process exits at once and
-  # the service reports "Deactivated successfully." while nothing runs.
-  # scripts/ibcstart.sh is the foreground service entrypoint, so exec-ing it
-  # keeps the Gateway as this unit's tracked main process.
+  # "-inline"; otherwise it spawns an xterm in the background and returns, so
+  # under systemd Type=simple the unit's main process would exit at once and
+  # the service would report "Deactivated successfully." while nothing runs.
   local entry="${IBC_PATH}/scripts/ibcstart.sh"
   [ -x "${entry}" ] || die "IBC entrypoint not found/executable: ${entry}"
 
@@ -83,13 +127,20 @@ main() {
   log "from ${IBC_INI} (chmod 600); never shown, never on the command line."
   log "Gateway Java: ${JAVA_PATH}/java"
 
-  # Credentials come from the config (--user/--pw are deliberately NOT passed).
-  # exec so systemd tracks the real process; IBC handles login + 2FA itself.
-  # --on2fatimeout=exit (NOT restart): on a 2FA timeout IBC must exit, never
-  # self-restart. Blind/automatic Gateway recovery is exactly what the
-  # account-safety gate and the unit's Restart=no forbid; recovery is an
-  # owner-authorized action, never IBC's own decision.
-  exec "${entry}" "${TWS_MAJOR_VRSN}" \
+  # Run IBC in the FOREGROUND as a child (deliberately NOT exec) so that when it
+  # ends we can classify HOW it ended and choose an exit code that drives
+  # systemd's bounded, fail-closed recovery. Credentials come from the config
+  # (--user/--pw are never passed). --on2fatimeout=exit (NOT restart): on a 2FA
+  # timeout IBC exits rather than self-restarting; blind recovery is forbidden.
+  local stopped=0 child_pid child_rc
+  stop_child() {
+    stopped=1
+    [ -n "${child_pid:-}" ] && kill -TERM "${child_pid}" 2>/dev/null || true
+  }
+  trap stop_child TERM INT
+
+  set +e
+  "${entry}" "${TWS_MAJOR_VRSN}" \
     --gateway \
     "--tws-path=${TWS_PATH}" \
     "--tws-settings-path=${TWS_PATH}" \
@@ -97,7 +148,40 @@ main() {
     "--ibc-ini=${IBC_INI}" \
     "--java-path=${JAVA_PATH}" \
     --mode=paper \
-    --on2fatimeout=exit
+    --on2fatimeout=exit &
+  child_pid=$!
+  wait "${child_pid}"
+  child_rc=$?
+  set -e
+
+  # Owner-initiated `systemctl stop` (SIGTERM/SIGINT): exit cleanly. systemd
+  # treats a requested stop as success and does not restart.
+  if [ "${stopped}" -eq 1 ]; then
+    log "received stop signal; Gateway shut down — no automatic restart"
+    exit 0
+  fi
+
+  # KNOWN fail-closed login condition (2FA timeout / authentication failure):
+  # sentinel 78 is in the unit's RestartPreventExitStatus, so systemd NEVER
+  # restarts. This is what guarantees no 2FA/auth restart loop can form.
+  if [ "$(classify_ibc_log)" = "FAILCLOSED" ]; then
+    die "fail-closed login condition (2FA timeout / auth failure); not restarting"
+  fi
+
+  # Clean Gateway shutdown (including IBC's own handling): nothing to recover.
+  if [ "${child_rc}" -eq 0 ]; then
+    log "Gateway exited cleanly (rc=0); no restart"
+    exit 0
+  fi
+
+  # Anything else is an UNEXPECTED crash -> let systemd perform bounded
+  # recovery. Never surface the fail-closed sentinel for a crash, or systemd
+  # would wrongly suppress the restart.
+  if [ "${child_rc}" -eq "${EXIT_FAIL_CLOSED}" ]; then
+    child_rc=1
+  fi
+  log "Gateway exited unexpectedly (rc=${child_rc}); systemd bounded recovery may restart"
+  exit "${child_rc}"
 }
 
 main "$@"

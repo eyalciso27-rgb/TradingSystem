@@ -10,11 +10,26 @@
 # read by IBC itself. No credential appears in this unit, in the command line
 # or in a visible Environment= entry.
 #
-# `Restart=no` is deliberate. Automatic restart is exactly the blind recovery
-# the account-safety gate exists to prevent: systemd cannot know whether an
-# order is working. Recovery is an owner-authorized action under
-# docs/runbooks/CHAOS_RECOVERY_DRILLS.md; the unattended watchdog only
-# supervises and alerts.
+# RECOVERY POLICY — bounded and fail-closed, never blind. Three cases:
+#
+#   A. Native scheduled IB Gateway Auto Restart is ALLOWED. IBC performs it
+#      INSIDE the running process (the same Jts/API/IBC settings return with no
+#      manual VNC work), so the unit's main process never exits and systemd is
+#      not involved.
+#   B. An UNEXPECTED process crash gets BOUNDED automatic recovery:
+#      Restart=on-failure with StartLimitIntervalSec/StartLimitBurst caps it at
+#      3 starts per 15 minutes; after that the unit stays `failed` (stopped).
+#   C. BLIND/UNBOUNDED recovery and any resend of trading actions are
+#      PROHIBITED. Known fail-closed conditions — invalid config, non-paper,
+#      missing Java/files, 2FA timeout, authentication failure — make the
+#      launcher exit 78, which is listed in RestartPreventExitStatus, so systemd
+#      does NOT restart. A deliberate `systemctl stop` also stays stopped.
+#
+# Process liveness is NOT trading permission: after any recovery, entries stay
+# INHIBITED until canonical broker reconciliation (positions, open orders,
+# executions/order state, lifecycle markers) succeeds. That gate lives in the
+# application + watchdog and is unaffected here. The watchdog still only
+# supervises and alerts; it is not a second restart manager.
 #
 # Install: copy to /etc/systemd/system/, then `systemctl daemon-reload`.
 # Do NOT enable/start until the owner has completed secure IBC setup and is
@@ -26,6 +41,10 @@ After=network-online.target
 Wants=network-online.target
 # /run/ibgateway is owned by tmpfiles.d, NOT by this unit (see below).
 After=systemd-tmpfiles-setup.service
+# Bound automatic recovery: at most StartLimitBurst starts per interval. After
+# that systemd refuses to restart and the unit stays `failed` (fail-closed).
+StartLimitIntervalSec=900
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -38,8 +57,19 @@ Environment=IBC_INI=/home/opc/.config/ibc/config.ini
 Environment=TWS_MAJOR_VRSN=1048
 Environment=IBC_LOG_PATH=/home/opc/ibc/logs
 ExecStart=/usr/bin/env bash /opt/trading/scripts/start_ibc_gateway.sh
-# NO automatic restart: recovery is owner-authorized, never blind.
-Restart=no
+# BOUNDED, FAIL-CLOSED recovery (see the RECOVERY POLICY header):
+#   * on-failure: restart only on an unexpected crash, never on a clean stop.
+#   * RestartSec: a sensible settle delay between attempts.
+#   * RestartPreventExitStatus=78: the launcher's fail-closed sentinel (invalid
+#     config, non-paper, missing Java/files, 2FA timeout, auth failure) is
+#     NEVER restarted — this is what stops a 2FA/auth restart loop.
+#   * StartLimitBurst=3 / StartLimitIntervalSec=900 (in [Unit]) cap the crash
+#     recovery at 3 starts / 15 min, then the unit fails closed.
+# This is NOT blind recovery: after any restart, trading entries remain
+# inhibited until broker reconciliation succeeds.
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=78
 #
 # RuntimeDirectory= IS DELIBERATELY ABSENT. DO NOT ADD IT.
 #

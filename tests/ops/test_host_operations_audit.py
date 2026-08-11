@@ -301,11 +301,15 @@ def test_logrotate_is_configured_restrictively() -> None:
     assert "rotate" in text
 
 
-def test_the_gateway_service_never_auto_restarts() -> None:
-    """Automatic restart is exactly the blind recovery the gate prevents."""
+def test_the_gateway_service_uses_bounded_fail_closed_recovery() -> None:
+    """Recovery is bounded and fail-closed, not blind: on-failure with a burst
+    cap and the fail-closed sentinel exempt. Never Restart=no (no recovery) or
+    Restart=always (blind/unbounded)."""
     text = IBC_SERVICE.read_text(encoding="utf-8")
-    assert "Restart=no" in text
-    for forbidden in ("Restart=always", "Restart=on-failure"):
+    assert "Restart=on-failure" in text
+    assert "StartLimitBurst=3" in text
+    assert "RestartPreventExitStatus=78" in text
+    for forbidden in ("Restart=always", "Restart=no"):
         assert forbidden not in text
 
 

@@ -85,15 +85,24 @@ CANONICAL_ASSETS: tuple[tuple[str, str, int], ...] = (
 )
 
 #: Effective Gateway properties the contract fixes exactly.
+#:
+#: ``Restart=on-failure`` + ``StartLimitBurst=3`` is BOUNDED, FAIL-CLOSED crash
+#: recovery. The fail-closed sentinel that must never restart
+#: (``RestartPreventExitStatus`` contains 78) is verified separately below.
 EXPECTED_GATEWAY_PROPERTIES: dict[str, str] = {
     "Type": "simple",
     "RemainAfterExit": "no",
-    "Restart": "no",
+    "Restart": "on-failure",
+    "StartLimitBurst": "3",
     "KillMode": "control-group",
     "ProtectSystem": "strict",
     "ProtectHome": "read-only",
     "PrivateTmp": "yes",
 }
+
+#: The launcher's fail-closed exit code, which the unit must exempt from the
+#: bounded restart so 2FA/auth/config failures never loop.
+GATEWAY_FAIL_CLOSED_EXIT_CODE = "78"
 #: Every path the canonical Gateway must be able to write, under
 #: ``ProtectHome=read-only`` and ``ProtectSystem=strict``. Kept in step with
 #: ``systemd_contract.CANONICAL_GATEWAY_WRITABLE_PATHS`` by a test — this
@@ -544,6 +553,8 @@ class Remediator:
             "Type",
             "RemainAfterExit",
             "Restart",
+            "RestartPreventExitStatus",
+            "StartLimitBurst",
             "KillMode",
             "ProtectSystem",
             "ProtectHome",
@@ -922,6 +933,20 @@ class Remediator:
                     f"gateway:{key}", actual == expected, f"{actual or '(blank)'} (want {expected})"
                 )
             )
+        # Bounded recovery is only safe if the fail-closed sentinel never
+        # restarts: RestartPreventExitStatus MUST exempt exit code 78. A
+        # blank/missing value is a failure — a 2FA/auth failure would otherwise
+        # be eligible for the bounded restart burst.
+        prevent = gateway.get("RestartPreventExitStatus", "")
+        prevent_tokens = prevent.replace(",", " ").split()
+        gates.append(
+            Gate(
+                "gateway:RestartPreventExitStatus",
+                GATEWAY_FAIL_CLOSED_EXIT_CODE in prevent_tokens,
+                f"{prevent or '(blank)'} (want {GATEWAY_FAIL_CLOSED_EXIT_CODE} exempt)",
+            )
+        )
+
         rwp = gateway.get("ReadWritePaths", "")
         # A leading '-' (tolerate if missing) or '+' (root relative) still
         # grants the write; the unit file separately forbids the '-' form.

@@ -534,12 +534,14 @@ def test_active_exited_with_no_main_pid_is_not_ownership() -> None:
 
 
 def test_effective_properties_contradicting_the_contract_fail() -> None:
+    # Restart=no now contradicts the bounded-recovery contract (on-failure),
+    # so it is flagged too — a stale no-recovery unit is a finding.
     findings = contract.check_effective_gateway(
         {"Type": "oneshot", "Restart": "no", "RemainAfterExit": "yes"}
     )
     assert contract.worst(findings) is contract.Severity.FAIL
     failed = {f.check for f in findings if f.severity is contract.Severity.FAIL}
-    assert failed == {"effective:Type", "effective:RemainAfterExit"}
+    assert failed == {"effective:Type", "effective:Restart", "effective:RemainAfterExit"}
 
 
 def test_a_correctly_owned_gateway_passes() -> None:

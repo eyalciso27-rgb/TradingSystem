@@ -60,6 +60,9 @@ SAFETY_CRITICAL_PROPERTIES: frozenset[str] = frozenset(
         "RemainAfterExit",
         "KillMode",
         "Restart",
+        "RestartPreventExitStatus",
+        "StartLimitBurst",
+        "StartLimitIntervalSec",
         "ExecStart",
         "User",
         "Group",
@@ -79,11 +82,24 @@ SAFETY_CRITICAL_PROPERTIES: frozenset[str] = frozenset(
 ALLOWED_DROPIN_SETTINGS: frozenset[str] = frozenset({"DISPLAY", "XAUTHORITY"})
 
 #: What the canonical Gateway unit must effectively be.
+#:
+#: ``Restart=on-failure`` with ``StartLimitBurst=3`` is BOUNDED, FAIL-CLOSED
+#: recovery — not blind restart. ``Restart=always`` (unbounded) is a contract
+#: violation, as is ``Restart=no`` (no crash recovery at all). The fail-closed
+#: sentinel that must never be restarted is checked separately by
+#: :func:`check_restart_prevent_exit_status`.
 CANONICAL_GATEWAY_CONTRACT: dict[str, str] = {
     "Type": "simple",
-    "Restart": "no",
+    "Restart": "on-failure",
     "RemainAfterExit": "no",
+    "StartLimitBurst": "3",
 }
+
+#: The launcher's fail-closed exit code. It MUST appear in the unit's effective
+#: ``RestartPreventExitStatus`` so a known fail-closed condition (invalid
+#: config, non-paper, missing Java/files, 2FA timeout, auth failure) can never
+#: drive an automatic restart loop.
+FAIL_CLOSED_EXIT_CODE = "78"
 
 #: The IB Gateway installation and settings tree. IBC's ``ibcstart.sh`` uses
 #: ``~/Jts`` as the TWS/Gateway path and writes there during startup, and the
@@ -291,6 +307,43 @@ def check_effective_gateway(properties: dict[str, str]) -> list[Finding]:
                 Finding(check=f"effective:{key}", severity=Severity.OK, detail=actual)
             )
     return findings
+
+
+def check_restart_prevent_exit_status(properties: dict[str, str]) -> Finding:
+    """Is the launcher's fail-closed sentinel (78) exempt from auto-restart?
+
+    Bounded crash recovery is only safe if KNOWN fail-closed conditions never
+    restart. The launcher exits 78 for every such condition, so the effective
+    ``RestartPreventExitStatus`` MUST contain 78. A blank/missing value is a
+    FAIL, not UNKNOWN: without it a 2FA-timeout or auth-failure would be
+    eligible for the bounded restart burst, i.e. a (short) 2FA loop.
+    """
+    if "RestartPreventExitStatus" not in properties:
+        return Finding(
+            check="effective:RestartPreventExitStatus",
+            severity=Severity.UNKNOWN,
+            detail="RestartPreventExitStatus not reported",
+        )
+    raw = properties.get("RestartPreventExitStatus", "")
+    tokens = raw.replace(",", " ").split()
+    if FAIL_CLOSED_EXIT_CODE in tokens:
+        return Finding(
+            check="effective:RestartPreventExitStatus",
+            severity=Severity.OK,
+            detail=raw,
+        )
+    return Finding(
+        check="effective:RestartPreventExitStatus",
+        severity=Severity.FAIL,
+        detail=(
+            f"fail-closed exit code {FAIL_CLOSED_EXIT_CODE} not exempt from restart"
+            f" (effective: {raw or '(blank)'})"
+        ),
+        remedy=(
+            f"set RestartPreventExitStatus={FAIL_CLOSED_EXIT_CODE} so known"
+            " fail-closed conditions (2FA/auth/config) never auto-restart"
+        ),
+    )
 
 
 def read_write_paths(value: str) -> list[str]:
@@ -534,6 +587,7 @@ __all__ = [
     "CANONICAL_GATEWAY_CONTRACT",
     "CANONICAL_GATEWAY_UNIT",
     "CANONICAL_GATEWAY_WRITABLE_PATHS",
+    "FAIL_CLOSED_EXIT_CODE",
     "CANONICAL_WATCHDOG_TIMER",
     "CANONICAL_WATCHDOG_UNIT",
     "GATEWAY_INSTALL_ROOT",
@@ -552,6 +606,7 @@ __all__ = [
     "check_effective_gateway",
     "check_gateway_writable_paths",
     "check_process_ownership",
+    "check_restart_prevent_exit_status",
     "check_watchdog_entrypoint",
     "classify_dropin",
     "contradicting_dropins",
