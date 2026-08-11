@@ -54,19 +54,55 @@ log() { printf '[start-ibc] %s\n' "$*"; }
 # Every die is a KNOWN fail-closed condition -> sentinel 78 -> no auto-restart.
 die() { printf '[start-ibc] ERROR: %s\n' "$*" >&2; exit "${EXIT_FAIL_CLOSED}"; }
 
-# classify_ibc_log — inspect the most recent IBC log for a TERMINAL fail-closed
-# login condition. Prints FAILCLOSED (2FA timeout or authentication failure) or
-# UNKNOWN. The phrases mirror the watchdog's parse_login_marker
-# (TWO_FA_TIMEOUT / LOGIN_FAILED) so the two never drift; a regression test
-# cross-checks them. Read-only; never prints credentials.
+# Baseline byte offsets of every IBC log that already existed BEFORE this
+# launcher started IBC. Classification reads ONLY content appended (or newly
+# created / rotated) during THIS invocation, so a stale 2FA/auth marker from a
+# previous run can never classify the current termination.
+declare -A _LOG_BASELINE=()
+
+# capture_log_baseline — record each existing *.log size just before launch.
+capture_log_baseline() {
+  _LOG_BASELINE=()
+  local f size
+  shopt -s nullglob
+  for f in "${LOG_PATH}"/*.log; do
+    size="$(stat -c '%s' "${f}" 2>/dev/null || echo 0)"
+    _LOG_BASELINE["${f}"]="${size}"
+  done
+  shopt -u nullglob
+}
+
+# _current_invocation_log_text — concatenate only the log bytes produced during
+# THIS invocation: for a pre-existing file, the bytes after its baseline offset;
+# for a file created or rotated-in during this run, the whole file (baseline 0);
+# for an in-place truncation (now shorter than baseline), the whole current
+# file. Read-only; never printed.
+_current_invocation_log_text() {
+  local f base size
+  shopt -s nullglob
+  for f in "${LOG_PATH}"/*.log; do
+    [ -r "${f}" ] || continue
+    base="${_LOG_BASELINE["${f}"]:-0}"
+    size="$(stat -c '%s' "${f}" 2>/dev/null || echo 0)"
+    if [ "${size}" -lt "${base}" ]; then
+      base=0  # truncated/rotated in place -> the whole current file is new
+    fi
+    if [ "${size}" -gt "${base}" ]; then
+      tail -c "+$((base + 1))" "${f}" 2>/dev/null || true
+      printf '\n'
+    fi
+  done
+  shopt -u nullglob
+}
+
+# classify_ibc_log — classify ONLY this invocation's IBC log output for a
+# TERMINAL fail-closed login condition. Prints FAILCLOSED (2FA timeout or
+# authentication failure) or UNKNOWN. The phrases mirror the watchdog's
+# parse_login_marker (TWO_FA_TIMEOUT / LOGIN_FAILED) so the two never drift; a
+# regression test cross-checks them. Read-only; never prints credentials.
 classify_ibc_log() {
-  local newest lowered
-  newest="$(ls -1t "${LOG_PATH}"/*.log 2>/dev/null | head -n 1 || true)"
-  if [ -z "${newest}" ] || [ ! -r "${newest}" ]; then
-    echo "UNKNOWN"
-    return 0
-  fi
-  lowered="$(tail -n 400 "${newest}" | tr '[:upper:]' '[:lower:]')"
+  local lowered
+  lowered="$(_current_invocation_log_text | tr '[:upper:]' '[:lower:]')"
   if printf '%s' "${lowered}" | grep -q 'second factor authentication' \
     && printf '%s' "${lowered}" | grep -Eq 'timed out|timeout'; then
     echo "FAILCLOSED"
@@ -77,6 +113,31 @@ classify_ibc_log() {
     return 0
   fi
   echo "UNKNOWN"
+}
+
+# recovery_exit_code <stopped> <child_rc> — the single source of truth for the
+# exit code that drives systemd's bounded, fail-closed recovery. Echoes the code
+# (does not exit) so it is unit-testable:
+#   * stopped=1 (owner systemctl stop / trapped TERM/INT)      -> 0   (no restart)
+#   * this invocation's log shows a fail-closed login condition -> 78  (no restart)
+#   * ANY other unrequested termination, INCLUDING a clean rc=0 -> 1   (bounded
+#     recovery) — an Auto Logoff / clean unrequested exit must come back, only an
+#     explicit owner stop stays down; the sentinel 78 is never surfaced here.
+recovery_exit_code() {
+  local stopped="$1" child_rc="$2"
+  if [ "${stopped}" -eq 1 ]; then
+    echo 0
+    return 0
+  fi
+  if [ "$(classify_ibc_log)" = "FAILCLOSED" ]; then
+    echo "${EXIT_FAIL_CLOSED}"
+    return 0
+  fi
+  if [ "${child_rc}" -eq 0 ] || [ "${child_rc}" -eq "${EXIT_FAIL_CLOSED}" ]; then
+    echo 1
+    return 0
+  fi
+  echo "${child_rc}"
 }
 
 validate_config() {
@@ -127,6 +188,9 @@ main() {
   log "from ${IBC_INI} (chmod 600); never shown, never on the command line."
   log "Gateway Java: ${JAVA_PATH}/java"
 
+  # Snapshot the logs NOW so fail-closed classification sees only this run.
+  capture_log_baseline
+
   # Run IBC in the FOREGROUND as a child (deliberately NOT exec) so that when it
   # ends we can classify HOW it ended and choose an exit code that drives
   # systemd's bounded, fail-closed recovery. Credentials come from the config
@@ -154,34 +218,20 @@ main() {
   child_rc=$?
   set -e
 
-  # Owner-initiated `systemctl stop` (SIGTERM/SIGINT): exit cleanly. systemd
-  # treats a requested stop as success and does not restart.
-  if [ "${stopped}" -eq 1 ]; then
-    log "received stop signal; Gateway shut down — no automatic restart"
-    exit 0
+  local code
+  code="$(recovery_exit_code "${stopped}" "${child_rc}")"
+  if [ "${code}" -eq 0 ]; then
+    log "owner stop; Gateway shut down — no automatic restart"
+  elif [ "${code}" -eq "${EXIT_FAIL_CLOSED}" ]; then
+    log "fail-closed login condition (2FA timeout / auth failure); not restarting"
+  else
+    log "Gateway terminated unrequested (rc=${code}); systemd bounded recovery will restart"
   fi
-
-  # KNOWN fail-closed login condition (2FA timeout / authentication failure):
-  # sentinel 78 is in the unit's RestartPreventExitStatus, so systemd NEVER
-  # restarts. This is what guarantees no 2FA/auth restart loop can form.
-  if [ "$(classify_ibc_log)" = "FAILCLOSED" ]; then
-    die "fail-closed login condition (2FA timeout / auth failure); not restarting"
-  fi
-
-  # Clean Gateway shutdown (including IBC's own handling): nothing to recover.
-  if [ "${child_rc}" -eq 0 ]; then
-    log "Gateway exited cleanly (rc=0); no restart"
-    exit 0
-  fi
-
-  # Anything else is an UNEXPECTED crash -> let systemd perform bounded
-  # recovery. Never surface the fail-closed sentinel for a crash, or systemd
-  # would wrongly suppress the restart.
-  if [ "${child_rc}" -eq "${EXIT_FAIL_CLOSED}" ]; then
-    child_rc=1
-  fi
-  log "Gateway exited unexpectedly (rc=${child_rc}); systemd bounded recovery may restart"
-  exit "${child_rc}"
+  exit "${code}"
 }
 
-main "$@"
+# Only run when EXECUTED, not when SOURCED (tests source this file to exercise
+# classify_ibc_log / the recovery decision without launching IBC).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

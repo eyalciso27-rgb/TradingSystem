@@ -544,6 +544,73 @@ def test_effective_properties_contradicting_the_contract_fail() -> None:
     assert failed == {"effective:Type", "effective:Restart", "effective:RemainAfterExit"}
 
 
+def test_bounded_recovery_contract_accepts_the_exact_policy() -> None:
+    effective = {
+        "Type": "simple",
+        "Restart": "on-failure",
+        "RemainAfterExit": "no",
+        "StartLimitBurst": "3",
+        "RestartUSec": "30s",
+        "StartLimitIntervalUSec": "15min",
+        "RestartPreventExitStatus": "78",
+    }
+    assert contract.worst(contract.check_effective_gateway(effective)) is contract.Severity.OK
+    assert contract.worst(contract.check_bounded_recovery(effective)) is contract.Severity.OK
+    assert contract.check_restart_prevent_exit_status(effective).severity is contract.Severity.OK
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("Restart", "always"),  # blind/unbounded
+        ("Restart", "no"),  # no recovery
+        ("StartLimitBurst", "10"),  # burst too wide
+    ],
+)
+def test_restart_or_burst_drift_fails(key: str, value: str) -> None:
+    effective = {
+        "Type": "simple", "Restart": "on-failure", "RemainAfterExit": "no",
+        "StartLimitBurst": "3",
+    }
+    effective[key] = value
+    findings = contract.check_effective_gateway(effective)
+    assert any(f.check == f"effective:{key}" and f.severity is contract.Severity.FAIL
+               for f in findings)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("RestartUSec", "5s"),  # settle delay drift
+        ("RestartUSec", ""),  # blank
+        ("StartLimitIntervalUSec", "60s"),  # window shrunk
+        ("StartLimitIntervalUSec", "30min"),  # window stretched
+    ],
+)
+def test_duration_drift_fails(key: str, value: str) -> None:
+    effective = {"RestartUSec": "30s", "StartLimitIntervalUSec": "15min"}
+    effective[key] = value
+    findings = contract.check_bounded_recovery(effective)
+    assert any(f.check == f"effective:{key}" and f.severity is contract.Severity.FAIL
+               for f in findings)
+
+
+def test_missing_fail_closed_sentinel_fails() -> None:
+    assert contract.check_restart_prevent_exit_status(
+        {"RestartPreventExitStatus": "0"}
+    ).severity is contract.Severity.FAIL
+    assert contract.check_restart_prevent_exit_status({}).severity is contract.Severity.UNKNOWN
+
+
+def test_duration_parsing_accepts_usec_and_human_forms() -> None:
+    assert contract.duration_seconds("30s") == 30.0
+    assert contract.duration_seconds("15min") == 900.0
+    assert contract.duration_seconds("900000000") == 900.0  # bare microseconds
+    assert contract.duration_seconds("1min30s") == 90.0
+    assert contract.duration_seconds("") is None
+    assert contract.duration_seconds("garbage") is None
+
+
 def test_a_correctly_owned_gateway_passes() -> None:
     finding = contract.check_process_ownership(
         {"ActiveState": "active", "SubState": "running", "MainPID": "4242"},

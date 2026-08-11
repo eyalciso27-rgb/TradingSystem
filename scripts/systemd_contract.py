@@ -60,6 +60,7 @@ SAFETY_CRITICAL_PROPERTIES: frozenset[str] = frozenset(
         "RemainAfterExit",
         "KillMode",
         "Restart",
+        "RestartSec",
         "RestartPreventExitStatus",
         "StartLimitBurst",
         "StartLimitIntervalSec",
@@ -100,6 +101,86 @@ CANONICAL_GATEWAY_CONTRACT: dict[str, str] = {
 #: config, non-paper, missing Java/files, 2FA timeout, auth failure) can never
 #: drive an automatic restart loop.
 FAIL_CLOSED_EXIT_CODE = "78"
+
+#: The exact bounded-recovery timings the effective unit must carry. Checked
+#: tolerantly (systemd renders these as ``RestartUSec`` / ``StartLimitIntervalUSec``
+#: in microseconds, or as ``30s`` / ``15min``).
+EXPECTED_RESTART_SECONDS = 30.0
+EXPECTED_START_LIMIT_INTERVAL_SECONDS = 900.0
+
+_DURATION_UNITS = {
+    "us": 1e-6, "usec": 1e-6,
+    "ms": 1e-3, "msec": 1e-3,
+    "s": 1.0, "sec": 1.0, "second": 1.0, "seconds": 1.0,
+    "m": 60.0, "min": 60.0, "minute": 60.0, "minutes": 60.0,
+    "h": 3600.0, "hr": 3600.0, "hour": 3600.0, "hours": 3600.0,
+}
+
+_DURATION_TOKEN = re.compile(r"(\d+(?:\.\d+)?)\s*([a-z]+)")
+
+
+def duration_seconds(value: str) -> float | None:
+    """Parse a systemd duration to seconds, or None if unparseable.
+
+    Accepts the two forms ``systemctl show`` can emit: a bare integer of
+    MICROSECONDS (the ``*USec`` convention, e.g. ``30000000``) and a composite
+    human form (``30s``, ``15min``, ``1min30s``).
+    """
+    text = value.strip().lower()
+    if not text:
+        return None
+    if text.isdigit():  # bare integer => microseconds
+        return int(text) / 1_000_000
+    total = 0.0
+    matched = False
+    for number, unit in _DURATION_TOKEN.findall(text):
+        factor = _DURATION_UNITS.get(unit)
+        if factor is None:
+            return None
+        total += float(number) * factor
+        matched = True
+    return total if matched else None
+
+
+def check_bounded_recovery(properties: dict[str, str]) -> list[Finding]:
+    """Verify the WHOLE bound: RestartSec≈30s and StartLimitInterval≈900s.
+
+    ``Restart=on-failure`` and ``StartLimitBurst=3`` are checked exactly by the
+    main contract; this covers the two duration values (rendered as ``*USec``),
+    so a drop-in cannot silently stretch the settle delay or the burst window.
+    """
+    findings: list[Finding] = []
+    for key, want in (
+        ("RestartUSec", EXPECTED_RESTART_SECONDS),
+        ("StartLimitIntervalUSec", EXPECTED_START_LIMIT_INTERVAL_SECONDS),
+    ):
+        if key not in properties:
+            findings.append(
+                Finding(check=f"effective:{key}", severity=Severity.UNKNOWN,
+                        detail=f"{key} not reported")
+            )
+            continue
+        raw = properties.get(key, "")
+        seconds = duration_seconds(raw)
+        if seconds is None:
+            findings.append(
+                Finding(check=f"effective:{key}", severity=Severity.FAIL,
+                        detail=f"unparseable {key}={raw or '(blank)'}")
+            )
+        elif abs(seconds - want) > 0.5:
+            findings.append(
+                Finding(
+                    check=f"effective:{key}",
+                    severity=Severity.FAIL,
+                    detail=f"{key}={raw} ({seconds:g}s), want {want:g}s",
+                    remedy=f"set the unit's {key[:-4]}Sec to {want:g} seconds",
+                )
+            )
+        else:
+            findings.append(
+                Finding(check=f"effective:{key}", severity=Severity.OK, detail=raw)
+            )
+    return findings
 
 #: The IB Gateway installation and settings tree. IBC's ``ibcstart.sh`` uses
 #: ``~/Jts`` as the TWS/Gateway path and writes there during startup, and the
@@ -587,6 +668,8 @@ __all__ = [
     "CANONICAL_GATEWAY_CONTRACT",
     "CANONICAL_GATEWAY_UNIT",
     "CANONICAL_GATEWAY_WRITABLE_PATHS",
+    "EXPECTED_RESTART_SECONDS",
+    "EXPECTED_START_LIMIT_INTERVAL_SECONDS",
     "FAIL_CLOSED_EXIT_CODE",
     "CANONICAL_WATCHDOG_TIMER",
     "CANONICAL_WATCHDOG_UNIT",
@@ -603,10 +686,12 @@ __all__ = [
     "DropInParseError",
     "Finding",
     "Severity",
+    "check_bounded_recovery",
     "check_effective_gateway",
     "check_gateway_writable_paths",
     "check_process_ownership",
     "check_restart_prevent_exit_status",
+    "duration_seconds",
     "check_watchdog_entrypoint",
     "classify_dropin",
     "contradicting_dropins",

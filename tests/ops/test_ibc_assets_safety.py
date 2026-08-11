@@ -97,11 +97,12 @@ def test_start_script_runs_foreground_ibcstart_not_gatewaystart() -> None:
 
 
 def test_start_script_bounded_fail_closed_recovery_semantics() -> None:
-    """The launcher drives systemd's bounded, fail-closed recovery via exit
-    codes: sentinel 78 for every KNOWN fail-closed condition (never restarted),
-    0 for clean/operator stop, other non-zero for an unexpected crash (bounded
-    restart). It must also detect a terminal 2FA-timeout / auth-failure in the
-    IBC log using the SAME phrases as the watchdog, so the two never drift."""
+    """The launcher drives systemd's bounded, fail-closed recovery via a single
+    testable decision (recovery_exit_code): sentinel 78 for a KNOWN fail-closed
+    condition (never restarted), 0 ONLY for an explicit owner stop, and a
+    recoverable non-zero for ANY other unrequested termination INCLUDING a clean
+    rc=0. Fail-closed classification is INVOCATION-SCOPED, and its markers match
+    the watchdog so the two never drift."""
     text = read(START_SH)
     code = "\n".join(
         line for line in text.splitlines() if not line.lstrip().startswith("#")
@@ -109,12 +110,17 @@ def test_start_script_bounded_fail_closed_recovery_semantics() -> None:
     # sentinel exit code, matching the unit's RestartPreventExitStatus
     assert "EXIT_FAIL_CLOSED=78" in code
     assert 'exit "${EXIT_FAIL_CLOSED}"' in code  # die() uses the sentinel
-    # a stop signal is a clean exit (systemd will not restart)
+    # single source of truth for the exit code, sourced/unit-tested separately
+    assert "recovery_exit_code()" in code
+    assert 'if [ "${BASH_SOURCE[0]}" = "${0}" ]; then' in code  # source guard
+    # an owner stop is trapped and is the ONLY clean (0) exit
     assert "trap stop_child TERM INT" in code
-    assert "exit 0" in code
-    # the log classifier drives the fail-closed decision
+    # a clean rc=0 that is NOT an owner stop is converted to a recoverable code
+    assert '[ "${child_rc}" -eq 0 ] || [ "${child_rc}" -eq "${EXIT_FAIL_CLOSED}" ]' in code
+    # classification is invocation-scoped (baseline captured before launch)
+    assert "capture_log_baseline" in code
     assert "classify_ibc_log" in code
-    assert 'FAILCLOSED' in code
+    assert "FAILCLOSED" in code
     # the launcher's fail-closed markers MUST match the watchdog's
     # parse_login_marker phrases (TWO_FA_TIMEOUT / LOGIN_FAILED) — no drift.
     watchdog = read(REPO_ROOT / "scripts" / "ib_gateway_watchdog.py").lower()
@@ -210,7 +216,7 @@ def test_ibc_service_bounded_fail_closed_recovery() -> None:
     assert "Restart=on-failure" in text
     assert "Restart=no" not in text  # the old no-recovery policy is gone
     assert "Restart=always" not in text  # never blind/unbounded
-    assert "RestartSec=" in text
+    assert "RestartSec=30" in text  # exact settle delay
     # the burst cap: <= 3 starts / 15 min, then fail closed
     assert "StartLimitBurst=3" in text
     assert "StartLimitIntervalSec=900" in text
