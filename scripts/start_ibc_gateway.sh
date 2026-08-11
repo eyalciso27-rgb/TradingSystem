@@ -21,6 +21,8 @@ IBC_PATH="${IBC_PATH:-/opt/ibc}"
 IBC_INI="${IBC_INI:-/home/opc/.config/ibc/config.ini}"
 # IB Gateway standalone major-version directory (e.g. ~/Jts/ibgateway/1048).
 TWS_MAJOR_VRSN="${TWS_MAJOR_VRSN:-1048}"
+# IB Gateway installation + settings tree (IBC --tws-path / --tws-settings-path).
+TWS_PATH="${TWS_PATH:-/home/opc/Jts}"
 LOG_PATH="${IBC_LOG_PATH:-/home/opc/ibc/logs}"
 
 log() { printf '[start-ibc] %s\n' "$*"; }
@@ -53,7 +55,15 @@ validate_config() {
 
 main() {
   [ -d "${IBC_PATH}" ] || die "IBC not installed at ${IBC_PATH} (run install_ibc_gateway.sh)"
-  local entry="${IBC_PATH}/gatewaystart.sh"
+
+  # Launch the REAL foreground IBC service script directly. IBC's
+  # gatewaystart.sh stays in the foreground ONLY when its first argument is
+  # "-inline"; otherwise it spawns an xterm in the background and returns,
+  # so under systemd Type=simple the unit's main process exits at once and
+  # the service reports "Deactivated successfully." while nothing runs.
+  # scripts/ibcstart.sh is the foreground service entrypoint, so exec-ing it
+  # keeps the Gateway as this unit's tracked main process.
+  local entry="${IBC_PATH}/scripts/ibcstart.sh"
   [ -x "${entry}" ] || die "IBC entrypoint not found/executable: ${entry}"
 
   validate_config
@@ -65,8 +75,12 @@ main() {
   # exec so systemd tracks the real process; IBC handles login + 2FA itself.
   exec "${entry}" "${TWS_MAJOR_VRSN}" \
     --gateway \
+    "--tws-path=${TWS_PATH}" \
+    "--tws-settings-path=${TWS_PATH}" \
+    "--ibc-path=${IBC_PATH}" \
+    "--ibc-ini=${IBC_INI}" \
     --mode=paper \
-    "--config=${IBC_INI}"
+    --on2fatimeout=restart
 }
 
 main "$@"
