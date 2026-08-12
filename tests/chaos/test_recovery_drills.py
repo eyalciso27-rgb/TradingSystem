@@ -34,6 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -103,7 +104,11 @@ from trading_execution_agent.reconciliation import (
     ReconciliationPolicy,
     ReconciliationTrigger,
 )
-from trading_execution_agent.reconciliation_latch import ALWAYS_PERMIT
+from trading_execution_agent.reconciliation_latch import (
+    ALWAYS_PERMIT,
+    CLEAN,
+    ReconciliationLatch,
+)
 
 AS_OF = datetime(2026, 7, 22, 14, 0, tzinfo=UTC)
 RECENT = AS_OF - timedelta(seconds=10)
@@ -267,6 +272,46 @@ def test_service_restart_rebuilds_state_only_via_reconciliation() -> None:
             Recommendation.BLOCK_NEW_ENTRIES,
         )
     assert len(drill.broker.get_open_orders("paper-main")) == 1  # untouched
+
+
+def test_persistent_entry_latch_blocks_entries_across_restart_until_clean(
+    tmp_path: Path,
+) -> None:
+    """Restart fault domain with the merged final-boundary reconciliation latch:
+    a Gateway/process restart rotates the broker-session token, so a NEW entry is
+    refused until a CURRENT-session account-safety CLEAN clears the PERSISTENT
+    latch — no new/duplicate order enters a freshly recovered session, and a
+    stale pre-restart CLEAN can never clear it. cancel()/protective paths are
+    never gated."""
+    drill = ExecutionDrill()
+    session = tmp_path / "gateway-session"
+    session.write_text("gw-1\n", encoding="utf-8")
+    latch = ReconciliationLatch(
+        session_path=session, latch_path=tmp_path / "reconciliation-required.json"
+    )
+    agent = ExecutionAgent(drill.broker, entry_gate=latch, clock=lambda: AS_OF)
+
+    # latch not cleared for the current session -> entry refused, zero orders
+    blocked = agent.process(drill.request("ord-l1"))
+    assert blocked.status is ExecutionStatus.NEEDS_REVIEW
+    assert any(code.startswith("RECONCILIATION_REQUIRED") for code in blocked.reason_codes)
+    assert drill.broker.get_open_orders("paper-main") == ()
+
+    # a CURRENT-session account-safety CLEAN clears the latch -> entry proceeds
+    assert latch.try_clear(CLEAN, "gw-1") is True
+    assert agent.process(drill.request("ord-l2")).status is ExecutionStatus.SUBMITTED
+    assert len(drill.broker.get_open_orders("paper-main")) == 1
+
+    # RESTART: the persistent state survives; the rotated token re-blocks entries
+    session.write_text("gw-2\n", encoding="utf-8")
+    after_restart = agent.process(drill.request("ord-l3"))
+    assert after_restart.status is ExecutionStatus.NEEDS_REVIEW
+    assert len(drill.broker.get_open_orders("paper-main")) == 1  # zero new orders
+
+    # a stale pre-restart CLEAN cannot clear the new session
+    assert latch.try_clear(CLEAN, "gw-1") is False
+    # a protective cancel is never gated by the entry latch
+    assert agent.cancel("ord-l2", correlation_id="c-l").status is ExecutionStatus.CANCEL_SENT
 
 
 # -- duplicate delivery / replay --------------------------------------------
@@ -638,8 +683,6 @@ def test_no_authorization_is_minted_in_any_unhealthy_state(
 
 
 def test_no_ibkr_sdk_or_network_import_in_this_module() -> None:
-    from pathlib import Path
-
     source = Path(__file__).read_text(encoding="utf-8")
     for line in source.splitlines():
         stripped = line.strip()
