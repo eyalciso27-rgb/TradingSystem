@@ -21,7 +21,7 @@
 
 | Question | Answer |
 |---|---|
-| Is the system built? | **Largely yes in code** — 72 of 82 canonical tasks are `IMPLEMENTED`. |
+| Is the system built? | **Mostly in code** — **65 of 82** canonical tasks are `IMPLEMENTED`. The 7 PHASE-6 source adapters (WhatsApp/Discord/Telegram-user/Telegram-bot/InvestingPro/News/TradingView) are **NOT built** — only their normalization contract (IMP-0605) exists. |
 | Is it integrated with the real world? | **Almost nowhere.** 2 of 15 PoIs PASS. |
 | Can it trade? | **No.** Paper Manual is blocked; Paper Auto and Live are **DISABLED**. |
 | Is any strategy profitable? | **Unknown — `PROFITABILITY_NOT_PROVEN`.** No hypothesis is even frozen. |
@@ -103,7 +103,7 @@ Counted from [`docs/baseline-v0.5/CLAUDE_CODE_TASKS.yaml`](../baseline-v0.5/CLAU
 | PHASE-3 | Security, Identity, Audit and Sessions | 5 | ✅ IMPLEMENTED |
 | PHASE-4 | Infrastructure, Docker and Operations Core | 5 | ✅ IMPLEMENTED |
 | PHASE-5 | Proof-of-Integration Execution | 3 | ⚠️ code complete, **exit gate NOT satisfied** |
-| PHASE-6 | Production Source Adapters | 8 | ✅ IMPLEMENTED (all PoIs BLOCKED) |
+| PHASE-6 | Production Source Adapters | 8 | ◻ **NOT BUILT** — only IMP-0605 normalization contract exists; the 7 adapters (IMP-0601/2/3/4/6/7/8) are NOT_IMPLEMENTED (all PoIs BLOCKED) |
 | PHASE-7 | Instrument, Market Data and Trading Calendar | 5 | ✅ IMPLEMENTED |
 | PHASE-8 | Research and Signal Engines | 6 | ✅ IMPLEMENTED (fakes only) |
 | PHASE-9 | Fusion, Decision, Risk and Portfolio | 6 | ✅ IMPLEMENTED (fakes only) |
@@ -114,21 +114,38 @@ Counted from [`docs/baseline-v0.5/CLAUDE_CODE_TASKS.yaml`](../baseline-v0.5/CLAU
 | PHASE-14 | Restricted Paper Auto | 4 | 🧊 FROZEN |
 | PHASE-15 | Long-run Operation and Live Readiness | 3 | 🧊 FROZEN |
 
-### 3.1 Completed — 72 tasks
+### 3.1 Completed — 65 tasks
 
-`IMP-0001 … IMP-1206` plus `IMP-1301`. `IMPLEMENTED` means *merged to `main`
-with code, tests and docs*. It says **nothing** about real integration or
-profitability.
+`IMP-0001 … IMP-1206` plus `IMP-1301`, **minus the 7 PHASE-6 source adapters
+that were never built** (IMP-0601/0602/0603/0604/0606/0607/0608). `IMPLEMENTED`
+means *merged to `main` with code, tests and docs*. It says **nothing** about
+real integration or profitability.
+
+> **PHASE-6 correction (2026-08 code re-audit).** A re-audit of `main` found
+> `apps/connectors` is an "IMP-0001 skeleton placeholder, no business logic"
+> and that **no WhatsApp/Discord/Telegram/TDLib/InvestingPro/News/TradingView
+> adapter module or adapter test exists.** Only the cross-adapter normalization
+> contract (**IMP-0605**, `trading_contracts.social`), the encrypted session
+> store (IMP-0303) and `SourceConfig` exist as shared scaffolding. The prior
+> "72 IMPLEMENTED / PHASE-6 IMPLEMENTED" claim was documentation drift and is
+> corrected here and in the machine-readable matrix.
 
 > **PHASE-5 caveat.** `IMP-0501…0503` are implementation-complete (registry,
 > evidence structure, drills, provider catalog) but the **exit gate is not
 > satisfied**: 2 of 12 P0 PoIs PASS, 10 are BLOCKED, and 0 alternate ADRs
 > exist. An ADR may not be created merely to paper over a missing account.
 
-### 3.2 Remaining — 10 tasks
+### 3.2 Remaining — 17 tasks
 
 | Task | Title | Disposition |
 |---|---|---|
+| IMP-0601 | Build WhatsApp user adapter | **NOT_IMPLEMENTED** — Track C; owner account |
+| IMP-0602 | Build Discord user adapter | **NOT_IMPLEMENTED** — Track C; owner account |
+| IMP-0603 | Build Telegram user adapter (TDLib) | **NOT_IMPLEMENTED** — Track C; owner account + host |
+| IMP-0604 | Build Telegram bot adapter | **NOT_IMPLEMENTED** — Track C; supplemental only |
+| IMP-0606 | Build InvestingPro adapter | **NOT_IMPLEMENTED** — Track C; authorized login + browser host |
+| IMP-0607 | Build news/filings adapters | **NOT_IMPLEMENTED** — Track C; provider access |
+| IMP-0608 | Build TradingView adapter | **NOT_IMPLEMENTED** — Track C; authenticated webhook |
 | IMP-1302 | Run Paper Manual | Evidence (Track B) — gated on POI-IBKR-001 |
 | IMP-1303 | Run chaos and recovery drills | Evidence (Track B) — B-02/B-03/B-04 |
 | IMP-1304 | Close operational defects | Continue as defects surface |
@@ -216,8 +233,8 @@ Summary:
 |---|---|---|
 | Platform / security | platform, security | ✅ INTEGRATION_VERIFIED |
 | Persistence | persistence | Implemented; no real dataset |
-| Social sources | whatsapp-user, discord-user, telegram-user, telegram-bot, telegram-coexistence | Implemented; **all PoIs BLOCKED** on owner accounts |
-| Other externals | investingpro, news, tradingview | Implemented; **all BLOCKED** |
+| Social sources | whatsapp-user, discord-user, telegram-user, telegram-bot, telegram-coexistence | **Adapters NOT_IMPLEMENTED**; only the normalization contract (IMP-0605) + session store + config exist; **all PoIs BLOCKED** on owner accounts |
+| Other externals | investingpro, news, tradingview | **Adapters NOT_IMPLEMENTED**; shared normalization layer only; **all BLOCKED** |
 | Market data | market-data | Read-only verified (IBKR); aggregate BLOCKED |
 | External provider | external-market-data-provider | **NOT_IMPLEMENTED**; no provider selected |
 | AI | ai-provider, ai-analysis-engines | Implemented; provider PoI BLOCKED; engines fakes-only |
