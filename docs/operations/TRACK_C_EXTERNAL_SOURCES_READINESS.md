@@ -35,12 +35,25 @@ The canonical, provider-agnostic layer that every adapter must use is
   the read-only broker probe. It is the wiring an adapter will reuse; it is not
   yet wired to any source adapter (none exists).
 
-**No production source adapter exists.** `apps/`/`packages/` contain the
-contract, the JSON schemas and the dashboard sources UI — but no WhatsApp /
-Discord / Telegram / TDLib / TradingView / News / InvestingPro runtime adapter.
-Building one requires the owner's real account, credentials and platform
-authorization (ToS), so it **cannot be completed offline** beyond the shared
-layer above.
+**No production source adapter exists** (verified by a 2026-08 code re-audit).
+`apps/connectors` is an *"IMP-0001 skeleton placeholder, no business logic"*;
+there is **no** WhatsApp / Discord / Telegram / TDLib / TradingView / News /
+InvestingPro adapter module and **no** adapter integration test anywhere in
+`apps/` or `packages/`. What exists is the shared scaffolding only: the contract
+(`trading_contracts.social`, IMP-0605), the encrypted session store
+(`trading_config.sessions`, IMP-0303), `SourceConfig`, the JSON schemas and the
+dashboard sources UI. Building an adapter requires the owner's real account,
+credentials and platform authorization (ToS), so it **cannot be completed
+offline** beyond the shared layer above.
+
+> **Status reconciliation (corrected in this PR).** The Master Plan and the
+> machine-readable Component Evidence Matrix previously marked the 7 PHASE-6
+> adapters (IMP-0601/0602/0603/0604/0606/0607/0608) as `IMPLEMENTED` — that was
+> documentation drift. They are now `NOT_IMPLEMENTED` in
+> `docs/status/COMPONENT_EVIDENCE_MATRIX.yaml`, the implemented task count is
+> corrected **72 → 65**, and a consistency test
+> (`test_the_unbuilt_source_adapters_are_not_claimed_implemented`) pins it so the
+> drift cannot silently return. Only IMP-0605 (normalization) remains IMPLEMENTED.
 
 ## 1. Source-by-source status (the 12 questions)
 
@@ -49,7 +62,7 @@ per-source producer yet.
 
 | # Question | WA user | DC user | TG user (TDLib) | TG bot | TG coex | InvestingPro | News | TradingView | Ext. market-data |
 |---|---|---|---|---|---|---|---|---|---|
-| PoI id | POI-SOC-WA-USER (P0) | POI-SOC-DC-USER (P0) | POI-SOC-TG-USER (P0) | POI-SOC-TG-BOT (P1) | POI-SOC-TG-COEX (P0) | *(SourceType only)* | POI-NEWS-001 | POI-TV-001 | POI-MD-001 |
+| PoI id | POI-SOC-WA-USER (P0) | POI-SOC-DC-USER (P0) | POI-SOC-TG-USER (P0) | POI-SOC-TG-BOT (P1) | POI-SOC-TG-COEX (P0) | POI-INVPRO-001 (P0) | POI-NEWS-001 | POI-TV-001 | POI-MD-001 |
 | 1 Production adapter | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ (no provider selected) |
 | 2 Auth/session | ⬜ | ⬜ | ⬜ (phone/QR/2FA, encrypted TDLib DB) | ⬜ (bot token) | ⬜ | ⬜ | ⬜ | ⬜ (signed alert verify) | ⬜ |
 | 3 Re-auth | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ |
@@ -73,9 +86,9 @@ Notes:
   ADR-0016 the realtime dependency for POI-IBKR-001 is satisfied by the IBKR
   realtime sub-gate. Introducing a new provider requires an owner decision/ADR —
   out of scope here.
-- **InvestingPro** is a canonical `SourceType` but has no dedicated PoI record in
-  the frozen backlog; treated as a source-type the shared layer supports, pending
-  an owner PoI if pursued.
+- **InvestingPro** has a dedicated canonical PoI — **POI-INVPRO-001 (P0,
+  BLOCKED)**, blocker "authorized login + browser-automation host" (IMP-0606
+  adapter is NOT built).
 
 ## 2. Offline gaps implemented in this package
 
@@ -95,7 +108,7 @@ adapter was created (it would be speculative and owner-credential/ToS-gated).
 | Telegram user (TDLib) | shared layer ✅; adapter ⬜ | ready | api_id/api_hash + phone/QR/2FA login; **host decision** (arm64/x86, POI-PLAT-ARM-001); encrypted TDLib DB | all events, restart with encrypted session, re-auth/revoke | ✅ (after host decision) |
 | Telegram bot | shared layer ✅; adapter ⬜ | ready | create a dedicated bot; isolate token | supplemental capture + private test alert; **never** replaces user mode | ✅ |
 | Telegram coexistence | depends on user+bot | contract proven | run the **same** post through both live modes | one canonical candidate, both observations retained | after user+bot |
-| InvestingPro | shared layer ✅; no PoI record | ready | owner decision to pursue + account | (define PoI if pursued) | ✅ |
+| InvestingPro | POI-INVPRO-001 BLOCKED; adapter ⬜ | shared layer ready | authorized login + browser-automation host | POI-INVPRO-001 PASS | ✅ |
 | News | shared layer ✅; adapter ⬜ | ready | news provider access | official negative-catalyst normalized | ✅ |
 | TradingView | shared layer ✅; adapter ⬜ | ready | signed-alert source + verification key | signed alert verified and re-checked | ✅ |
 | External market-data | provider undecided | blocked on ADR | **owner ADR** to select a provider | provider benchmark, outage/fallback plan | ❌ (needs ADR first) |

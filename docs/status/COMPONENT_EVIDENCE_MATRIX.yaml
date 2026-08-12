@@ -27,8 +27,13 @@ authoritative_prose: docs/roadmaps/TRADING_SYSTEM_MASTER_PLAN.md
 canonical_tasks:
   source: docs/baseline-v0.5/CLAUDE_CODE_TASKS.yaml
   total: 82
-  implemented: 72          # IMP-0001 … IMP-1206 plus IMP-1301
-  remaining: 10            # IMP-1302..1304, IMP-1401..1404, IMP-1501..1503
+  # Corrected 2026-08 after a code re-audit (PR "PHASE-13 closeout"): the seven
+  # PHASE-6 SOURCE ADAPTER tasks (IMP-0601/0602/0603/0604/0606/0607/0608) were
+  # never built — apps/connectors is an "IMP-0001 skeleton placeholder, no
+  # business logic" and no adapter module or adapter test exists. Only IMP-0605
+  # (cross-adapter normalization: trading_contracts.social) is implemented.
+  implemented: 65          # was over-counted as 72; PHASE-6 adapters removed
+  remaining: 17            # + IMP-0601/2/3/4/6/7/8 (adapters not built)
   # PHASE-5 (IMP-0501..0503) is implementation-complete but its EXIT GATE is
   # NOT satisfied: 2 of 12 P0 PoIs are PASS and 0 alternate ADRs exist.
   # "IMPLEMENTED" is a code-merged claim only; it is never integration proof.
@@ -110,7 +115,7 @@ components:
   - component_id: whatsapp-user
     name: WhatsApp personal-user adapter (mandatory user-session path)
     canonical_task_ids: [IMP-0601, IMP-0605]
-    implementation_status: IMPLEMENTED
+    implementation_status: NOT_IMPLEMENTED
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-SOC-WA-USER
@@ -126,7 +131,7 @@ components:
   - component_id: discord-user
     name: Discord personal-user adapter (mandatory user-session path)
     canonical_task_ids: [IMP-0602, IMP-0605]
-    implementation_status: IMPLEMENTED
+    implementation_status: NOT_IMPLEMENTED
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-SOC-DC-USER
@@ -140,7 +145,7 @@ components:
   - component_id: telegram-user
     name: Telegram personal-user adapter via TDLib (primary Telegram path)
     canonical_task_ids: [IMP-0603, IMP-0605]
-    implementation_status: IMPLEMENTED
+    implementation_status: NOT_IMPLEMENTED
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-SOC-TG-USER
@@ -156,7 +161,7 @@ components:
   - component_id: telegram-bot
     name: Telegram Bot API adapter (SUPPLEMENTAL only)
     canonical_task_ids: [IMP-0604]
-    implementation_status: IMPLEMENTED
+    implementation_status: NOT_IMPLEMENTED
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-SOC-TG-BOT
@@ -172,7 +177,7 @@ components:
   - component_id: telegram-coexistence
     name: Telegram user + bot coexistence proof
     canonical_task_ids: [IMP-0603, IMP-0604, IMP-0605]
-    implementation_status: IMPLEMENTED
+    implementation_status: NOT_IMPLEMENTED
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-SOC-TG-COEX
@@ -187,7 +192,7 @@ components:
   - component_id: investingpro
     name: InvestingPro adapter
     canonical_task_ids: [IMP-0606]
-    implementation_status: IMPLEMENTED
+    implementation_status: NOT_IMPLEMENTED
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-INVPRO-001
@@ -201,7 +206,7 @@ components:
   - component_id: news
     name: News / filings adapters
     canonical_task_ids: [IMP-0607, IMP-0803]
-    implementation_status: IMPLEMENTED
+    implementation_status: NOT_IMPLEMENTED
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-NEWS-001
@@ -215,7 +220,7 @@ components:
   - component_id: tradingview
     name: TradingView adapter
     canonical_task_ids: [IMP-0608]
-    implementation_status: IMPLEMENTED
+    implementation_status: NOT_IMPLEMENTED
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-TV-001

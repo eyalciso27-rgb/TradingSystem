@@ -42,7 +42,7 @@
 | `main` commit | `b4d65de` (Merge PR #55) |
 | Baseline | `docs/baseline-v0.5/` |
 | Canonical tasks (counted from YAML) | **82** |
-| `IMPLEMENTED` canonical tasks | **72** (IMP-0001…IMP-1206 + IMP-1301) |
+| `IMPLEMENTED` canonical tasks | **65** (IMP-0001…IMP-1206 + IMP-1301, minus the 7 PHASE-6 source adapters IMP-0601/2/3/4/6/7/8 which were never built — only IMP-0605 normalization exists) |
 | Remaining canonical tasks | **10** (IMP-1302–1304, IMP-1401–1404, IMP-1501–1503) |
 | PoIs PASS | **2 of 15** (POI-PLAT-ARM-001, POI-SEC-SESS-002) |
 | Deferred owner-runs | **DEF-19 PASS**; DEF-14 DEFERRED; the other **18 NOT_RUN** |
@@ -251,6 +251,8 @@ No parallel implementation task is opened. `EVD-0001…EVD-0013` remain
 - Tests are never a PoI PASS; no integration/strategy status without real
   evidence; never rely on chat memory; counts come only from the YAML.
 - Known discrepancies (repo wins): chat said 76 total tasks → YAML says
-  **82**; chat's running count ~59 → verified **72** implemented; "ADR-0015"
-  was proposed in chat but **does not exist**; IBC host install is reported
-  working but has **no host evidence in the repo**.
+  **82**; a 2026-08 code re-audit corrected the implemented count from an
+  over-stated **72** to **65** (the 7 PHASE-6 source adapters IMP-0601/2/3/4/6/7/8
+  were never built — only IMP-0605 normalization exists); "ADR-0015" was
+  proposed in chat but **does not exist**; IBC host install is reported working
+  but has **no host evidence in the repo**.

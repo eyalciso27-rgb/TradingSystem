@@ -3,8 +3,8 @@
 **Task:** IMP-1304 "Close operational defects" — *"Resolve P0/P1 defects and
 rerun regression; No open critical/high safety defect."*
 
-This is a fresh re-audit of **current `main`** (through PR #68, with PR #69 the
-in-flight IMP-1303 offline addition) that supersedes the older audit in
+This is a fresh re-audit of **current `main`** (through the merged PRs #66–#69)
+that supersedes the older audit in
 `IMP_1304_DEFECT_REGISTER.md` (which was written against an earlier main). It
 does **not** change any PoI status; POI-IBKR-001 stays BLOCKED / NOT RUN.
 
@@ -17,7 +17,7 @@ does **not** change any PoI status; POI-IBKR-001 stays BLOCKED / NOT RUN.
 - Reviewed the code merged in **#66** (bounded, fail-closed Gateway recovery +
   the final-boundary reconciliation latch), **#67** (IMP-1301 E2E-shadow
   acceptance), **#68** (IMP-1302 Paper-Manual offline), **#69** (IMP-1303 chaos
-  restart-latch, in-flight) for any newly-introduced safety/operational defect.
+  restart-latch, merged) for any newly-introduced safety/operational defect.
 - Marker sweep and full regression.
 
 ## 2. Findings

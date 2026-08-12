@@ -229,6 +229,27 @@ def test_the_telegram_bot_is_marked_supplemental(
     assert bot.get("supplemental_only") is True
 
 
+def test_the_unbuilt_source_adapters_are_not_claimed_implemented(
+    components: list[dict[str, Any]],
+) -> None:
+    """2026-08 code re-audit: apps/connectors is an IMP-0001 skeleton placeholder
+    and NO WhatsApp/Discord/Telegram/InvestingPro/News/TradingView adapter module
+    or adapter test exists. Only IMP-0605 normalization
+    (trading_contracts.social) is implemented. These components must therefore
+    NOT claim implementation_status IMPLEMENTED — that was documentation drift and
+    must not silently return."""
+    unbuilt = {
+        "whatsapp-user", "discord-user", "telegram-user", "telegram-bot",
+        "telegram-coexistence", "investingpro", "news", "tradingview",
+    }
+    for component in components:
+        if component["component_id"] in unbuilt:
+            assert component["implementation_status"] == "NOT_IMPLEMENTED", (
+                f"{component['component_id']} claims"
+                f" {component['implementation_status']}; the adapter is not built"
+            )
+
+
 # -- 3. strategy eligibility ------------------------------------------------
 
 

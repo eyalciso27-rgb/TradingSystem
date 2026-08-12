@@ -11,7 +11,7 @@ or chaos PASS that the real owner runs have not produced.
 |---|---|---|---|---|
 | **IMP-1301** | Run E2E shadow scenarios | ✅ **complete** (merged #67) | n/a (fully offline) | Traceability acceptance suite passes; run/split isolation + subsequent-candidate recovery added; all-source-types + combined Track-C acceptance |
 | **IMP-1302** | Run Paper Manual | ✅ **offline complete** (merged #68) | ⏳ **pending** (owner) | Fakes-only DoD proof (zero duplicate orders / zero required unprotected positions) across 17 lifecycle scenarios incl. the entry-reconciliation latch; owner-run CLI + deferred-run manifest ready; **real IBKR Paper runs DEF-01/02/03/04/05/09/18/20 NOT RUN**; DEF-19 verify-clean PASS |
-| **IMP-1303** | Run chaos and recovery drills | ✅ **offline complete** (#69, in flight) | ⏳ **pending** (owner) | 24 fakes drills + DB outbox/inbox chaos + persistent restart-latch drill; runbook documents safe behavior; **host drills DEF-06/07/08/10/11 NOT RUN**; NATS transport deferred (no adapter) |
+| **IMP-1303** | Run chaos and recovery drills | ✅ **offline complete** (merged #69) | ⏳ **pending** (owner) | 24 fakes drills + DB outbox/inbox chaos + persistent restart-latch drill; runbook documents safe behavior; **host drills DEF-06/07/08/10/11 NOT RUN**; NATS transport deferred (no adapter) |
 | **IMP-1304** | Close operational defects | ✅ **complete for committed code** | ⏳ DEF-15/17 (owner) | Re-audit (`IMP_1304_REAUDIT.md`): **no open offline P0/P1 defect**; empirical verifications owner-gated |
 
 ## Engineering-complete vs. evidence-pending vs. deferred
@@ -30,7 +30,12 @@ or chaos PASS that the real owner runs have not produced.
 
 ## What is explicitly NOT claimed
 
-- No Paper-Manual empirical PASS (no real order was ever sent).
+- **No post-fix complete Paper-Manual empirical PASS exists.** (A real IBKR
+  Paper cancel-path owner-run *did* reach the broker earlier: submit +
+  acknowledgement + idempotent resubmit succeeded, but the **cancellation
+  failed and the owner cancelled by hand** — pre-clock-fix. That real
+  submit/ack evidence is not erased; it is simply **not sufficient for a PASS**,
+  and the post-fix cancellation verification (DEF-18) is still NOT_RUN.)
 - No chaos host-drill PASS (no real Gateway kill / DB restart performed).
 - No source marked CONNECTED (no adapter has produced runtime evidence).
 - PAPER_AUTO disabled; watchdog timer disabled; Gateway/systemd/IBC untouched;
