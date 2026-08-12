@@ -920,3 +920,82 @@ def test_traceability_acceptance_report() -> None:
         assert row["conservation"] is True
         versions = row["versions"]
         assert isinstance(versions, dict) and versions["e2e-shadow"]
+
+
+# -- Track-C shared source-integration acceptance -------------------------------------
+#
+# The per-source invariants are proven above and in tests/contracts/test_social.py.
+# These prove them SIMULTANEOUSLY for every Track-C source type in one run — the
+# combined acceptance the external-source PoIs (POI-SOC-*, POI-NEWS-001,
+# POI-TV-001) will map their real evidence onto.
+
+
+def test_trackc_all_sources_combined_shadow_acceptance() -> None:
+    """One shadow run mixing independent discovery + every canonical source type
+    + a Telegram user/bot coexistence pair + one UNAVAILABLE source. Proves, at
+    once: independent discovery completes with no social source; each source is
+    normalized through the canonical contract with provenance; an unavailable
+    source is DEGRADED (never CONNECTED, never a PoI pass) and blocks nothing;
+    cross-mode observations collapse to one candidate; nothing is executable;
+    conservation + lineage hold; the run is deterministic."""
+    events = [
+        # independent scanner discovery — no social source involved
+        scan("s1", 0, "c1"),
+        assessment("a1", 1, "c1"),
+        evaluate("e1", 2, "c1"),
+        # one unavailable source — DEGRADED, must not block c1
+        source("wa-down", 3, "WHATSAPP", status="UNAVAILABLE"),
+        # every other canonical source type, normalized with provenance
+        source("dc-1", 4, "DISCORD", channel="dc", message_id="d1", candidate="c2"),
+        # Telegram user + bot observing the SAME post -> one canonical candidate
+        source("tg-user", 5, "TELEGRAM", channel="tg", message_id="t1", candidate="c3"),
+        source("tg-bot", 6, "TELEGRAM", channel="tg", message_id="t1", candidate="c3"),
+        source("ip-1", 7, "INVESTINGPRO", channel="ip", message_id="i1"),
+        source("news-1", 8, "NEWS", channel="nw", message_id="n1"),
+        source("fil-1", 9, "FILING", channel="fl", message_id="f1"),
+        source("mkt-1", 10, "MARKET", channel="mk", message_id="k1"),
+    ]
+    _, report, harness = run_scenario(events)
+
+    # independent scanner candidate completed with no social normalization on it
+    c1 = next(h for h in report.funnel.histories if h.candidate_id == "c1")
+    assert c1.current_stage.value == "APPROVED"
+
+    # every normalized source went through the canonical contract with provenance
+    normalized = {e.engine for e in report.trace if e.stage == "SOURCE_NORMALIZED"}
+    assert {"DISCORD", "TELEGRAM", "INVESTINGPRO", "NEWS", "FILING", "MARKET"} <= normalized
+    for entry in report.trace:
+        if entry.stage == "SOURCE_NORMALIZED":
+            assert "canonical contract" in entry.finding
+
+    # the unavailable source is DEGRADED, never CONNECTED, never a PoI pass
+    degraded = next(e for e in report.trace if e.stage == "SOURCE_UNAVAILABLE")
+    assert degraded.outcome == "DEGRADED"
+    assert "not CONNECTED" in degraded.finding
+    assert not any(e.outcome == "CONNECTED" for e in report.trace)
+
+    # cross-mode Telegram user+bot collapsed to exactly one candidate
+    assert any(e.stage == "SOURCE_DEDUPED" for e in report.trace)
+    assert sum(1 for h in report.funnel.histories if h.candidate_id == "c3") == 1
+
+    # shared safety: conservation, lineage, no execution surface, deterministic
+    assert report.total_candidates == report.active_candidates + report.terminal_candidates
+    assert report.lineage_complete is True
+    for surface in ("submit", "cancel", "execute", "authorize", "place_order"):
+        assert not hasattr(harness, surface)
+    hash_a = report.report_hash
+    _, report_b, _ = run_scenario(events)
+    assert report_b.report_hash == hash_a
+
+
+def test_trackc_reconnect_replay_never_duplicates_a_candidate() -> None:
+    """A redelivered source observation after a reconnect (same canonical
+    dedup key) collapses to one candidate — reconnect never replays a
+    duplicate candidate."""
+    original = source("tg-1", 0, "TELEGRAM", channel="tg", message_id="t1", candidate="c1")
+    # a reconnect redelivers the identical observation (new event id, same key)
+    replayed = source("tg-1-again", 5, "TELEGRAM", channel="tg", message_id="t1", candidate="c1")
+    events = [original, replayed, assessment("a1", 6, "c1"), evaluate("e1", 7, "c1")]
+    _, report, _ = run_scenario(events)
+    assert report.total_candidates == 1
+    assert any(e.stage == "SOURCE_DEDUPED" for e in report.trace)
