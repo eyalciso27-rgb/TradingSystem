@@ -229,25 +229,76 @@ def test_the_telegram_bot_is_marked_supplemental(
     assert bot.get("supplemental_only") is True
 
 
-def test_the_unbuilt_source_adapters_are_not_claimed_implemented(
+#: Source adapters with NO official / ToS-permitted programmatic access path.
+#: The PHASE-6 package (2026-08-13) left these fail-closed / NOT_IMPLEMENTED —
+#: WhatsApp has no personal-user API, a Discord user self-bot violates ToS, and
+#: InvestingPro would require ToS-violating scraping. None may be built without
+#: an approved ADR, so the pin must not silently regress to IMPLEMENTED.
+TOS_BLOCKED_ADAPTERS = {"whatsapp-user", "discord-user", "investingpro"}
+
+#: Source adapters WITH an official path, built as real production modules by the
+#: PHASE-6 package and tested with deterministic fakes. Their CODE is IMPLEMENTED
+#: but their real-account PoIs stay BLOCKED (owner credentials/hosts required).
+BUILT_ADAPTERS = {
+    "telegram-user", "telegram-bot", "telegram-coexistence", "news", "tradingview",
+}
+
+
+def test_the_tos_blocked_source_adapters_are_not_claimed_implemented(
     components: list[dict[str, Any]],
 ) -> None:
-    """2026-08 code re-audit: apps/connectors is an IMP-0001 skeleton placeholder
-    and NO WhatsApp/Discord/Telegram/InvestingPro/News/TradingView adapter module
-    or adapter test exists. Only IMP-0605 normalization
-    (trading_contracts.social) is implemented. These components must therefore
-    NOT claim implementation_status IMPLEMENTED — that was documentation drift and
-    must not silently return."""
-    unbuilt = {
-        "whatsapp-user", "discord-user", "telegram-user", "telegram-bot",
-        "telegram-coexistence", "investingpro", "news", "tradingview",
-    }
+    """WhatsApp-user, Discord-user and InvestingPro have no approved access path.
+
+    They must NOT claim implementation_status IMPLEMENTED — fabricating an
+    unofficial/ToS-violating client is exactly the failure mode the package was
+    told to refuse. They must also name a real blocker and an owner dependency.
+    """
     for component in components:
-        if component["component_id"] in unbuilt:
+        if component["component_id"] in TOS_BLOCKED_ADAPTERS:
             assert component["implementation_status"] == "NOT_IMPLEMENTED", (
                 f"{component['component_id']} claims"
-                f" {component['implementation_status']}; the adapter is not built"
+                f" {component['implementation_status']}; no approved path exists"
             )
+            blocker = str(component["current_blocker"]).strip().lower()
+            assert blocker not in {"", "none", "n/a", "-"}, (
+                f"{component['component_id']} is ToS-blocked but states no blocker"
+            )
+            assert component["owner_dependency"] != "NONE"
+
+
+def test_the_built_source_adapters_are_implemented_but_not_integration_verified(
+    components: list[dict[str, Any]],
+) -> None:
+    """The four buildable PHASE-6 adapters are code-IMPLEMENTED, PoI-BLOCKED.
+
+    Real production modules exist and are tested with fakes, so
+    implementation_status is IMPLEMENTED and each names an adapter module/test
+    file that EXISTS. But no fake test is integration proof: real_integration_
+    status and evidence_class must stay BLOCKED until the owner-run PoI passes.
+    """
+    seen = set()
+    for component in components:
+        cid = component["component_id"]
+        if cid not in BUILT_ADAPTERS:
+            continue
+        seen.add(cid)
+        assert component["implementation_status"] == "IMPLEMENTED", (
+            f"{cid} adapter code is built; it must claim IMPLEMENTED"
+        )
+        # code exists on disk — the claim is falsifiable
+        for key in ("adapter_module", "adapter_tests"):
+            path = component.get(key)
+            if path is not None:
+                assert (REPO_ROOT / path).is_file(), f"{cid}.{key} points at missing {path}"
+        assert component.get("adapter_tests"), f"{cid} must name its adapter_tests file"
+        # a fake test is NEVER integration proof
+        assert component["real_integration_status"] == "BLOCKED", (
+            f"{cid} is tested with fakes only; real_integration_status must be BLOCKED"
+        )
+        assert component["evidence_class"] == "BLOCKED", (
+            f"{cid} evidence_class must be BLOCKED until its owner-run PoI passes"
+        )
+    assert seen == BUILT_ADAPTERS, f"missing built adapters: {sorted(BUILT_ADAPTERS - seen)}"
 
 
 # -- 3. strategy eligibility ------------------------------------------------

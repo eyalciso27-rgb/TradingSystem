@@ -38,12 +38,12 @@
 
 | Field | Value |
 |---|---|
-| Date | 2026-08-02 |
-| `main` commit | `b4d65de` (Merge PR #55) |
+| Date | 2026-08-13 |
+| `main` commit | `b4d65de` (Merge PR #55) — PHASE-6 adapters on branch `feat/phase6-source-adapters` (unmerged) |
 | Baseline | `docs/baseline-v0.5/` |
 | Canonical tasks (counted from YAML) | **82** |
-| `IMPLEMENTED` canonical tasks | **65** (IMP-0001…IMP-1206 + IMP-1301, minus the 7 PHASE-6 source adapters IMP-0601/2/3/4/6/7/8 which were never built — only IMP-0605 normalization exists) |
-| Remaining canonical tasks | **10** (IMP-1302–1304, IMP-1401–1404, IMP-1501–1503) |
+| `IMPLEMENTED` canonical tasks | **69** (IMP-0001…IMP-1206 + IMP-1301 + the 4 buildable PHASE-6 adapters IMP-0603/0604/0607/0608 — code, fakes-tested, real PoIs BLOCKED — on top of IMP-0605 normalization) |
+| Remaining canonical tasks | **13** (IMP-0601/0602/0606 ToS-blocked adapters; IMP-1302–1304; IMP-1401–1404; IMP-1501–1503) |
 | PoIs PASS | **2 of 15** (POI-PLAT-ARM-001, POI-SEC-SESS-002) |
 | Deferred owner-runs | **DEF-19 PASS**; DEF-14 DEFERRED; the other **18 NOT_RUN** |
 | Current stage | **Evidence Delivery** (feature delivery paused after PHASE-13/IMP-1301) |
@@ -252,7 +252,10 @@ No parallel implementation task is opened. `EVD-0001…EVD-0013` remain
   evidence; never rely on chat memory; counts come only from the YAML.
 - Known discrepancies (repo wins): chat said 76 total tasks → YAML says
   **82**; a 2026-08 code re-audit corrected the implemented count from an
-  over-stated **72** to **65** (the 7 PHASE-6 source adapters IMP-0601/2/3/4/6/7/8
-  were never built — only IMP-0605 normalization exists); "ADR-0015" was
-  proposed in chat but **does not exist**; IBC host install is reported working
-  but has **no host evidence in the repo**.
+  over-stated **72** to **65** (the 7 PHASE-6 source adapters had never been
+  built — only IMP-0605 normalization existed); the 2026-08-13 PHASE-6 package
+  then built the 4 ToS-permitted adapters (IMP-0603/0604/0607/0608), lifting the
+  count to **69** — their code is IMPLEMENTED but their real PoIs stay BLOCKED,
+  and IMP-0601/0602/0606 remain NOT_IMPLEMENTED (no ToS-permitted path). "ADR-0015"
+  was proposed in chat but **does not exist**; IBC host install is reported
+  working but has **no host evidence in the repo**.

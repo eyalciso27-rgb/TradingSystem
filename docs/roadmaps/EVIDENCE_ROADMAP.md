@@ -9,9 +9,12 @@
 > Authority boundaries, the no-auto-promotion rule and the process for making
 > EVD tasks canonical are binding per ADR-0015.
 
-**The pivot:** 65/82 canonical tasks are `IMPLEMENTED` (corrected 2026-08 from
-an over-stated 72 — the 7 PHASE-6 source adapters were never built), but almost
-everything else is only `TESTED_WITH_FAKES`. The scarce resource is now
+**The pivot:** 69/82 canonical tasks are `IMPLEMENTED` (corrected 2026-08 from
+an over-stated 72 down to 65, then raised to 69 on 2026-08-13 when the PHASE-6
+package built the four ToS-permitted source adapters — IMP-0603/0604/0607/0608 —
+as real modules; the three ToS-blocked adapters IMP-0601/0602/0606 remain
+NOT_IMPLEMENTED), but almost everything else — including those four new
+adapters — is only `TESTED_WITH_FAKES`. The scarce resource is now
 **evidence** — real integration evidence and real strategy evidence — not more
 features. Work is
 split into three tracks; Track C is frozen until evidence gates pass.

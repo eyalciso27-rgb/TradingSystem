@@ -19,7 +19,7 @@
 #
 # Tests passing is NEVER integration evidence.
 version: "1.0"
-updated: "2026-08-02"
+updated: "2026-08-13"
 baseline: docs/baseline-v0.5/
 authoritative_prose: docs/roadmaps/TRADING_SYSTEM_MASTER_PLAN.md
 
@@ -27,13 +27,22 @@ authoritative_prose: docs/roadmaps/TRADING_SYSTEM_MASTER_PLAN.md
 canonical_tasks:
   source: docs/baseline-v0.5/CLAUDE_CODE_TASKS.yaml
   total: 82
-  # Corrected 2026-08 after a code re-audit (PR "PHASE-13 closeout"): the seven
-  # PHASE-6 SOURCE ADAPTER tasks (IMP-0601/0602/0603/0604/0606/0607/0608) were
-  # never built — apps/connectors is an "IMP-0001 skeleton placeholder, no
-  # business logic" and no adapter module or adapter test exists. Only IMP-0605
-  # (cross-adapter normalization: trading_contracts.social) is implemented.
-  implemented: 65          # was over-counted as 72; PHASE-6 adapters removed
-  remaining: 17            # + IMP-0601/2/3/4/6/7/8 (adapters not built)
+  # 2026-08 code re-audit (PR "PHASE-13 closeout") corrected an over-count from
+  # 72 to 65: the seven PHASE-6 SOURCE ADAPTER tasks had never been built.
+  # 2026-08-13 PHASE-6 IMPLEMENTATION PACKAGE (branch feat/phase6-source-adapters)
+  # then built the four adapters that have an official / ToS-permitted access
+  # path — IMP-0603 (Telegram user/TDLib), IMP-0604 (Telegram bot), IMP-0607
+  # (news/filings via SEC EDGAR + news port), IMP-0608 (TradingView webhook) —
+  # as real production modules under
+  # packages/py/application/src/trading_application/source_adapters/, each with
+  # deterministic-fake contract/reconnect/failure tests under tests/adapters/.
+  # Their CODE is IMPLEMENTED; their real-account PoIs remain BLOCKED (owner
+  # credentials/hosts required). IMP-0601 (WhatsApp user), IMP-0602 (Discord
+  # user) and IMP-0606 (InvestingPro) stay NOT_IMPLEMENTED: no official /
+  # ToS-permitted programmatic access path exists and none may be fabricated
+  # without an approved ADR (see docs/status/PHASE6_SOURCE_ADAPTERS.md).
+  implemented: 69          # 65 + IMP-0603, IMP-0604, IMP-0607, IMP-0608 (code)
+  remaining: 13            # IMP-0601/0602/0606 (ToS-blocked) + non-PHASE-6 work
   # PHASE-5 (IMP-0501..0503) is implementation-complete but its EXIT GATE is
   # NOT satisfied: 2 of 12 P0 PoIs are PASS and 0 alternate ADRs exist.
   # "IMPLEMENTED" is a code-merged claim only; it is never integration proof.
@@ -120,11 +129,18 @@ components:
     real_integration_status: BLOCKED
     poi_id: POI-SOC-WA-USER
     strategy_dependency: OPTIONAL
+    blocker_class: TOS_NO_APPROVED_PATH
     current_blocker: >-
-      PoI BLOCKED: needs the owner's personal WhatsApp account and QR pairing
-      on a controlled host (risk accepted, ADR-0013)
-    owner_dependency: OWNER_ACCOUNT
-    next_action: owner performs the WhatsApp user-session PoI
+      NOT built by the PHASE-6 package: WhatsApp offers NO official personal-user
+      ingestion API; the only paths are unofficial web/reverse-engineered clients
+      that violate WhatsApp ToS and risk the owner's number. Per the package
+      fail-closed rule the adapter is left NOT_IMPLEMENTED — no unofficial client
+      may be fabricated without an approved ADR. See
+      docs/status/PHASE6_SOURCE_ADAPTERS.md.
+    owner_dependency: OWNER_DECISION
+    next_action: >-
+      owner ADR decision on an approved access path before any adapter is built;
+      no code until then
     exit_criterion: POI-SOC-WA-USER PASS with masked evidence
     read_only_for_trading: true
 
@@ -136,39 +152,63 @@ components:
     real_integration_status: BLOCKED
     poi_id: POI-SOC-DC-USER
     strategy_dependency: OPTIONAL
-    current_blocker: "PoI BLOCKED: owner's Discord user session on a controlled host"
-    owner_dependency: OWNER_ACCOUNT
-    next_action: owner performs the Discord user-session PoI
+    blocker_class: TOS_NO_APPROVED_PATH
+    current_blocker: >-
+      NOT built by the PHASE-6 package: automating a personal Discord USER
+      account (a "self-bot") is explicitly prohibited by Discord ToS and risks a
+      permanent account ban; the official Bot API is a different identity, not the
+      owner's user session. Per the package fail-closed rule the adapter is left
+      NOT_IMPLEMENTED — no self-bot client may be fabricated without an approved
+      ADR. See docs/status/PHASE6_SOURCE_ADAPTERS.md.
+    owner_dependency: OWNER_DECISION
+    next_action: >-
+      owner ADR decision on an approved access path before any adapter is built;
+      no code until then
     exit_criterion: POI-SOC-DC-USER PASS with masked evidence
     read_only_for_trading: true
 
   - component_id: telegram-user
     name: Telegram personal-user adapter via TDLib (primary Telegram path)
     canonical_task_ids: [IMP-0603, IMP-0605]
-    implementation_status: NOT_IMPLEMENTED
+    implementation_status: IMPLEMENTED
+    code_status: TESTED_WITH_FAKES
+    adapter_module: packages/py/application/src/trading_application/source_adapters/telegram_user.py
+    adapter_tests: tests/adapters/test_telegram_user_adapter.py
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-SOC-TG-USER
     strategy_dependency: OPTIONAL
     current_blocker: >-
-      PoI BLOCKED: TDLib build, api_id/api_hash via IMP-0302, owner login and
-      an arm64 TDLib host proof
+      adapter code IMPLEMENTED (TDLib user connector over an injected client
+      port: WAIT_PHONE/WAIT_CODE/WAIT_PASSWORD(2FA)->AUTH_REQUIRED, READY gates
+      the mandatory user session, edit->revision, delete->tombstone, allowlist,
+      restart-resume no-dup) and tested with deterministic fakes; PoI BLOCKED
+      pending the real TDLib build, api_id/api_hash via IMP-0302, owner login
+      and an arm64 TDLib host proof
     owner_dependency: OWNER_ACCOUNT
-    next_action: owner completes the TDLib build and user login PoI
+    next_action: owner completes the real TDLib build and user login PoI (code complete)
     exit_criterion: POI-SOC-TG-USER PASS with masked evidence
     read_only_for_trading: true
 
   - component_id: telegram-bot
     name: Telegram Bot API adapter (SUPPLEMENTAL only)
     canonical_task_ids: [IMP-0604]
-    implementation_status: NOT_IMPLEMENTED
+    implementation_status: IMPLEMENTED
+    code_status: TESTED_WITH_FAKES
+    adapter_module: packages/py/application/src/trading_application/source_adapters/telegram_bot.py
+    adapter_tests: tests/adapters/test_telegram_bot_adapter.py
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-SOC-TG-BOT
     strategy_dependency: OPTIONAL
-    current_blocker: "PoI BLOCKED (P1): bot token and owner-controlled test chat"
+    current_blocker: >-
+      adapter code IMPLEMENTED (getUpdates offset/cursor resume, allowlist,
+      edit->revision, dedup, AUTH_REQUIRED when unauthorized;
+      satisfies_user_requirement() is hard-wired False so the bot can NEVER
+      satisfy the user gate) and tested with deterministic fakes; PoI BLOCKED
+      (P1) pending a bot token and an owner-controlled test chat
     owner_dependency: OWNER_ACCOUNT
-    next_action: owner performs the bot PoI
+    next_action: owner performs the real bot PoI (code complete)
     exit_criterion: POI-SOC-TG-BOT PASS
     # Binding: the bot path must NEVER substitute for the user path.
     supplemental_only: true
@@ -177,14 +217,20 @@ components:
   - component_id: telegram-coexistence
     name: Telegram user + bot coexistence proof
     canonical_task_ids: [IMP-0603, IMP-0604, IMP-0605]
-    implementation_status: NOT_IMPLEMENTED
+    implementation_status: IMPLEMENTED
+    code_status: TESTED_WITH_FAKES
+    adapter_tests: tests/adapters/test_telegram_coexistence.py
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-SOC-TG-COEX
     strategy_dependency: OPTIONAL
-    current_blocker: "PoI BLOCKED: depends on POI-SOC-TG-USER and POI-SOC-TG-BOT"
+    current_blocker: >-
+      coexistence CODE IMPLEMENTED (user and bot captures of one post share the
+      IMP-0605 canonical dedup key -> one candidate; the bot can never satisfy
+      the user gate) and proven with deterministic fakes; real PoI BLOCKED,
+      depends on POI-SOC-TG-USER and POI-SOC-TG-BOT with live accounts
     owner_dependency: OWNER_ACCOUNT
-    next_action: run after both Telegram PoIs pass
+    next_action: run after both Telegram PoIs pass (coexistence code complete)
     exit_criterion: POI-SOC-TG-COEX PASS with no silent fallback between paths
     read_only_for_trading: true
 
@@ -197,37 +243,65 @@ components:
     real_integration_status: BLOCKED
     poi_id: POI-INVPRO-001
     strategy_dependency: OPTIONAL
-    current_blocker: "PoI BLOCKED: authorized login + browser-automation host"
-    owner_dependency: OWNER_ACCOUNT
-    next_action: owner supplies an authorized session and host
+    blocker_class: TOS_NO_APPROVED_PATH
+    current_blocker: >-
+      NOT built by the PHASE-6 package: InvestingPro exposes no official data API
+      for this use; ingestion would require scraping/browser-automation behind an
+      authenticated session, which violates the site ToS and is brittle to layout
+      drift. Per the package fail-closed rule the adapter is left NOT_IMPLEMENTED
+      — no scraper may be fabricated without an approved ADR. See
+      docs/status/PHASE6_SOURCE_ADAPTERS.md.
+    owner_dependency: OWNER_DECISION
+    next_action: >-
+      owner ADR decision on an approved/licensed data path before any adapter is
+      built; no code until then
     exit_criterion: POI-INVPRO-001 PASS
     read_only_for_trading: true
 
   - component_id: news
     name: News / filings adapters
     canonical_task_ids: [IMP-0607, IMP-0803]
-    implementation_status: NOT_IMPLEMENTED
+    implementation_status: IMPLEMENTED
+    code_status: TESTED_WITH_FAKES
+    adapter_module: packages/py/application/src/trading_application/source_adapters/filings.py
+    adapter_tests: tests/adapters/test_filings_adapter.py
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-NEWS-001
     strategy_dependency: OPTIONAL
-    current_blocker: "PoI BLOCKED: provider access/credentials not supplied"
+    current_blocker: >-
+      IMP-0607 adapter code IMPLEMENTED (official-source + news ingestion over
+      an injected fetch port: canonical four-timestamp point-in-time model with
+      look-ahead refused, dedup by accession, cross-source clustering,
+      amendment=correction revision, malformed input opens the circuit and
+      reports DEGRADED never a silent default) and tested with deterministic
+      fakes; PoI BLOCKED pending a live provider (e.g. SEC EDGAR endpoint /
+      news feed) selection and any credentials. IMP-0803 not built.
     owner_dependency: OWNER_ACCOUNT
-    next_action: owner selects and authorizes a news/filings source
+    next_action: owner selects and authorizes a live news/filings source (adapter code complete)
     exit_criterion: POI-NEWS-001 PASS
     read_only_for_trading: true
 
   - component_id: tradingview
     name: TradingView adapter
     canonical_task_ids: [IMP-0608]
-    implementation_status: NOT_IMPLEMENTED
+    implementation_status: IMPLEMENTED
+    code_status: TESTED_WITH_FAKES
+    adapter_module: packages/py/application/src/trading_application/source_adapters/tradingview.py
+    adapter_tests: tests/adapters/test_tradingview_adapter.py
     evidence_class: BLOCKED
     real_integration_status: BLOCKED
     poi_id: POI-TV-001
     strategy_dependency: OPTIONAL
-    current_blocker: "PoI BLOCKED (P1): owner account/session"
+    current_blocker: >-
+      IMP-0608 adapter code IMPLEMENTED (authenticated webhook receiver:
+      constant-time HMAC-SHA256 verification of the exact raw body, normalizes
+      to an EXTERNAL research-only signal with provenance, replay/idempotency,
+      NO order path, secret never logged) and tested with deterministic fakes;
+      PoI BLOCKED (P1) pending the owner's shared webhook secret and a live
+      TradingView alert.
     owner_dependency: OWNER_ACCOUNT
-    next_action: owner supplies an authorized session
+    next_action: owner supplies the shared webhook secret and fires a live alert (code complete)
     exit_criterion: POI-TV-001 PASS
     read_only_for_trading: true
 
