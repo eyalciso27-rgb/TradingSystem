@@ -110,7 +110,7 @@ Counted from [`docs/baseline-v0.5/CLAUDE_CODE_TASKS.yaml`](../baseline-v0.5/CLAU
 | PHASE-10 | Broker Execution and Position Management | 6 | ✅ IMPLEMENTED (fakes + 1 partial real run) |
 | PHASE-11 | Operations Console | 7 | ✅ IMPLEMENTED |
 | PHASE-12 | Replay, Backtesting and Calibration | 6 | ✅ IMPLEMENTED (fakes only) |
-| PHASE-13 | End-to-End Shadow and Paper Manual | 4 | 🟡 1 of 4 (IMP-1301 only) |
+| PHASE-13 | End-to-End Shadow and Paper Manual | 4 | 🟡 **OFFLINE_ENGINEERING_COMPLETE**: IMP-1301 shadow harness IMPLEMENTED; IMP-1302 Paper-Manual + IMP-1303 chaos/recovery are **EVIDENCE_PENDING** (owner-run, gated on POI-IBKR-001 **BLOCKED**); IMP-1304 defects ongoing |
 | PHASE-14 | Restricted Paper Auto | 4 | 🧊 FROZEN |
 | PHASE-15 | Long-run Operation and Live Readiness | 3 | 🧊 FROZEN |
 
@@ -138,6 +138,20 @@ real-account PoIs remain **BLOCKED**.
 > to **69**. Their code is IMPLEMENTED; their PoIs stay BLOCKED. The three
 > ToS-blocked adapters were deliberately **not** built (see §3.2 and
 > `docs/status/PHASE6_SOURCE_ADAPTERS.md`); no unofficial client was fabricated.
+
+> **Strategy Evidence Foundation + Source Activation (2026-08-13).** Two
+> readiness packages were added. **Track A** (strategy freeze, point-in-time
+> dataset foundation, backtest readiness, real-data ingestion readiness) makes
+> the research pipeline production-ready **without inventing any trading
+> parameter**: `DatasetStatus` stays `REAL_DATASET_NOT_BUILT` and every run is
+> `PROFITABILITY_NOT_PROVEN` until the owner freezes a strategy and real data
+> exists. **Track C** takes the four merged adapters to
+> `ACTIVATION_READY` — production secret-store integration, read-only preflight,
+> sanitized PoI evidence artifacts, and per-source owner runbooks
+> (`docs/status/PHASE6_SOURCE_ACTIVATION.md`) — while their real-account PoIs
+> stay **BLOCKED** and a FAKE probe can only ever be `NOT_EVIDENCE`, never PASS.
+> **These are readiness machinery for existing tasks; the canonical IMPLEMENTED
+> count is unchanged at 69.**
 
 > **PHASE-5 caveat.** `IMP-0501…0503` are implementation-complete (registry,
 > evidence structure, drills, provider catalog) but the **exit gate is not

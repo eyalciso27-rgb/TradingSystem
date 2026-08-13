@@ -259,3 +259,14 @@ No parallel implementation task is opened. `EVD-0001…EVD-0013` remain
   and IMP-0601/0602/0606 remain NOT_IMPLEMENTED (no ToS-permitted path). "ADR-0015"
   was proposed in chat but **does not exist**; IBC host install is reported
   working but has **no host evidence in the repo**.
+- 2026-08-13 readiness packages (no count change): **Track A** (strategy freeze,
+  point-in-time dataset foundation, backtest readiness, ingestion readiness) —
+  `DatasetStatus` stays `REAL_DATASET_NOT_BUILT`, runs stay
+  `PROFITABILITY_NOT_PROVEN`, no trading parameter invented. **Track C** — the 4
+  built adapters are `ACTIVATION_READY` (secret-store integration, read-only
+  preflight, sanitized PoI evidence, owner runbooks in
+  `docs/status/PHASE6_SOURCE_ACTIVATION.md`); real PoIs stay BLOCKED and a FAKE
+  probe is always `NOT_EVIDENCE`, never PASS. PHASE-13 is
+  `OFFLINE_ENGINEERING_COMPLETE` (IMP-1301 implemented; IMP-1302/1303
+  EVIDENCE_PENDING on POI-IBKR-001). Canonical IMPLEMENTED count unchanged at
+  **69**.
