@@ -1,0 +1,299 @@
+strategy_id: baseline-trend-breakout-v1
+version_id: v1
+status: FROZEN
+# FROZEN 2026-08-13 on owner approval. Fingerprint (deterministic; status/approval/
+# timestamp are NOT hashed) is invariant from the approved DRAFT:
+#   sha256:75f299b89e408ef332cd39a46f92d417ef637b3c5a5c1712801774c9e84dfed0
+# This record is immutable. Any material change requires a NEW version_id (supersede).
+owner_approval_ref: "OWNER-EYAL-2026-08-13-BASELINE-TREND-BREAKOUT-V1"
+frozen_at: "2026-08-13T19:45:00+00:00"
+source_commit: "4b7714c696f9c0e4bc256efbb83e693313bdac5a"
+# fusion_manifest: baseline is a pure technical breakout — NO social/AI input. The
+# single REQUIRED technical-breakout trigger is a structural (signal-family)
+# representation of rule 7, not an invented trading parameter (it carries no
+# threshold/lookback). OWNER-APPROVED verbatim on 2026-08-13:
+# technical.breakout / role=REQUIRED / required_status=TRIGGERED — no thresholds,
+# lookbacks or new semantics added.
+fusion_manifest:
+  version: v1
+  entries:
+    - assessment_key: technical.breakout
+      role: REQUIRED
+      required_status: TRIGGERED
+
+parameters:
+  # provenance: source encodes the owner identity (schema has a single `source`
+  # field); supplied_at is the owner-approval date (2026-08-13), metadata only.
+  - key: universe.definition
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      S&P 500. Historical membership MUST be Point-in-Time: a historical decision
+      uses only the constituents that belonged to the S&P 500 at that historical
+      decision time. Current membership must NEVER be projected backward.
+  - key: universe.min_liquidity
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: "20-day Average Dollar Volume >= USD 50,000,000."
+  - key: universe.min_price
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: "Price >= USD 10."
+  - key: universe.max_spread
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: "Spread <= 10 bps / 0.10%."
+  - key: timeframe.primary
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: "1D / Daily. Completed RTH daily bars only."
+  - key: setup.definition
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      Trend: Close > SMA150 AND SMA150(today) > SMA150(20 trading days ago).
+      Contracting Base: base duration 10-20 trading days; Range(last 5 days) <
+      Range(previous 5 days); ATR10 < ATR20; price remains above SMA150.
+      Volume: retained as analytical data, NOT a mandatory V1 setup condition.
+      The breakout bar must NOT be included when determining the pre-breakout
+      base, BaseLow, or breakout Resistance.
+      Definitions (owner clarification 2026-08-13): Range(window) = Highest High
+      in the window - Lowest Low in the window. Resistance = Highest High of the
+      completed Contracting Base. BaseLow = Lowest Low of the completed
+      Contracting Base. The breakout bar is excluded from Range, Resistance and
+      BaseLow calculations.
+  - key: trigger.definition
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      Valid signal only when the daily completed RTH Close > Resistance of the
+      completed Contracting Base. No intraday breakout is sufficient.
+  - key: entry.rule
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      After a valid breakout is confirmed at the completed RTH daily close:
+      attempt entry in the NEXT RTH session using a BUY Marketable Limit.
+      MaximumEntryPrice = BreakoutClose + 0.25 * ATR20. If market price is
+      already above MaximumEntryPrice: SKIP TRADE, DO NOT CHASE. Do not
+      automatically raise the limit to obtain a fill. The ATR20 used for the
+      entry cap must be the ATR20 value known at the completion of the breakout
+      bar.
+  - key: exit.stop_rule
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      StructuralStop = BaseLow - 0.25 * ATR20 (ATR20 snapshotted at completion of
+      the breakout bar). If EntryPrice - StructuralStop > 2.5 * ATR20 then SKIP
+      TRADE. After fill the protective order must be a broker-side SELL
+      STOP-MARKET GTC, subject to broker/instrument capability. Do NOT use
+      Stop-Limit as the protective emergency stop.
+  - key: exit.target_rule
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      No fixed take-profit target. Before +1R: retain the current structural
+      protective stop. Once the trade has reached +1R: TrailingStop =
+      HighestCloseSinceEntry - 2.5 * ATR20; NewStop = max(CurrentStop,
+      TrailingStop). The stop may only tighten, never widen. For trailing, ATR20
+      is calculated using the latest COMPLETED daily RTH bar available at the
+      decision point. An increase in ATR must never cause an already tightened
+      stop to move downward.
+      +1R definition (owner clarification 2026-08-13): +1R is reached only when a
+      COMPLETED RTH DAILY CLOSE satisfies Close >= EntryPrice +
+      InitialRiskPerShare, where InitialRiskPerShare = EntryPrice -
+      InitialStructuralStop. An intraday High touching +1R is NOT sufficient. The
+      same +1R definition governs both activation of trailing-stop mode and
+      permanent disabling of the 20-session Time Exit.
+  - key: exit.time_exit
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      If, after 20 trading sessions from entry, the trade has NEVER reached +1R:
+      EXIT in the next RTH session. If +1R was reached at any time, Time Exit is
+      permanently disabled for that trade and the position continues under the
+      trailing-stop logic.
+  - key: exit.invalidation
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      Failed Breakout: if within the first 3 trading sessions after entry the
+      daily completed RTH Close < original Breakout Resistance, EXIT in the next
+      RTH session. The broker-side protective stop remains active throughout.
+  - key: sizing.method
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      Fixed fractional risk sizing. RiskBudget = AccountEquity * RiskPerTrade.
+      RiskPerShare = EntryPrice - InitialStop. Shares = floor(RiskBudget /
+      RiskPerShare). The market-structure stop determines position size; never
+      move the stop closer simply to obtain a larger position.
+  - key: risk.per_trade
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: "0.25% of current Account Equity."
+  - key: risk.max_concurrent_positions
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      8. Additional approved concentration guard: maximum 3 open positions in the
+      same GICS sector; maximum initial planned risk in one GICS sector = 0.75%
+      of equity.
+  - key: risk.max_portfolio_exposure
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      75% gross exposure maximum. This is a ceiling, not an allocation target.
+      Gross-exposure precedence (owner clarification 2026-08-13): first calculate
+      the normal fixed-fractional risk-based quantity. If that quantity would
+      cause total gross portfolio exposure to exceed the approved 75% ceiling,
+      reduce the new position quantity to the maximum whole-share quantity that
+      keeps total gross exposure <= 75%; do not change or tighten the structural
+      stop to make the trade fit; do not increase risk; if the permitted quantity
+      is less than 1 whole share, SKIP TRADE. The 0.25% risk-per-trade value is a
+      maximum risk budget, not a requirement to consume the full budget.
+  - key: risk.daily_loss_limit
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      1.5% of Start-of-Day Equity. Daily loss measurement must include unrealized
+      P&L. Conceptually DailyPnL = CurrentNetLiquidationValue -
+      StartOfDayNetLiquidationValue - NetExternalCashFlows.
+  - key: risk.action_on_breach
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      At 1.5% daily loss breach: BLOCK_NEW_ENTRIES; CANCEL_PENDING_ENTRY_ORDERS;
+      PRESERVE_PROTECTIVE_EXITS; ALLOW_RISK_REDUCING_ACTIONS; NEVER_WIDEN_STOPS;
+      NO_INTRADAY_AUTO_RESET; state becomes RISK_HALTED. Re-enable new entries
+      only on the next trading session AND only after clean broker reconciliation
+      confirms known account/order/position state. A daily-loss breach is NOT a
+      command to automatically liquidate every profitable position.
+  - key: sessions.allowed
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      New entries: RTH ONLY. Signal generation: COMPLETED RTH DAILY BARS ONLY.
+      Protective/risk-reducing exits: remain available whenever broker/instrument
+      capabilities allow. Extended-hours new entries: FORBIDDEN. No averaging
+      down. No adding new risk outside the allowed entry session. Do not hard-code
+      09:30-16:00 as the only source of truth if a canonical instrument/exchange
+      trading calendar is available.
+  - key: data.point_in_time_requirement
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      STRICT PIT. Every value used by a trading decision must satisfy available_at
+      <= decision_at. Applies to OHLCV, index membership, SMA150, ATR10, ATR20,
+      base/resistance values, corrections/revisions, derived features, and any
+      other strategy input. Historical corrections may only be visible to a
+      historical decision if they were actually available at that decision time.
+  - key: data.staleness_behaviour
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      Required data stale: BLOCK_NEW_SIGNALS. Required data missing:
+      BLOCK_NEW_SIGNALS. Unknown/untrusted timestamp: BLOCK_NEW_SIGNALS.
+      Conflicting required data: FAIL_CLOSED. Interpolation for trading decisions:
+      FORBIDDEN. Existing broker-side protective exits: PRESERVE. A strategy-data
+      failure must never cancel already-existing protective risk controls.
+  - key: costs.commission_model
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      Primary: ACTUAL_IBKR_ACCOUNT_PRICING. Until the real account pricing plan is
+      verified, the provisional simulation assumption is USD 0.005/share, minimum
+      USD 1/order. This provisional number must NOT be treated as verified
+      real-account pricing.
+  - key: costs.slippage_model
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      Normal: 2 bps adverse beyond the modeled spread. Mandatory robustness test:
+      2x total modeled transaction costs. Costs should be adverse to the strategy
+      by default, not optimistic.
+  - key: costs.spread_assumption
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      Preferred: Historical NBBO. Fallback when historical bid/ask is genuinely
+      unavailable: Full spread = 10 bps; marketable execution cost from midpoint =
+      5 bps adverse. Do not silently substitute fallback if actual historical
+      quotes are available.
+  - key: costs.partial_fill_assumption
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      Maximum participation: 1% of trailing 20-day Average Daily Volume in shares.
+      Partial fill: ACCEPT. Unfilled remainder: CANCEL. Automatic price chasing:
+      FORBIDDEN.
+  - key: metrics.primary
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: "Deflated Sharpe Ratio (DSR). GO threshold: DSR >= 0.95."
+  - key: metrics.min_sample_size
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      At least 200 completed trades across evaluated strategy history AND 50
+      completed trades in Final OOS. If below the required sample:
+      INSUFFICIENT_EVIDENCE. Do NOT reinterpret insufficient evidence as PASS or
+      FAIL.
+  - key: metrics.confidence_interval_method
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: "Stationary Block Bootstrap. 95% confidence level."
+  - key: splits.train
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: "60%. Chronological."
+  - key: splits.validation
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: "20%. Chronological. Immediately follows Train."
+  - key: splits.test_oos
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      Final 20%. Chronological. LOCKED until final evaluation. Once Final OOS is
+      viewed for V1, parameter changes may not be made and then re-use the same
+      period as untouched OOS. Historical pre-split warm-up is allowed for
+      indicators such as SMA150/ATR, but performance before the split start must
+      not be scored in that split.
+  - key: splits.walk_forward
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      Context/history window: 60 months. Evaluation window: 12 months. Step: 12
+      months. Parameter re-optimization: FORBIDDEN. Initial walk-forward analysis
+      scope: TRAIN + VALIDATION ONLY. Final OOS must stay outside the initial
+      walk-forward process.
+  - key: gonogo.go_requires
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      ALL must be true: DSR >= 0.95; Final OOS net return > 0 after modeled
+      transaction costs; Final OOS maximum drawdown <= 12%; Final OOS net return
+      remains > 0 under 2x transaction-cost stress; >50% of walk-forward
+      evaluation windows have positive net return; zero Point-in-Time /
+      look-ahead violations; dataset, strategy, inputs and run are fully
+      reproducible; sample-size requirements satisfied.
+  - key: gonogo.nogo_if
+    source: "owner:Eyal (project owner)"
+    supplied_at: "2026-08-13T00:00:00+00:00"
+    value: |
+      ANY of: any PIT / look-ahead integrity failure; Final OOS net return <= 0;
+      Final OOS maximum drawdown > 15%; strategy becomes unprofitable under 2x
+      transaction costs; backtest cannot be reproduced. Intermediate cases:
+      HOLD / REVIEW (e.g. 12% < Final OOS MaxDD <= 15% must NOT automatically
+      become GO or hard NO-GO). If DSR is below 0.95 without another hard failure:
+      HOLD / INSUFFICIENT_STATISTICAL_CONFIDENCE, not automatic parameter tuning.
+      Verdict precedence (owner clarification 2026-08-13): (A) any integrity
+      failure - PIT/look-ahead violation or non-reproducible dataset/run => NO-GO
+      immediately, regardless of sample size. (B) if no integrity failure exists
+      but either sample requirement is not met (fewer than 200 completed trades
+      overall OR fewer than 50 completed Final OOS trades) => INSUFFICIENT_EVIDENCE;
+      in this state observed profitability/drawdown must not be treated as a
+      statistical PASS or FAIL. (C) if sample requirements are satisfied, evaluate
+      the hard NO-GO conditions. (D) if no NO-GO condition exists and ALL GO
+      requirements pass => GO. (E) otherwise => HOLD / REVIEW.
