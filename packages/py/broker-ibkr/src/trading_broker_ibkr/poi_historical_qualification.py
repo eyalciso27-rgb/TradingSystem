@@ -14,10 +14,10 @@ id). A SMALL sample is used to prove schema/coverage — never a bulk S&P downlo
 Usage (on the owner's controlled host, Gateway logged into PAPER, Read-Only
 API = ON, bound to 127.0.0.1:4002):
 
-    uv run python -m trading_broker_ibkr.poi_historical_qualification \
+    uv run --no-sync python -m trading_broker_ibkr.poi_historical_qualification \
         --host 127.0.0.1 --port 4002 \
         --symbols AAPL,MSFT --patterns META \
-        --account-alias paper-primary \
+        --account-alias paper-poi \
         --out docs/poi/evidence/POI-IBKR-HIST.json
 """
 
@@ -71,7 +71,11 @@ class QualificationEvidence:
     matching: list[dict[str, object]] = field(default_factory=list)
     capabilities: dict[str, str] = field(default_factory=dict)  # capability -> PASS/FAIL/PARTIAL
     notes: list[str] = field(default_factory=list)
-    sufficient_for_frozen_strategy: bool = False
+    # ACTIVE-name daily price qualification only. This is NOT full V1 dataset
+    # readiness: PIT S&P 500 membership, as-of GICS, delisted history and
+    # corporate actions remain unresolved, so the full contract stays not-ready.
+    active_name_price_qualification_sufficient: bool = False
+    full_dataset_contract_ready: bool = False  # always False here — reference-layer gaps remain
     observed_at: str = ""
     evidence_checksum: str = ""
 
@@ -96,7 +100,10 @@ class QualificationEvidence:
             "matching": self.matching,
             "capabilities": self.capabilities,
             "notes": self.notes,
-            "sufficient_for_frozen_strategy": self.sufficient_for_frozen_strategy,
+            "active_name_price_qualification_sufficient": (
+                self.active_name_price_qualification_sufficient
+            ),
+            "full_dataset_contract_ready": self.full_dataset_contract_ready,
             "observed_at": self.observed_at,
         }
 
@@ -213,9 +220,10 @@ def run_qualification(
             "Commission SCHEDULE is not a read-only API endpoint; read it from IBKR"
             " Account Management (Reports) — this run only proves connectivity.",
         ]
-        evidence.sufficient_for_frozen_strategy = (
-            any_trades_ok and any_con_id
-        )  # for ACTIVE names only; reference-layer gaps remain
+        # ACTIVE-name price qualification only — never the full V1 dataset
+        # contract (membership/GICS/delisted/corporate-actions remain gaps).
+        evidence.active_name_price_qualification_sufficient = any_trades_ok and any_con_id
+        evidence.full_dataset_contract_ready = False
     finally:
         client.close()
 
@@ -224,15 +232,54 @@ def run_qualification(
     return evidence
 
 
+#: An entitlement / no-data / pacing note is NOT a genuine request failure.
+_SOFT_ERROR_MARKERS = (
+    "entitle", "no data", "no historical", "requires subscription",
+    "not subscribed", "pacing",
+)
+
+
+def _is_soft_error(error: object) -> bool:
+    if not isinstance(error, str) or not error.strip():
+        return False
+    lowered = error.lower()
+    return any(marker in lowered for marker in _SOFT_ERROR_MARKERS)
+
+
 def _quote_capability(evidence: QualificationEvidence) -> str:
-    got = 0
+    """PASS only if BID+ASK+MIDPOINT are ALL available for at least one symbol.
+
+    PARTIAL if only a subset is available (or nothing is available but only
+    because of missing entitlement / empty data). FAIL ONLY when a genuine
+    request failure occurred and nothing was retrievable — a missing entitlement
+    is never a FAIL.
+    """
+    families = ("BID", "ASK", "MIDPOINT")
+    any_all_three = False
+    any_subset = False
+    genuine_failure = False
     for symbol in evidence.symbols:
-        for wts in ("BID", "ASK", "MIDPOINT"):
+        present: set[str] = set()
+        for wts in families:
             entry = symbol.series.get(wts, {})
             row_count = entry.get("row_count", 0)
             if isinstance(row_count, int) and row_count > 0:
-                got += 1
-    return "PASS" if got else "PARTIAL"
+                present.add(wts)
+                continue
+            error = entry.get("error")
+            if error and not _is_soft_error(error):
+                genuine_failure = True
+        if len(present) == len(families):
+            any_all_three = True
+        elif present:
+            any_subset = True
+    if any_all_three:
+        return "PASS"
+    if any_subset:
+        return "PARTIAL"
+    if genuine_failure:
+        return "FAIL"
+    return "PARTIAL"  # nothing available, but only entitlement/empty — not a failure
 
 
 def main(argv: list[str]) -> int:
@@ -241,7 +288,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--port", type=int, default=4002)
     parser.add_argument("--symbols", default="AAPL,MSFT")
     parser.add_argument("--patterns", default="META")
-    parser.add_argument("--account-alias", default="paper-primary")
+    parser.add_argument("--account-alias", default="paper-poi")
     parser.add_argument("--duration", default="10 D")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv[1:])
@@ -260,8 +307,9 @@ def main(argv: list[str]) -> int:
 
     for capability, verdict in sorted(evidence.capabilities.items()):
         print(f"{capability}: {verdict}")
-    print(f"sufficient_for_frozen_strategy (ACTIVE names only): "
-          f"{evidence.sufficient_for_frozen_strategy}")
+    print("active_name_price_qualification_sufficient: "
+          f"{evidence.active_name_price_qualification_sufficient}")
+    print(f"full_dataset_contract_ready: {evidence.full_dataset_contract_ready}")
     print(f"evidence_checksum: {evidence.evidence_checksum}")
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)

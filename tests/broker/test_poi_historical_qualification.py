@@ -17,6 +17,8 @@ from trading_broker_ibkr.poi_historical_data_client import (
 )
 from trading_broker_ibkr.poi_historical_qualification import (
     QualificationEvidence,
+    SymbolEvidence,
+    _quote_capability,
     main,
     run_qualification,
 )
@@ -175,7 +177,7 @@ def _run(**kw: object) -> QualificationEvidence:
     client = IbkrHistoricalRawClient(lambda: transport, timeout_seconds=2.0)
     return run_qualification(
         client, host="127.0.0.1", port=4002, symbols=["AAPL", "MSFT"], patterns=["META"],
-        account_alias="paper-primary", now="2026-08-13T20:00:00+00:00",
+        account_alias="paper-poi", now="2026-08-13T20:00:00+00:00",
     )
 
 
@@ -203,9 +205,65 @@ def test_active_run_is_not_proof_of_delisted_or_membership() -> None:
     ev = _run()
     joined = " ".join(ev.notes).lower()
     assert "delisted" in joined and "membership" in joined and "gics" in joined
-    # sufficiency is explicitly scoped to ACTIVE names only
-    assert ev.sufficient_for_frozen_strategy is True  # active-name coverage proven
+    # sufficiency is explicitly scoped to ACTIVE names only, and NEVER implies
+    # the full V1 dataset contract is satisfied.
+    assert ev.active_name_price_qualification_sufficient is True  # active-name coverage proven
+    assert ev.full_dataset_contract_ready is False  # reference-layer gaps remain
     assert "active-symbol" in joined
+    # the machine-readable body must not carry the old over-claiming field name
+    assert "sufficient_for_frozen_strategy" not in str(ev.to_dict())
+
+
+# -- bid_ask_midpoint capability semantics (Fix 1) ----------------------------
+
+
+def _sym(available: dict[str, int], errors: dict[str, str] | None = None) -> SymbolEvidence:
+    errs = errors or {}
+    series: dict[str, dict[str, object]] = {
+        wts: {
+            "row_count": available.get(wts, 0), "earliest": None, "latest": None,
+            "schema_ok": available.get(wts, 0) > 0, "error": errs.get(wts),
+        }
+        for wts in ("BID", "ASK", "MIDPOINT")
+    }
+    return SymbolEvidence(
+        symbol="X", con_id=1, long_name="", primary_exchange="", head_timestamp_trades="x",
+        series=series, trades_schema_ok=True, pacing_notes=(),
+    )
+
+
+def _ev(*syms: SymbolEvidence) -> QualificationEvidence:
+    return QualificationEvidence(symbols=list(syms))
+
+
+def test_quote_only_midpoint_is_partial() -> None:
+    assert _quote_capability(_ev(_sym({"MIDPOINT": 5}))) == "PARTIAL"
+
+
+def test_quote_bid_ask_without_midpoint_is_partial() -> None:
+    assert _quote_capability(_ev(_sym({"BID": 5, "ASK": 5}))) == "PARTIAL"
+
+
+def test_quote_all_three_is_pass() -> None:
+    assert _quote_capability(_ev(_sym({"BID": 5, "ASK": 5, "MIDPOINT": 5}))) == "PASS"
+
+
+def test_quote_missing_entitlement_is_not_fail() -> None:
+    # nothing available, but only because of missing entitlement -> PARTIAL, not FAIL
+    ev = _ev(_sym({}, {"BID": "market data is not subscribed / no entitlement"}))
+    assert _quote_capability(ev) == "PARTIAL"
+
+
+def test_quote_genuine_request_failure_is_fail() -> None:
+    # nothing available and a genuine (non-entitlement) request error -> FAIL
+    ev = _ev(_sym({}, {"BID": "malformed historical response"}))
+    assert _quote_capability(ev) == "FAIL"
+
+
+def test_quote_all_three_on_one_symbol_passes_despite_other_failure() -> None:
+    good = _sym({"BID": 5, "ASK": 5, "MIDPOINT": 5})
+    bad = _sym({}, {"BID": "malformed historical response"})
+    assert _quote_capability(_ev(good, bad)) == "PASS"
 
 
 def test_checksum_is_deterministic() -> None:
@@ -227,4 +285,8 @@ def test_cli_writes_sanitized_evidence(tmp_path: Path, monkeypatch: pytest.Monke
     text = out.read_text(encoding="utf-8")
     assert PAPER_ACCOUNT not in text
     assert "sha256:" in text
-    assert "daily_trades_rth_schema: PASS" in capsys.readouterr().out
+    assert "full_dataset_contract_ready" in text
+    assert "sufficient_for_frozen_strategy" not in text  # old over-claiming name gone
+    printed = capsys.readouterr().out
+    assert "daily_trades_rth_schema: PASS" in printed
+    assert "full_dataset_contract_ready: False" in printed

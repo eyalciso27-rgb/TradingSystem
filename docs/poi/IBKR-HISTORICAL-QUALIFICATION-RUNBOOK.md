@@ -19,13 +19,17 @@
 
 ## A. Exact command (owner's controlled host)
 ```bash
-uv run python -m trading_broker_ibkr.poi_historical_qualification \
+uv run --no-sync python -m trading_broker_ibkr.poi_historical_qualification \
   --host 127.0.0.1 --port 4002 \
   --symbols AAPL,MSFT --patterns META \
-  --account-alias paper-primary \
+  --account-alias paper-poi \
   --duration "10 D" \
   --out docs/poi/evidence/POI-IBKR-HIST.json
 ```
+
+> `account_alias` (`paper-poi`, the project's canonical Paper alias) is evidence
+> **metadata only** — the actual safety gate is `localhost:4002` + the `DU`
+> account-id prefix, enforced in code regardless of the alias.
 
 ## B. What it queries (all read-only)
 1. `reqCurrentTime` — connectivity.
@@ -53,11 +57,19 @@ issues each request once and records any pacing code (no auto-retry).
 | `daily_trades_rth_schema` | ≥1 symbol returns 1-day TRADES bars with non-empty O/H/L/C **and** volume |
 | `contract_identity_conid` | conId resolved for ≥1 symbol |
 | `head_timestamp_coverage` | a head timestamp returned (depth recorded) |
-| `bid_ask_midpoint` | PASS if BID/ASK/MIDPOINT bars returned; `PARTIAL` if entitlement-limited |
+| `bid_ask_midpoint` | PASS only if **BID+ASK+MIDPOINT all** available for ≥1 symbol; `PARTIAL` for a subset or missing entitlement; `FAIL` only for a genuine request failure |
 | `symbol_change_discovery` | matches returned for the pattern (`PARTIAL` if none) |
 
-Overall run returns non-zero if any capability is `FAIL`. `sufficient_for_frozen_strategy`
-is reported **for ACTIVE names only**.
+Overall run returns non-zero if any capability is `FAIL`.
+`active_name_price_qualification_sufficient` is reported **for ACTIVE names
+only**; `full_dataset_contract_ready` is always **False** here (PIT membership,
+as-of GICS, delisted history and corporate actions remain unresolved). A
+machine-readable TRUE never implies the full V1 dataset contract is satisfied.
+
+Note on `bid_ask_midpoint`: **PASS** only when BID **and** ASK **and** MIDPOINT
+are all available for at least one symbol; **PARTIAL** for a subset (or a missing
+entitlement); **FAIL** only for a genuine request failure — never for a mere
+missing entitlement.
 
 ## E. Records captured (sanitized evidence JSON)
 - request parameters (symbols, whatToShow, barSize, useRTH, duration);
