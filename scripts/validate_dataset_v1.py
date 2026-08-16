@@ -5,7 +5,6 @@ from pathlib import Path
 
 from trading_market_data_core.dataset_v1 import DatasetCapabilityMatrix
 
-
 DEFAULT_EVIDENCE = Path("docs/poi/evidence/POI-IBKR-HIST.json")
 
 
