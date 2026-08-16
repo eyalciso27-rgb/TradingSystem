@@ -5,7 +5,6 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
-
 from trading_market_data_core.dataset_v1 import (
     CapabilityState,
     CorporateActionRecord,
@@ -20,7 +19,6 @@ from trading_market_data_core.dataset_v1 import (
     Provenance,
     SecurityIdentity,
 )
-
 
 UTC_NOW = datetime(2026, 8, 16, 10, 28, tzinfo=UTC)
 PROVENANCE = Provenance(source="fixture", observed_at=UTC_NOW)
