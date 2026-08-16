@@ -7,12 +7,12 @@ it does not claim that any external source has supplied those fields.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import StrEnum
-import json
 from pathlib import Path
-from typing import Iterable, Mapping
 
 
 class CapabilityState(StrEnum):
@@ -296,9 +296,6 @@ class DatasetCapabilityMatrix:
         declared = payload.get("evidence_checksum")
         if not isinstance(declared, str) or not declared.startswith("sha256:"):
             raise ValueError("historical evidence is missing evidence_checksum")
-        # The qualification checksum is over the canonical evidence body before
-        # its checksum field is attached, so preserve/trace the producer's value
-        # rather than pretending a raw-file hash is equivalent.
         capabilities = payload.get("capabilities")
         if not isinstance(capabilities, dict):
             raise ValueError("historical evidence capabilities must be an object")
