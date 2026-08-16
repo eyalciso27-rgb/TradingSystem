@@ -34,16 +34,23 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 from trading_market_data_core.dataset_v1 import (
     CapabilityState,
+    CorporateActionRecord,
+    CorporateActionType,
     DatasetV1,
+    DelistingReason,
+    DelistingRecord,
     EffectiveInterval,
     GicsRecord,
     MembershipRecord,
     Provenance,
+    RetractionRecord,
+    SymbolHistoryRecord,
 )
 
 INGESTION_VERSION = "dataset-v1-reference-ingestion-1.0.0"
@@ -157,6 +164,82 @@ class GicsSource(Protocol):
     def capabilities(self) -> SourceCapabilities: ...
 
     def fetch_gics_intervals(self) -> tuple[RawGicsInterval, ...]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RawSymbolInterval:
+    """A ticker an identity traded under. ``symbol_key`` resolves the identity."""
+
+    symbol_key: str  # the resolver key (e.g. the security's canonical symbol)
+    symbol: str  # the ticker during this interval
+    valid_from: date
+    valid_to: date | None
+    known_at: datetime
+    source_record_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RawDelisting:
+    """One canonical delisting assertion, keyed by symbol, with knowledge time."""
+
+    symbol: str
+    delisted_on: date
+    known_at: datetime
+    source_record_id: str
+    reason: DelistingReason = DelistingReason.UNKNOWN
+    listing_date: date | None = None
+    last_trading_date: date | None = None
+    venue: str | None = None
+    successor_symbol: str | None = None
+    corrects: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RawCorporateAction:
+    """One canonical corporate-action event, keyed by symbol, with knowledge time."""
+
+    symbol: str
+    action_type: CorporateActionType
+    effective_on: date
+    known_at: datetime
+    source_record_id: str
+    ratio: Decimal | None = None
+    cash_amount: Decimal | None = None
+    currency: str | None = None
+    ex_date: date | None = None
+    record_date: date | None = None
+    payment_date: date | None = None
+    predecessor_symbol: str | None = None
+    successor_symbol: str | None = None
+    corrects: str | None = None
+
+
+@runtime_checkable
+class DelistingSource(Protocol):
+    @property
+    def source_id(self) -> str: ...
+
+    @property
+    def kind(self) -> SourceKind: ...
+
+    @property
+    def capabilities(self) -> SourceCapabilities: ...
+
+    def fetch_delistings(self) -> tuple[RawDelisting, ...]: ...
+
+
+@runtime_checkable
+class CorporateActionSource(Protocol):
+    @property
+    def source_id(self) -> str: ...
+
+    @property
+    def kind(self) -> SourceKind: ...
+
+    @property
+    def capabilities(self) -> SourceCapabilities: ...
+
+    def fetch_corporate_actions(self) -> tuple[RawCorporateAction, ...]: ...
 
 
 # -- identity resolution ------------------------------------------------------
@@ -346,6 +429,148 @@ def ingest_gics(
     return tuple(sorted(records.values(), key=lambda r: r.record_id))
 
 
+def ingest_delistings(
+    source: DelistingSource, resolver: IdentityResolver, *, observed_at: datetime
+) -> tuple[DelistingRecord, ...]:
+    """Normalize raw delistings into deterministic bitemporal records.
+
+    A delisting is a historical FACT about a security that keeps its stable
+    ``security_id`` forever; an unknown symbol fails closed rather than being
+    dropped (which is how survivorship bias enters a dataset).
+    """
+    raw = source.fetch_delistings()
+    id_by_source: dict[str, str] = {}
+    resolved: list[tuple[RawDelisting, str, str | None, str]] = []
+    for row in raw:
+        security_id = resolver.resolve(row.symbol)
+        successor_id = (
+            resolver.resolve(row.successor_symbol) if row.successor_symbol else None
+        )
+        record_id = _record_id(
+            "d",
+            (security_id, row.delisted_on.isoformat(), row.known_at.isoformat(),
+             row.reason.value, row.listing_date.isoformat() if row.listing_date else None,
+             row.last_trading_date.isoformat() if row.last_trading_date else None,
+             row.venue, successor_id, source.source_id),
+        )
+        if row.source_record_id in id_by_source and id_by_source[row.source_record_id] != record_id:
+            raise IngestionError(
+                f"source_record_id {row.source_record_id!r} maps to two different records"
+            )
+        id_by_source[row.source_record_id] = record_id
+        resolved.append((row, security_id, successor_id, record_id))
+
+    records: dict[str, DelistingRecord] = {}
+    for row, security_id, successor_id, record_id in resolved:
+        supersedes = None
+        if row.corrects is not None:
+            supersedes = id_by_source.get(row.corrects)
+            if supersedes is None:
+                raise IngestionError(
+                    f"delisting correction references unknown source record {row.corrects!r}"
+                )
+        records[record_id] = DelistingRecord(
+            record_id=record_id, security_id=security_id, delisted_on=row.delisted_on,
+            known_at=row.known_at,
+            provenance=Provenance(source.source_id, observed_at, row.source_record_id),
+            reason=row.reason, listing_date=row.listing_date,
+            last_trading_date=row.last_trading_date, venue=row.venue,
+            successor_security_id=successor_id, supersedes=supersedes,
+        )
+    return tuple(sorted(records.values(), key=lambda r: r.record_id))
+
+
+def ingest_corporate_actions(
+    source: CorporateActionSource, resolver: IdentityResolver, *, observed_at: datetime
+) -> tuple[CorporateActionRecord, ...]:
+    """Normalize raw corporate actions into deterministic bitemporal events."""
+    raw = source.fetch_corporate_actions()
+    id_by_source: dict[str, str] = {}
+    resolved: list[tuple[RawCorporateAction, str, str | None, str | None, str]] = []
+    for row in raw:
+        security_id = resolver.resolve(row.symbol)
+        successor_id = (
+            resolver.resolve(row.successor_symbol) if row.successor_symbol else None
+        )
+        predecessor_id = (
+            resolver.resolve(row.predecessor_symbol) if row.predecessor_symbol else None
+        )
+        record_id = _record_id(
+            "ca",
+            (security_id, row.action_type.value, row.effective_on.isoformat(),
+             row.known_at.isoformat(), str(row.ratio) if row.ratio is not None else None,
+             str(row.cash_amount) if row.cash_amount is not None else None, row.currency,
+             row.ex_date.isoformat() if row.ex_date else None,
+             row.record_date.isoformat() if row.record_date else None,
+             row.payment_date.isoformat() if row.payment_date else None,
+             predecessor_id, successor_id, source.source_id),
+        )
+        if row.source_record_id in id_by_source and id_by_source[row.source_record_id] != record_id:
+            raise IngestionError(
+                f"source_record_id {row.source_record_id!r} maps to two different records"
+            )
+        id_by_source[row.source_record_id] = record_id
+        resolved.append((row, security_id, predecessor_id, successor_id, record_id))
+
+    records: dict[str, CorporateActionRecord] = {}
+    for row, security_id, predecessor_id, successor_id, record_id in resolved:
+        supersedes = None
+        if row.corrects is not None:
+            supersedes = id_by_source.get(row.corrects)
+            if supersedes is None:
+                raise IngestionError(
+                    "corporate-action correction references unknown source record"
+                    f" {row.corrects!r}"
+                )
+        records[record_id] = CorporateActionRecord(
+            record_id=record_id, security_id=security_id, action_type=row.action_type,
+            effective_on=row.effective_on, known_at=row.known_at,
+            provenance=Provenance(source.source_id, observed_at, row.source_record_id),
+            ratio=row.ratio, cash_amount=row.cash_amount, currency=row.currency,
+            ex_date=row.ex_date, record_date=row.record_date, payment_date=row.payment_date,
+            predecessor_security_id=predecessor_id, successor_security_id=successor_id,
+            supersedes=supersedes,
+        )
+    return tuple(sorted(records.values(), key=lambda r: r.record_id))
+
+
+def ingest_symbol_history(
+    rows: Sequence[RawSymbolInterval],
+    resolver: IdentityResolver,
+    *,
+    source_id: str,
+    observed_at: datetime,
+) -> tuple[SymbolHistoryRecord, ...]:
+    """Normalize symbol intervals: a rename is a new SYMBOL under the SAME id."""
+    records: dict[str, SymbolHistoryRecord] = {}
+    for row in rows:
+        security_id = resolver.resolve(row.symbol_key)
+        record_id = _record_id(
+            "s",
+            (security_id, row.symbol, row.valid_from.isoformat(),
+             row.valid_to.isoformat() if row.valid_to else None,
+             row.known_at.isoformat(), source_id),
+        )
+        records[record_id] = SymbolHistoryRecord(
+            record_id=record_id, security_id=security_id, symbol=row.symbol,
+            interval=EffectiveInterval(row.valid_from, row.valid_to), known_at=row.known_at,
+            provenance=Provenance(source_id, observed_at, row.source_record_id),
+        )
+    return tuple(sorted(records.values(), key=lambda r: r.record_id))
+
+
+def build_retraction(
+    target_record_id: str, *, known_at: datetime, source: str, observed_at: datetime,
+    reason: str | None = None,
+) -> RetractionRecord:
+    """A deterministic tombstone for an assertion that was never valid."""
+    record_id = _record_id("r", (target_record_id, known_at.isoformat(), source))
+    return RetractionRecord(
+        record_id=record_id, target_record_id=target_record_id, known_at=known_at,
+        provenance=Provenance(source, observed_at, None), reason=reason,
+    )
+
+
 # -- deterministic dataset fingerprint ---------------------------------------
 
 
@@ -392,28 +617,59 @@ def dataset_fingerprint(dataset: DatasetV1) -> str:
             ),
             key=lambda entry: str(entry["record_id"]),
         ),
+        "symbol_history": sorted(
+            (
+                {"record_id": s.record_id, "security_id": s.security_id, "symbol": s.symbol,
+                 "valid_from": s.interval.valid_from.isoformat(),
+                 "valid_to": s.interval.valid_to.isoformat() if s.interval.valid_to else None,
+                 "known_at": s.known_at.isoformat(), "supersedes": s.supersedes,
+                 "provenance": prov(s.provenance)}
+                for s in dataset.symbol_history
+            ),
+            key=lambda entry: str(entry["record_id"]),
+        ),
         "delistings": sorted(
             (
-                {"security_id": d.security_id, "delisted_on": d.delisted_on.isoformat(),
-                 "reason": d.reason, "provenance": prov(d.provenance)}
+                {"record_id": d.record_id, "security_id": d.security_id,
+                 "delisted_on": d.delisted_on.isoformat(), "reason": d.reason.value,
+                 "listing_date": d.listing_date.isoformat() if d.listing_date else None,
+                 "last_trading_date": (
+                     d.last_trading_date.isoformat() if d.last_trading_date else None
+                 ),
+                 "venue": d.venue, "successor_security_id": d.successor_security_id,
+                 "known_at": d.known_at.isoformat(), "supersedes": d.supersedes,
+                 "provenance": prov(d.provenance)}
                 for d in dataset.delistings
             ),
-            key=lambda entry: (str(entry["security_id"]), str(entry["delisted_on"])),
+            key=lambda entry: str(entry["record_id"]),
         ),
         "corporate_actions": sorted(
             (
-                {"security_id": c.security_id, "action_type": c.action_type.value,
+                {"record_id": c.record_id, "security_id": c.security_id,
+                 "action_type": c.action_type.value,
                  "effective_on": c.effective_on.isoformat(),
                  "ratio": str(c.ratio) if c.ratio is not None else None,
                  "cash_amount": str(c.cash_amount) if c.cash_amount is not None else None,
+                 "currency": c.currency,
+                 "ex_date": c.ex_date.isoformat() if c.ex_date else None,
+                 "record_date": c.record_date.isoformat() if c.record_date else None,
+                 "payment_date": c.payment_date.isoformat() if c.payment_date else None,
+                 "predecessor_security_id": c.predecessor_security_id,
                  "successor_security_id": c.successor_security_id,
+                 "known_at": c.known_at.isoformat(), "supersedes": c.supersedes,
                  "provenance": prov(c.provenance)}
                 for c in dataset.corporate_actions
             ),
-            key=lambda entry: (
-                str(entry["security_id"]), str(entry["effective_on"]),
-                str(entry["action_type"]),
+            key=lambda entry: str(entry["record_id"]),
+        ),
+        "retractions": sorted(
+            (
+                {"record_id": r.record_id, "target_record_id": r.target_record_id,
+                 "known_at": r.known_at.isoformat(), "reason": r.reason,
+                 "provenance": prov(r.provenance)}
+                for r in dataset.retractions
             ),
+            key=lambda entry: str(entry["record_id"]),
         ),
         "prices": sorted(
             (
@@ -426,7 +682,10 @@ def dataset_fingerprint(dataset: DatasetV1) -> str:
                  "adjusted_close": (
                      str(p.adjusted_close) if p.adjusted_close is not None else None
                  ),
-                 "ibkr_con_id": p.ibkr_con_id, "provenance": prov(p.provenance)}
+                 "ibkr_con_id": p.ibkr_con_id,
+                 "adjustment_status": p.adjustment_status.value,
+                 "adjusted_with_ledger": p.adjusted_with_ledger,
+                 "provenance": prov(p.provenance)}
                 for p in dataset.prices
             ),
             key=lambda entry: (str(entry["security_id"]), str(entry["trading_date"])),
@@ -524,21 +783,30 @@ class ReferenceReadinessReport:
 __all__ = [
     "INGESTION_VERSION",
     "CapabilityAssessment",
+    "CorporateActionSource",
+    "DelistingSource",
     "GicsSource",
     "IdentityResolver",
     "IngestionError",
     "MembershipSource",
+    "RawCorporateAction",
+    "RawDelisting",
     "RawGicsAssignment",
     "RawGicsInterval",
     "RawMembershipChange",
     "RawMembershipInterval",
+    "RawSymbolInterval",
     "ReferenceReadinessReport",
     "SourceCapabilities",
     "SourceKind",
     "assess_reference_capability",
+    "build_retraction",
     "dataset_fingerprint",
     "gics_assignments_to_intervals",
+    "ingest_corporate_actions",
+    "ingest_delistings",
     "ingest_gics",
     "ingest_membership",
+    "ingest_symbol_history",
     "membership_changes_to_intervals",
 ]
