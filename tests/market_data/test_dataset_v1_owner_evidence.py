@@ -1,8 +1,7 @@
-from pathlib import Path
 from trading_market_data_core.dataset_v1 import CapabilityState, DatasetCapabilityMatrix
 
 
-EVIDENCE = Path("docs/poi/evidence/POI-IBKR-HIST.json")
+EVIDENCE = "docs/poi/evidence/POI-IBKR-HIST.json"
 EXPECTED_CHECKSUM = "sha256:663150437934774a09c3a5d5b81614458b4da329dfb42df64f930533ab552945"
 EMPIRICALLY_VERIFIED = {
     "connectivity_paper_du_gate",
