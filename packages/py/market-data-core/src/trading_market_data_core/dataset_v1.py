@@ -1,6 +1,6 @@
 """Point-in-time Dataset V1 contract.
 
-The contract is deliberately provider-neutral.  It models the information a
+The contract is deliberately provider-neutral. It models the information a
 research/backtest dataset must carry to avoid survivorship and look-ahead bias;
 it does not claim that any external source has supplied those fields.
 """
@@ -10,9 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import StrEnum
-from pathlib import Path
-import hashlib
 import json
+from pathlib import Path
 from typing import Iterable, Mapping
 
 
@@ -221,8 +220,15 @@ class DatasetV1:
             for error in provenance.validate():
                 errors.append(f"{kind} {security_id}: {error}")
 
-        errors.extend(_overlap_errors(self.memberships, key=lambda r: (r.index_id, r.security_id)))
-        errors.extend(_overlap_errors(self.gics, key=lambda r: (r.security_id,)))
+        errors.extend(
+            _overlap_errors(
+                ((row.index_id, row.security_id), row.interval)
+                for row in self.memberships
+            )
+        )
+        errors.extend(
+            _overlap_errors(((row.security_id,), row.interval) for row in self.gics)
+        )
 
         membership_ids = {row.security_id for row in self.memberships}
         delisted_ids = {row.security_id for row in self.delistings}
@@ -236,17 +242,11 @@ class DatasetV1:
 
 
 def _overlap_errors(
-    rows: Iterable[MembershipRecord] | Iterable[GicsRecord],
-    *,
-    key: object,
+    rows: Iterable[tuple[tuple[str, ...], EffectiveInterval]],
 ) -> list[str]:
-    # `key` is kept untyped at the public boundary so both record types remain
-    # simple dataclasses; callers below always pass a callable.
-    key_fn = key
     grouped: dict[tuple[str, ...], list[EffectiveInterval]] = {}
-    for row in rows:
-        group_key = key_fn(row)  # type: ignore[operator]
-        grouped.setdefault(group_key, []).append(row.interval)
+    for group_key, interval in rows:
+        grouped.setdefault(group_key, []).append(interval)
     errors: list[str] = []
     for group_key, intervals in grouped.items():
         ordered = sorted(intervals, key=lambda value: value.valid_from)
@@ -290,8 +290,7 @@ class DatasetCapabilityMatrix:
 
     @classmethod
     def from_ibkr_historical_evidence(cls, path: str | Path) -> DatasetCapabilityMatrix:
-        raw_bytes = Path(path).read_bytes()
-        payload = json.loads(raw_bytes)
+        payload = json.loads(Path(path).read_bytes())
         if payload.get("poi_id") != "POI-IBKR-HIST":
             raise ValueError("unexpected historical evidence poi_id")
         declared = payload.get("evidence_checksum")
@@ -336,4 +335,6 @@ class DatasetCapabilityMatrix:
             for name in DATASET_V1_REQUIRED_CAPABILITIES
             if self.states.get(name) is not CapabilityState.EMPIRICALLY_VERIFIED
         )
-        raise ValueError("Dataset V1 is not empirically ready; unresolved: " + ", ".join(unresolved))
+        raise ValueError(
+            "Dataset V1 is not empirically ready; unresolved: " + ", ".join(unresolved)
+        )
