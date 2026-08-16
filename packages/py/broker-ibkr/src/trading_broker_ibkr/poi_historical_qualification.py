@@ -172,6 +172,7 @@ def run_qualification(
                     "latest": result.latest_bar,
                     "schema_ok": schema_ok,
                     "error": result.error,
+                    "request_id": result.request_id,  # unique per request (lifecycle proof)
                 }
             any_trades_ok = any_trades_ok or trades_ok
             evidence.symbols.append(

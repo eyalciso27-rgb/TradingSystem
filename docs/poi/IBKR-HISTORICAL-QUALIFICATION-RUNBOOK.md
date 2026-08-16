@@ -45,10 +45,22 @@ uv run --no-sync python -m trading_broker_ibkr.poi_historical_qualification \
 6. Per pattern: `reqMatchingSymbols` — symbol-change / ticker-history discovery.
 
 ## C. Expected non-mutating effects
-None on the account: no order, position, or balance changes. Only read requests
-and their read-only cancels (`cancelHistoricalData`, `cancelHeadTimeStamp`,
-`cancelAccountSummary`). Historical requests are pacing-limited by IBKR; the run
-issues each request once and records any pacing code (no auto-retry).
+None on the account: no order, position, or balance changes. Only read requests.
+Request lifecycle is correct: **every request gets a unique reqId** (monotonic
+allocator); a finite `reqHistoricalData` (`keepUpToDate=False`) and
+`reqHeadTimeStamp` are **complete on their end/callback and are NOT cancelled
+afterwards** — cancel happens only on a timeout/abort, and only for that reqId.
+`reqAccountSummary` (a subscription) is cancelled after its end. Errors are
+**reqId-correlated**: a late error for a retired reqId is recorded as a stray
+note and can never contaminate another request. Requests are issued once and
+pacing codes recorded (no auto-retry).
+
+> Codes **322** (Duplicate ticker ID), **366** (No historical data query found)
+> and **162** (query cancelled) seen on an earlier client build were a
+> **request-lifecycle bug** (a single reused reqId + a cancel after normal
+> completion), **not** an IBKR entitlement failure. That is fixed here; such
+> codes, if they ever appear for a retired reqId, are stray notes and are not
+> treated as entitlement evidence.
 
 ## D. Pass / fail criteria (per capability)
 | Capability | PASS when |
