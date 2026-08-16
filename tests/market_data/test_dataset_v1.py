@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+import json
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,7 @@ from trading_market_data_core.dataset_v1 import (
 )
 
 
-UTC_NOW = datetime(2026, 8, 16, 10, 28, tzinfo=timezone.utc)
+UTC_NOW = datetime(2026, 8, 16, 10, 28, tzinfo=UTC)
 PROVENANCE = Provenance(source="fixture", observed_at=UTC_NOW)
 
 
@@ -32,6 +33,26 @@ def _security(security_id: str, symbol: str) -> SecurityIdentity:
         primary_exchange="NASDAQ",
         ibkr_con_id=1,
     )
+
+
+def _write_evidence(tmp_path: Path, bid_ask_midpoint: str = "PASS") -> Path:
+    evidence = {
+        "poi_id": "POI-IBKR-HIST",
+        "capabilities": {
+            "connectivity_paper_du_gate": "PASS",
+            "daily_trades_rth_schema": "PASS",
+            "contract_identity_conid": "PASS",
+            "head_timestamp_coverage": "PASS",
+            "bid_ask_midpoint": bid_ask_midpoint,
+            "symbol_change_discovery": "PASS",
+        },
+        "active_name_price_qualification_sufficient": True,
+        "full_dataset_contract_ready": False,
+        "evidence_checksum": "sha256:abc123",
+    }
+    path = tmp_path / "evidence.json"
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+    return path
 
 
 def test_membership_lookup_is_point_in_time_and_excludes_future_entrant() -> None:
@@ -82,8 +103,12 @@ def test_gics_lookup_uses_as_of_classification() -> None:
         ),
     )
 
-    assert dataset.gics_as_of("x", date(2021, 1, 1)).sector == "Information Technology"  # type: ignore[union-attr]
-    assert dataset.gics_as_of("x", date(2024, 1, 1)).sector == "Communication Services"  # type: ignore[union-attr]
+    old_gics = dataset.gics_as_of("x", date(2021, 1, 1))
+    new_gics = dataset.gics_as_of("x", date(2024, 1, 1))
+    assert old_gics is not None
+    assert new_gics is not None
+    assert old_gics.sector == "Information Technology"
+    assert new_gics.sector == "Communication Services"
 
 
 def test_delisted_security_is_preserved_in_identity_and_history() -> None:
@@ -163,28 +188,22 @@ def test_corporate_action_split_requires_positive_ratio() -> None:
     assert not dataset.validate().valid
 
 
-def test_ibkr_evidence_maps_only_proven_capabilities_to_empirical_state(tmp_path: Path) -> None:
-    evidence = {
-        "poi_id": "POI-IBKR-HIST",
-        "capabilities": {
-            "connectivity_paper_du_gate": "PASS",
-            "daily_trades_rth_schema": "PASS",
-            "contract_identity_conid": "PASS",
-            "head_timestamp_coverage": "PASS",
-            "bid_ask_midpoint": "PASS",
-            "symbol_change_discovery": "PASS",
-        },
-        "active_name_price_qualification_sufficient": True,
-        "full_dataset_contract_ready": False,
-        "evidence_checksum": "sha256:abc123",
+def test_ibkr_evidence_maps_only_proven_capabilities_to_empirical_state(
+    tmp_path: Path,
+) -> None:
+    matrix = DatasetCapabilityMatrix.from_ibkr_historical_evidence(
+        _write_evidence(tmp_path)
+    )
+
+    empirical = {
+        "connectivity_paper_du_gate",
+        "daily_trades_rth_schema",
+        "contract_identity_conid",
+        "head_timestamp_coverage",
+        "bid_ask_midpoint",
+        "symbol_change_discovery",
     }
-    path = tmp_path / "evidence.json"
-    import json
-
-    path.write_text(json.dumps(evidence), encoding="utf-8")
-    matrix = DatasetCapabilityMatrix.from_ibkr_historical_evidence(path)
-
-    for name in evidence["capabilities"]:
+    for name in empirical:
         assert matrix.states[name] is CapabilityState.EMPIRICALLY_VERIFIED
     assert matrix.states["pit_sp500_membership"] is CapabilityState.BLOCKED_EXTERNAL
     assert matrix.states["asof_gics"] is CapabilityState.BLOCKED_EXTERNAL
@@ -196,46 +215,16 @@ def test_ibkr_evidence_maps_only_proven_capabilities_to_empirical_state(tmp_path
 def test_full_readiness_fails_closed_until_every_required_capability_is_empirical(
     tmp_path: Path,
 ) -> None:
-    evidence = {
-        "poi_id": "POI-IBKR-HIST",
-        "capabilities": {
-            "connectivity_paper_du_gate": "PASS",
-            "daily_trades_rth_schema": "PASS",
-            "contract_identity_conid": "PASS",
-            "head_timestamp_coverage": "PASS",
-            "bid_ask_midpoint": "PASS",
-            "symbol_change_discovery": "PASS",
-        },
-        "active_name_price_qualification_sufficient": True,
-        "evidence_checksum": "sha256:abc123",
-    }
-    path = tmp_path / "evidence.json"
-    import json
-
-    path.write_text(json.dumps(evidence), encoding="utf-8")
-    matrix = DatasetCapabilityMatrix.from_ibkr_historical_evidence(path)
+    matrix = DatasetCapabilityMatrix.from_ibkr_historical_evidence(
+        _write_evidence(tmp_path)
+    )
 
     with pytest.raises(ValueError, match="pit_sp500_membership"):
         matrix.assert_full_dataset_contract_ready()
 
 
 def test_non_pass_ibkr_capability_cannot_be_promoted(tmp_path: Path) -> None:
-    evidence = {
-        "poi_id": "POI-IBKR-HIST",
-        "capabilities": {
-            "connectivity_paper_du_gate": "PASS",
-            "daily_trades_rth_schema": "PASS",
-            "contract_identity_conid": "PASS",
-            "head_timestamp_coverage": "PASS",
-            "bid_ask_midpoint": "PARTIAL",
-            "symbol_change_discovery": "PASS",
-        },
-        "active_name_price_qualification_sufficient": True,
-        "evidence_checksum": "sha256:abc123",
-    }
-    path = tmp_path / "evidence.json"
-    import json
-
-    path.write_text(json.dumps(evidence), encoding="utf-8")
     with pytest.raises(ValueError, match="bid_ask_midpoint"):
-        DatasetCapabilityMatrix.from_ibkr_historical_evidence(path)
+        DatasetCapabilityMatrix.from_ibkr_historical_evidence(
+            _write_evidence(tmp_path, bid_ask_midpoint="PARTIAL")
+        )
