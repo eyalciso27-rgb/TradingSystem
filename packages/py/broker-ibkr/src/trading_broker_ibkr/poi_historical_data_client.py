@@ -2,8 +2,8 @@
 
 Extends the established read-only PoI pattern (``poi_market_data_client`` /
 ``poi_readonly_session``) with the historical requests needed to EMPIRICALLY
-qualify the owner's IBKR access against the frozen strategy's dataset contract —
-without any order, cancel, or account-mutating surface anywhere.
+qualify the owner's IBKR access for the frozen strategy's dataset contract —
+without any order, cancel-order, modify or account-mutating surface anywhere.
 
 Read-only requests only:
 
@@ -13,21 +13,33 @@ Read-only requests only:
   adjustment semantics (never a bulk S&P download);
 - ``reqContractDetails`` -> conId + longName + primaryExchange (identity/provenance);
 - ``reqMatchingSymbols`` -> symbol-change / ticker-history discovery;
-- ``reqAccountSummary`` -> the DU-paper gate only (masked; no values surfaced
-  beyond the connectivity proof).
+- ``reqAccountSummary`` -> the DU-paper gate only (masked; no values surfaced).
 
-Safety (ADR-0014; PoI plan v2), identical to the merged read-only clients:
+Request lifecycle correctness (fixes the reqId-reuse bug found on the owner run,
+which produced 322 "Duplicate ticker ID", 366 "No historical data query found"
+and 162 "query cancelled"):
 
-- ISOLATION: ``ibapi`` is imported lazily inside ``_build_ibapi_transport`` and
-  only read-only request verbs are ever called; this module imports and is fully
-  unit-tested WITHOUT ``ibapi`` and WITHOUT any socket via an injected transport.
-- PAPER ONLY: endpoint re-validated (localhost + paper port 4002; live 4001
-  rejected). The DU-account gate + masking live alongside.
-- HONEST DATA: bar values are recorded as strings exactly as IBKR returns them
-  (no float in evidence, no invented adjustment). The ACTUAL adjustment is
-  revealed by comparing TRADES vs ADJUSTED_LAST — never assumed.
-- FAIL CLOSED: every timeout or genuine IBKR error fails closed; pacing/error
-  codes are recorded, never silently retried. No order verb is referenced.
+- **Unique request ids.** A per-client monotonic allocator gives EVERY request
+  (historical, head-timestamp, contract, matching, account) its own reqId. No
+  fixed constant is reused across sequential requests.
+- **Request-correlated callbacks.** Every callback and error carries its reqId
+  and is routed to that request's own slot. An error for a retired reqId is a
+  stray note and can NEVER mutate a later request's evidence.
+- **No cancel after normal completion.** A finite ``reqHistoricalData``
+  (``keepUpToDate=False``) is complete on ``historicalDataEnd`` and is NOT
+  cancelled afterwards (cancelling a completed one-shot is what generated 366).
+  ``reqHeadTimeStamp`` completion is likewise not cancelled. Cancel happens ONLY
+  on a timeout/abort while the request is still active, and only for that reqId.
+  (``reqAccountSummary`` IS a subscription, so it is cancelled after its end —
+  the documented pattern.)
+
+Safety (ADR-0014; PoI plan v2): ``ibapi`` is imported lazily inside
+``_build_ibapi_transport`` and only read-only request verbs are ever called;
+this module imports and is fully unit-tested WITHOUT ``ibapi`` and WITHOUT any
+socket. Endpoint re-validated (localhost + paper port 4002; live 4001 rejected).
+Bar values are recorded as strings exactly as IBKR returns them (no float in
+evidence). Every timeout or genuine IBKR error fails closed; no order verb is
+referenced.
 """
 
 from __future__ import annotations
@@ -49,26 +61,25 @@ from trading_broker_ibkr.poi_readonly_session import (
     _validate_endpoint,
 )
 
-HISTORICAL_CLIENT_VERSION = "poi-ibkr-historical-client-1.0.0"
+HISTORICAL_CLIENT_VERSION = "poi-ibkr-historical-client-2.0.0"
 
 DEFAULT_CLIENT_ID = 0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 
-_ACCOUNT_SUMMARY_REQ_ID = 8101
-_HEAD_TS_REQ_ID = 8201
-_HISTORICAL_REQ_ID = 8301
-_CONTRACT_REQ_ID = 8401
-_MATCHING_REQ_ID = 8501
-_ACCOUNT_SUMMARY_TAGS = "NetLiquidation"
+#: Base for the monotonic per-client request-id allocator. IBKR reqIds must be
+#: positive and unique per connection; a fresh id is allocated for EVERY request.
+_REQ_ID_BASE = 9000
 
 #: whatToShow values relevant to the frozen strategy's dataset contract.
 WHAT_TO_SHOW = ("TRADES", "BID", "ASK", "MIDPOINT", "ADJUSTED_LAST")
 
 #: IBKR error codes that indicate PACING / historical service limits (recorded,
-#: never silently retried). 162 carries pacing violations + "no data"; 165 is a
-#: service note; 320-322 server/pacing; 366 no query found; 100 max message rate.
+#: never silently retried). 162 carries pacing/"no data"/"cancelled"; 165 a
+#: service note; 320-322 server/duplicate-id; 366 no query found; 100 max rate.
 _PACING_ERROR_CODES: frozenset[int] = frozenset({100, 162, 165, 320, 321, 322, 366, 420})
 _NO_SECURITY_DEFINITION_CODE = 200
+#: reqId-less system messages below this code are treated as connection-fatal
+#: unless they are benign connectivity notices.
 _FATAL_ERROR_CEILING = 1100
 _CONNECTIVITY_NOTICES: frozenset[int] = frozenset({1100, 1101, 1102})
 
@@ -100,6 +111,7 @@ class HistoricalSeries:
     bars_sample: tuple[HistoricalBar, ...]  # first/last only, for evidence
     pacing_notes: tuple[str, ...]
     error: str | None
+    request_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +120,7 @@ class HeadTimestamp:
     what_to_show: str
     value: str | None
     error: str | None
+    request_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +152,12 @@ class MatchingSymbols:
 
 
 class HistoricalTransport(Protocol):
-    """Minimal read-only historical transport seam the client drives."""
+    """Minimal read-only historical transport seam the client drives.
+
+    Every request carries its own ``req_id``; cancels target a specific
+    ``req_id`` and are issued ONLY on timeout/abort (except account summary,
+    a subscription cancelled after its end).
+    """
 
     def start(self, host: str, port: int, client_id: int, sink: HistoricalSink) -> None: ...
 
@@ -170,33 +188,55 @@ class HistoricalTransport(Protocol):
 
 
 @dataclass
+class _Slot:
+    """Per-reqId request state; a request only ever touches its own slot."""
+
+    kind: str  # hist | head | contract | match | account
+    done: threading.Event = field(default_factory=threading.Event)
+    error: str | None = None
+    pacing: list[str] = field(default_factory=list)
+    # historical
+    bars: list[HistoricalBar] = field(default_factory=list)
+    complete: bool = False  # historicalDataEnd received (normal completion)
+    # head
+    head_value: str | None = None
+    # contract
+    con_ids: list[int] = field(default_factory=list)
+    long_name: str = ""
+    primary_exchange: str = ""
+    # match
+    matches: list[SymbolMatch] = field(default_factory=list)
+    # account
+    account_id: str = ""
+
+
+@dataclass
 class HistoricalSink:
-    """Thread-safe buffers + events that read-only callbacks feed."""
+    """Thread-safe, per-reqId routing of read-only callbacks and errors."""
 
     ready: threading.Event = field(default_factory=threading.Event)
     time_ready: threading.Event = field(default_factory=threading.Event)
-    account_ready: threading.Event = field(default_factory=threading.Event)
-    head_ready: threading.Event = field(default_factory=threading.Event)
-    hist_ready: threading.Event = field(default_factory=threading.Event)
-    contract_ready: threading.Event = field(default_factory=threading.Event)
-    matching_ready: threading.Event = field(default_factory=threading.Event)
     _lock: threading.Lock = field(default_factory=threading.Lock)
-
     time_value: str = ""
-    account_id: str = ""
-    head_value: str | None = None
-    head_error: str | None = None
-    bars: list[HistoricalBar] = field(default_factory=list)
-    hist_error: str | None = None
-    pacing_notes: list[str] = field(default_factory=list)
-    contract_con_ids: list[int] = field(default_factory=list)
-    contract_long_name: str = ""
-    contract_primary_exchange: str = ""
-    contract_error: str | None = None
-    matches: list[SymbolMatch] = field(default_factory=list)
-    matching_error: str | None = None
+    slots: dict[int, _Slot] = field(default_factory=dict)
+    stray_errors: list[str] = field(default_factory=list)
     fatal_error: str | None = None
 
+    # -- slot lifecycle ----------------------------------------------------
+    def open_slot(self, req_id: int, kind: str) -> _Slot:
+        slot = _Slot(kind=kind)
+        with self._lock:
+            self.slots[req_id] = slot
+        return slot
+
+    def close_slot(self, req_id: int) -> None:
+        with self._lock:
+            self.slots.pop(req_id, None)
+
+    def _slot(self, req_id: int) -> _Slot | None:
+        return self.slots.get(req_id)
+
+    # -- connection / time -------------------------------------------------
     def on_ready(self) -> None:
         self.ready.set()
 
@@ -205,83 +245,102 @@ class HistoricalSink:
             self.time_value = datetime.fromtimestamp(int(epoch_seconds), tz=UTC).isoformat()
         self.time_ready.set()
 
-    def on_account_value(self, account: str, tag: str, value: str) -> None:
+    # -- account -----------------------------------------------------------
+    def on_account_value(self, req_id: int, account: str, tag: str, value: str) -> None:
         with self._lock:
-            if not self.account_id:
-                self.account_id = account
+            slot = self.slots.get(req_id)
+            if slot is not None and not slot.account_id:
+                slot.account_id = account
 
-    def on_account_end(self) -> None:
-        self.account_ready.set()
+    def on_account_end(self, req_id: int) -> None:
+        self._complete(req_id)
 
-    def on_head_timestamp(self, value: str) -> None:
+    # -- head timestamp ----------------------------------------------------
+    def on_head_timestamp(self, req_id: int, value: str) -> None:
         with self._lock:
-            self.head_value = str(value)
-        self.head_ready.set()
+            slot = self.slots.get(req_id)
+            if slot is not None:
+                slot.head_value = str(value)
+        self._complete(req_id)
 
+    # -- historical --------------------------------------------------------
     def on_historical_bar(
-        self, date: str, o: object, h: object, low: object, c: object, volume: object
+        self, req_id: int, date: str, o: object, h: object, low: object, c: object, volume: object
     ) -> None:
         with self._lock:
-            self.bars.append(
-                HistoricalBar(str(date), str(o), str(h), str(low), str(c), str(volume))
-            )
+            slot = self.slots.get(req_id)
+            if slot is not None:
+                slot.bars.append(
+                    HistoricalBar(str(date), str(o), str(h), str(low), str(c), str(volume))
+                )
 
-    def on_historical_end(self) -> None:
-        self.hist_ready.set()
-
-    def on_contract(self, con_id: int, long_name: str, primary_exchange: str) -> None:
+    def on_historical_end(self, req_id: int) -> None:
         with self._lock:
-            self.contract_con_ids.append(int(con_id))
-            self.contract_long_name = str(long_name)
-            self.contract_primary_exchange = str(primary_exchange)
+            slot = self.slots.get(req_id)
+            if slot is not None:
+                slot.complete = True
+        self._complete(req_id)
 
-    def on_contract_end(self) -> None:
-        self.contract_ready.set()
-
-    def on_symbol_match(
-        self, symbol: str, con_id: int, sec_type: str, primary_exchange: str, description: str
-    ) -> None:
+    # -- contract details --------------------------------------------------
+    def on_contract(self, req_id: int, con_id: int, long_name: str, primary_exchange: str) -> None:
         with self._lock:
-            self.matches.append(
-                SymbolMatch(str(symbol), int(con_id), str(sec_type),
-                            str(primary_exchange), str(description))
-            )
-        self.matching_ready.set()
+            slot = self.slots.get(req_id)
+            if slot is not None:
+                slot.con_ids.append(int(con_id))
+                slot.long_name = str(long_name)
+                slot.primary_exchange = str(primary_exchange)
 
+    def on_contract_end(self, req_id: int) -> None:
+        self._complete(req_id)
+
+    # -- matching symbols --------------------------------------------------
+    def on_symbol_samples(self, req_id: int, matches: list[SymbolMatch]) -> None:
+        with self._lock:
+            slot = self.slots.get(req_id)
+            if slot is not None:
+                slot.matches.extend(matches)
+        self._complete(req_id)
+
+    # -- errors ------------------------------------------------------------
     def on_callback_shape_error(self, detail: str) -> None:
         with self._lock:
             self.fatal_error = f"IBKR callback incompatibility: {detail}"
         self._release_all()
 
-    def on_error(self, code: int, message: object) -> None:
+    def on_error(self, req_id: int | None, code: int, message: object) -> None:
         text = f"{code}: {normalize_message(message)}"
-        if code in _PACING_ERROR_CODES:
+        if req_id is not None and req_id >= 0:
             with self._lock:
-                self.pacing_notes.append(text)
-                # 162/366 terminate the pending historical/head request.
-                if self.head_value is None:
-                    self.head_error = self.head_error or text
-                self.hist_error = self.hist_error or text
-            self.head_ready.set()
-            self.hist_ready.set()
+                slot = self.slots.get(req_id)
+                if slot is None:
+                    # Late error for a retired request: recorded but NEVER
+                    # allowed to touch any active request's evidence.
+                    self.stray_errors.append(text)
+                    return
+                if code in _PACING_ERROR_CODES:
+                    slot.pacing.append(text)
+                if slot.error is None:
+                    slot.error = text
+                event = slot.done
+            event.set()
             return
-        if code == _NO_SECURITY_DEFINITION_CODE:
-            with self._lock:
-                self.contract_error = text
-                self.matching_error = self.matching_error or text
-            self.contract_ready.set()
-            self.matching_ready.set()
-            return
+        # reqId-less system message: fatal only for a genuine connection failure.
         if code < _FATAL_ERROR_CEILING and code not in _CONNECTIVITY_NOTICES:
             with self._lock:
                 self.fatal_error = f"IBKR error {text}"
             self._release_all()
 
+    def _complete(self, req_id: int) -> None:
+        slot = self.slots.get(req_id)
+        if slot is not None:
+            slot.done.set()
+
     def _release_all(self) -> None:
-        for event in (
-            self.ready, self.time_ready, self.account_ready, self.head_ready,
-            self.hist_ready, self.contract_ready, self.matching_ready,
-        ):
+        self.ready.set()
+        self.time_ready.set()
+        with self._lock:
+            events = [slot.done for slot in self.slots.values()]
+        for event in events:
             event.set()
 
 
@@ -290,7 +349,7 @@ def _utc_now_iso() -> str:
 
 
 class IbkrHistoricalRawClient:
-    """Concrete read-only historical client driving a transport seam."""
+    """Concrete read-only historical client with unique-reqId correlation."""
 
     def __init__(
         self,
@@ -306,6 +365,14 @@ class IbkrHistoricalRawClient:
         self._now = now
         self._transport: HistoricalTransport | None = None
         self._sink: HistoricalSink | None = None
+        self._next_req_id = _REQ_ID_BASE
+        self._id_lock = threading.Lock()
+
+    def _alloc(self) -> int:
+        with self._id_lock:
+            req_id = self._next_req_id
+            self._next_req_id += 1
+        return req_id
 
     def open(self, host: str, port: int) -> None:
         _validate_endpoint(host, port)
@@ -319,90 +386,107 @@ class IbkrHistoricalRawClient:
             raise PoiSessionError(f"connect failed: {type(error).__name__}") from error
         self._transport = transport
         self._sink = sink
-        self._await(sink.ready, "connection ready")
+        if not sink.ready.wait(self._timeout):
+            raise PoiSessionError("timed out waiting for connection ready")
+        if sink.fatal_error:
+            raise PoiSessionError(sink.fatal_error)
 
     def current_time(self) -> str:
         sink, transport = self._require_open()
         sink.time_ready.clear()
         transport.request_current_time()
-        self._await(sink.time_ready, "current time")
+        if not sink.time_ready.wait(self._timeout):
+            raise PoiSessionError("timed out waiting for current time")
+        self._check_fatal(sink)
         return sink.time_value
 
     def account_summary(self) -> ReadOnlyAccountSummary:
         sink, transport = self._require_open()
-        sink.account_ready.clear()
-        transport.request_account_summary(_ACCOUNT_SUMMARY_REQ_ID, _ACCOUNT_SUMMARY_TAGS)
-        self._await(sink.account_ready, "account summary")
-        transport.cancel_account_summary(_ACCOUNT_SUMMARY_REQ_ID)
+        req_id = self._alloc()
+        slot = sink.open_slot(req_id, "account")
+        transport.request_account_summary(req_id, "NetLiquidation")
+        try:
+            self._wait_slot(sink, slot, req_id, "account summary", transport.cancel_account_summary)
+        finally:
+            pass
+        # Account summary is a SUBSCRIPTION: cancel after its end (documented).
+        transport.cancel_account_summary(req_id)
+        account_id = slot.account_id
+        sink.close_slot(req_id)
         return ReadOnlyAccountSummary(
-            account_id=sink.account_id, net_liquidation="", total_cash="", buying_power=""
+            account_id=account_id, net_liquidation="", total_cash="", buying_power=""
         )
 
     def head_timestamp(self, symbol: str, what_to_show: str, use_rth: int = 1) -> HeadTimestamp:
         sink, transport = self._require_open()
-        sink.head_ready.clear()
-        sink.head_value = None
-        sink.head_error = None
-        transport.request_head_timestamp(_HEAD_TS_REQ_ID, symbol, what_to_show, use_rth)
-        self._await(sink.head_ready, "head timestamp")
-        transport.cancel_head_timestamp(_HEAD_TS_REQ_ID)
-        return HeadTimestamp(symbol, what_to_show, sink.head_value, sink.head_error)
+        req_id = self._alloc()
+        slot = sink.open_slot(req_id, "head")
+        transport.request_head_timestamp(req_id, symbol, what_to_show, use_rth)
+        # A one-shot head timestamp; on normal completion do NOT cancel (that is
+        # what generated cleanup errors). Cancel ONLY if the wait times out.
+        self._wait_slot(sink, slot, req_id, "head timestamp", transport.cancel_head_timestamp)
+        result = HeadTimestamp(symbol, what_to_show, slot.head_value, slot.error, req_id)
+        sink.close_slot(req_id)
+        return result
 
     def historical(
         self, symbol: str, what_to_show: str, *, bar_size: str = "1 day",
         duration: str = "10 D", use_rth: int = 1,
     ) -> HistoricalSeries:
         sink, transport = self._require_open()
-        sink.hist_ready.clear()
-        sink.bars = []
-        sink.hist_error = None
-        sink.pacing_notes = []
+        req_id = self._alloc()
+        slot = sink.open_slot(req_id, "hist")
         transport.request_historical_data(
-            _HISTORICAL_REQ_ID, symbol, what_to_show, bar_size, duration, use_rth
+            req_id, symbol, what_to_show, bar_size, duration, use_rth
         )
-        self._await(sink.hist_ready, "historical data")
-        transport.cancel_historical_data(_HISTORICAL_REQ_ID)  # read-only cleanup
-        bars = list(sink.bars)
+        # A finite (keepUpToDate=False) request is complete on historicalDataEnd;
+        # do NOT cancel it afterwards. Cancel ONLY on a timeout while still active.
+        self._wait_slot(sink, slot, req_id, "historical data", transport.cancel_historical_data)
+        bars = list(slot.bars)
         sample: tuple[HistoricalBar, ...] = ()
         if bars:
             sample = (bars[0], bars[-1]) if len(bars) > 1 else (bars[0],)
-        return HistoricalSeries(
+        result = HistoricalSeries(
             symbol=symbol, what_to_show=what_to_show, bar_size=bar_size, use_rth=use_rth,
             duration=duration, row_count=len(bars),
             earliest_bar=bars[0].date if bars else None,
             latest_bar=bars[-1].date if bars else None,
-            bars_sample=sample, pacing_notes=tuple(sink.pacing_notes), error=sink.hist_error,
+            bars_sample=sample, pacing_notes=tuple(slot.pacing), error=slot.error,
+            request_id=req_id,
         )
+        sink.close_slot(req_id)
+        return result
 
     def contract_identity(self, symbol: str) -> ContractIdentity:
         sink, transport = self._require_open()
-        sink.contract_ready.clear()
-        sink.contract_con_ids = []
-        sink.contract_error = None
-        transport.request_contract_details(_CONTRACT_REQ_ID, symbol)
-        self._await(sink.contract_ready, "contract details")
-        if sink.contract_error is not None:
-            return ContractIdentity(symbol, False, None, "", "", sink.contract_error)
-        count = len(sink.contract_con_ids)
-        if count == 0:
+        req_id = self._alloc()
+        slot = sink.open_slot(req_id, "contract")
+        transport.request_contract_details(req_id, symbol)
+        self._wait_slot(sink, slot, req_id, "contract details", None)
+        error, con_ids = slot.error, list(slot.con_ids)
+        long_name, primary = slot.long_name, slot.primary_exchange
+        sink.close_slot(req_id)
+        if error is not None:
+            return ContractIdentity(symbol, False, None, "", "", error)
+        if len(con_ids) == 0:
             return ContractIdentity(symbol, False, None, "", "", "no contract found")
-        if count > 1:
+        if len(con_ids) > 1:
             return ContractIdentity(
-                symbol, False, None, "", "", f"ambiguous: {count} contracts; fail closed"
+                symbol, False, None, "", "", f"ambiguous: {len(con_ids)} contracts; fail closed"
             )
         return ContractIdentity(
-            symbol, True, sink.contract_con_ids[0], sink.contract_long_name,
-            sink.contract_primary_exchange, "single contract resolved",
+            symbol, True, con_ids[0], long_name, primary, "single contract resolved"
         )
 
     def matching_symbols(self, pattern: str) -> MatchingSymbols:
         sink, transport = self._require_open()
-        sink.matching_ready.clear()
-        sink.matches = []
-        sink.matching_error = None
-        transport.request_matching_symbols(_MATCHING_REQ_ID, pattern)
-        self._await(sink.matching_ready, "matching symbols")
-        return MatchingSymbols(pattern, tuple(sink.matches), sink.matching_error)
+        req_id = self._alloc()
+        slot = sink.open_slot(req_id, "match")
+        transport.request_matching_symbols(req_id, pattern)
+        self._wait_slot(sink, slot, req_id, "matching symbols", None)
+        result = MatchingSymbols(pattern, tuple(slot.matches), slot.error)
+        sink.close_slot(req_id)
+        return result
 
     def close(self) -> None:
         if self._transport is not None:
@@ -410,16 +494,34 @@ class IbkrHistoricalRawClient:
         self._transport = None
         self._sink = None
 
+    # -- internals ---------------------------------------------------------
     def _require_open(self) -> tuple[HistoricalSink, HistoricalTransport]:
         if self._sink is None or self._transport is None:
             raise PoiSessionError("client is not open")
         return self._sink, self._transport
 
-    def _await(self, event: threading.Event, what: str) -> None:
-        if not event.wait(self._timeout):
-            raise PoiSessionError(f"timed out waiting for {what}")
-        if self._sink is not None and self._sink.fatal_error:
-            raise PoiSessionError(self._sink.fatal_error)
+    def _wait_slot(
+        self,
+        sink: HistoricalSink,
+        slot: _Slot,
+        req_id: int,
+        what: str,
+        cancel: Callable[[int], None] | None,
+    ) -> None:
+        """Wait for THIS request's completion; cancel only on timeout/abort."""
+        if not slot.done.wait(self._timeout):
+            if cancel is not None:
+                cancel(req_id)  # cancel ONLY this request, and ONLY on timeout
+            sink.close_slot(req_id)
+            raise PoiSessionError(f"timed out waiting for {what} (reqId={req_id})")
+        if sink.fatal_error:
+            sink.close_slot(req_id)
+            raise PoiSessionError(sink.fatal_error)
+
+    @staticmethod
+    def _check_fatal(sink: HistoricalSink) -> None:
+        if sink.fatal_error:
+            raise PoiSessionError(sink.fatal_error)
 
 
 def _build_ibapi_transport() -> HistoricalTransport:
@@ -466,30 +568,31 @@ def _build_ibapi_transport() -> HistoricalTransport:
             self, req_id: int, account: str, tag: str, value: str, currency: str
         ) -> None:
             if self._sink is not None:
-                self._sink.on_account_value(account, tag, value)
+                self._sink.on_account_value(req_id, account, tag, value)
 
         def accountSummaryEnd(self, req_id: int) -> None:  # noqa: N802
             if self._sink is not None:
-                self._sink.on_account_end()
+                self._sink.on_account_end(req_id)
 
         def headTimestamp(self, req_id: int, head_timestamp: str) -> None:  # noqa: N802
             if self._sink is not None:
-                self._sink.on_head_timestamp(head_timestamp)
+                self._sink.on_head_timestamp(req_id, head_timestamp)
 
         def historicalData(self, req_id: int, bar: Any) -> None:  # noqa: N802
             if self._sink is not None:
                 self._sink.on_historical_bar(
-                    bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume
+                    req_id, bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume
                 )
 
         def historicalDataEnd(self, req_id: int, start: str, end: str) -> None:  # noqa: N802
             if self._sink is not None:
-                self._sink.on_historical_end()
+                self._sink.on_historical_end(req_id)
 
         def contractDetails(self, req_id: int, contract_details: Any) -> None:  # noqa: N802
             if self._sink is not None:
                 contract = contract_details.contract
                 self._sink.on_contract(
+                    req_id,
                     getattr(contract, "conId", 0),
                     getattr(contract_details, "longName", ""),
                     getattr(contract, "primaryExchange", ""),
@@ -497,21 +600,22 @@ def _build_ibapi_transport() -> HistoricalTransport:
 
         def contractDetailsEnd(self, req_id: int) -> None:  # noqa: N802
             if self._sink is not None:
-                self._sink.on_contract_end()
+                self._sink.on_contract_end(req_id)
 
         def symbolSamples(self, req_id: int, contract_descriptions: Any) -> None:  # noqa: N802
             if self._sink is None:
                 return
-            for description in contract_descriptions:
-                contract = description.contract
-                self._sink.on_symbol_match(
-                    getattr(contract, "symbol", ""),
-                    getattr(contract, "conId", 0),
-                    getattr(contract, "secType", ""),
-                    getattr(contract, "primaryExchange", ""),
+            matches = [
+                SymbolMatch(
+                    getattr(description.contract, "symbol", ""),
+                    getattr(description.contract, "conId", 0),
+                    getattr(description.contract, "secType", ""),
+                    getattr(description.contract, "primaryExchange", ""),
                     ",".join(getattr(description, "derivativeSecTypes", []) or []),
                 )
-            self._sink.matching_ready.set()
+                for description in contract_descriptions
+            ]
+            self._sink.on_symbol_samples(req_id, matches)
 
         def error(self, *args: object, **kwargs: object) -> None:  # noqa: N802
             if self._sink is None:
@@ -521,7 +625,7 @@ def _build_ibapi_transport() -> HistoricalTransport:
             except ErrorCallbackShapeError as shape_error:
                 self._sink.on_callback_shape_error(str(shape_error))
                 return
-            self._sink.on_error(normalized.code, normalized.message)
+            self._sink.on_error(normalized.request_id, normalized.code, normalized.message)
 
     class _IbApiTransport:  # pragma: no cover - exercised only on the host
         def __init__(self) -> None:
