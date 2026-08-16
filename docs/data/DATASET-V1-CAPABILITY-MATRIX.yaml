@@ -82,6 +82,15 @@ capabilities:
       Synthetic or fabricated events are never evidence; the cell stays blocked
       until a REAL historical source with a verifiable checksum is supplied.
 
+builder:
+  implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1_builder.py
+  snapshot_readiness_levels: [CONTRACT_ONLY, PARTIAL_DATA, EMPIRICAL_REFERENCE_READY,
+                              BACKTEST_ELIGIBLE]
+  # A snapshot built from fixtures reaches CONTRACT_ONLY at most. While any of the
+  # four external cells below is BLOCKED_EXTERNAL, no snapshot can be
+  # BACKTEST_ELIGIBLE — "built successfully" is never "backtest ready".
+  current_max_readiness: CONTRACT_ONLY
+
 readiness:
   active_name_price_qualification_sufficient: true
   full_dataset_contract_ready: false

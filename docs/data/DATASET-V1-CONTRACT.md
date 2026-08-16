@@ -114,6 +114,78 @@ evidence. No real reference source or evidence is wired in this repository, so
 `corporate_actions` **all remain `BLOCKED_EXTERNAL`** and
 `full_dataset_contract_ready` stays false.
 
+## Builder / materialization / reproducible snapshot
+
+`packages/py/market-data-core/src/trading_market_data_core/dataset_v1_builder.py`
+composes the model into an immutable, versioned, point-in-time **snapshot**.
+
+**Explicit build inputs — no hidden "today".** `BuildConfig` requires `as_of`,
+`known_as_of` (tz-aware), `index_id`, an `AdjustmentPolicy` and a `LineagePolicy`.
+Nothing reads a wall clock to decide visibility; `built_at` is manifest metadata
+and is **excluded from the fingerprint**, so rebuilding later yields the same
+`snapshot_id`.
+
+**Materialization.** The universe is the membership effective at `as_of` and known
+by `known_as_of` (later-delisted names retained, future entrants excluded, the
+**historical** ticker resolved via symbol history). GICS is resolved as-of and
+reports `KNOWN` / `UNKNOWN` / `NO_SOURCE_COVERAGE` — never back-projected. Prices
+are bounded by `as_of` **and** by the knowledge cutoff on their observation time;
+invalid prices are rejected; forward-fill is **off** unless explicitly enabled
+with a written justification.
+
+**Adjust exactly once.** `RAW` keeps raw prices; `PROVIDER_ADJUSTED` never
+re-adjusts a provider series; `INTERNAL_LEDGER_ADJUSTED` adjusts **raw** prices
+only, requires visible corporate-action coverage, applies splits/reverse splits
+deterministically (`ratio` = new shares per old share; only prices strictly
+before the effective date are restated) and stamps `adjusted_with_ledger`.
+`UNKNOWN` or **mixed** adjustment status fails closed. Dividend adjustment is
+deliberately not implemented and fails closed rather than emitting unverified
+adjusted returns.
+
+**Lineage is recorded, never applied.** `LineagePolicy.NO_STITCH` is the default
+and the only implemented policy; `STITCH_ECONOMIC_LINEAGE` fails closed so
+stitching can never happen implicitly. Links are typed
+(`SAME_SECURITY_SYMBOL_CHANGE`, `TERMINATED_PREDECESSOR`, `SUCCESSOR_SECURITY`,
+`SPINOFF_CHILD`, `UNKNOWN_AMBIGUOUS`) and the policy is recorded in the manifest.
+
+**Manifest + integrity.** The manifest carries contract/builder versions,
+snapshot id, fingerprint, as_of/known_as_of, index, counts, source names/versions/
+checksums, verified evidence references, adjustment and lineage policy, readiness,
+blocked capabilities, validation errors, warnings and the coverage report; it has
+its own `checksum()`. `serialize_snapshot` emits canonical deterministic JSON
+(Decimals as strings, ISO dates/timestamps, sorted keys), and
+`snapshot_fingerprint_from_serialized` re-verifies both the manifest checksum and
+the content fingerprint, so manifest **or** data tampering is detected.
+
+**Reproducibility guarantees (tested).** Same inputs/config → same snapshot id;
+input and ingestion ordering are irrelevant; wall clock does not affect the
+fingerprint; a later restatement or retraction does **not** alter an older
+snapshot rebuilt with the same `known_as_of`, while a later `known_as_of`
+legitimately differs; adjustment policy, lineage policy, `as_of` and source
+checksums all change the fingerprint.
+
+## Backtest contract boundary
+
+The future backtest engine consumes a **materialized, validated `DatasetSnapshot`**
+— never raw ingestion records.
+
+It **may assume**: the universe is point-in-time and survivorship-safe; symbols
+are historical; GICS coverage state is explicit; prices are bounded by `as_of`,
+knowledge-gated, `Decimal`, and adjusted **exactly once** per the recorded policy;
+lineage links are informational; the manifest fingerprint identifies the exact
+inputs.
+
+It **must never infer**: that missing price data means delisting; that an
+`UNKNOWN` GICS is the current sector; that lineage may be stitched; that it may
+re-adjust prices; or that a successful build implies data quality.
+
+**Required readiness:** a backtest may only run on a snapshot whose
+`ReadinessLevel` is `BACKTEST_ELIGIBLE`. The levels are `CONTRACT_ONLY` →
+`PARTIAL_DATA` → `EMPIRICAL_REFERENCE_READY` → `BACKTEST_ELIGIBLE`, computed from
+**real capability evidence** (plus clean validation and full price coverage).
+Fixtures reach `CONTRACT_ONLY` at most; while the four external cells are
+`BLOCKED_EXTERNAL`, no snapshot can be backtest-eligible.
+
 ## Survivorship-bias protection
 
 Proven by acceptance tests: a security present in historical membership stays in
