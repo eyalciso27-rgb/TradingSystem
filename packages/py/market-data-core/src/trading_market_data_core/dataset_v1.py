@@ -7,12 +7,15 @@ it does not claim that any external source has supplied those fields.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 
 class CapabilityState(StrEnum):
@@ -106,8 +109,10 @@ class CorporateActionRecord:
     action_type: CorporateActionType
     effective_on: date
     provenance: Provenance
-    ratio: float | None = None
-    cash_amount: float | None = None
+    # Financial magnitudes are Decimal, never float (market-data-core convention;
+    # precision is never lost to floats — see ``types.py``).
+    ratio: Decimal | None = None
+    cash_amount: Decimal | None = None
     successor_security_id: str | None = None
 
 
@@ -115,13 +120,13 @@ class CorporateActionRecord:
 class DailyPriceRecord:
     security_id: str
     trading_date: date
-    close: float
+    close: Decimal
     provenance: Provenance
-    open: float | None = None
-    high: float | None = None
-    low: float | None = None
-    volume: float | None = None
-    adjusted_close: float | None = None
+    open: Decimal | None = None
+    high: Decimal | None = None
+    low: Decimal | None = None
+    volume: Decimal | None = None
+    adjusted_close: Decimal | None = None
     ibkr_con_id: int | None = None
 
 
@@ -177,6 +182,13 @@ class DatasetV1:
         identities = {identity.security_id: identity for identity in self.securities}
         if len(identities) != len(self.securities):
             errors.append("duplicate security_id in securities")
+        for identity in self.securities:
+            if not identity.security_id.strip():
+                errors.append("security identity has empty security_id")
+            if not identity.symbol.strip():
+                errors.append(f"security {identity.security_id} has empty symbol")
+            if not identity.primary_exchange.strip():
+                errors.append(f"security {identity.security_id} has empty primary_exchange")
 
         def require_identity(kind: str, security_id: str) -> None:
             if security_id not in identities:
@@ -218,6 +230,8 @@ class DatasetV1:
             seen_prices.add(key)
             if price.close <= 0:
                 errors.append(f"price close must be > 0 for {price.security_id}")
+            if price.volume is not None and price.volume < 0:
+                errors.append(f"price volume must be >= 0 for {price.security_id}")
             provenance_rows.append(("price", price.security_id, price.provenance))
 
         for kind, security_id, provenance in provenance_rows:
@@ -267,6 +281,19 @@ def _overlap_errors(
     return errors
 
 
+def _recompute_evidence_checksum(payload: Mapping[str, Any]) -> str:
+    """Recompute the ``sha256:`` evidence checksum over the body.
+
+    Mirrors ``poi_historical_qualification`` exactly: the checksum covers every
+    field EXCEPT ``evidence_checksum`` itself, canonically serialized with sorted
+    keys, tight separators and ASCII encoding. Kept here (rather than importing
+    the broker package) so market-data-core has no broker dependency.
+    """
+    body = {key: value for key, value in payload.items() if key != "evidence_checksum"}
+    serialized = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(serialized.encode("ascii")).hexdigest()
+
+
 IBKR_HISTORICAL_CAPABILITIES = frozenset(
     {
         "connectivity_paper_du_gate",
@@ -297,11 +324,23 @@ class DatasetCapabilityMatrix:
     @classmethod
     def from_ibkr_historical_evidence(cls, path: str | Path) -> DatasetCapabilityMatrix:
         payload = json.loads(Path(path).read_bytes())
+        if not isinstance(payload, dict):
+            raise ValueError("historical evidence must be a JSON object")
         if payload.get("poi_id") != "POI-IBKR-HIST":
             raise ValueError("unexpected historical evidence poi_id")
         declared = payload.get("evidence_checksum")
         if not isinstance(declared, str) or not declared.startswith("sha256:"):
             raise ValueError("historical evidence is missing evidence_checksum")
+        # The checksum must be VERIFIED against the body, not merely present:
+        # a corrupt or tampered evidence file (e.g. a flipped capability) whose
+        # checksum was not regenerated is rejected fail-closed. This is what makes
+        # the checksum evidence rather than decoration.
+        recomputed = _recompute_evidence_checksum(payload)
+        if recomputed != declared:
+            raise ValueError(
+                "historical evidence checksum mismatch (tampered or corrupt): "
+                f"declared {declared}, recomputed {recomputed}"
+            )
         capabilities = payload.get("capabilities")
         if not isinstance(capabilities, dict):
             raise ValueError("historical evidence capabilities must be an object")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -51,8 +53,8 @@ def _security(security_id: str, symbol: str) -> SecurityIdentity:
     )
 
 
-def _write_evidence(tmp_path: Path, bid_ask_midpoint: str = "PASS") -> Path:
-    evidence = {
+def _evidence_body(bid_ask_midpoint: str = "PASS") -> dict[str, object]:
+    return {
         "poi_id": "POI-IBKR-HIST",
         "capabilities": {
             "connectivity_paper_du_gate": "PASS",
@@ -64,8 +66,21 @@ def _write_evidence(tmp_path: Path, bid_ask_midpoint: str = "PASS") -> Path:
         },
         "active_name_price_qualification_sufficient": True,
         "full_dataset_contract_ready": False,
-        "evidence_checksum": "sha256:abc123",
     }
+
+
+def _checksum(body: dict[str, object]) -> str:
+    serialized = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(serialized.encode("ascii")).hexdigest()
+
+
+def _write_evidence(
+    tmp_path: Path, bid_ask_midpoint: str = "PASS", *, checksum: str | None = None
+) -> Path:
+    body = _evidence_body(bid_ask_midpoint)
+    evidence = dict(body)
+    # a genuine checksum by default; an explicit one lets a test forge/tamper it
+    evidence["evidence_checksum"] = checksum if checksum is not None else _checksum(body)
     path = tmp_path / "evidence.json"
     path.write_text(json.dumps(evidence), encoding="utf-8")
     return path
@@ -134,7 +149,7 @@ def test_delisted_security_is_preserved_in_identity_and_history() -> None:
             DelistingRecord("gone", date(2021, 5, 3), "acquired", PROVENANCE),
         ),
         prices=(
-            DailyPriceRecord("gone", date(2021, 4, 30), 12.5, PROVENANCE),
+            DailyPriceRecord("gone", date(2021, 4, 30), Decimal("12.5"), PROVENANCE),
         ),
     )
 
@@ -173,7 +188,7 @@ def test_validator_rejects_unknown_identity_and_missing_provenance() -> None:
             DailyPriceRecord(
                 "missing",
                 date(2026, 8, 14),
-                100.0,
+                Decimal("100.0"),
                 Provenance(source="", observed_at=datetime(2026, 8, 16, 10, 0)),
             ),
         )
@@ -196,7 +211,7 @@ def test_corporate_action_split_requires_positive_ratio() -> None:
                 action_type=CorporateActionType.SPLIT,
                 effective_on=date(2024, 6, 1),
                 provenance=PROVENANCE,
-                ratio=0,
+                ratio=Decimal("0"),
             ),
         ),
     )
@@ -245,3 +260,48 @@ def test_non_pass_ibkr_capability_cannot_be_promoted(tmp_path: Path) -> None:
         DatasetCapabilityMatrix.from_ibkr_historical_evidence(
             _write_evidence(tmp_path, bid_ask_midpoint="PARTIAL")
         )
+
+
+def test_evidence_with_wrong_checksum_is_rejected(tmp_path: Path) -> None:
+    # a well-formed body but a checksum that does not match it -> fail closed
+    path = _write_evidence(tmp_path, checksum="sha256:" + "0" * 64)
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        DatasetCapabilityMatrix.from_ibkr_historical_evidence(path)
+
+
+def test_flipped_capability_with_stale_checksum_is_rejected(tmp_path: Path) -> None:
+    # the checksum is authenticated: flip a capability but keep the CLEAN body's
+    # checksum -> the recompute no longer matches -> rejected (not merely cosmetic)
+    body = _evidence_body()
+    stale_checksum = _checksum(body)
+    capabilities = body["capabilities"]
+    assert isinstance(capabilities, dict)
+    capabilities["daily_trades_rth_schema"] = "FAIL"  # tamper AFTER checksum
+    forged = dict(body)
+    forged["evidence_checksum"] = stale_checksum
+    path = tmp_path / "forged.json"
+    path.write_text(json.dumps(forged), encoding="utf-8")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        DatasetCapabilityMatrix.from_ibkr_historical_evidence(path)
+
+
+def test_validator_rejects_empty_security_identity() -> None:
+    dataset = DatasetV1(securities=(SecurityIdentity("", "", "", ibkr_con_id=1),))
+    report = dataset.validate()
+    assert not report.valid
+    text = " ".join(report.errors)
+    assert "empty security_id" in text
+
+
+def test_validator_rejects_negative_volume() -> None:
+    dataset = DatasetV1(
+        securities=(_security("x", "XYZ"),),
+        prices=(
+            DailyPriceRecord(
+                "x", date(2024, 1, 2), Decimal("10"), PROVENANCE, volume=Decimal("-1")
+            ),
+        ),
+    )
+    report = dataset.validate()
+    assert not report.valid
+    assert "volume must be >= 0" in " ".join(report.errors)
