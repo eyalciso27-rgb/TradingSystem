@@ -1,4 +1,4 @@
-import trading_market_data_core.dataset_v1 as dataset_v1
+from trading_market_data_core import dataset_v1
 
 
 EVIDENCE = "docs/poi/evidence/POI-IBKR-HIST.json"
