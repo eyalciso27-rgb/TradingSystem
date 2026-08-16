@@ -24,6 +24,7 @@ from trading_market_data_core.dataset_v1 import (
 
 UTC_NOW = datetime(2026, 8, 16, 10, 28, tzinfo=UTC)
 PROVENANCE = Provenance(source="fixture", observed_at=UTC_NOW)
+KNOWN = datetime(2019, 12, 1, tzinfo=UTC)  # knowledge time for reference assertions
 OWNER_EVIDENCE = Path("docs/poi/evidence/POI-IBKR-HIST.json")
 OWNER_EVIDENCE_CHECKSUM = (
     "sha256:663150437934774a09c3a5d5b81614458b4da329dfb42df64f930533ab552945"
@@ -91,16 +92,14 @@ def test_membership_lookup_is_point_in_time_and_excludes_future_entrant() -> Non
         securities=(_security("old", "OLD"), _security("new", "NEW")),
         memberships=(
             MembershipRecord(
-                "SP500",
-                "old",
-                EffectiveInterval(date(2020, 1, 1), date(2021, 12, 31)),
-                PROVENANCE,
+                record_id="m-old", index_id="SP500", security_id="old",
+                interval=EffectiveInterval(date(2020, 1, 1), date(2021, 12, 31)),
+                known_at=KNOWN, provenance=PROVENANCE,
             ),
             MembershipRecord(
-                "SP500",
-                "new",
-                EffectiveInterval(date(2022, 1, 1)),
-                PROVENANCE,
+                record_id="m-new", index_id="SP500", security_id="new",
+                interval=EffectiveInterval(date(2022, 1, 1)),
+                known_at=KNOWN, provenance=PROVENANCE,
             ),
         ),
     )
@@ -114,22 +113,16 @@ def test_gics_lookup_uses_as_of_classification() -> None:
         securities=(_security("x", "XYZ"),),
         gics=(
             GicsRecord(
-                "x",
-                "Information Technology",
-                None,
-                None,
-                None,
-                EffectiveInterval(date(2020, 1, 1), date(2022, 12, 31)),
-                PROVENANCE,
+                record_id="g-old", security_id="x", sector="Information Technology",
+                industry_group=None, industry=None, sub_industry=None,
+                interval=EffectiveInterval(date(2020, 1, 1), date(2022, 12, 31)),
+                known_at=KNOWN, provenance=PROVENANCE,
             ),
             GicsRecord(
-                "x",
-                "Communication Services",
-                None,
-                None,
-                None,
-                EffectiveInterval(date(2023, 1, 1)),
-                PROVENANCE,
+                record_id="g-new", security_id="x", sector="Communication Services",
+                industry_group=None, industry=None, sub_industry=None,
+                interval=EffectiveInterval(date(2023, 1, 1)),
+                known_at=KNOWN, provenance=PROVENANCE,
             ),
         ),
     )
@@ -163,16 +156,14 @@ def test_validator_rejects_overlapping_membership_intervals() -> None:
         securities=(_security("x", "XYZ"),),
         memberships=(
             MembershipRecord(
-                "SP500",
-                "x",
-                EffectiveInterval(date(2020, 1, 1), date(2021, 12, 31)),
-                PROVENANCE,
+                record_id="m-1", index_id="SP500", security_id="x",
+                interval=EffectiveInterval(date(2020, 1, 1), date(2021, 12, 31)),
+                known_at=KNOWN, provenance=PROVENANCE,
             ),
             MembershipRecord(
-                "SP500",
-                "x",
-                EffectiveInterval(date(2021, 6, 1), date(2022, 12, 31)),
-                PROVENANCE,
+                record_id="m-2", index_id="SP500", security_id="x",
+                interval=EffectiveInterval(date(2021, 6, 1), date(2022, 12, 31)),
+                known_at=KNOWN, provenance=PROVENANCE,
             ),
         ),
     )
@@ -291,6 +282,67 @@ def test_validator_rejects_empty_security_identity() -> None:
     assert not report.valid
     text = " ".join(report.errors)
     assert "empty security_id" in text
+
+
+def test_membership_restatement_is_invisible_before_it_is_known() -> None:
+    # original assertion: member 2020-01-01 .. 2021-12-31, known from 2020-01-01
+    original = MembershipRecord(
+        record_id="m-o", index_id="SP500", security_id="x",
+        interval=EffectiveInterval(date(2020, 1, 1), date(2021, 12, 31)),
+        known_at=datetime(2020, 1, 1, tzinfo=UTC), provenance=PROVENANCE,
+    )
+    # a later correction restating the exit EARLIER, first knowable on 2021-08-01
+    correction = MembershipRecord(
+        record_id="m-c", index_id="SP500", security_id="x",
+        interval=EffectiveInterval(date(2020, 1, 1), date(2021, 6, 30)),
+        known_at=datetime(2021, 8, 1, tzinfo=UTC), provenance=PROVENANCE, supersedes="m-o",
+    )
+    dataset = DatasetV1(securities=(_security("x", "XYZ"),), memberships=(original, correction))
+    assert dataset.validate().valid  # supersession, not a conflict
+
+    # a decision on 2021-07-01 (knowledge cutoff = that day) must NOT see the
+    # correction reported on 2021-08-01 -> x still looks like a member (no leak)
+    assert dataset.members_as_of("SP500", date(2021, 7, 1)) == frozenset({"x"})
+    # a decision on 2021-09-01 now knows x actually left on 2021-06-30
+    assert dataset.members_as_of("SP500", date(2021, 9, 1)) == frozenset()
+    # explicit knowledge axis: same event date, two different knowledge cutoffs
+    assert dataset.members_as_of(
+        "SP500", date(2021, 9, 1), known_as_of=datetime(2021, 7, 1, tzinfo=UTC)
+    ) == frozenset({"x"})
+    assert dataset.members_as_of(
+        "SP500", date(2021, 9, 1), known_as_of=datetime(2022, 1, 1, tzinfo=UTC)
+    ) == frozenset()
+
+
+def test_reference_records_require_tz_aware_known_at() -> None:
+    naive = datetime(2020, 1, 1)  # noqa: DTZ001 - deliberately naive for the test
+    with pytest.raises(ValueError, match="known_at must be timezone-aware"):
+        MembershipRecord(
+            record_id="m", index_id="SP500", security_id="x",
+            interval=EffectiveInterval(date(2020, 1, 1)), known_at=naive, provenance=PROVENANCE,
+        )
+    with pytest.raises(ValueError, match="known_at must be timezone-aware"):
+        GicsRecord(
+            record_id="g", security_id="x", sector="IT", industry_group=None, industry=None,
+            sub_industry=None, interval=EffectiveInterval(date(2020, 1, 1)), known_at=naive,
+            provenance=PROVENANCE,
+        )
+
+
+def test_members_as_of_rejects_naive_known_as_of() -> None:
+    dataset = DatasetV1(
+        securities=(_security("x", "XYZ"),),
+        memberships=(
+            MembershipRecord(
+                record_id="m", index_id="SP500", security_id="x",
+                interval=EffectiveInterval(date(2020, 1, 1)), known_at=KNOWN, provenance=PROVENANCE,
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="known_as_of must be timezone-aware"):
+        dataset.members_as_of(
+            "SP500", date(2021, 1, 1), known_as_of=datetime(2021, 1, 1)  # noqa: DTZ001
+        )
 
 
 def test_validator_rejects_negative_volume() -> None:
