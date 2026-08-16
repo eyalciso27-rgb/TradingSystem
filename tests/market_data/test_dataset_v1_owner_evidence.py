@@ -1,6 +1,9 @@
 from pathlib import Path
 
-from trading_market_data_core.dataset_v1 import CapabilityState, DatasetCapabilityMatrix
+from trading_market_data_core.dataset_v1 import (
+    CapabilityState,
+    DatasetCapabilityMatrix,
+)
 
 
 EVIDENCE = Path("docs/poi/evidence/POI-IBKR-HIST.json")
