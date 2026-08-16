@@ -9,13 +9,21 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+
+#: The end of an ``as_of`` calendar day in UTC — the default knowledge cutoff for
+#: a daily backtest deciding on that date (it may use any fact KNOWN by then).
+_UTC_MAX = datetime.max.replace(tzinfo=UTC)
+
+
+def end_of_day_utc(as_of: date) -> datetime:
+    return datetime.combine(as_of, time.max, tzinfo=UTC)
 
 
 class CapabilityState(StrEnum):
@@ -78,21 +86,55 @@ class SecurityIdentity:
 
 @dataclass(frozen=True, slots=True)
 class MembershipRecord:
+    """A bitemporal index-membership assertion.
+
+    Two time axes are carried: EFFECTIVE validity (``interval`` — when the
+    security genuinely was a member) and KNOWLEDGE/transaction time
+    (``known_at`` — when this assertion first became knowable). A later
+    correction supersedes an earlier assertion via ``supersedes`` and, because
+    it carries a later ``known_at``, is invisible to any as-of query whose
+    knowledge cutoff precedes it — restatements never leak backwards.
+    """
+
+    record_id: str
     index_id: str
     security_id: str
     interval: EffectiveInterval
+    known_at: datetime
     provenance: Provenance
+    supersedes: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.known_at.tzinfo is None:
+            raise ValueError("MembershipRecord.known_at must be timezone-aware")
+
+    @property
+    def bitemporal_key(self) -> tuple[str, ...]:
+        return (self.index_id, self.security_id)
 
 
 @dataclass(frozen=True, slots=True)
 class GicsRecord:
+    """A bitemporal as-of GICS classification assertion (see MembershipRecord)."""
+
+    record_id: str
     security_id: str
     sector: str
     industry_group: str | None
     industry: str | None
     sub_industry: str | None
     interval: EffectiveInterval
+    known_at: datetime
     provenance: Provenance
+    supersedes: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.known_at.tzinfo is None:
+            raise ValueError("GicsRecord.known_at must be timezone-aware")
+
+    @property
+    def bitemporal_key(self) -> tuple[str, ...]:
+        return (self.security_id,)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +172,40 @@ class DailyPriceRecord:
     ibkr_con_id: int | None = None
 
 
+class _Bitemporal(Protocol):
+    """Structural type for a bitemporal reference assertion (read-only)."""
+
+    @property
+    def record_id(self) -> str: ...
+
+    @property
+    def known_at(self) -> datetime: ...
+
+    @property
+    def supersedes(self) -> str | None: ...
+
+    @property
+    def bitemporal_key(self) -> tuple[str, ...]: ...
+
+
+def resolve_visible[B: _Bitemporal](records: Sequence[B], known_as_of: datetime) -> tuple[B, ...]:
+    """The current assertions known by ``known_as_of``.
+
+    Only assertions with ``known_at <= known_as_of`` are visible, and any
+    assertion superseded by a visible correction is dropped. This is the
+    knowledge-time (transaction-time) axis: a correction reported LATER than the
+    cutoff simply does not exist yet, so a past decision can never see a future
+    restatement.
+    """
+    if known_as_of.tzinfo is None:
+        raise ValueError("known_as_of must be timezone-aware")
+    visible = [record for record in records if record.known_at <= known_as_of]
+    superseded = {
+        record.supersedes for record in visible if record.supersedes is not None
+    }
+    return tuple(record for record in visible if record.record_id not in superseded)
+
+
 @dataclass(frozen=True, slots=True)
 class ValidationReport:
     errors: tuple[str, ...] = ()
@@ -153,21 +229,37 @@ class DatasetV1:
     corporate_actions: tuple[CorporateActionRecord, ...] = ()
     prices: tuple[DailyPriceRecord, ...] = ()
 
-    def members_as_of(self, index_id: str, as_of: date) -> frozenset[str]:
+    def members_as_of(
+        self, index_id: str, as_of: date, *, known_as_of: datetime | None = None
+    ) -> frozenset[str]:
+        """Members of ``index_id`` effective on ``as_of``, per knowledge available
+        by ``known_as_of`` (default: end of the ``as_of`` day, UTC).
+
+        Enforces BOTH axes: event-time (the interval must contain ``as_of``) and
+        knowledge-time (the assertion must have been known by ``known_as_of``),
+        so a later restatement cannot change a historical answer.
+        """
+        cutoff = known_as_of if known_as_of is not None else end_of_day_utc(as_of)
         return frozenset(
             row.security_id
-            for row in self.memberships
+            for row in resolve_visible(self.memberships, cutoff)
             if row.index_id == index_id and row.interval.contains(as_of)
         )
 
-    def gics_as_of(self, security_id: str, as_of: date) -> GicsRecord | None:
+    def gics_as_of(
+        self, security_id: str, as_of: date, *, known_as_of: datetime | None = None
+    ) -> GicsRecord | None:
+        """As-of GICS classification, enforcing event-time AND knowledge-time."""
+        cutoff = known_as_of if known_as_of is not None else end_of_day_utc(as_of)
         matches = [
             row
-            for row in self.gics
+            for row in resolve_visible(self.gics, cutoff)
             if row.security_id == security_id and row.interval.contains(as_of)
         ]
         if len(matches) > 1:
-            raise ValueError(f"overlapping GICS intervals for {security_id} on {as_of}")
+            raise ValueError(
+                f"conflicting GICS classifications for {security_id} on {as_of}"
+            )
         return matches[0] if matches else None
 
     def is_delisted_as_of(self, security_id: str, as_of: date) -> bool:
@@ -238,17 +330,8 @@ class DatasetV1:
             for error in provenance.validate():
                 errors.append(f"{kind} {security_id}: {error}")
 
-        errors.extend(
-            _overlap_errors(
-                ((membership.index_id, membership.security_id), membership.interval)
-                for membership in self.memberships
-            )
-        )
-        errors.extend(
-            _overlap_errors(
-                ((gics_row.security_id,), gics_row.interval) for gics_row in self.gics
-            )
-        )
+        errors.extend(_bitemporal_errors("membership", self.memberships))
+        errors.extend(_bitemporal_errors("gics", self.gics))
 
         membership_ids = {membership.security_id for membership in self.memberships}
         delisted_ids = {delisting.security_id for delisting in self.delistings}
@@ -259,6 +342,67 @@ class DatasetV1:
                 "absence of a delisting row is not evidence that a security survived"
             )
         return ValidationReport(tuple(errors), tuple(warnings))
+
+
+class _BitemporalReference(Protocol):
+    """A bitemporal reference record carrying an effective interval (read-only)."""
+
+    @property
+    def record_id(self) -> str: ...
+
+    @property
+    def known_at(self) -> datetime: ...
+
+    @property
+    def supersedes(self) -> str | None: ...
+
+    @property
+    def interval(self) -> EffectiveInterval: ...
+
+    @property
+    def bitemporal_key(self) -> tuple[str, ...]: ...
+
+
+def _bitemporal_errors[BR: _BitemporalReference](kind: str, records: Sequence[BR]) -> list[str]:
+    """Validate a bitemporal reference collection.
+
+    Checks duplicate ``record_id``, tz-aware ``known_at``, supersession integrity
+    (target exists, same key, and a correction is never reported with an EARLIER
+    ``known_at``), and — over the CURRENT survivors at full knowledge — that no
+    two effective intervals for the same key overlap. Disjoint intervals (a real
+    re-addition) are allowed; a supersession removes the corrected record, so a
+    restatement is not double-counted; two overlapping, non-superseding records
+    are a genuine duplicate/conflict and fail closed.
+    """
+    errors: list[str] = []
+    by_id: dict[str, BR] = {}
+    for record in records:
+        if record.known_at.tzinfo is None:
+            errors.append(f"{kind} {record.record_id}: known_at must be timezone-aware")
+        if record.record_id in by_id:
+            errors.append(f"duplicate {kind} record_id={record.record_id}")
+        by_id[record.record_id] = record
+    for record in records:
+        if record.supersedes is None:
+            continue
+        target = by_id.get(record.supersedes)
+        if target is None:
+            errors.append(
+                f"{kind} {record.record_id} supersedes unknown record {record.supersedes}"
+            )
+        elif target.bitemporal_key != record.bitemporal_key:
+            errors.append(
+                f"{kind} {record.record_id} supersedes a record with a different key"
+            )
+        elif record.known_at < target.known_at:
+            errors.append(
+                f"{kind} {record.record_id} supersedes with an earlier known_at"
+            )
+    survivors = resolve_visible(records, _UTC_MAX)
+    errors.extend(
+        _overlap_errors((survivor.bitemporal_key, survivor.interval) for survivor in survivors)
+    )
+    return errors
 
 
 def _overlap_errors(

@@ -41,14 +41,21 @@ capabilities:
   pit_sp500_membership:
     state: BLOCKED_EXTERNAL
     contract_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1.py
+    ingestion_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1_ingestion.py
     blocked_on: >-
       An owner-approved point-in-time S&P 500 membership source with historical
-      effective dates and provenance. Current-constituent snapshots are not acceptable.
+      effective dates, knowledge time (known_at), stable identity and provenance.
+      Current-constituent snapshots are not acceptable. The bitemporal ingestion
+      pipeline and fail-closed promotion gate exist, but no REAL source or
+      verifiable evidence is wired, so the cell stays blocked.
   asof_gics:
     state: BLOCKED_EXTERNAL
     contract_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1.py
+    ingestion_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1_ingestion.py
     blocked_on: >-
-      An owner-approved historical GICS source with effective/as-of intervals and provenance.
+      An owner-approved historical GICS source with effective/as-of intervals,
+      knowledge time and provenance. As with membership, the ingestion pipeline
+      exists but no REAL source/evidence is wired; the cell stays blocked.
   delisted_security_history:
     state: BLOCKED_EXTERNAL
     contract_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1.py
