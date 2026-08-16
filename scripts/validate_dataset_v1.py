@@ -1,7 +1,4 @@
-#!/usr/bin/env python3
 """Validate Dataset V1 evidence/readiness without contacting external services."""
-
-from __future__ import annotations
 
 import argparse
 from pathlib import Path
