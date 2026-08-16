@@ -22,6 +22,24 @@ from trading_market_data_core.dataset_v1 import (
 
 UTC_NOW = datetime(2026, 8, 16, 10, 28, tzinfo=UTC)
 PROVENANCE = Provenance(source="fixture", observed_at=UTC_NOW)
+OWNER_EVIDENCE = Path("docs/poi/evidence/POI-IBKR-HIST.json")
+OWNER_EVIDENCE_CHECKSUM = (
+    "sha256:663150437934774a09c3a5d5b81614458b4da329dfb42df64f930533ab552945"
+)
+EMPIRICALLY_VERIFIED = {
+    "connectivity_paper_du_gate",
+    "daily_trades_rth_schema",
+    "contract_identity_conid",
+    "head_timestamp_coverage",
+    "bid_ask_midpoint",
+    "symbol_change_discovery",
+}
+BLOCKED_EXTERNAL = {
+    "pit_sp500_membership",
+    "asof_gics",
+    "delisted_security_history",
+    "corporate_actions",
+}
 
 
 def _security(security_id: str, symbol: str) -> SecurityIdentity:
@@ -193,20 +211,21 @@ def test_ibkr_evidence_maps_only_proven_capabilities_to_empirical_state(
         _write_evidence(tmp_path)
     )
 
-    empirical = {
-        "connectivity_paper_du_gate",
-        "daily_trades_rth_schema",
-        "contract_identity_conid",
-        "head_timestamp_coverage",
-        "bid_ask_midpoint",
-        "symbol_change_discovery",
-    }
-    for name in empirical:
+    for name in EMPIRICALLY_VERIFIED:
         assert matrix.states[name] is CapabilityState.EMPIRICALLY_VERIFIED
-    assert matrix.states["pit_sp500_membership"] is CapabilityState.BLOCKED_EXTERNAL
-    assert matrix.states["asof_gics"] is CapabilityState.BLOCKED_EXTERNAL
-    assert matrix.states["delisted_security_history"] is CapabilityState.BLOCKED_EXTERNAL
-    assert matrix.states["corporate_actions"] is CapabilityState.BLOCKED_EXTERNAL
+    for name in BLOCKED_EXTERNAL:
+        assert matrix.states[name] is CapabilityState.BLOCKED_EXTERNAL
+    assert not matrix.full_dataset_contract_ready
+
+
+def test_checked_in_owner_evidence_drives_dataset_capability_matrix() -> None:
+    matrix = DatasetCapabilityMatrix.from_ibkr_historical_evidence(OWNER_EVIDENCE)
+
+    assert matrix.evidence_checksum == OWNER_EVIDENCE_CHECKSUM
+    for name in EMPIRICALLY_VERIFIED:
+        assert matrix.states[name] is CapabilityState.EMPIRICALLY_VERIFIED
+    for name in BLOCKED_EXTERNAL:
+        assert matrix.states[name] is CapabilityState.BLOCKED_EXTERNAL
     assert not matrix.full_dataset_contract_ready
 
 
