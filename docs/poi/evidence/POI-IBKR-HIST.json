@@ -1,0 +1,601 @@
+{
+  "poi_id": "POI-IBKR-HIST",
+  "qualification_version": "poi-ibkr-hist-qualification-1.0.0",
+  "client_version": "poi-ibkr-historical-client-2.0.0",
+  "account_alias": "paper-poi",
+  "masked_account_id": "DU*****32",
+  "server_time": "2026-08-16T10:28:23+00:00",
+  "symbols": [
+    {
+      "symbol": "AAPL",
+      "con_id": 265598,
+      "long_name": "APPLE INC",
+      "primary_exchange": "NASDAQ",
+      "head_timestamp_trades": "345479400",
+      "series": {
+        "TRADES": {
+          "row_count": 10,
+          "earliest": "20260803",
+          "latest": "20260814",
+          "schema_ok": true,
+          "error": null,
+          "request_id": 9003
+        },
+        "BID": {
+          "row_count": 10,
+          "earliest": "20260803",
+          "latest": "20260814",
+          "schema_ok": true,
+          "error": null,
+          "request_id": 9004
+        },
+        "ASK": {
+          "row_count": 10,
+          "earliest": "20260803",
+          "latest": "20260814",
+          "schema_ok": true,
+          "error": null,
+          "request_id": 9005
+        },
+        "MIDPOINT": {
+          "row_count": 10,
+          "earliest": "20260803",
+          "latest": "20260814",
+          "schema_ok": true,
+          "error": null,
+          "request_id": 9006
+        },
+        "ADJUSTED_LAST": {
+          "row_count": 10,
+          "earliest": "20260803",
+          "latest": "20260814",
+          "schema_ok": true,
+          "error": null,
+          "request_id": 9007
+        }
+      },
+      "trades_schema_ok": true,
+      "pacing_notes": []
+    },
+    {
+      "symbol": "MSFT",
+      "con_id": 272093,
+      "long_name": "MICROSOFT CORP",
+      "primary_exchange": "NASDAQ",
+      "head_timestamp_trades": "511108200",
+      "series": {
+        "TRADES": {
+          "row_count": 10,
+          "earliest": "20260803",
+          "latest": "20260814",
+          "schema_ok": true,
+          "error": null,
+          "request_id": 9010
+        },
+        "BID": {
+          "row_count": 10,
+          "earliest": "20260803",
+          "latest": "20260814",
+          "schema_ok": true,
+          "error": null,
+          "request_id": 9011
+        },
+        "ASK": {
+          "row_count": 10,
+          "earliest": "20260803",
+          "latest": "20260814",
+          "schema_ok": true,
+          "error": null,
+          "request_id": 9012
+        },
+        "MIDPOINT": {
+          "row_count": 10,
+          "earliest": "20260803",
+          "latest": "20260814",
+          "schema_ok": true,
+          "error": null,
+          "request_id": 9013
+        },
+        "ADJUSTED_LAST": {
+          "row_count": 10,
+          "earliest": "20260803",
+          "latest": "20260814",
+          "schema_ok": true,
+          "error": null,
+          "request_id": 9014
+        }
+      },
+      "trades_schema_ok": true,
+      "pacing_notes": []
+    }
+  ],
+  "matching": [
+    {
+      "pattern": "META",
+      "match_count": 77,
+      "matches": [
+        {
+          "symbol": "META",
+          "con_id": 107113386,
+          "sec_type": "STK",
+          "primary_exchange": "NASDAQ"
+        },
+        {
+          "symbol": "META",
+          "con_id": 114922621,
+          "sec_type": "STK",
+          "primary_exchange": "MEXI"
+        },
+        {
+          "symbol": "META",
+          "con_id": 600541860,
+          "sec_type": "STK",
+          "primary_exchange": "SFB"
+        },
+        {
+          "symbol": "META",
+          "con_id": 355194893,
+          "sec_type": "STK",
+          "primary_exchange": "BVME.ETF"
+        },
+        {
+          "symbol": "META",
+          "con_id": 355191857,
+          "sec_type": "STK",
+          "primary_exchange": "LSEETF"
+        },
+        {
+          "symbol": "META",
+          "con_id": 530091499,
+          "sec_type": "STK",
+          "primary_exchange": "TSE"
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "METAL",
+          "con_id": 734181266,
+          "sec_type": "STK",
+          "primary_exchange": "NSE"
+        },
+        {
+          "symbol": "METALIC",
+          "con_id": 905536241,
+          "sec_type": "STK",
+          "primary_exchange": "NSE"
+        },
+        {
+          "symbol": "META11",
+          "con_id": 810313196,
+          "sec_type": "STK",
+          "primary_exchange": "B3"
+        },
+        {
+          "symbol": "METAA",
+          "con_id": 666011161,
+          "sec_type": "STK",
+          "primary_exchange": "BVME.ETF"
+        },
+        {
+          "symbol": "METAJ",
+          "con_id": 666011164,
+          "sec_type": "STK",
+          "primary_exchange": "BVME.ETF"
+        },
+        {
+          "symbol": "META.RTS2",
+          "con_id": 684159852,
+          "sec_type": "STK",
+          "primary_exchange": "CORPACT"
+        },
+        {
+          "symbol": "METAL.RTS",
+          "con_id": 706149020,
+          "sec_type": "STK",
+          "primary_exchange": "CORPACT"
+        },
+        {
+          "symbol": "METALG.RT",
+          "con_id": 706149034,
+          "sec_type": "STK",
+          "primary_exchange": "CORPACT"
+        },
+        {
+          "symbol": "METALIETF",
+          "con_id": 724297244,
+          "sec_type": "STK",
+          "primary_exchange": "NSE"
+        },
+        {
+          "symbol": "METABTA",
+          "con_id": 890736809,
+          "sec_type": "STK",
+          "primary_exchange": "VALUE"
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "DJGSP",
+          "con_id": 37916022,
+          "sec_type": "IND",
+          "primary_exchange": "CBOT"
+        },
+        {
+          "symbol": "XME.IV",
+          "con_id": 39966402,
+          "sec_type": "IND",
+          "primary_exchange": "PSE"
+        },
+        {
+          "symbol": "AAM",
+          "con_id": 40387332,
+          "sec_type": "IND",
+          "primary_exchange": "CME"
+        },
+        {
+          "symbol": "DBP.IV",
+          "con_id": 42404122,
+          "sec_type": "IND",
+          "primary_exchange": "PSE"
+        },
+        {
+          "symbol": "DBB.IV",
+          "con_id": 42404134,
+          "sec_type": "IND",
+          "primary_exchange": "PSE"
+        },
+        {
+          "symbol": "HHM.IV",
+          "con_id": 44042405,
+          "sec_type": "IND",
+          "primary_exchange": "PSE"
+        },
+        {
+          "symbol": "XMM",
+          "con_id": 46610811,
+          "sec_type": "IND",
+          "primary_exchange": "ASX"
+        },
+        {
+          "symbol": "JJM.IV",
+          "con_id": 47101036,
+          "sec_type": "IND",
+          "primary_exchange": "NYSE"
+        },
+        {
+          "symbol": "JJP.IV",
+          "con_id": 52175880,
+          "sec_type": "IND",
+          "primary_exchange": "PSE"
+        },
+        {
+          "symbol": "DBBMIX",
+          "con_id": 57497452,
+          "sec_type": "IND",
+          "primary_exchange": "PSE"
+        },
+        {
+          "symbol": "RJZ.IV",
+          "con_id": 60909064,
+          "sec_type": "IND",
+          "primary_exchange": "PSE"
+        },
+        {
+          "symbol": "CNXMET",
+          "con_id": 115557329,
+          "sec_type": "IND",
+          "primary_exchange": "NSE"
+        },
+        {
+          "symbol": "TPNMET",
+          "con_id": 130867635,
+          "sec_type": "IND",
+          "primary_exchange": "OSE.JPN"
+        },
+        {
+          "symbol": "TPMETL",
+          "con_id": 130867659,
+          "sec_type": "IND",
+          "primary_exchange": "OSE.JPN"
+        },
+        {
+          "symbol": "WPM",
+          "con_id": 274836867,
+          "sec_type": "STK",
+          "primary_exchange": "NYSE"
+        },
+        {
+          "symbol": "WPM",
+          "con_id": 276051659,
+          "sec_type": "STK",
+          "primary_exchange": "TSE"
+        },
+        {
+          "symbol": "5016",
+          "con_id": 762287742,
+          "sec_type": "STK",
+          "primary_exchange": "TSEJ"
+        },
+        {
+          "symbol": "VAML",
+          "con_id": 881954859,
+          "sec_type": "STK",
+          "primary_exchange": "NSE"
+        },
+        {
+          "symbol": "5713",
+          "con_id": 13905595,
+          "sec_type": "STK",
+          "primary_exchange": "TSEJ"
+        },
+        {
+          "symbol": "PMETAL",
+          "con_id": 705924674,
+          "sec_type": "STK",
+          "primary_exchange": "BURSAMY"
+        },
+        {
+          "symbol": "000630",
+          "con_id": 257313248,
+          "sec_type": "STK",
+          "primary_exchange": "SEHKSZSE"
+        },
+        {
+          "symbol": "LLOYDSME",
+          "con_id": 642406447,
+          "sec_type": "STK",
+          "primary_exchange": "NSE"
+        },
+        {
+          "symbol": "DPM",
+          "con_id": 814025540,
+          "sec_type": "STK",
+          "primary_exchange": "TSE"
+        },
+        {
+          "symbol": "DPM",
+          "con_id": 815021979,
+          "sec_type": "STK",
+          "primary_exchange": "ASX"
+        },
+        {
+          "symbol": "601061",
+          "con_id": 705075819,
+          "sec_type": "STK",
+          "primary_exchange": "SEHKNTL"
+        },
+        {
+          "symbol": "MTLN",
+          "con_id": 804483095,
+          "sec_type": "STK",
+          "primary_exchange": "LSE"
+        },
+        {
+          "symbol": "CMC",
+          "con_id": 5811,
+          "sec_type": "STK",
+          "primary_exchange": "NYSE"
+        },
+        {
+          "symbol": "601618",
+          "con_id": 165301420,
+          "sec_type": "STK",
+          "primary_exchange": "SEHKNTL"
+        },
+        {
+          "symbol": "CMM",
+          "con_id": 221920910,
+          "sec_type": "STK",
+          "primary_exchange": "ASX"
+        },
+        {
+          "symbol": "FGADX",
+          "con_id": 124968758,
+          "sec_type": "FUND",
+          "primary_exchange": "FUNDSERV"
+        },
+        {
+          "symbol": "FKRCX",
+          "con_id": 141153689,
+          "sec_type": "FUND",
+          "primary_exchange": "FUNDSERV"
+        },
+        {
+          "symbol": "EKWYX",
+          "con_id": 141157690,
+          "sec_type": "FUND",
+          "primary_exchange": "FUNDSERV"
+        },
+        {
+          "symbol": "PMPIX",
+          "con_id": 141158296,
+          "sec_type": "FUND",
+          "primary_exchange": "FUNDSERV"
+        },
+        {
+          "symbol": "EKWAX",
+          "con_id": 141158534,
+          "sec_type": "FUND",
+          "primary_exchange": "FUNDSERV"
+        },
+        {
+          "symbol": "USERX",
+          "con_id": 141175422,
+          "sec_type": "FUND",
+          "primary_exchange": "FUNDSERV"
+        },
+        {
+          "symbol": "FRGOX",
+          "con_id": 141406627,
+          "sec_type": "FUND",
+          "primary_exchange": "FUNDSERV"
+        },
+        {
+          "symbol": "PMPSX",
+          "con_id": 141410669,
+          "sec_type": "FUND",
+          "primary_exchange": "FUNDSERV"
+        },
+        {
+          "symbol": "EKWCX",
+          "con_id": 141411221,
+          "sec_type": "FUND",
+          "primary_exchange": "FUNDSERV"
+        },
+        {
+          "symbol": "USAGX",
+          "con_id": 141447835,
+          "sec_type": "FUND",
+          "primary_exchange": "FUNDSERV"
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        },
+        {
+          "symbol": "",
+          "con_id": 0,
+          "sec_type": "BOND",
+          "primary_exchange": ""
+        }
+      ],
+      "error": null
+    }
+  ],
+  "capabilities": {
+    "connectivity_paper_du_gate": "PASS",
+    "daily_trades_rth_schema": "PASS",
+    "contract_identity_conid": "PASS",
+    "head_timestamp_coverage": "PASS",
+    "bid_ask_midpoint": "PASS",
+    "symbol_change_discovery": "PASS"
+  },
+  "notes": [
+    "Active-symbol daily TRADES/RTH coverage is what this run can prove.",
+    "Delisted-name history, PIT S&P 500 membership and as-of GICS are NOT tested here and remain external gaps.",
+    "Adjustment semantics: compare TRADES vs ADJUSTED_LAST row values on the host.",
+    "Commission SCHEDULE is not a read-only API endpoint; read it from IBKR Account Management (Reports) \u2014 this run only proves connectivity."
+  ],
+  "active_name_price_qualification_sufficient": true,
+  "full_dataset_contract_ready": false,
+  "observed_at": "2026-08-16T10:28:23.925020+00:00",
+  "evidence_checksum": "sha256:663150437934774a09c3a5d5b81614458b4da329dfb42df64f930533ab552945"
+}

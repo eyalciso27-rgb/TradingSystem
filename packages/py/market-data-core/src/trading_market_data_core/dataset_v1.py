@@ -1,0 +1,382 @@
+"""Point-in-time Dataset V1 contract.
+
+The contract is deliberately provider-neutral. It models the information a
+research/backtest dataset must carry to avoid survivorship and look-ahead bias;
+it does not claim that any external source has supplied those fields.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from decimal import Decimal
+from enum import StrEnum
+from pathlib import Path
+from typing import Any
+
+
+class CapabilityState(StrEnum):
+    """Evidence state for one Dataset V1 capability."""
+
+    EMPIRICALLY_VERIFIED = "EMPIRICALLY_VERIFIED"
+    CONTRACT_READY = "CONTRACT_READY"
+    BLOCKED_EXTERNAL = "BLOCKED_EXTERNAL"
+
+
+class CorporateActionType(StrEnum):
+    SPLIT = "SPLIT"
+    CASH_DIVIDEND = "CASH_DIVIDEND"
+    STOCK_DIVIDEND = "STOCK_DIVIDEND"
+    MERGER = "MERGER"
+    SPINOFF = "SPINOFF"
+    SYMBOL_CHANGE = "SYMBOL_CHANGE"
+    DELISTING = "DELISTING"
+    OTHER = "OTHER"
+
+
+@dataclass(frozen=True, slots=True)
+class Provenance:
+    source: str
+    observed_at: datetime
+    source_record_id: str | None = None
+
+    def validate(self) -> tuple[str, ...]:
+        errors: list[str] = []
+        if not self.source.strip():
+            errors.append("provenance.source must be non-empty")
+        if self.observed_at.tzinfo is None:
+            errors.append("provenance.observed_at must be timezone-aware")
+        return tuple(errors)
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveInterval:
+    valid_from: date
+    valid_to: date | None = None
+
+    def __post_init__(self) -> None:
+        if self.valid_to is not None and self.valid_to < self.valid_from:
+            raise ValueError("valid_to must be >= valid_from")
+
+    def contains(self, as_of: date) -> bool:
+        return self.valid_from <= as_of and (
+            self.valid_to is None or as_of <= self.valid_to
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SecurityIdentity:
+    security_id: str
+    symbol: str
+    primary_exchange: str
+    currency: str = "USD"
+    ibkr_con_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MembershipRecord:
+    index_id: str
+    security_id: str
+    interval: EffectiveInterval
+    provenance: Provenance
+
+
+@dataclass(frozen=True, slots=True)
+class GicsRecord:
+    security_id: str
+    sector: str
+    industry_group: str | None
+    industry: str | None
+    sub_industry: str | None
+    interval: EffectiveInterval
+    provenance: Provenance
+
+
+@dataclass(frozen=True, slots=True)
+class DelistingRecord:
+    security_id: str
+    delisted_on: date
+    reason: str | None
+    provenance: Provenance
+
+
+@dataclass(frozen=True, slots=True)
+class CorporateActionRecord:
+    security_id: str
+    action_type: CorporateActionType
+    effective_on: date
+    provenance: Provenance
+    # Financial magnitudes are Decimal, never float (market-data-core convention;
+    # precision is never lost to floats — see ``types.py``).
+    ratio: Decimal | None = None
+    cash_amount: Decimal | None = None
+    successor_security_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DailyPriceRecord:
+    security_id: str
+    trading_date: date
+    close: Decimal
+    provenance: Provenance
+    open: Decimal | None = None
+    high: Decimal | None = None
+    low: Decimal | None = None
+    volume: Decimal | None = None
+    adjusted_close: Decimal | None = None
+    ibkr_con_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationReport:
+    errors: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def valid(self) -> bool:
+        return not self.errors
+
+    def require_valid(self) -> None:
+        if self.errors:
+            raise ValueError("Dataset V1 validation failed: " + "; ".join(self.errors))
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetV1:
+    securities: tuple[SecurityIdentity, ...] = ()
+    memberships: tuple[MembershipRecord, ...] = ()
+    gics: tuple[GicsRecord, ...] = ()
+    delistings: tuple[DelistingRecord, ...] = ()
+    corporate_actions: tuple[CorporateActionRecord, ...] = ()
+    prices: tuple[DailyPriceRecord, ...] = ()
+
+    def members_as_of(self, index_id: str, as_of: date) -> frozenset[str]:
+        return frozenset(
+            row.security_id
+            for row in self.memberships
+            if row.index_id == index_id and row.interval.contains(as_of)
+        )
+
+    def gics_as_of(self, security_id: str, as_of: date) -> GicsRecord | None:
+        matches = [
+            row
+            for row in self.gics
+            if row.security_id == security_id and row.interval.contains(as_of)
+        ]
+        if len(matches) > 1:
+            raise ValueError(f"overlapping GICS intervals for {security_id} on {as_of}")
+        return matches[0] if matches else None
+
+    def is_delisted_as_of(self, security_id: str, as_of: date) -> bool:
+        return any(
+            row.security_id == security_id and row.delisted_on <= as_of
+            for row in self.delistings
+        )
+
+    def validate(self) -> ValidationReport:
+        errors: list[str] = []
+        warnings: list[str] = []
+        identities = {identity.security_id: identity for identity in self.securities}
+        if len(identities) != len(self.securities):
+            errors.append("duplicate security_id in securities")
+        for identity in self.securities:
+            if not identity.security_id.strip():
+                errors.append("security identity has empty security_id")
+            if not identity.symbol.strip():
+                errors.append(f"security {identity.security_id} has empty symbol")
+            if not identity.primary_exchange.strip():
+                errors.append(f"security {identity.security_id} has empty primary_exchange")
+
+        def require_identity(kind: str, security_id: str) -> None:
+            if security_id not in identities:
+                errors.append(f"{kind} references unknown security_id={security_id}")
+
+        provenance_rows: list[tuple[str, str, Provenance]] = []
+        for membership in self.memberships:
+            require_identity("membership", membership.security_id)
+            provenance_rows.append(
+                ("membership", membership.security_id, membership.provenance)
+            )
+        for gics_row in self.gics:
+            require_identity("gics", gics_row.security_id)
+            if not gics_row.sector.strip():
+                errors.append(f"gics sector missing for {gics_row.security_id}")
+            provenance_rows.append(("gics", gics_row.security_id, gics_row.provenance))
+        for delisting in self.delistings:
+            require_identity("delisting", delisting.security_id)
+            provenance_rows.append(
+                ("delisting", delisting.security_id, delisting.provenance)
+            )
+        for action in self.corporate_actions:
+            require_identity("corporate_action", action.security_id)
+            if action.successor_security_id is not None:
+                require_identity("corporate_action successor", action.successor_security_id)
+            if action.action_type is CorporateActionType.SPLIT and (
+                action.ratio is None or action.ratio <= 0
+            ):
+                errors.append(f"split ratio must be > 0 for {action.security_id}")
+            provenance_rows.append(("corporate_action", action.security_id, action.provenance))
+        seen_prices: set[tuple[str, date]] = set()
+        for price in self.prices:
+            require_identity("price", price.security_id)
+            key = (price.security_id, price.trading_date)
+            if key in seen_prices:
+                errors.append(
+                    f"duplicate price for security_id={price.security_id} date={price.trading_date}"
+                )
+            seen_prices.add(key)
+            if price.close <= 0:
+                errors.append(f"price close must be > 0 for {price.security_id}")
+            if price.volume is not None and price.volume < 0:
+                errors.append(f"price volume must be >= 0 for {price.security_id}")
+            provenance_rows.append(("price", price.security_id, price.provenance))
+
+        for kind, security_id, provenance in provenance_rows:
+            for error in provenance.validate():
+                errors.append(f"{kind} {security_id}: {error}")
+
+        errors.extend(
+            _overlap_errors(
+                ((membership.index_id, membership.security_id), membership.interval)
+                for membership in self.memberships
+            )
+        )
+        errors.extend(
+            _overlap_errors(
+                ((gics_row.security_id,), gics_row.interval) for gics_row in self.gics
+            )
+        )
+
+        membership_ids = {membership.security_id for membership in self.memberships}
+        delisted_ids = {delisting.security_id for delisting in self.delistings}
+        missing_delisted_history = membership_ids.intersection(identities) - delisted_ids
+        if membership_ids and missing_delisted_history:
+            warnings.append(
+                "delisting coverage is not proven for all historical members; "
+                "absence of a delisting row is not evidence that a security survived"
+            )
+        return ValidationReport(tuple(errors), tuple(warnings))
+
+
+def _overlap_errors(
+    rows: Iterable[tuple[tuple[str, ...], EffectiveInterval]],
+) -> list[str]:
+    grouped: dict[tuple[str, ...], list[EffectiveInterval]] = {}
+    for group_key, interval in rows:
+        grouped.setdefault(group_key, []).append(interval)
+    errors: list[str] = []
+    for group_key, intervals in grouped.items():
+        ordered = sorted(intervals, key=lambda value: value.valid_from)
+        previous: EffectiveInterval | None = None
+        for current in ordered:
+            if previous is not None and (
+                previous.valid_to is None or current.valid_from <= previous.valid_to
+            ):
+                errors.append(f"overlapping effective intervals for {group_key}")
+                break
+            previous = current
+    return errors
+
+
+def _recompute_evidence_checksum(payload: Mapping[str, Any]) -> str:
+    """Recompute the ``sha256:`` evidence checksum over the body.
+
+    Mirrors ``poi_historical_qualification`` exactly: the checksum covers every
+    field EXCEPT ``evidence_checksum`` itself, canonically serialized with sorted
+    keys, tight separators and ASCII encoding. Kept here (rather than importing
+    the broker package) so market-data-core has no broker dependency.
+    """
+    body = {key: value for key, value in payload.items() if key != "evidence_checksum"}
+    serialized = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(serialized.encode("ascii")).hexdigest()
+
+
+IBKR_HISTORICAL_CAPABILITIES = frozenset(
+    {
+        "connectivity_paper_du_gate",
+        "daily_trades_rth_schema",
+        "contract_identity_conid",
+        "head_timestamp_coverage",
+        "bid_ask_midpoint",
+        "symbol_change_discovery",
+    }
+)
+
+DATASET_V1_REQUIRED_CAPABILITIES = frozenset(
+    {
+        *IBKR_HISTORICAL_CAPABILITIES,
+        "pit_sp500_membership",
+        "asof_gics",
+        "delisted_security_history",
+        "corporate_actions",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetCapabilityMatrix:
+    states: Mapping[str, CapabilityState] = field(default_factory=dict)
+    evidence_checksum: str | None = None
+
+    @classmethod
+    def from_ibkr_historical_evidence(cls, path: str | Path) -> DatasetCapabilityMatrix:
+        payload = json.loads(Path(path).read_bytes())
+        if not isinstance(payload, dict):
+            raise ValueError("historical evidence must be a JSON object")
+        if payload.get("poi_id") != "POI-IBKR-HIST":
+            raise ValueError("unexpected historical evidence poi_id")
+        declared = payload.get("evidence_checksum")
+        if not isinstance(declared, str) or not declared.startswith("sha256:"):
+            raise ValueError("historical evidence is missing evidence_checksum")
+        # The checksum must be VERIFIED against the body, not merely present:
+        # a corrupt or tampered evidence file (e.g. a flipped capability) whose
+        # checksum was not regenerated is rejected fail-closed. This is what makes
+        # the checksum evidence rather than decoration.
+        recomputed = _recompute_evidence_checksum(payload)
+        if recomputed != declared:
+            raise ValueError(
+                "historical evidence checksum mismatch (tampered or corrupt): "
+                f"declared {declared}, recomputed {recomputed}"
+            )
+        capabilities = payload.get("capabilities")
+        if not isinstance(capabilities, dict):
+            raise ValueError("historical evidence capabilities must be an object")
+        missing = IBKR_HISTORICAL_CAPABILITIES - capabilities.keys()
+        if missing:
+            raise ValueError(f"historical evidence missing capabilities: {sorted(missing)}")
+        not_pass = sorted(
+            name for name in IBKR_HISTORICAL_CAPABILITIES if capabilities.get(name) != "PASS"
+        )
+        if not_pass:
+            raise ValueError(f"historical capabilities not PASS: {not_pass}")
+        if payload.get("active_name_price_qualification_sufficient") is not True:
+            raise ValueError("active-name qualification is not sufficient")
+        states: dict[str, CapabilityState] = {
+            name: CapabilityState.EMPIRICALLY_VERIFIED
+            for name in IBKR_HISTORICAL_CAPABILITIES
+        }
+        for name in DATASET_V1_REQUIRED_CAPABILITIES - IBKR_HISTORICAL_CAPABILITIES:
+            states[name] = CapabilityState.BLOCKED_EXTERNAL
+        return cls(states=states, evidence_checksum=declared)
+
+    @property
+    def full_dataset_contract_ready(self) -> bool:
+        return all(
+            self.states.get(name) is CapabilityState.EMPIRICALLY_VERIFIED
+            for name in DATASET_V1_REQUIRED_CAPABILITIES
+        )
+
+    def assert_full_dataset_contract_ready(self) -> None:
+        if self.full_dataset_contract_ready:
+            return
+        unresolved = sorted(
+            name
+            for name in DATASET_V1_REQUIRED_CAPABILITIES
+            if self.states.get(name) is not CapabilityState.EMPIRICALLY_VERIFIED
+        )
+        raise ValueError(
+            "Dataset V1 is not empirically ready; unresolved: " + ", ".join(unresolved)
+        )

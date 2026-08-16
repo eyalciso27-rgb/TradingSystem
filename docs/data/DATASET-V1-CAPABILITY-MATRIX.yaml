@@ -1,0 +1,73 @@
+version: "1.0"
+updated: "2026-08-16"
+contract: DATASET-V1-CONTRACT.md
+
+# State vocabulary:
+#   EMPIRICALLY_VERIFIED - proven by real owner-host evidence.
+#   CONTRACT_READY       - code/schema/validation exists, but no real source evidence yet.
+#   BLOCKED_EXTERNAL     - requires a real external source/entitlement/dataset before proof.
+#
+# This matrix is about research Dataset V1 readiness. It does NOT change the
+# frozen POI-IBKR-001 order-lifecycle status in docs/poi/STATUS.yaml.
+
+historical_price_evidence:
+  poi_id: POI-IBKR-HIST
+  evidence: ../poi/evidence/POI-IBKR-HIST.json
+  observed_at: "2026-08-16T10:28:23.925020+00:00"
+  checksum: "sha256:663150437934774a09c3a5d5b81614458b4da329dfb42df64f930533ab552945"
+  account_alias: paper-poi
+  account_id: "DU*****32"
+
+capabilities:
+  connectivity_paper_du_gate:
+    state: EMPIRICALLY_VERIFIED
+    evidence: ../poi/evidence/POI-IBKR-HIST.json
+  daily_trades_rth_schema:
+    state: EMPIRICALLY_VERIFIED
+    evidence: ../poi/evidence/POI-IBKR-HIST.json
+  contract_identity_conid:
+    state: EMPIRICALLY_VERIFIED
+    evidence: ../poi/evidence/POI-IBKR-HIST.json
+  head_timestamp_coverage:
+    state: EMPIRICALLY_VERIFIED
+    evidence: ../poi/evidence/POI-IBKR-HIST.json
+  bid_ask_midpoint:
+    state: EMPIRICALLY_VERIFIED
+    evidence: ../poi/evidence/POI-IBKR-HIST.json
+  symbol_change_discovery:
+    state: EMPIRICALLY_VERIFIED
+    evidence: ../poi/evidence/POI-IBKR-HIST.json
+
+  pit_sp500_membership:
+    state: BLOCKED_EXTERNAL
+    contract_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1.py
+    blocked_on: >-
+      An owner-approved point-in-time S&P 500 membership source with historical
+      effective dates and provenance. Current-constituent snapshots are not acceptable.
+  asof_gics:
+    state: BLOCKED_EXTERNAL
+    contract_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1.py
+    blocked_on: >-
+      An owner-approved historical GICS source with effective/as-of intervals and provenance.
+  delisted_security_history:
+    state: BLOCKED_EXTERNAL
+    contract_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1.py
+    blocked_on: >-
+      A source that preserves historical/delisted securities and stable identity rather
+      than returning only today's live symbol universe.
+  corporate_actions:
+    state: BLOCKED_EXTERNAL
+    contract_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1.py
+    blocked_on: >-
+      A source for splits, dividends, mergers, spinoffs, symbol changes and delistings
+      with effective dates and provenance. IBKR ADJUSTED_LAST availability alone does
+      not prove the event-level corporate-action contract.
+
+readiness:
+  active_name_price_qualification_sufficient: true
+  full_dataset_contract_ready: false
+  reason: >-
+    The six IBKR active-name historical capabilities are empirically verified, but PIT
+    membership, as-of GICS, delisted history and event-level corporate actions remain
+    external-data gaps. The implementation must fail closed until all required cells
+    are EMPIRICALLY_VERIFIED.
