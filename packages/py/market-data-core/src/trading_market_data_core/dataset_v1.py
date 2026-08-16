@@ -174,7 +174,7 @@ class DatasetV1:
     def validate(self) -> ValidationReport:
         errors: list[str] = []
         warnings: list[str] = []
-        identities = {row.security_id: row for row in self.securities}
+        identities = {identity.security_id: identity for identity in self.securities}
         if len(identities) != len(self.securities):
             errors.append("duplicate security_id in securities")
 
@@ -183,38 +183,42 @@ class DatasetV1:
                 errors.append(f"{kind} references unknown security_id={security_id}")
 
         provenance_rows: list[tuple[str, str, Provenance]] = []
-        for row in self.memberships:
-            require_identity("membership", row.security_id)
-            provenance_rows.append(("membership", row.security_id, row.provenance))
-        for row in self.gics:
-            require_identity("gics", row.security_id)
-            if not row.sector.strip():
-                errors.append(f"gics sector missing for {row.security_id}")
-            provenance_rows.append(("gics", row.security_id, row.provenance))
-        for row in self.delistings:
-            require_identity("delisting", row.security_id)
-            provenance_rows.append(("delisting", row.security_id, row.provenance))
-        for row in self.corporate_actions:
-            require_identity("corporate_action", row.security_id)
-            if row.successor_security_id is not None:
-                require_identity("corporate_action successor", row.successor_security_id)
-            if row.action_type is CorporateActionType.SPLIT and (
-                row.ratio is None or row.ratio <= 0
+        for membership in self.memberships:
+            require_identity("membership", membership.security_id)
+            provenance_rows.append(
+                ("membership", membership.security_id, membership.provenance)
+            )
+        for gics_row in self.gics:
+            require_identity("gics", gics_row.security_id)
+            if not gics_row.sector.strip():
+                errors.append(f"gics sector missing for {gics_row.security_id}")
+            provenance_rows.append(("gics", gics_row.security_id, gics_row.provenance))
+        for delisting in self.delistings:
+            require_identity("delisting", delisting.security_id)
+            provenance_rows.append(
+                ("delisting", delisting.security_id, delisting.provenance)
+            )
+        for action in self.corporate_actions:
+            require_identity("corporate_action", action.security_id)
+            if action.successor_security_id is not None:
+                require_identity("corporate_action successor", action.successor_security_id)
+            if action.action_type is CorporateActionType.SPLIT and (
+                action.ratio is None or action.ratio <= 0
             ):
-                errors.append(f"split ratio must be > 0 for {row.security_id}")
-            provenance_rows.append(("corporate_action", row.security_id, row.provenance))
+                errors.append(f"split ratio must be > 0 for {action.security_id}")
+            provenance_rows.append(("corporate_action", action.security_id, action.provenance))
         seen_prices: set[tuple[str, date]] = set()
-        for row in self.prices:
-            require_identity("price", row.security_id)
-            key = (row.security_id, row.trading_date)
+        for price in self.prices:
+            require_identity("price", price.security_id)
+            key = (price.security_id, price.trading_date)
             if key in seen_prices:
                 errors.append(
-                    f"duplicate price for security_id={row.security_id} date={row.trading_date}"
+                    f"duplicate price for security_id={price.security_id} date={price.trading_date}"
                 )
             seen_prices.add(key)
-            if row.close <= 0:
-                errors.append(f"price close must be > 0 for {row.security_id}")
-            provenance_rows.append(("price", row.security_id, row.provenance))
+            if price.close <= 0:
+                errors.append(f"price close must be > 0 for {price.security_id}")
+            provenance_rows.append(("price", price.security_id, price.provenance))
 
         for kind, security_id, provenance in provenance_rows:
             for error in provenance.validate():
@@ -222,16 +226,18 @@ class DatasetV1:
 
         errors.extend(
             _overlap_errors(
-                ((row.index_id, row.security_id), row.interval)
-                for row in self.memberships
+                ((membership.index_id, membership.security_id), membership.interval)
+                for membership in self.memberships
             )
         )
         errors.extend(
-            _overlap_errors(((row.security_id,), row.interval) for row in self.gics)
+            _overlap_errors(
+                ((gics_row.security_id,), gics_row.interval) for gics_row in self.gics
+            )
         )
 
-        membership_ids = {row.security_id for row in self.memberships}
-        delisted_ids = {row.security_id for row in self.delistings}
+        membership_ids = {membership.security_id for membership in self.memberships}
+        delisted_ids = {delisting.security_id for delisting in self.delistings}
         missing_delisted_history = membership_ids.intersection(identities) - delisted_ids
         if membership_ids and missing_delisted_history:
             warnings.append(
@@ -309,7 +315,7 @@ class DatasetCapabilityMatrix:
             raise ValueError(f"historical capabilities not PASS: {not_pass}")
         if payload.get("active_name_price_qualification_sufficient") is not True:
             raise ValueError("active-name qualification is not sufficient")
-        states = {
+        states: dict[str, CapabilityState] = {
             name: CapabilityState.EMPIRICALLY_VERIFIED
             for name in IBKR_HISTORICAL_CAPABILITIES
         }
