@@ -1,4 +1,4 @@
-from trading_market_data_core.dataset_v1 import CapabilityState, DatasetCapabilityMatrix
+import trading_market_data_core.dataset_v1 as dataset_v1
 
 
 EVIDENCE = "docs/poi/evidence/POI-IBKR-HIST.json"
@@ -20,11 +20,11 @@ BLOCKED_EXTERNAL = {
 
 
 def test_checked_in_owner_evidence_drives_dataset_capability_matrix() -> None:
-    matrix = DatasetCapabilityMatrix.from_ibkr_historical_evidence(EVIDENCE)
+    matrix = dataset_v1.DatasetCapabilityMatrix.from_ibkr_historical_evidence(EVIDENCE)
 
     assert matrix.evidence_checksum == EXPECTED_CHECKSUM
     for name in EMPIRICALLY_VERIFIED:
-        assert matrix.states[name] is CapabilityState.EMPIRICALLY_VERIFIED
+        assert matrix.states[name] is dataset_v1.CapabilityState.EMPIRICALLY_VERIFIED
     for name in BLOCKED_EXTERNAL:
-        assert matrix.states[name] is CapabilityState.BLOCKED_EXTERNAL
+        assert matrix.states[name] is dataset_v1.CapabilityState.BLOCKED_EXTERNAL
     assert not matrix.full_dataset_contract_ready
