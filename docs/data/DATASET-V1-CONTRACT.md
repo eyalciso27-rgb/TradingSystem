@@ -8,8 +8,10 @@ Dataset V1 is the minimum research/backtest dataset contract required before a f
 2. **Point-in-time membership.** Index membership is represented by effective intervals. A backtest at date `T` may use only members whose interval contains `T`; today's constituent list must never be projected backwards.
 3. **As-of classification.** GICS data carries effective intervals. The sector/industry observed for a historical date is the classification effective on that date, not the latest classification.
 3a. **Bitemporal — knowledge time as well as event time.** Membership and GICS assertions carry BOTH effective validity (`valid_from`/`valid_to`) AND knowledge time (`known_at`). Every as-of API enforces both axes: a fact is usable at decision date `T` only if its interval contains `T` **and** it was known by `T` (default knowledge cutoff = end of day `T`, UTC; an explicit `known_as_of` is accepted). A later restatement (a correction with a later `known_at`, linked by `supersedes`) is invisible to any earlier decision — **restatements can never leak backwards**. Re-additions are disjoint intervals; a correction supersedes the record it restates rather than overlapping it.
-4. **Delisted names remain addressable.** Historical securities are not removed from identity history because they later delisted, merged or changed symbol.
-5. **Corporate actions are event-level data.** Splits, dividends, mergers, spinoffs, symbol changes and delistings carry effective dates and provenance. An adjusted-price series is useful but is not a substitute for the event ledger.
+4. **Delisted names remain addressable.** Historical securities are not removed from identity history because they later delisted, merged or changed symbol. A delisting is a bitemporal `DelistingRecord` carrying (where the source supplies them) `listing_date`, `delisted_on`, `last_trading_date`, a typed `DelistingReason`, venue and successor. `lifecycle_state_as_of` distinguishes **NOT_YET_EXISTED / ACTIVE / DELISTED / UNKNOWN** — and **missing price data is never interpreted as a delisting**: with no lifecycle facts the answer is `UNKNOWN`.
+4a. **Symbols are attributes, never identity.** `SymbolHistoryRecord` records the ticker an identity traded under during an interval; a rename adds a new symbol interval under the SAME `security_id`. `resolve_security_by_symbol_as_of` resolves a HISTORICAL ticker — today's symbol map is never used as history.
+5. **Corporate actions are event-level data.** Splits, reverse splits, cash/special/stock dividends, mergers, acquisitions, spinoffs, symbol changes, exchange changes and delistings are bitemporal `CorporateActionRecord` events with effective/ex/record/payment dates, `Decimal` ratio and cash amounts, currency, predecessor/successor and provenance. An adjusted-price series is useful but is not a substitute for the event ledger.
+5a. **Identity transitions are exposed, never auto-applied.** `successors_of` reports the successor identities asserted by visible merger/acquisition/spin-off events; the Dataset Builder decides whether to stitch, so price histories are never blindly concatenated across different securities. A terminal transition (merger/acquisition) must name a successor, may not point at itself, may not contradict another terminal successor for the same security, and may not form a cycle. A spin-off legitimately produces several successors.
 6. **Every externally sourced historical fact has provenance.** `source` and timezone-aware `observed_at` are mandatory. Source record identifiers may be attached where available.
 7. **Fail closed.** Dataset V1 is not full-contract ready until every required capability has real empirical evidence. Code/schema availability alone cannot promote a capability to `EMPIRICALLY_VERIFIED`.
 
@@ -35,14 +37,56 @@ Effective intervals are inclusive (`valid_from <= as_of <= valid_to`); an omitte
 
 `DatasetCapabilityMatrix.assert_full_dataset_contract_ready()` is the execution gate for the full contract. It refuses readiness while any required capability lacks `EMPIRICALLY_VERIFIED` evidence.
 
+## Retraction / tombstone semantics
+
+A **retraction** states that an earlier assertion was determined **never to have
+been valid** — distinct from a correction (which restates it). It is modelled by
+an explicit `RetractionRecord` (`target_record_id`, `known_at`, provenance,
+reason), **never** by a zero-length interval. The retracted record keeps its
+immutable identity and stays in the dataset.
+
+Resolution is deterministic (`resolve_visible`), in this order:
+
+1. only assertions with `known_at <= known_as_of` are visible;
+2. assertions targeted by a **retraction visible at the cutoff** are dropped;
+3. assertions **superseded by a surviving correction** are dropped.
+
+Because retraction is applied *before* supersession, **retracting a correction
+restores the record that correction had superseded**. Earlier backtests still see
+exactly what was known then; later backtests no longer treat the retracted
+assertion as valid. The mechanism is shared by membership, GICS, symbol history,
+delistings and corporate actions. Retracting a retraction is unsupported and
+fails closed (it would make resolution order ambiguous), as do self-targeting
+retractions, duplicate retractions of one record, and retractions of unknown
+records.
+
+## Price adjustment boundary (no double adjustment)
+
+`DailyPriceRecord.adjustment_status` is explicit: `RAW_UNADJUSTED`,
+`PROVIDER_ADJUSTED`, `INTERNALLY_ADJUSTED` or `UNKNOWN` (the **fail-closed
+default** — an unlabelled series may not be adjusted, because double adjustment
+cannot be ruled out). Validation enforces the boundary:
+
+- a `RAW_UNADJUSTED` row may not carry an `adjusted_close`;
+- an `INTERNALLY_ADJUSTED` row **must** name the `adjusted_with_ledger`
+  fingerprint of the corporate-action ledger already applied, so the same actions
+  are never applied twice;
+- a row that names `adjusted_with_ledger` while not internally adjusted is
+  contradictory.
+
+The raw price observations, the adjusted observations and the corporate-action
+ledger are three separate things; the Builder decides which to use.
+
 ## PIT reference-layer ingestion
 
 `packages/py/market-data-core/src/trading_market_data_core/dataset_v1_ingestion.py`
-is the provider-neutral, offline pipeline for the two highest-value blocked
-cells (membership, as-of GICS). It provides:
+is the provider-neutral, offline pipeline for the blocked reference/event cells
+(membership, as-of GICS, delisted history, corporate actions). It provides:
 
-- injected `MembershipSource` / `GicsSource` ports (no commercial provider is
-  selected or hard-coded; an in-memory FIXTURE source drives the tests);
+- injected `MembershipSource` / `GicsSource` / `DelistingSource` /
+  `CorporateActionSource` ports plus `ingest_symbol_history` and
+  `build_retraction` (no commercial provider is selected or hard-coded; in-memory
+  FIXTURE sources drive the tests);
 - normalization that resolves a provider `symbol` to a stable `security_id` via
   an injected `IdentityResolver` and **fails closed on an unknown security**
   (historical truth is never keyed by ticker);
@@ -64,9 +108,20 @@ supplies at least one historical change, validation passes, AND a verifiable
 real-evidence checksum is present. A **FIXTURE** source, a **current-snapshot-only**
 source, a source with no historical change, missing checksum, or any validation
 error keeps the cell `BLOCKED_EXTERNAL` (a clean fixture proves the machinery
-only, as `CONTRACT_READY`). No real reference source or evidence is wired in this
-repository, so both cells remain `BLOCKED_EXTERNAL` and
+only, as `CONTRACT_READY`). Synthetic or manually fabricated events are never
+evidence. No real reference source or evidence is wired in this repository, so
+`pit_sp500_membership`, `asof_gics`, `delisted_security_history` and
+`corporate_actions` **all remain `BLOCKED_EXTERNAL`** and
 `full_dataset_contract_ready` stays false.
+
+## Survivorship-bias protection
+
+Proven by acceptance tests: a security present in historical membership stays in
+the historical universe after it later delists; a delisted security remains
+resolvable by stable `security_id`; a missing current broker contract
+(`ibkr_con_id is None`) does not erase historical existence; historical symbol
+resolution never uses today's symbol map; and today's surviving universe is never
+used as the historical membership answer.
 
 ## Empirical state on 2026-08-16
 

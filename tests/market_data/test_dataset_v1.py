@@ -14,6 +14,7 @@ from trading_market_data_core.dataset_v1 import (
     DailyPriceRecord,
     DatasetCapabilityMatrix,
     DatasetV1,
+    DelistingReason,
     DelistingRecord,
     EffectiveInterval,
     GicsRecord,
@@ -139,7 +140,10 @@ def test_delisted_security_is_preserved_in_identity_and_history() -> None:
     dataset = DatasetV1(
         securities=(_security("gone", "GONE"),),
         delistings=(
-            DelistingRecord("gone", date(2021, 5, 3), "acquired", PROVENANCE),
+            DelistingRecord(
+                record_id="d-gone", security_id="gone", delisted_on=date(2021, 5, 3),
+                known_at=KNOWN, provenance=PROVENANCE, reason=DelistingReason.ACQUIRED,
+            ),
         ),
         prices=(
             DailyPriceRecord("gone", date(2021, 4, 30), Decimal("12.5"), PROVENANCE),
@@ -198,9 +202,11 @@ def test_corporate_action_split_requires_positive_ratio() -> None:
         securities=(_security("x", "XYZ"),),
         corporate_actions=(
             CorporateActionRecord(
+                record_id="ca-1",
                 security_id="x",
                 action_type=CorporateActionType.SPLIT,
                 effective_on=date(2024, 6, 1),
+                known_at=KNOWN,
                 provenance=PROVENANCE,
                 ratio=Decimal("0"),
             ),

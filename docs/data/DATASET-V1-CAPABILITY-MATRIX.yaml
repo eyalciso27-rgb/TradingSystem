@@ -59,16 +59,28 @@ capabilities:
   delisted_security_history:
     state: BLOCKED_EXTERNAL
     contract_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1.py
+    ingestion_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1_ingestion.py
+    contract_status: CONTRACT_READY  # model + ingestion + validation exist and are tested
     blocked_on: >-
       A source that preserves historical/delisted securities and stable identity rather
-      than returning only today's live symbol universe.
+      than returning only today's live symbol universe, with listing/delisting/
+      last-trading dates, reason, venue, successor and knowledge time. The bitemporal
+      delisting model, lifecycle states (NOT_YET_EXISTED/ACTIVE/DELISTED/UNKNOWN),
+      symbol history and ingestion port exist and are fixture-tested, but no REAL
+      source or verifiable evidence is wired, so the cell stays blocked.
   corporate_actions:
     state: BLOCKED_EXTERNAL
     contract_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1.py
+    ingestion_implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1_ingestion.py
+    contract_status: CONTRACT_READY  # model + ingestion + validation exist and are tested
     blocked_on: >-
-      A source for splits, dividends, mergers, spinoffs, symbol changes and delistings
-      with effective dates and provenance. IBKR ADJUSTED_LAST availability alone does
-      not prove the event-level corporate-action contract.
+      A source for splits, reverse splits, cash/special/stock dividends, mergers,
+      acquisitions, spinoffs, symbol changes, exchange changes and delistings with
+      effective/ex/record/payment dates, Decimal ratios and amounts, currency,
+      successor/predecessor identity, provenance and knowledge time. IBKR
+      ADJUSTED_LAST availability alone does not prove the event-level contract.
+      Synthetic or fabricated events are never evidence; the cell stays blocked
+      until a REAL historical source with a verifiable checksum is supplied.
 
 readiness:
   active_name_price_qualification_sufficient: true
