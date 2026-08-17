@@ -5,7 +5,43 @@
 > [`DATASET-V1-CONTRACT.md`](DATASET-V1-CONTRACT.md) and
 > [`DATASET-V1-CAPABILITY-MATRIX.yaml`](DATASET-V1-CAPABILITY-MATRIX.yaml).
 
-## Source discovery — result as of 2026-08-17
+## Owner source decision (2026-08-17)
+
+**IBKR is the primary approved data source**, and FREE, PUBLIC, LEGALLY
+ACCESSIBLE official sources may supplement capabilities IBKR cannot supply. No
+paid provider may be integrated without a further owner decision.
+
+Approved supplementary sources: **SEC EDGAR / data.sec.gov**, and official public
+S&P Dow Jones Indices announcements where legally and technically available.
+
+### Source authority levels
+
+| Authority | Meaning | Used for |
+|---|---|---|
+| `OWNER_PRIMARY` | the owner's approved IBKR environment | prices, conId identity, adjustment behaviour |
+| `OFFICIAL_PUBLIC` | regulator / index-owner official material | SEC filings, S&P announcements |
+| `PUBLIC_SECONDARY` | free third-party dataset | only when labelled honestly; never as "official" |
+| `FIXTURE` / `SNAPSHOT_ONLY` | test data / today-only state | never promotable |
+
+Reconciliation across sources is deterministic: agreement corroborates; a
+**strictly higher** authority resolves a disagreement (and the disagreement is
+still recorded); **equal-authority disagreement stays UNRESOLVED** (fail closed).
+
+### What each source can and cannot supply
+
+| Capability | IBKR (primary) | SEC EDGAR | S&P public | Status |
+|---|---|---|---|---|
+| `delisted_security_history` | conId/contract identity; price history disappears after delisting | **Form 25 / 25-NSE / 15-12B** evidence delisting/deregistration with filing + acceptance time | — | engineering complete; **pending owner run** |
+| `corporate_actions` | TRADES vs ADJUSTED_LAST characterises adjustment; event feed may need an entitlement (**detected, never assumed**) | filings evidence mergers/reorganisations | — | partial by design; **pending owner run** |
+| `pit_sp500_membership` | not provided | — | official change announcements carry announced + effective dates | **pending**: needs owner-supplied announcement records |
+| `asof_gics` | classification history not exposed | does not provide company-level GICS | taxonomy ≠ company classification | **BLOCKED** — no free official company-level historical GICS |
+
+**Critical boundary:** an adjusted-price divergence (TRADES vs ADJUSTED_LAST)
+proves *a provider adjustment happened*. It is **not** event-level corporate-action
+evidence, and `AdjustmentCrossCheck` records that inference boundary in the
+artifact so the two can never be conflated.
+
+## Earlier discovery — result as of 2026-08-17
 
 A repository/environment discovery was performed **before** writing any adapter:
 
@@ -120,15 +156,27 @@ permitted; the evidence artifact carries metadata and checksums, not the data.
 
 | Capability | State | Why |
 |---|---|---|
-| `pit_sp500_membership` | **BLOCKED_EXTERNAL** | no approved real source |
-| `asof_gics` | **BLOCKED_EXTERNAL** | no approved real source |
-| `delisted_security_history` | **BLOCKED_EXTERNAL** | no approved real source |
-| `corporate_actions` | **BLOCKED_EXTERNAL** | no approved real source |
+| `pit_sp500_membership` | **BLOCKED_EXTERNAL** | adapter ready; needs owner-supplied official S&P announcement records |
+| `asof_gics` | **BLOCKED_EXTERNAL** | no free official company-level historical GICS source exists |
+| `delisted_security_history` | **BLOCKED_EXTERNAL** | SEC adapter ready; **pending owner run** (`SEC_EDGAR_USER_AGENT` + IB Gateway) |
+| `corporate_actions` | **BLOCKED_EXTERNAL** | IBKR probe + SEC adapter ready; **pending owner run** |
 | six IBKR historical capabilities | `EMPIRICALLY_VERIFIED` | authenticated `POI-IBKR-HIST.json` |
 
 `full_dataset_contract_ready = false`. No snapshot can reach
 `BACKTEST_ELIGIBLE`; the maximum reachable readiness is `CONTRACT_ONLY`.
 
-**Remaining blocker:** an owner decision approving (and licensing) at least one
-real historical source per capability. Until then these four cells stay blocked —
-by design, not by omission.
+**Remaining blocker is now EXECUTION, not a decision.** The owner decision is
+recorded and the adapters exist. Two host-side inputs are required, neither of
+which may be fabricated here:
+
+1. `export SEC_EDGAR_USER_AGENT='Your Name your.email@example.com'` — SEC
+   automated access requires a **real contact**; the client fails closed without
+   it and this repository will not invent one.
+2. A running **paper** IB Gateway on `127.0.0.1:4002` (port 4001/live is refused).
+
+Then run `./scripts/run_dataset_v1_real_qualification.sh`. Cells flip only where
+the resulting authenticated evidence genuinely passes.
+
+`asof_gics` additionally needs an owner decision, because no free official
+company-level historical GICS source is known to exist — closing it would require
+a licensed provider, which is outside the current approval.

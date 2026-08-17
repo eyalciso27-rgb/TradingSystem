@@ -22,6 +22,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 SOURCE_CONFIG="${DATASET_V1_SOURCE_CONFIG:-config/data-sources/dataset-v1-sources.yaml}"
+IB_HOST="${IB_GATEWAY_HOST:-127.0.0.1}"
+IB_PORT="${IB_GATEWAY_PORT:-4002}"   # PAPER only; 4001 (live) is never used
 EVIDENCE_DIR="${DATASET_V1_EVIDENCE_DIR:-docs/poi/evidence/dataset-v1}"
 CLI="trading_market_data_core.dataset_v1_qualification_cli"
 
@@ -41,6 +43,39 @@ if [ ! -d "packages/py/market-data-core" ]; then
   exit 2
 fi
 echo "preflight: OK"
+echo
+
+# -- 1b. IBKR (OWNER_PRIMARY) preflight -------------------------------------
+# Paper-only: port 4002. The live API port is never contacted. Read-only; there
+# is no order surface anywhere in this path.
+IBKR_STATUS="NOT_RUN"
+if [ "$IB_PORT" = "4001" ]; then
+  echo "PREFLIGHT_FAILED: port 4001 is the LIVE API port and is never allowed" >&2
+  exit 2
+fi
+if command -v nc >/dev/null 2>&1 && nc -z "$IB_HOST" "$IB_PORT" 2>/dev/null; then
+  IBKR_STATUS="GATEWAY_REACHABLE"
+else
+  IBKR_STATUS="GATEWAY_UNREACHABLE"
+fi
+echo "IBKR paper gateway ($IB_HOST:$IB_PORT): $IBKR_STATUS"
+if [ "$IBKR_STATUS" = "GATEWAY_REACHABLE" ]; then
+  echo "  -> run the read-only historical qualification to refresh POI-IBKR-HIST:"
+  echo "     uv run --no-sync python -m trading_broker_ibkr.poi_historical_qualification \\"
+  echo "       --host $IB_HOST --port $IB_PORT --account-alias paper-poi \\"
+  echo "       --out docs/poi/evidence/POI-IBKR-HIST.json"
+fi
+
+# -- 1c. SEC EDGAR (OFFICIAL_PUBLIC) access-rule preflight -------------------
+SEC_STATUS="NOT_CONFIGURED"
+if [ -n "${SEC_EDGAR_USER_AGENT:-}" ]; then
+  SEC_STATUS="USER_AGENT_CONFIGURED"
+else
+  echo "SEC EDGAR: SEC_EDGAR_USER_AGENT is not set."
+  echo "  SEC automated access requires a real contact, e.g.:"
+  echo "  export SEC_EDGAR_USER_AGENT='Your Name your.email@example.com'"
+fi
+echo "SEC EDGAR: $SEC_STATUS"
 echo
 
 # -- 2. acceptance criteria (what a real source must prove) ------------------
@@ -76,6 +111,19 @@ STATUS=$?
 set -e
 
 echo
+echo "== SOURCE QUALIFICATION =="
+printf '%-28s %s
+' "IBKR (OWNER_PRIMARY)" "$IBKR_STATUS"
+printf '%-28s %s
+' "SEC EDGAR (OFFICIAL)" "$SEC_STATUS"
+printf '%-28s %s
+' "S&P PUBLIC ANNOUNCEMENTS" "NOT_CONFIGURED"
+printf '%-28s %s
+' "FREE SECONDARY" "NOT_USED"
+echo
+echo "evidence_dir  $EVIDENCE_DIR"
+echo
+
 if [ "$STATUS" -eq 0 ]; then
   echo "RESULT: full_dataset_contract_ready = TRUE"
   echo "A real DatasetSnapshot may now be built; readiness is still computed by"
