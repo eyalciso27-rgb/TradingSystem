@@ -126,6 +126,31 @@ state and blocked reasons, and exits non-zero while
 `full_dataset_contract_ready` is false — so an owner run can never be mistaken
 for success. It never prints credentials and never promotes anything by itself.
 
+### What the runner does and does NOT do
+
+The `SOURCE QUALIFICATION` block reports **access/configuration state, not
+capability qualification**:
+
+| Line | What it actually means |
+|---|---|
+| `IBKR ... GATEWAY_REACHABLE` | a TCP connection to the paper port succeeded — nothing more |
+| `SEC EDGAR ... USER_AGENT_CONFIGURED` | `SEC_EDGAR_USER_AGENT` is set. **The runner issues no SEC request, performs no ingestion and runs no SEC qualification.** |
+| `PREFLIGHT_TOOL_UNAVAILABLE` | no TCP probe exists on this host. This is a **tooling gap**, not a statement about the Gateway |
+
+Capability states come only from the authenticated evidence artifacts. Reading
+`USER_AGENT_CONFIGURED` as "SEC data was ingested" would be wrong.
+
+### Gateway reachability preflight
+
+The probe is layered and dependency-free: bash's own `/dev/tcp` first, then
+Python's stdlib socket, then `nc`. Each returns *open*, *closed*, or
+**unavailable** — and an unavailable probe defers to the next one instead of
+voting. A missing or broken tool can therefore never be reported as an
+unreachable Gateway. Port **4001 (live) is rejected before any connection is
+attempted** and is never contacted.
+
+Overrides: `IB_GATEWAY_HOST`, `IB_GATEWAY_PORT` (paper only), `IB_GATEWAY_PROBE_TIMEOUT`.
+
 Environment overrides: `DATASET_V1_SOURCE_CONFIG`, `DATASET_V1_EVIDENCE_DIR`.
 
 The equivalent CLI (also usable directly):
