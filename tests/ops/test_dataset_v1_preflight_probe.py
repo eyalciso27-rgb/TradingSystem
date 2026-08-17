@@ -269,8 +269,20 @@ def test_runner_does_not_gate_the_probe_on_nc_being_installed() -> None:
     assert "/dev/tcp/" in text, "expected a dependency-free TCP probe"
 
 
-def test_runner_does_not_claim_sec_ingestion() -> None:
-    """The SEC line reports CONFIGURATION only; it must not imply a real run."""
+def test_runner_separates_configuration_from_execution() -> None:
+    """Configuration must never be printed as a qualification result.
+
+    The runner now genuinely exercises SEC, so the report has a SOURCE EXECUTION
+    section fed by real exit codes; the User-Agent check is labelled a gate.
+    """
     text = Path(RUNNER).read_text(encoding="utf-8")
-    assert "configuration only" in text
-    assert "not exercised" in text
+    assert "SOURCE EXECUTION" in text
+    assert "configuration is a gate" in text
+    assert "SOURCE QUALIFICATION" not in text, "configuration was renamed to execution"
+
+
+def test_execution_status_never_reports_pass_without_a_zero_exit() -> None:
+    """classify_execution maps only exit code 0 to PASS."""
+    text = Path(RUNNER).read_text(encoding="utf-8")
+    assert "classify_execution()" in text
+    assert 'echo "NOT_AVAILABLE"' in text

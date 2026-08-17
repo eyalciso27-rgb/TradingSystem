@@ -177,12 +177,88 @@ uv run --no-sync python -m trading_market_data_core.dataset_v1_qualification_cli
 Licensed bulk data must **not** be committed where redistribution is not
 permitted; the evidence artifact carries metadata and checksums, not the data.
 
+## Real source execution (what the runner actually does)
+
+One owner command performs the whole pipeline:
+
+```bash
+export SEC_EDGAR_USER_AGENT='Your Name your.email@example.com'
+./scripts/run_dataset_v1_real_qualification.sh
+```
+
+Stages: preflight -> IBKR read-only qualification (historical + corporate) ->
+SEC discovery/ingestion/qualification -> S&P official membership ingestion ->
+identity crosswalk -> evidence generation -> evidence verification -> capability
+promotion -> readiness -> snapshot attempt.
+
+The report ends with **SOURCE EXECUTION**, which describes what each source
+*produced on that run*. It is fed by real exit codes, not by configuration:
+
+| Status | Meaning |
+|---|---|
+| `PASS` | real authenticated evidence, promotion eligible |
+| `PARTIAL` | real evidence written, genuinely incomplete (sub-capabilities listed) |
+| `FAIL` | the stage ran and produced nothing usable |
+| `NOT_AVAILABLE` | no legally/technically reproducible path on this host |
+| `NOT_RUN` | the gate was not satisfied (e.g. no SEC User-Agent) |
+
+`SEC_EDGAR_USER_AGENT is set` is a **gate**, never a result.
+
+### SEC EDGAR - bounded, compliant ingestion
+
+Delisted names are **discovered, not guessed**: the runner fetches ONE quarter of
+SEC's official catalogue (`full-index/<year>/QTR<q>/master.idx`), selects a
+deterministic, capped slice of real Form 25 / 25-NSE filings, then fetches those
+filers' submissions. Identity comes from SEC's own payload (`cik`, `name`,
+`tickers`, `exchanges`, `formerNames`), so no local guess can enter the dataset.
+
+* Declared User-Agent with a real contact; **fails closed** without it.
+* Rate-limited below SEC's published ceiling.
+* Bounded: 1 index + `DATASET_V1_SEC_LIMIT` submission requests (default 5).
+* The index is **not committed** - only its sha256 and a reproducible URL.
+
+`security_id` is `sec-cik:<10-digit CIK>` - stable, not a ticker, and it survives
+delisting. **A delisted name stays resolvable with no current IBKR contract.**
+
+Form 25's statutory effective date is **never computed**. The metadata publishes
+a filing date and an acceptance time; `delisting_effective_date_published`
+reports honestly whether a real effective date was found.
+
+### IBKR - what it does and does not establish
+
+`poi_corporate_actions_qualification` compares TRADES vs ADJUSTED_LAST at
+**matched bar dates only** (comparing different days would manufacture a
+divergence). This characterises **adjustment behaviour**. It is not an event
+ledger: no event type, no ratio, no ex-date. Entitlement messages are classified
+as `ENTITLEMENT_REQUIRED`, never as a capability failure and never as
+availability; a clean-but-empty response is `UNAVAILABLE`, not `AVAILABLE`.
+
+The event-level corporate-action feed is **probed, not assumed**: no such
+endpoint is reachable through the read-only historical API surface used here.
+That is recorded as observed, and qualification continues with SEC.
+
+### S&P DJI - official documents, no scraping
+
+Automated retrieval is blocked by the publisher: a plain automated request to
+`spglobal.com` returns **HTTP 403, including for `robots.txt`**. Circumventing
+bot protection is not permitted, so membership is ingested from OFFICIAL
+documents the owner supplies through
+[`sp500-announcements.example.json`](../../config/data-sources/sp500-announcements.example.json),
+each bound to a recomputed sha256.
+
+Anti-leak rules enforced at load time: the baseline **must** be anchored at the
+window start (a later baseline is refused as current-universe projection), every
+announcement must sit inside the declared window, and an effect may not precede
+its announcement. PIT replay honours both axes - a change announced after the
+knowledge time is invisible.
+
 ## Current status
+
 
 | Capability | State | Why |
 |---|---|---|
 | `pit_sp500_membership` | **BLOCKED_EXTERNAL** | adapter ready; needs owner-supplied official S&P announcement records |
-| `asof_gics` | **BLOCKED_EXTERNAL** | no free official company-level historical GICS source exists |
+| `asof_gics` | **BLOCKED_EXTERNAL** | no free official company-level historical GICS source exists - see below |
 | `delisted_security_history` | **BLOCKED_EXTERNAL** | SEC adapter ready; **pending owner run** (`SEC_EDGAR_USER_AGENT` + IB Gateway) |
 | `corporate_actions` | **BLOCKED_EXTERNAL** | IBKR probe + SEC adapter ready; **pending owner run** |
 | six IBKR historical capabilities | `EMPIRICALLY_VERIFIED` | authenticated `POI-IBKR-HIST.json` |
@@ -205,3 +281,21 @@ the resulting authenticated evidence genuinely passes.
 `asof_gics` additionally needs an owner decision, because no free official
 company-level historical GICS source is known to exist — closing it would require
 a licensed provider, which is outside the current approval.
+
+## as-of GICS - the exact missing requirement
+
+Still `BLOCKED_EXTERNAL`, and deliberately not worked around. What is missing is a
+**company-level HISTORICAL GICS series**: security -> GICS code -> effective date
+-> knowledge date.
+
+Checked and rejected:
+
+* **IBKR** exposes no classification history through the read-only API;
+* **SEC** assigns **SIC**, not GICS. SIC is a different taxonomy and is not a
+  GICS substitute;
+* **S&P DJI** publishes the GICS *structure* (the code taxonomy) publicly, but
+  not free company-level historical assignments.
+
+Deriving history from current GICS, current sector, or a business description
+would fabricate the series, so it is refused. Closing this cell requires a
+licensed provider - an owner decision, not more engineering.
