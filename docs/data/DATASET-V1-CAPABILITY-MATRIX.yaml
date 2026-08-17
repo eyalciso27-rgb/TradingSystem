@@ -82,6 +82,19 @@ capabilities:
       Synthetic or fabricated events are never evidence; the cell stays blocked
       until a REAL historical source with a verifiable checksum is supplied.
 
+real_source_qualification:
+  runbook: DATASET-V1-REAL-SOURCE-QUALIFICATION.md
+  harness: packages/py/market-data-core/src/trading_market_data_core/dataset_v1_qualification.py
+  owner_command: ./scripts/run_dataset_v1_real_qualification.sh
+  # Discovery on 2026-08-17 found NO owner-approved real historical source for any
+  # of the four external cells (no secret store, no committed datasets,
+  # market-data providers PENDING_POI, InvestingPro ToS-blocked, and POI-IBKR-HIST
+  # explicitly excludes membership/GICS/delisted history). No adapter was written
+  # against a specific provider and no evidence was fabricated; the harness exists
+  # so promotion happens the moment a real source is supplied.
+  sources_discovered: none
+  evidence_artifacts: none
+
 builder:
   implementation: packages/py/market-data-core/src/trading_market_data_core/dataset_v1_builder.py
   snapshot_readiness_levels: [CONTRACT_ONLY, PARTIAL_DATA, EMPIRICAL_REFERENCE_READY,
