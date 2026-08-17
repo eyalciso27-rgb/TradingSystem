@@ -34,6 +34,21 @@ IB_PORT="${IB_GATEWAY_PORT:-4002}"   # PAPER only; 4001 (live) is never used
 IB_PROBE_TIMEOUT="${IB_GATEWAY_PROBE_TIMEOUT:-3}"
 EVIDENCE_DIR="${DATASET_V1_EVIDENCE_DIR:-docs/poi/evidence/dataset-v1}"
 CLI="trading_market_data_core.dataset_v1_qualification_cli"
+INGEST_CLI="trading_market_data_core.dataset_v1_ingest_cli"
+SNAPSHOT_CLI="trading_market_data_core.dataset_v1_snapshot_cli"
+
+# -- real-source execution knobs (all bounded; nothing here is a bulk crawl) --
+RUN_IBKR="${DATASET_V1_RUN_IBKR:-1}"
+IB_ACCOUNT_ALIAS="${IB_ACCOUNT_ALIAS:-paper-poi}"
+IBKR_CORPORATE_ARTIFACT="${DATASET_V1_IBKR_CORPORATE_ARTIFACT:-docs/poi/evidence/POI-IBKR-CORP.json}"
+#: one quarter of SEC's official catalogue + a capped number of filers
+SEC_YEAR="${DATASET_V1_SEC_YEAR:-2023}"
+SEC_QUARTER="${DATASET_V1_SEC_QUARTER:-1}"
+SEC_LIMIT="${DATASET_V1_SEC_LIMIT:-5}"
+SP_MANIFEST="${DATASET_V1_SP_MANIFEST:-config/data-sources/sp500-announcements.json}"
+SP_PRODUCTION_START="${DATASET_V1_SP_PRODUCTION_START:-}"
+SP_PRODUCTION_END="${DATASET_V1_SP_PRODUCTION_END:-}"
+SNAPSHOT_OUT="${DATASET_V1_SNAPSHOT_OUT:-docs/poi/evidence/dataset-v1-snapshot-report.json}"
 
 # -- TCP preflight ------------------------------------------------------------
 # Each probe returns: 0 = port open, 1 = port closed/unreachable, 2 = this probe
@@ -140,6 +155,28 @@ ibkr_preflight_status() {
     return 0
 }
 
+classify_execution() {
+    # Map an ingestion CLI exit code to an honest SOURCE EXECUTION status.
+    # These describe what the run ACHIEVED. Configuration state is never
+    # reported here: "the User-Agent is set" is not "SEC was qualified".
+    case "${1:-}" in
+        0) echo "PASS" ;;
+        3) echo "PARTIAL" ;;
+        4) echo "NOT_AVAILABLE" ;;
+        2) echo "FAIL" ;;   # source could not be read
+        *) echo "FAIL" ;;
+    esac
+}
+
+run_stage() {
+    # run_stage <label> <command...>; echoes the status, preserves the code.
+    local label="$1"; shift
+    local rc=0
+    echo "== $label ==" >&2
+    "$@" >&2 || rc=$?
+    classify_execution "$rc"
+}
+
 main() {
     set -euo pipefail
 
@@ -189,17 +226,19 @@ main() {
     esac
 
     # -- 1c. SEC EDGAR (OFFICIAL_PUBLIC) access-rule preflight ----------------
-    # CONFIGURATION CHECK ONLY. This runner issues no SEC request.
-    local SEC_STATUS="NOT_CONFIGURED"
+    # Configuration is only the GATE. Whether SEC was actually exercised is
+    # decided below by the ingestion stages, and reported as SOURCE EXECUTION.
+    local SEC_CONFIGURED="NO"
     if [ -n "${SEC_EDGAR_USER_AGENT:-}" ]; then
-        SEC_STATUS="USER_AGENT_CONFIGURED"
+        SEC_CONFIGURED="YES"
     else
         echo "SEC EDGAR: SEC_EDGAR_USER_AGENT is not set."
         echo "  SEC automated access requires a real contact, e.g.:"
         echo "  export SEC_EDGAR_USER_AGENT='Your Name your.email@example.com'"
+        echo "  Without it the SEC client fails closed and SEC stays NOT_RUN."
     fi
-    echo "SEC EDGAR: $SEC_STATUS (configuration only; this runner performs NO SEC"
-    echo "  request, NO ingestion and NO qualification)"
+    echo "SEC EDGAR user-agent configured: $SEC_CONFIGURED (configuration is a gate,"
+    echo "  not a qualification result)"
     echo
 
     # -- 2. acceptance criteria (what a real source must prove) ---------------
@@ -211,6 +250,39 @@ main() {
     echo "== source discovery =="
     uv run --no-sync python -m "$CLI" discover \
         --config "$SOURCE_CONFIG" --evidence-dir "$EVIDENCE_DIR"
+    echo
+
+    # -- 3b. REAL SOURCE EXECUTION -------------------------------------------
+    # Everything below actually exercises the approved sources. A stage that
+    # cannot run reports NOT_RUN/NOT_AVAILABLE; it never reports PASS.
+    local IBKR_EXEC="NOT_RUN" SEC_EXEC="NOT_RUN" SP_EXEC="NOT_RUN" GICS_EXEC="NOT_RUN"
+    local CROSSWALK_EXEC="NOT_RUN"
+
+    if [ "$IBKR_STATUS" = "GATEWAY_REACHABLE" ] && [ "$RUN_IBKR" = "1" ]; then
+        local ibkr_rc=0
+        echo "== IBKR read-only historical qualification ==" >&2
+        uv run --no-sync python -m trading_broker_ibkr.poi_historical_qualification             --host "$IB_HOST" --port "$IB_PORT" --account-alias "$IB_ACCOUNT_ALIAS"             --out docs/poi/evidence/POI-IBKR-HIST.json >&2 || ibkr_rc=$?
+        echo "== IBKR read-only corporate-action qualification ==" >&2
+        uv run --no-sync python -m trading_broker_ibkr.poi_corporate_actions_qualification             --host "$IB_HOST" --port "$IB_PORT" --account-alias "$IB_ACCOUNT_ALIAS"             --out "$IBKR_CORPORATE_ARTIFACT" >&2 || ibkr_rc=$?
+        if [ "$ibkr_rc" -eq 0 ]; then IBKR_EXEC="PASS"; else IBKR_EXEC="PARTIAL"; fi
+    fi
+
+    if [ "$SEC_CONFIGURED" = "YES" ]; then
+        SEC_EXEC="$(run_stage "SEC delisting ingestion + qualification"             uv run --no-sync python -m "$INGEST_CLI" sec-delisting             --evidence-dir "$EVIDENCE_DIR" --year "$SEC_YEAR" --quarter "$SEC_QUARTER"             --limit "$SEC_LIMIT")"
+        local sec_corp
+        sec_corp="$(run_stage "SEC corporate-action ingestion + qualification"             uv run --no-sync python -m "$INGEST_CLI" sec-corporate             --evidence-dir "$EVIDENCE_DIR" --year "$SEC_YEAR" --quarter "$SEC_QUARTER"             --limit "$SEC_LIMIT" --ibkr-artifact "$IBKR_CORPORATE_ARTIFACT")"
+        # the weaker of the two SEC stages is the honest SEC status
+        if [ "$sec_corp" = "FAIL" ] || [ "$SEC_EXEC" = "FAIL" ]; then
+            SEC_EXEC="FAIL"
+        elif [ "$sec_corp" = "PARTIAL" ] || [ "$SEC_EXEC" = "PARTIAL" ]; then
+            SEC_EXEC="PARTIAL"
+        fi
+        CROSSWALK_EXEC="$(run_stage "identity crosswalk"             uv run --no-sync python -m "$INGEST_CLI" crosswalk             --evidence-dir "$EVIDENCE_DIR" --year "$SEC_YEAR" --quarter "$SEC_QUARTER"             --limit "$SEC_LIMIT")"
+    fi
+
+    SP_EXEC="$(run_stage "S&P official membership ingestion"         uv run --no-sync python -m "$INGEST_CLI" sp-membership         --evidence-dir "$EVIDENCE_DIR" --manifest "$SP_MANIFEST"         --production-start "$SP_PRODUCTION_START" --production-end "$SP_PRODUCTION_END")"
+
+    GICS_EXEC="$(run_stage "as-of GICS free-source discovery"         uv run --no-sync python -m "$INGEST_CLI" gics)"
     echo
 
     # -- 4. verify each evidence artifact individually ------------------------
@@ -237,15 +309,41 @@ main() {
     set -e
 
     echo
-    echo "== SOURCE QUALIFICATION =="
-    echo "(these are ACCESS/CONFIGURATION states, not capability qualification;"
-    echo " capability states come from the authenticated evidence above)"
-    printf '%-28s %s\n' "IBKR (OWNER_PRIMARY)" "$IBKR_STATUS"
-    printf '%-28s %s\n' "SEC EDGAR (OFFICIAL)" "$SEC_STATUS (not exercised)"
-    printf '%-28s %s\n' "S&P PUBLIC ANNOUNCEMENTS" "NOT_CONFIGURED"
+    echo "== SOURCE EXECUTION =="
+    echo "(what each source ACTUALLY produced on this run; configuration state is"
+    echo " never reported as a qualification result)"
+    printf '%-28s %s\n' "IBKR" "$IBKR_EXEC"
+    printf '%-28s %s\n' "SEC EDGAR" "$SEC_EXEC"
+    printf '%-28s %s\n' "S&P PUBLIC ANNOUNCEMENTS" "$SP_EXEC"
     printf '%-28s %s\n' "FREE SECONDARY" "NOT_USED"
+    printf '%-28s %s\n' "IDENTITY CROSSWALK" "$CROSSWALK_EXEC"
+    printf '%-28s %s\n' "AS-OF GICS DISCOVERY" "$GICS_EXEC"
     echo
-    echo "evidence_dir  $EVIDENCE_DIR"
+    echo "gateway_preflight  $IBKR_STATUS"
+    echo "evidence_dir       $EVIDENCE_DIR"
+    echo
+    if [ -d "$EVIDENCE_DIR" ]; then
+        echo "evidence checksums:"
+        shopt -s nullglob
+        local seal
+        for seal in "$EVIDENCE_DIR"/*.json; do
+            sha256sum "$seal" 2>/dev/null || shasum -a 256 "$seal" 2>/dev/null || true
+        done
+        shopt -u nullglob
+        echo
+    fi
+
+    # -- 6. real snapshot attempt --------------------------------------------
+    echo "== snapshot attempt =="
+    set +e
+    uv run --no-sync python -m "$SNAPSHOT_CLI" \
+        --evidence-dir "$EVIDENCE_DIR" --out "$SNAPSHOT_OUT"
+    local SNAP_RC=$?
+    set -e
+    if [ "$SNAP_RC" -ne 0 ]; then
+        echo "snapshot_readiness is below BACKTEST_ELIGIBLE (expected while any"
+        echo "required capability is blocked). Readiness is NEVER forced here."
+    fi
     echo
 
     if [ "$STATUS" -eq 0 ]; then

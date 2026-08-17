@@ -1,0 +1,53 @@
+{
+  "_README": [
+    "TEMPLATE ONLY - contains no real index data and qualifies nothing.",
+    "Copy to sp500-announcements.json and fill it from OFFICIAL S&P DJI",
+    "announcement documents you downloaded yourself.",
+    "",
+    "Why manual: spglobal.com returns HTTP 403 to plain automated requests",
+    "(robots.txt included) - publisher bot protection. Circumventing it is not",
+    "permitted, so the owner supplies the official documents and this manifest",
+    "binds each one to a verified sha256 of the document file.",
+    "",
+    "Hard rules enforced at load time (all fail closed):",
+    "  * baseline.as_of MUST equal coverage.start - a later baseline would",
+    "    project today's universe backwards (survivorship bias).",
+    "  * every announcement must fall inside the declared coverage window.",
+    "  * effective_on must not precede announced_on.",
+    "  * source_document_checksum must be a real 64-hex sha256; when",
+    "    document_path is set, the file digest is RECOMPUTED and must match.",
+    "  * every added/removed ticker must map to a stable security_id.",
+    "",
+    "Coverage is bounded on purpose. Declare the production window you actually",
+    "need via --production-start/--production-end: if the manifest is narrower,",
+    "the result is PARTIAL, never an overclaimed PASS."
+  ],
+  "index_id": "SP500",
+  "coverage": {
+    "start": "REPLACE-WITH-WINDOW-START-YYYY-MM-DD",
+    "end": "REPLACE-WITH-WINDOW-END-YYYY-MM-DD"
+  },
+  "baseline": {
+    "as_of": "MUST-EQUAL-coverage.start",
+    "security_ids": [
+      "sec-cik:0000000000"
+    ],
+    "source_url": "https://REPLACE-with-the-official-document-URL",
+    "source_document_checksum": "sha256:REPLACE-with-64-hex-characters",
+    "_note": "Constituents as published AT the window start, from an official point-in-time document. Never today's list."
+  },
+  "security_id_by_ticker": {
+    "REPLACE-TICKER": "sec-cik:0000000000"
+  },
+  "announcements": [
+    {
+      "announced_on": "YYYY-MM-DD",
+      "effective_on": "YYYY-MM-DD",
+      "added_ticker": "REPLACE-OR-NULL",
+      "removed_ticker": "REPLACE-OR-NULL",
+      "source_url": "https://REPLACE-with-the-official-announcement-URL",
+      "source_document_checksum": "sha256:REPLACE-with-64-hex-characters",
+      "document_path": "optional-local-filename-of-the-official-document"
+    }
+  ]
+}

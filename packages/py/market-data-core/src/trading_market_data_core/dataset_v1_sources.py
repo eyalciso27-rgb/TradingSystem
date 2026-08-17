@@ -75,6 +75,8 @@ class SecEdgarClient:
     """
 
     BASE = "https://data.sec.gov"
+    #: The quarterly filing catalogue lives on the www host, same access rules.
+    ARCHIVES = "https://www.sec.gov/Archives"
 
     def __init__(
         self,
@@ -105,19 +107,113 @@ class SecEdgarClient:
         padded = str(cik).strip().lstrip("CIK").zfill(10)
         if not padded.isdigit():
             raise SourceAdapterError(f"invalid CIK {cik!r}")
-        # rate limit below SEC's published ceiling
+        self._throttle()  # stay below SEC's published request ceiling
+        return self._fetcher.get_json(
+            f"{self.BASE}/submissions/CIK{padded}.json", headers=self._headers()
+        )
+
+    def _throttle(self) -> None:
         if self._last_request is not None:
             elapsed = time.monotonic() - self._last_request
             if elapsed < self._min_interval:
                 self._sleep(self._min_interval - elapsed)
         self._last_request = time.monotonic()
-        return self._fetcher.get_json(
-            f"{self.BASE}/submissions/CIK{padded}.json", headers=self._headers()
+
+    def full_index(self, year: int, quarter: int, *, fetcher: HttpBytesFetcher) -> bytes:
+        """One quarter of SEC's official filing catalogue (``master.idx``).
+
+        Bounded by construction: a single quarter, fetched once, rate-limited.
+        The bytes are returned so the caller can bind a genuine checksum without
+        committing the artifact itself.
+        """
+        if quarter not in (1, 2, 3, 4):
+            raise SourceAdapterError(f"invalid SEC index quarter {quarter!r}")
+        self._throttle()
+        return fetcher.get_bytes(
+            f"{self.ARCHIVES}/edgar/full-index/{year}/QTR{quarter}/master.idx",
+            headers=self._headers(),
         )
+
+
+@runtime_checkable
+class HttpBytesFetcher(Protocol):
+    """Read-only transport for non-JSON SEC artifacts (the quarterly index)."""
+
+    def get_bytes(self, url: str, *, headers: Mapping[str, str]) -> bytes: ...
 
 
 #: SEC forms that evidence an exchange delisting / registration removal.
 DELISTING_FORMS = frozenset({"25", "25-NSE", "15-12B", "15-12G", "15-15D"})
+
+
+@dataclass(frozen=True, slots=True)
+class MasterIndexRow:
+    """One row of SEC's quarterly master index (the official filing catalogue)."""
+
+    cik: str
+    company: str
+    form: str
+    date_filed: date
+    filename: str
+
+
+def parse_master_index(raw: bytes) -> tuple[MasterIndexRow, ...]:
+    """Parse SEC's pipe-delimited ``master.idx``. Fail closed on a bad row.
+
+    This is the official catalogue of filings for one quarter, which is how real
+    delisting filings are DISCOVERED instead of guessed. Malformed rows are a
+    parsing failure, never silently skipped.
+    """
+    text = raw.decode("latin-1")
+    rows: list[MasterIndexRow] = []
+    started = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not started:
+            # the header block ends with a dashed separator line
+            if set(stripped) == {"-"} and len(stripped) > 10:
+                started = True
+            continue
+        if not stripped:
+            continue
+        parts = stripped.split("|")
+        if len(parts) != 5:
+            raise SourceAdapterError(
+                f"SEC master index row has {len(parts)} fields, expected 5: {stripped[:80]!r}"
+            )
+        cik, company, form, filed, filename = parts
+        try:
+            filed_on = date.fromisoformat(filed.strip())
+        except ValueError as error:
+            raise SourceAdapterError(
+                f"unparseable SEC master index date {filed!r}: {error}"
+            ) from error
+        rows.append(
+            MasterIndexRow(
+                cik=cik.strip().zfill(10), company=company.strip(), form=form.strip(),
+                date_filed=filed_on, filename=filename.strip(),
+            )
+        )
+    if not started:
+        raise SourceAdapterError("SEC master index has no header separator; fail closed")
+    return tuple(rows)
+
+
+def discover_delisting_candidates(
+    rows: Sequence[MasterIndexRow], *, limit: int, forms: Sequence[str] = ("25", "25-NSE")
+) -> tuple[MasterIndexRow, ...]:
+    """A bounded, deterministic slice of real delisting filings.
+
+    Deterministic ordering (date, CIK, accession path) keeps a qualification run
+    reproducible, and ``limit`` keeps the follow-up requests qualification-scale
+    rather than a bulk crawl.
+    """
+    if limit <= 0:
+        raise SourceAdapterError("candidate limit must be positive")
+    wanted = {form.upper() for form in forms}
+    matching = [row for row in rows if row.form.upper() in wanted]
+    matching.sort(key=lambda row: (row.date_filed, row.cik, row.filename))
+    return tuple(matching[:limit])
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +294,20 @@ def parse_sec_submissions(raw: bytes, parsed: object) -> tuple[SecFilingRecord, 
         )
     del raw  # the caller binds the raw checksum; parsing must not depend on it
     return tuple(records)
+
+
+def combined_artifact_checksum(parts: Sequence[bytes]) -> str:
+    """One digest over EVERY raw response a run actually consumed.
+
+    Binding only the discovery index would leave the normalized records
+    unauthenticated: the filings come from separate submissions responses. Each
+    part is hashed, the digests sorted, then hashed again, so the result is
+    stable regardless of fetch order but changes if any response changes.
+    """
+    if not parts:
+        raise SourceAdapterError("cannot checksum an empty set of source artifacts")
+    digests = sorted(hashlib.sha256(part).hexdigest() for part in parts)
+    return "sha256:" + hashlib.sha256("|".join(digests).encode("ascii")).hexdigest()
 
 
 def artifact_checksum(raw: bytes) -> str:
@@ -537,28 +647,335 @@ def canonical_json(payload: object) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
+# -- real transport (owner host only; never exercised in CI) ------------------
+
+
+class UrllibHttpFetcher:
+    """Real read-only HTTP transport built on the stdlib.
+
+    Used ONLY by the owner-host runner. Unit tests inject a recorded fetcher and
+    never reach this class, so CI stays offline and deterministic.
+    """
+
+    def __init__(self, *, timeout_seconds: float = 30.0) -> None:
+        self._timeout = timeout_seconds
+
+    def get_bytes(self, url: str, *, headers: Mapping[str, str]) -> bytes:
+        return self._fetch(url, headers)[0]
+
+    def get_json(self, url: str, *, headers: Mapping[str, str]) -> tuple[bytes, object]:
+        raw = self._fetch(url, headers)[0]
+        try:
+            parsed: object = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise SourceAdapterError(f"{url} did not return valid JSON: {error}") from error
+        return raw, parsed
+
+    def _fetch(self, url: str, headers: Mapping[str, str]) -> tuple[bytes, int]:
+        import gzip
+        import urllib.error
+        import urllib.request
+
+        request = urllib.request.Request(url, headers=dict(headers))  # noqa: S310
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:  # noqa: S310
+                status = int(response.status)
+                raw = bytes(response.read())
+                encoding = str(response.headers.get("Content-Encoding", "")).lower()
+        except urllib.error.HTTPError as error:
+            raise SourceAdapterError(f"{url} returned HTTP {error.code}") from error
+        except OSError as error:
+            raise SourceAdapterError(f"{url} could not be retrieved: {error}") from error
+        if status != 200:
+            raise SourceAdapterError(f"{url} returned HTTP {status}")
+        if encoding == "gzip":
+            raw = gzip.decompress(raw)
+        return raw, status
+
+
+# -- SEC pagination + ticker/CIK mapping --------------------------------------
+
+
+def sec_filing_shards(parsed: object) -> tuple[str, ...]:
+    """Older filing shards referenced by a submissions payload (``filings.files``).
+
+    SEC keeps only the most recent filings inline; the remainder live in
+    additional documents. Ignoring them would silently truncate history, so the
+    caller must fetch these too.
+    """
+    if not isinstance(parsed, dict):
+        raise SourceAdapterError("SEC submissions payload must be a JSON object")
+    filings = parsed.get("filings")
+    if not isinstance(filings, dict):
+        return ()
+    files = filings.get("files")
+    if files is None:
+        return ()
+    if not isinstance(files, list):
+        raise SourceAdapterError("SEC filings.files must be an array")
+    names: list[str] = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise SourceAdapterError("SEC filings.files entry must be an object")
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise SourceAdapterError("SEC filings.files entry has no name")
+        names.append(name.strip())
+    return tuple(names)
+
+
+def parse_sec_filing_shard(raw: bytes, parsed: object, *, cik: str) -> tuple[SecFilingRecord, ...]:
+    """Normalize an older SEC filing shard (columns at the top level)."""
+    if not isinstance(parsed, dict):
+        raise SourceAdapterError("SEC filing shard must be a JSON object")
+    wrapped = {"cik": cik, "filings": {"recent": parsed}}
+    return parse_sec_submissions(raw, wrapped)
+
+
+@dataclass(frozen=True, slots=True)
+class SecEntityProfile:
+    """Identity SEC itself publishes for a filer — never invented locally.
+
+    Building the crosswalk from this rather than from a hand-written mapping
+    means the authoritative source supplies the identity, so a wrong local guess
+    cannot enter the dataset.
+    """
+
+    cik: str
+    name: str
+    tickers: tuple[str, ...]
+    exchanges: tuple[str, ...]
+    former_names: tuple[str, ...]
+
+    @property
+    def security_id(self) -> str:
+        """A stable identity that is NOT a ticker and survives delisting."""
+        return f"sec-cik:{self.cik}"
+
+
+def parse_sec_entity_profile(raw: bytes, parsed: object) -> SecEntityProfile:
+    """Extract filer identity from a submissions payload. Fail closed on shape."""
+    del raw
+    if not isinstance(parsed, dict):
+        raise SourceAdapterError("SEC submissions payload must be a JSON object")
+    cik = str(parsed.get("cik", "")).strip()
+    if not cik:
+        raise SourceAdapterError("SEC submissions payload has no cik")
+
+    def _string_list(key: str) -> tuple[str, ...]:
+        value = parsed.get(key)
+        if value is None:
+            return ()
+        if not isinstance(value, list):
+            raise SourceAdapterError(f"SEC {key} must be an array")
+        return tuple(str(item).strip() for item in value if str(item).strip())
+
+    former = parsed.get("formerNames")
+    former_names: tuple[str, ...] = ()
+    if isinstance(former, list):
+        former_names = tuple(
+            str(entry.get("name", "")).strip()
+            for entry in former
+            if isinstance(entry, dict) and str(entry.get("name", "")).strip()
+        )
+    return SecEntityProfile(
+        cik=cik.zfill(10),
+        name=str(parsed.get("name", "")).strip(),
+        tickers=tuple(t.upper() for t in _string_list("tickers")),
+        exchanges=_string_list("exchanges"),
+        former_names=former_names,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SecTickerRecord:
+    """One SEC ticker↔CIK mapping row (identity, not price data)."""
+
+    cik: str
+    ticker: str
+    title: str
+
+
+def parse_sec_company_tickers(raw: bytes, parsed: object) -> tuple[SecTickerRecord, ...]:
+    """Normalize SEC's company_tickers.json. Fail closed on an unexpected shape."""
+    del raw
+    if not isinstance(parsed, dict):
+        raise SourceAdapterError("SEC company_tickers payload must be a JSON object")
+    records: list[SecTickerRecord] = []
+    for key, entry in sorted(parsed.items()):
+        if not isinstance(entry, dict):
+            raise SourceAdapterError(f"SEC company_tickers entry {key!r} must be an object")
+        cik_value = entry.get("cik_str")
+        ticker = entry.get("ticker")
+        if cik_value is None or not isinstance(ticker, str) or not ticker.strip():
+            raise SourceAdapterError(f"SEC company_tickers entry {key!r} is missing cik/ticker")
+        records.append(
+            SecTickerRecord(
+                cik=str(cik_value).zfill(10),
+                ticker=ticker.strip().upper(),
+                title=str(entry.get("title", "")).strip(),
+            )
+        )
+    return tuple(records)
+
+
+# -- canonical corporate events ----------------------------------------------
+
+
+class CorporateEventType(StrEnum):
+    """Event-level corporate actions Dataset V1 recognises."""
+
+    SPLIT = "SPLIT"
+    REVERSE_SPLIT = "REVERSE_SPLIT"
+    DIVIDEND = "DIVIDEND"
+    MERGER = "MERGER"
+    SYMBOL_CHANGE = "SYMBOL_CHANGE"
+    DELISTING = "DELISTING"
+    DEREGISTRATION = "DEREGISTRATION"
+
+
+#: SEC forms mapped to the event they genuinely evidence. Nothing else is
+#: inferred: a form that does not by itself establish an event is not listed.
+SEC_FORM_EVENTS: Mapping[str, CorporateEventType] = {
+    "25": CorporateEventType.DELISTING,
+    "25-NSE": CorporateEventType.DELISTING,
+    "15-12B": CorporateEventType.DEREGISTRATION,
+    "15-12G": CorporateEventType.DEREGISTRATION,
+    "15-15D": CorporateEventType.DEREGISTRATION,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalCorporateEvent:
+    """One event-level corporate action with full provenance.
+
+    Every event must carry a stable identity, at least one real date, and a
+    source checksum. An event whose only support is an adjusted-price
+    divergence is NOT constructible here — see ``AdjustmentCrossCheck``.
+    """
+
+    event_id: str
+    security_id: str
+    event_type: CorporateEventType
+    source_id: str
+    source_authority: SourceAuthority
+    source_checksum: str
+    provenance: str
+    effective_on: date | None = None
+    ex_date: date | None = None
+    filing_date: date | None = None
+    known_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.security_id.strip():
+            raise SourceAdapterError("a corporate event requires a stable security_id")
+        if not (self.effective_on or self.ex_date or self.filing_date):
+            raise SourceAdapterError(
+                f"corporate event {self.event_id!r} has no effective/ex/filing date;"
+                " an undated event cannot be placed on a timeline (fail closed)"
+            )
+        digest = self.source_checksum.removeprefix("sha256:")
+        if digest == self.source_checksum or len(digest) != 64:
+            raise SourceAdapterError(
+                f"corporate event {self.event_id!r} requires a sha256 source checksum"
+            )
+        if not self.provenance.strip():
+            raise SourceAdapterError(
+                f"corporate event {self.event_id!r} requires event-level provenance"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "event_id": self.event_id,
+            "security_id": self.security_id,
+            "event_type": self.event_type.value,
+            "source_id": self.source_id,
+            "source_authority": self.source_authority.value,
+            "source_checksum": self.source_checksum,
+            "provenance": self.provenance,
+            "effective_on": self.effective_on.isoformat() if self.effective_on else None,
+            "ex_date": self.ex_date.isoformat() if self.ex_date else None,
+            "filing_date": self.filing_date.isoformat() if self.filing_date else None,
+            "known_at": self.known_at.isoformat() if self.known_at else None,
+        }
+
+
+def sec_filings_to_events(
+    filings: Sequence[SecFilingRecord],
+    *,
+    security_id_by_cik: Mapping[str, str],
+    source_id: str,
+    source_checksum: str,
+) -> tuple[CanonicalCorporateEvent, ...]:
+    """Convert SEC filings into canonical events. Unmapped identity is skipped.
+
+    Only forms in ``SEC_FORM_EVENTS`` produce events. The effective date is
+    deliberately left unset: Form 25 states a filing date, and the delisting's
+    effectiveness follows a statutory period that this parser does NOT compute.
+    Guessing it would manufacture a date the source never published.
+    """
+    events: list[CanonicalCorporateEvent] = []
+    for filing in filings:
+        event_type = SEC_FORM_EVENTS.get(filing.form)
+        if event_type is None:
+            continue
+        security_id = security_id_by_cik.get(filing.cik.zfill(10))
+        if not security_id:
+            continue  # unresolved identity is reported by the crosswalk, never guessed
+        events.append(
+            CanonicalCorporateEvent(
+                event_id=f"sec:{filing.accession}",
+                security_id=security_id,
+                event_type=event_type,
+                source_id=source_id,
+                source_authority=SourceAuthority.OFFICIAL_PUBLIC,
+                source_checksum=source_checksum,
+                provenance=f"SEC {filing.form} accession {filing.accession}",
+                filing_date=filing.filing_date,
+                known_at=filing.accepted_at,
+            )
+        )
+    return tuple(sorted(events, key=lambda event: (event.event_id, event.security_id)))
+
+
 __all__ = [
     "DELISTING_FORMS",
+    "SEC_FORM_EVENTS",
     "SEC_MIN_REQUEST_INTERVAL_SECONDS",
     "SOURCES_VERSION",
     "AdjustmentCrossCheck",
+    "CanonicalCorporateEvent",
+    "CorporateEventType",
     "CrosswalkEntry",
     "CrosswalkResolution",
+    "HttpBytesFetcher",
     "HttpFetcher",
     "IbkrCapabilityProbe",
     "IbkrReferenceCapability",
     "IdentityCrosswalk",
     "IndexChangeAnnouncement",
+    "MasterIndexRow",
     "ProbeOutcome",
     "ReconciledFact",
     "SecEdgarClient",
+    "SecEntityProfile",
     "SecFilingRecord",
+    "SecTickerRecord",
     "SourceAdapterError",
     "SourceAuthority",
     "SourcedFact",
+    "UrllibHttpFetcher",
     "artifact_checksum",
     "canonical_json",
+    "combined_artifact_checksum",
+    "discover_delisting_candidates",
+    "parse_master_index",
+    "parse_sec_company_tickers",
+    "parse_sec_entity_profile",
+    "parse_sec_filing_shard",
     "parse_sec_submissions",
     "reconcile_facts",
     "reconciliation_report",
+    "sec_filing_shards",
+    "sec_filings_to_events",
 ]
