@@ -286,3 +286,29 @@ def test_execution_status_never_reports_pass_without_a_zero_exit() -> None:
     text = Path(RUNNER).read_text(encoding="utf-8")
     assert "classify_execution()" in text
     assert 'echo "NOT_AVAILABLE"' in text
+
+
+def test_runner_verifies_artifacts_by_type_not_by_glob_assumption() -> None:
+    """The owner-host bug: every JSON was parsed as qualification evidence.
+
+    The runner still iterates the directory, but the CLI it calls classifies
+    each file first, so an auxiliary artifact is verified with its own schema.
+    """
+    text = Path(RUNNER).read_text(encoding="utf-8")
+    assert "verify each artifact BY ITS OWN TYPE" in text
+    assert "never parsed with the qualification-evidence schema" in text
+
+
+def test_runner_does_not_require_chmod_or_secondary_commands() -> None:
+    text = Path(RUNNER).read_text(encoding="utf-8")
+    assert "chmod" not in text
+    # every stage runs inside main(); nothing is left for the owner to run by hand
+    for stage in ("poi_historical_qualification", "sec-delisting", "sec-corporate",
+                  "sp-membership", "crosswalk", "gics", "SNAPSHOT_CLI"):
+        assert stage in text, f"stage {stage} must run from the single command"
+
+
+def test_runner_passes_a_documents_dir_for_official_sp_documents() -> None:
+    text = Path(RUNNER).read_text(encoding="utf-8")
+    assert "--documents-dir" in text
+    assert "SP_DOCUMENTS" in text

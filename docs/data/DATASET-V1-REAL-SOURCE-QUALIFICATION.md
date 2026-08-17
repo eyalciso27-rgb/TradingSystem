@@ -252,6 +252,100 @@ announcement must sit inside the declared window, and an effect may not precede
 its announcement. PIT replay honours both axes - a change announced after the
 knowledge time is invisible.
 
+## Evidence artifact types (added after the owner-host run)
+
+The first real owner-host run failed with
+
+```
+EVIDENCE_INVALID docs/poi/evidence/dataset-v1/identity-crosswalk.json
+evidence is missing a sha256 normalized_checksum
+```
+
+on a perfectly valid crosswalk: the verifier globbed `*.json` and applied the
+qualification-evidence schema to everything in the directory. The fix is
+**classification, not relaxation** - every type keeps its own integrity rules.
+
+| `artifact_type` | Written by | Verified with | Promotable |
+|---|---|---|---|
+| `qualification_evidence` | the qualification harness | evidence checksum over the canonical body | **yes - the only one** |
+| `identity_crosswalk` | the crosswalk stage | its own canonical checksum | no |
+| `snapshot_report` | the snapshot stage | build-time bindings | no |
+| `auxiliary_data_quality_report` | coverage/candidate reports | its own checksum | no |
+| `source_manifest` | the owner (S&P documents) | per-document sha256 | no |
+
+Artifacts self-declare `artifact_type`. Files written before the field existed
+are still recognised by a narrow structural fallback that can only *recognise*,
+never invent; anything unrecognisable is reported as `UNCLASSIFIED` and fails
+closed rather than being forced through the wrong schema.
+
+**A tampered auxiliary artifact still fails its own validation** - it simply
+fails as a crosswalk rather than as evidence.
+
+### Identity crosswalk integrity
+
+`identity-crosswalk.json` is a first-class authenticated artifact: canonical
+serialization (sorted throughout, so input order cannot change the digest),
+`schema_version`, source bindings with real sha256 digests, identity metrics,
+and a checksum recomputed on load. The snapshot **binds and re-verifies it**,
+and refuses to assert any `security_id` the crosswalk did not resolve. A
+tampered crosswalk invalidates the snapshot build.
+
+## Form 25 primary documents
+
+The owner run proved 36 delisting filings but `delisting_effective_date_published`
+was 0/36: the submissions metadata carries a filing date and an acceptance time,
+never a delisting effective date. That date, when published at all, is in the
+primary document.
+
+The runner now retrieves each selected Form 25 / 25-NSE primary document and
+extracts only what the document explicitly publishes:
+
+- effective delisting date, last trading date, issuer, exchange, rule provision;
+- the **raw document checksum**, plus per-field provenance recording the exact
+  element and raw text each value came from, so any parse can be audited;
+- **nothing is computed.** SEC Rule 12d2-2 makes a delisting effective ten days
+  after filing, but that is a statutory rule, not a published per-filing fact.
+  A filing without an explicit date yields `None` and the sub-capability stays
+  PARTIAL.
+
+An unrecognised document is **diagnosed, not guessed**: the observed element
+names are written to `form25-coverage.json` so the allow-list can be widened
+from real documents rather than from assumptions about the schema. Documents
+declaring a DTD/ENTITY are refused outright.
+
+## Corporate actions - event types and the required set
+
+| Sub-capability | Source | Status |
+|---|---|---|
+| `event_delisting` | SEC Form 25 / 25-NSE | proven on the owner host (36 events) |
+| `event_split` / `event_reverse_split` | SEC **XBRL** `StockholdersEquityNoteStockSplitConversionRatio1` | attempted per filer |
+| `event_dividend` | SEC **XBRL** `CommonStockDividendsPerShareDeclared` | attempted per filer |
+| `event_merger` / `event_acquisition` / `event_spinoff` / `event_symbol_change` | no free structured official source | unproven |
+| `adjustment_behaviour_characterised` | IBKR TRADES vs ADJUSTED_LAST | corroboration only |
+| `ibkr_event_feed_available` | IBKR probe | UNAVAILABLE on the owner account |
+
+XBRL is SEC's own **structured** data: each fact carries a value, a period, the
+accession that reported it and the date it was filed. A concept a filer never
+reported returns HTTP 404 and is recorded as unavailable - never invented. A
+dividend's **ex-date is not published by XBRL**, so `effective_on` stays unset
+and the period is recorded as provenance instead.
+
+8-K item codes are published metadata but are **ambiguous** about what occurred
+(item 2.01 covers an acquisition *or* a disposition). They are written to
+`corporate-action-candidates.json` as review leads and **qualify nothing**.
+
+`corporate_actions` may only PASS when every event type in the production
+contract's **required set** (split, reverse split, dividend, merger, symbol
+change, delisting) is proven with event-level evidence. Proving delisting alone
+is a genuine PARTIAL.
+
+### IBKR/SEC reconciliation
+
+Where SEC reports a price-affecting event and IBKR shows an adjustment
+divergence, corroboration is recorded. Where they disagree, the disagreement is
+recorded explicitly and **never silently resolved**. IBKR observations never
+create an event: the event count is identical with and without them.
+
 ## Current status
 
 

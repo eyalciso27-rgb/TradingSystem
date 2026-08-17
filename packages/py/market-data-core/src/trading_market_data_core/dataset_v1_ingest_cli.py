@@ -28,8 +28,22 @@ import json
 import sys
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
+from functools import lru_cache
 from pathlib import Path
 
+from trading_market_data_core.dataset_v1_artifacts import (
+    ArtifactType,
+    AuxiliaryReport,
+    CrosswalkArtifact,
+    CrosswalkSourceBinding,
+)
+from trading_market_data_core.dataset_v1_form25 import (
+    candidate_signals,
+    effective_dates_by_accession,
+    parse_form25_document,
+    primary_document_url,
+    summarize_form25,
+)
 from trading_market_data_core.dataset_v1_qualification import (
     CoverageWindow,
     QualificationEvidence,
@@ -48,6 +62,9 @@ from trading_market_data_core.dataset_v1_real_ingestion import (
     real_source_descriptor,
 )
 from trading_market_data_core.dataset_v1_sources import (
+    XBRL_DIVIDEND_CONCEPTS,
+    XBRL_SPLIT_CONCEPTS,
+    AdjustmentCrossCheck,
     CanonicalCorporateEvent,
     CrosswalkEntry,
     IbkrCapabilityProbe,
@@ -65,7 +82,9 @@ from trading_market_data_core.dataset_v1_sources import (
     parse_master_index,
     parse_sec_entity_profile,
     parse_sec_submissions,
+    parse_xbrl_concept,
     sec_filings_to_events,
+    xbrl_facts_to_events,
 )
 
 DEFAULT_EVIDENCE_DIR = Path("docs/poi/evidence/dataset-v1")
@@ -112,6 +131,18 @@ def _now() -> datetime:
     return datetime.now(tz=UTC)
 
 
+@lru_cache(maxsize=1)
+def _sec_transport() -> tuple[UrllibHttpFetcher, SecEdgarClient]:
+    """ONE fetcher + client for the whole process.
+
+    Every stage shares this so SEC's published request ceiling is respected
+    across the run. Separate clients would each open their own unpaced budget
+    and the effective rate would be a multiple of the limit.
+    """
+    fetcher = UrllibHttpFetcher()
+    return fetcher, SecEdgarClient(fetcher)
+
+
 def _discover_and_fetch(
     *,
     year: int,
@@ -123,8 +154,7 @@ def _discover_and_fetch(
     Returns (filings, profiles, index_checksum, index_url). Bounded: one
     quarterly index plus at most ``limit`` submission requests.
     """
-    fetcher = UrllibHttpFetcher()
-    client = SecEdgarClient(fetcher)
+    fetcher, client = _sec_transport()
     index_raw = client.full_index(year, quarter, fetcher=fetcher)
     consumed: list[bytes] = [index_raw]
     index_url = f"{SecEdgarClient.ARCHIVES}/edgar/full-index/{year}/QTR{quarter}/master.idx"
@@ -140,6 +170,55 @@ def _discover_and_fetch(
         filings.extend(parse_sec_submissions(raw, parsed))
     # Authenticate EVERY response the run consumed, not just the index.
     return filings, profiles, combined_artifact_checksum(consumed), index_url
+
+
+
+def _fetch_form25_documents(
+    filings: Sequence[SecFilingRecord], *, limit: int
+) -> tuple[list[object], list[bytes], list[str]]:
+    """Retrieve and parse the primary document of each real delisting filing.
+
+    The submissions metadata never carries a delisting effective date; when that
+    date exists at all it is inside the document. Anything unreachable is
+    recorded as a note, never filled in.
+    """
+    from trading_market_data_core.dataset_v1_form25 import Form25Document
+
+    fetcher, client = _sec_transport()
+    documents: list[Form25Document] = []
+    consumed: list[bytes] = []
+    notes: list[str] = []
+    delistings = [f for f in filings if f.form in ("25", "25-NSE")][:limit]
+    for filing in delistings:
+        try:
+            url = primary_document_url(filing)
+        except SourceAdapterError as error:
+            notes.append(f"{filing.accession}: {error}")
+            continue
+        try:
+            client.pace()  # shared throttle: one budget for the whole run
+            raw = fetcher.get_bytes(url, headers={"User-Agent": _sec_user_agent()})
+        except SourceAdapterError as error:
+            notes.append(f"{filing.accession}: document unreachable ({error})")
+            continue
+        consumed.append(raw)
+        try:
+            documents.append(parse_form25_document(raw, filing=filing))
+        except SourceAdapterError as error:
+            notes.append(f"{filing.accession}: document not parsed ({error})")
+    return list(documents), consumed, notes
+
+
+def _sec_user_agent() -> str:
+    """The owner's declared contact. Fails closed exactly like the client does."""
+    import os
+
+    agent = os.environ.get("SEC_EDGAR_USER_AGENT", "")
+    if not agent.strip():
+        raise SourceAdapterError(
+            "SEC automated access requires SEC_EDGAR_USER_AGENT with a real contact"
+        )
+    return agent
 
 
 def _crosswalk_from_profiles(
@@ -178,10 +257,40 @@ def cmd_sec_delisting(args: argparse.Namespace) -> int:
     crosswalk = _crosswalk_from_profiles(profiles)
     security_id_by_cik = {p.cik: p.security_id for p in profiles}
     dates = sorted(f.filing_date for f in filings)
+
+    # Primary documents: the ONLY place a published delisting effective date
+    # can come from. Nothing is derived from the statutory period.
+    documents, doc_bytes, doc_notes = _fetch_form25_documents(filings, limit=args.limit)
+    coverage_report = summarize_form25(documents)  # type: ignore[arg-type]
+    effective = effective_dates_by_accession(documents)  # type: ignore[arg-type]
+    if doc_bytes:
+        # Chain the prior digest with the document bytes so the evidence
+        # authenticates the documents as well as the discovery responses.
+        index_checksum = combined_artifact_checksum(
+            [index_checksum.encode("ascii"), *doc_bytes]
+        )
+    AuxiliaryReport(
+        name="form25-primary-document-coverage",
+        observed_at=_now(),
+        findings=tuple(coverage_report.findings) + tuple(doc_notes),
+        counts={
+            "documents": coverage_report.documents,
+            "with_effective_date": coverage_report.with_effective_date,
+            "with_last_trading_date": coverage_report.with_last_trading_date,
+            "unparsed_documents": coverage_report.unparsed_documents,
+        },
+        notes=(
+            "Element names observed in the real documents, for widening the"
+            " allow-list from data rather than assumptions:",
+            ", ".join(coverage_report.observed_elements) or "(none)",
+        ),
+    ).write(args.evidence_dir / "form25-coverage.json")
+
     evidence = qualify_delisted_security_history(
         filings,
         crosswalk=crosswalk,
         security_id_by_cik=security_id_by_cik,
+        effective_dates=effective,
         source=real_source_descriptor(
             source_id="sec-edgar",
             name="SEC EDGAR (data.sec.gov + full-index)",
@@ -205,8 +314,14 @@ def cmd_sec_delisting(args: argparse.Namespace) -> int:
     return _exit_code(evidence)
 
 
-def _load_ibkr_probes(path: Path | None) -> tuple[list[IbkrCapabilityProbe], list[str]]:
-    """Read the IBKR corporate artifact produced on the owner host."""
+def _load_ibkr_probes(
+    path: Path | None,
+) -> tuple[list[IbkrCapabilityProbe], list[AdjustmentCrossCheck]]:
+    """Read the IBKR corporate artifact produced on the owner host.
+
+    Adjustment observations are returned so they can corroborate ADJUSTMENT
+    BEHAVIOUR. They are never turned into events.
+    """
     if path is None or not path.is_file():
         return [], []
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -227,8 +342,29 @@ def _load_ibkr_probes(path: Path | None) -> tuple[list[IbkrCapabilityProbe], lis
                 detail=str(entry.get("detail", "")),
             )
         )
-    notes = [str(note) for note in payload.get("notes", [])]
-    return probes, notes
+    adjustments: list[AdjustmentCrossCheck] = []
+    for entry in payload.get("adjustment_observations", []):
+        if not isinstance(entry, dict):
+            raise SourceAdapterError("IBKR adjustment observation must be an object")
+        bar_date = str(entry.get("bar_date", ""))
+        try:
+            observed_on = datetime.strptime(bar_date, "%Y%m%d").replace(tzinfo=UTC).date()
+        except ValueError:
+            try:
+                observed_on = date.fromisoformat(bar_date)
+            except ValueError:
+                raise SourceAdapterError(
+                    f"unparseable IBKR bar_date {bar_date!r}"
+                ) from None
+        adjustments.append(
+            AdjustmentCrossCheck(
+                symbol=str(entry.get("symbol", "")), observed_on=observed_on,
+                trades_close=str(entry.get("trades_close", "")),
+                adjusted_last_close=str(entry.get("adjusted_last_close", "")),
+                diverges=bool(entry.get("diverges", False)),
+            )
+        )
+    return probes, adjustments
 
 
 def cmd_sec_corporate(args: argparse.Namespace) -> int:
@@ -244,14 +380,52 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
             source_checksum=index_checksum,
         )
     )
-    probes, _ = _load_ibkr_probes(args.ibkr_artifact)
+    probes, adjustments = _load_ibkr_probes(args.ibkr_artifact)
+
+    # SEC's own STRUCTURED financial data: real split and dividend facts with a
+    # value, a period, an accession and a filing date. A concept the filer never
+    # reported returns 404 and is recorded as unavailable, never invented.
+    xbrl_notes: list[str] = []
+    _, client = _sec_transport()
+    for profile in profiles:
+        for concept in (*XBRL_DIVIDEND_CONCEPTS, *XBRL_SPLIT_CONCEPTS):
+            try:
+                raw, parsed = client.company_concept(profile.cik, "us-gaap", concept)
+            except SourceAdapterError as error:
+                xbrl_notes.append(f"{profile.cik} {concept}: unavailable ({error})")
+                continue
+            events.extend(
+                xbrl_facts_to_events(
+                    parse_xbrl_concept(raw, parsed),
+                    security_id=profile.security_id,
+                    source_id="sec-xbrl",
+                    source_checksum=combined_artifact_checksum([raw]),
+                )
+            )
+
+    candidates = sorted(
+        {signal for filing in filings for signal in candidate_signals(filing.items)}
+    )
+    AuxiliaryReport(
+        name="sec-corporate-action-candidates",
+        observed_at=_now(),
+        findings=tuple(xbrl_notes),
+        counts={"candidate_signals": len(candidates), "events_minted": len(events)},
+        notes=(
+            "8-K item codes are published metadata but are AMBIGUOUS about what"
+            " occurred; they are review leads and qualify NOTHING. Only parsed"
+            " document/XBRL evidence mints an event.",
+            *candidates,
+        ),
+    ).write(args.evidence_dir / "corporate-action-candidates.json")
+
     if not events:
         print("NO_REAL_EVENTS: nothing ingested; capability stays blocked")
         return EXIT_FAIL
     dates = sorted(e.filing_date for e in events if e.filing_date)
     evidence = qualify_corporate_actions(
         events,
-        adjustment_checks=(),
+        adjustment_checks=adjustments,
         ibkr_probes=probes,
         source=real_source_descriptor(
             source_id="sec-edgar+ibkr",
@@ -284,7 +458,10 @@ def cmd_sp_membership(args: argparse.Namespace) -> int:
         print(f"NOT_AVAILABLE: no official announcement manifest at {args.manifest}")
         print(SP_AUTOMATED_ACCESS_NOTE)
         return EXIT_NOT_AVAILABLE
-    manifest = load_index_manifest(args.manifest, document_root=args.manifest.parent)
+    # Official documents may live beside the manifest or in their own directory;
+    # either way each declared checksum is RECOMPUTED from the real file.
+    documents_dir = args.documents_dir if args.documents_dir else args.manifest.parent
+    manifest = load_index_manifest(args.manifest, document_root=documents_dir)
     production = None
     if args.production_start and args.production_end:
         production = (
@@ -314,7 +491,7 @@ def cmd_sp_membership(args: argparse.Namespace) -> int:
 
 
 def cmd_crosswalk(args: argparse.Namespace) -> int:
-    _, profiles, _, _ = _discover_and_fetch(
+    _, profiles, index_checksum, _ = _discover_and_fetch(
         year=args.year, quarter=args.quarter, limit=args.limit
     )
     crosswalk = _crosswalk_from_profiles(profiles)
@@ -323,9 +500,25 @@ def cmd_crosswalk(args: argparse.Namespace) -> int:
     )
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
     path = args.evidence_dir / "identity-crosswalk.json"
-    path.write_text(json.dumps(report.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
-    print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    artifact = CrosswalkArtifact(
+        entries=report.entries,
+        resolved=report.resolved,
+        ambiguous=report.ambiguous,
+        unresolved=report.unresolved,
+        conflicting=report.conflicting,
+        observed_at=_now(),
+        sources=(
+            CrosswalkSourceBinding(
+                name="sec-edgar", version=f"{args.year}Q{args.quarter}",
+                checksum=index_checksum,
+            ),
+        ),
+    ).sealed()
+    checksum = artifact.write(path)
+    print(json.dumps(artifact.to_dict(), indent=2, sort_keys=True))
     print(f"crosswalk written: {path}")
+    print(f"crosswalk artifact_type: {ArtifactType.IDENTITY_CROSSWALK.value}")
+    print(f"crosswalk checksum: {checksum}")
     return EXIT_PASS if report.clean else EXIT_PARTIAL
 
 
@@ -350,6 +543,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--manifest", type=Path, default=Path("config/data-sources/sp500-announcements.json")
     )
+    parser.add_argument("--documents-dir", type=Path, default=None)
     parser.add_argument("--production-start", default="")
     parser.add_argument("--production-end", default="")
     _force_utf8_stdout()

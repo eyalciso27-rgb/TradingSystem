@@ -261,8 +261,23 @@ def qualify_delisted_security_history(
 # -- corporate actions (IBKR primary + SEC official) --------------------------
 
 
-#: Event types the capability wants covered. Absence is reported, never faked.
+#: Every event type the capability tracks. Absence is reported, never faked.
 CORPORATE_ACTION_TYPES: tuple[CorporateEventType, ...] = (
+    CorporateEventType.SPLIT,
+    CorporateEventType.REVERSE_SPLIT,
+    CorporateEventType.DIVIDEND,
+    CorporateEventType.SPECIAL_DIVIDEND,
+    CorporateEventType.MERGER,
+    CorporateEventType.ACQUISITION,
+    CorporateEventType.SPINOFF,
+    CorporateEventType.SYMBOL_CHANGE,
+    CorporateEventType.DELISTING,
+)
+
+#: The production contract's REQUIRED set. `corporate_actions` may only PASS
+#: when every one of these is proven with event-level evidence. Proving a single
+#: type (delisting) is a genuine PARTIAL, never a PASS.
+REQUIRED_CORPORATE_EVENTS: tuple[CorporateEventType, ...] = (
     CorporateEventType.SPLIT,
     CorporateEventType.REVERSE_SPLIT,
     CorporateEventType.DIVIDEND,
@@ -270,6 +285,79 @@ CORPORATE_ACTION_TYPES: tuple[CorporateEventType, ...] = (
     CorporateEventType.SYMBOL_CHANGE,
     CorporateEventType.DELISTING,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationOutcome:
+    """How IBKR adjustment behaviour relates to a SEC event. Never silent."""
+
+    security_id: str
+    event_id: str
+    event_type: str
+    corroborated: bool
+    detail: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "security_id": self.security_id, "event_id": self.event_id,
+            "event_type": self.event_type, "corroborated": self.corroborated,
+            "detail": self.detail,
+        }
+
+
+def reconcile_events_with_adjustments(
+    events: Sequence[CanonicalCorporateEvent],
+    adjustment_checks: Sequence[AdjustmentCrossCheck],
+) -> tuple[ReconciliationOutcome, ...]:
+    """Corroborate SEC events against IBKR adjustment behaviour.
+
+    IBKR observations are used ONLY as corroboration of adjustment behaviour;
+    they never become event-level facts and never create an event. Agreement is
+    recorded as corroboration, disagreement is recorded explicitly, and nothing
+    is silently resolved in either direction.
+    """
+    price_affecting = {
+        CorporateEventType.SPLIT,
+        CorporateEventType.REVERSE_SPLIT,
+        CorporateEventType.DIVIDEND,
+        CorporateEventType.SPECIAL_DIVIDEND,
+    }
+    any_divergence = any(check.diverges for check in adjustment_checks)
+    outcomes: list[ReconciliationOutcome] = []
+    for event in sorted(events, key=lambda e: e.event_id):
+        if event.event_type not in price_affecting:
+            continue
+        if not adjustment_checks:
+            outcomes.append(
+                ReconciliationOutcome(
+                    security_id=event.security_id, event_id=event.event_id,
+                    event_type=event.event_type.value, corroborated=False,
+                    detail="no IBKR adjustment observation on this run; NOT corroborated",
+                )
+            )
+        elif any_divergence:
+            outcomes.append(
+                ReconciliationOutcome(
+                    security_id=event.security_id, event_id=event.event_id,
+                    event_type=event.event_type.value, corroborated=True,
+                    detail=(
+                        "IBKR TRADES vs ADJUSTED_LAST diverges, consistent with a"
+                        " price-affecting action; adjustment behaviour only"
+                    ),
+                )
+            )
+        else:
+            outcomes.append(
+                ReconciliationOutcome(
+                    security_id=event.security_id, event_id=event.event_id,
+                    event_type=event.event_type.value, corroborated=False,
+                    detail=(
+                        "DISAGREEMENT: SEC reports a price-affecting event but IBKR"
+                        " shows no adjustment divergence; recorded, not resolved"
+                    ),
+                )
+            )
+    return tuple(outcomes)
 
 
 def qualify_corporate_actions(
@@ -280,6 +368,7 @@ def qualify_corporate_actions(
     source: SourceDescriptor,
     coverage: CoverageWindow,
     observed_at: datetime,
+    required_events: Sequence[CorporateEventType] = REQUIRED_CORPORATE_EVENTS,
 ) -> QualificationEvidence:
     """Qualify event-level corporate actions across real sources.
 
@@ -290,19 +379,44 @@ def qualify_corporate_actions(
     for event in events:
         if not event.provenance.strip():
             raise SourceAdapterError("every canonical event requires event-level provenance")
+    seen_ids = [event.event_id for event in events]
+    duplicates = sorted({eid for eid in seen_ids if seen_ids.count(eid) > 1})
+    if duplicates:
+        raise SourceAdapterError(
+            f"duplicate corporate event ids {duplicates}; a repeated event would"
+            " inflate the evidence count (fail closed)"
+        )
 
     by_type: dict[CorporateEventType, list[CanonicalCorporateEvent]] = {}
     for event in events:
         by_type.setdefault(event.event_type, []).append(event)
 
+    required = set(required_events)
     subs: list[SubCapabilityResult] = [
         SubCapabilityResult(
             name=f"event_{event_type.value.lower()}",
             passed=bool(by_type.get(event_type)),
-            detail=f"{len(by_type.get(event_type, []))} event(s) with full provenance",
+            detail=(
+                f"{len(by_type.get(event_type, []))} event(s) with full provenance"
+                f"{' [REQUIRED]' if event_type in required else ' [optional]'}"
+            ),
         )
         for event_type in CORPORATE_ACTION_TYPES
     ]
+    missing_required = sorted(
+        event_type.value for event_type in required_events if not by_type.get(event_type)
+    )
+    subs.append(
+        SubCapabilityResult(
+            name="required_event_types_proven",
+            passed=not missing_required,
+            detail=(
+                f"missing required event types: {missing_required}"
+                if missing_required
+                else "every required event type is proven with event-level evidence"
+            ),
+        )
+    )
     subs.append(
         SubCapabilityResult(
             name="adjustment_behaviour_characterised",
@@ -324,6 +438,19 @@ def qualify_corporate_actions(
                 f"probe outcome {feed_probe.outcome.value}: {feed_probe.detail}"
                 if feed_probe is not None
                 else "not probed on this run"
+            ),
+        )
+    )
+
+    reconciliation = reconcile_events_with_adjustments(events, adjustment_checks)
+    disagreements = [item for item in reconciliation if not item.corroborated]
+    subs.append(
+        SubCapabilityResult(
+            name="ibkr_sec_reconciled",
+            passed=bool(reconciliation) and not disagreements,
+            detail=(
+                f"{len(reconciliation)} price-affecting event(s) checked against IBKR"
+                f" adjustment behaviour; {len(disagreements)} not corroborated"
             ),
         )
     )
@@ -686,9 +813,11 @@ def real_source_descriptor(
 __all__ = [
     "ASOF_GICS_MISSING_REQUIREMENT",
     "CORPORATE_ACTION_TYPES",
+    "REQUIRED_CORPORATE_EVENTS",
     "REAL_INGESTION_VERSION",
     "SP_AUTOMATED_ACCESS_NOTE",
     "CrosswalkReport",
+    "ReconciliationOutcome",
     "IndexAnnouncementManifest",
     "MembershipBaseline",
     "build_crosswalk_from_entries",
@@ -698,5 +827,6 @@ __all__ = [
     "qualify_delisted_security_history",
     "qualify_pit_membership",
     "real_source_descriptor",
+    "reconcile_events_with_adjustments",
     "replay_membership_as_of",
 ]

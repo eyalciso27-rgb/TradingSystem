@@ -29,6 +29,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
@@ -112,12 +113,42 @@ class SecEdgarClient:
             f"{self.BASE}/submissions/CIK{padded}.json", headers=self._headers()
         )
 
+    def pace(self) -> None:
+        """Block until another request is allowed under SEC's published ceiling.
+
+        Public so a caller fetching a document through the same transport shares
+        ONE throttle state instead of opening a second, unpaced budget.
+        """
+        self._throttle()
+
     def _throttle(self) -> None:
         if self._last_request is not None:
             elapsed = time.monotonic() - self._last_request
             if elapsed < self._min_interval:
                 self._sleep(self._min_interval - elapsed)
         self._last_request = time.monotonic()
+
+    def company_concept(self, cik: str, taxonomy: str, concept: str) -> tuple[bytes, object]:
+        """One XBRL concept's full history for a filer.
+
+        This is SEC's own STRUCTURED financial data: each fact carries a value,
+        a period, the accession that reported it and the date it was filed
+        (knowledge time). It is the only free official path to split and
+        dividend facts that does not require interpreting prose.
+
+        A concept the filer never reported returns HTTP 404, which the transport
+        raises. That is an honest "unavailable", never a reason to invent a fact.
+        """
+        padded = str(cik).strip().lstrip("CIK").zfill(10)
+        if not padded.isdigit():
+            raise SourceAdapterError(f"invalid CIK {cik!r}")
+        if not taxonomy.strip() or not concept.strip():
+            raise SourceAdapterError("company_concept requires a taxonomy and concept")
+        self._throttle()
+        return self._fetcher.get_json(
+            f"{self.BASE}/api/xbrl/companyconcept/CIK{padded}/{taxonomy}/{concept}.json",
+            headers=self._headers(),
+        )
 
     def full_index(self, year: int, quarter: int, *, fetcher: HttpBytesFetcher) -> bytes:
         """One quarter of SEC's official filing catalogue (``master.idx``).
@@ -227,6 +258,9 @@ class SecFilingRecord:
     #: SEC exposes the acceptance datetime for many filings; knowledge time.
     accepted_at: datetime | None = None
     primary_document: str | None = None
+    #: SEC's published 8-K item codes (e.g. "2.01,9.01"). Structured metadata,
+    #: but ambiguous about what occurred - treated as review leads, not events.
+    items: str = ""
 
     @property
     def is_delisting_form(self) -> bool:
@@ -251,7 +285,10 @@ def parse_sec_submissions(raw: bytes, parsed: object) -> tuple[SecFilingRecord, 
     if not isinstance(block, dict):
         raise SourceAdapterError("SEC submissions payload has no filings.recent block")
     columns: dict[str, list[object]] = {}
-    for name in ("form", "accessionNumber", "filingDate", "acceptanceDateTime", "primaryDocument"):
+    for name in (
+        "form", "accessionNumber", "filingDate", "acceptanceDateTime",
+        "primaryDocument", "items",
+    ):
         column = block.get(name)
         if column is None:
             columns[name] = []
@@ -266,6 +303,7 @@ def parse_sec_submissions(raw: bytes, parsed: object) -> tuple[SecFilingRecord, 
     dates = columns["filingDate"]
     accepted = columns["acceptanceDateTime"]
     documents = columns["primaryDocument"]
+    items = columns["items"]
     if not (len(forms) == len(accessions) == len(dates)):
         raise SourceAdapterError("SEC submissions arrays are not aligned; fail closed")
     records: list[SecFilingRecord] = []
@@ -290,6 +328,7 @@ def parse_sec_submissions(raw: bytes, parsed: object) -> tuple[SecFilingRecord, 
                 primary_document=(
                     str(documents[index]) if index < len(documents) and documents[index] else None
                 ),
+                items=str(items[index]) if index < len(items) and items[index] else "",
             )
         )
     del raw  # the caller binds the raw checksum; parsing must not depend on it
@@ -828,7 +867,10 @@ class CorporateEventType(StrEnum):
     SPLIT = "SPLIT"
     REVERSE_SPLIT = "REVERSE_SPLIT"
     DIVIDEND = "DIVIDEND"
+    SPECIAL_DIVIDEND = "SPECIAL_DIVIDEND"
     MERGER = "MERGER"
+    ACQUISITION = "ACQUISITION"
+    SPINOFF = "SPINOFF"
     SYMBOL_CHANGE = "SYMBOL_CHANGE"
     DELISTING = "DELISTING"
     DEREGISTRATION = "DEREGISTRATION"
@@ -900,6 +942,156 @@ class CanonicalCorporateEvent:
         }
 
 
+#: XBRL concepts that publish a real corporate-action fact.
+XBRL_DIVIDEND_CONCEPTS: tuple[str, ...] = (
+    "CommonStockDividendsPerShareDeclared",
+    "CommonStockDividendsPerShareCashPaid",
+)
+XBRL_SPLIT_CONCEPTS: tuple[str, ...] = (
+    "StockholdersEquityNoteStockSplitConversionRatio1",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class XbrlFact:
+    """One reported XBRL fact, with its period and its knowledge time."""
+
+    concept: str
+    unit: str
+    value: str
+    period_start: date | None
+    period_end: date | None
+    #: The date SEC received the filing that reported it - the knowledge axis.
+    filed_on: date
+    accession: str
+    form: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "concept": self.concept, "unit": self.unit, "value": self.value,
+            "period_start": self.period_start.isoformat() if self.period_start else None,
+            "period_end": self.period_end.isoformat() if self.period_end else None,
+            "filed_on": self.filed_on.isoformat(), "accession": self.accession,
+            "form": self.form,
+        }
+
+
+def _optional_xbrl_date(row: Mapping[str, object], key: str) -> date | None:
+    value = row.get(key)
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError as error:
+        raise SourceAdapterError(f"unparseable XBRL {key} {value!r}: {error}") from error
+
+
+def parse_xbrl_concept(raw: bytes, parsed: object) -> tuple[XbrlFact, ...]:
+    """Normalize an XBRL companyconcept payload. Fail closed on a bad shape."""
+    del raw
+    if not isinstance(parsed, dict):
+        raise SourceAdapterError("XBRL concept payload must be a JSON object")
+    concept = str(parsed.get("tag", "")).strip()
+    if not concept:
+        raise SourceAdapterError("XBRL concept payload has no tag")
+    units = parsed.get("units")
+    if not isinstance(units, dict):
+        raise SourceAdapterError("XBRL concept payload has no units object")
+    facts: list[XbrlFact] = []
+    for unit, entries in sorted(units.items()):
+        if not isinstance(entries, list):
+            raise SourceAdapterError(f"XBRL unit {unit!r} must be an array")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise SourceAdapterError(f"XBRL fact in unit {unit!r} must be an object")
+            if "val" not in entry or "filed" not in entry or "accn" not in entry:
+                raise SourceAdapterError(
+                    f"XBRL fact in unit {unit!r} is missing val/filed/accn; fail closed"
+                )
+            try:
+                filed_on = date.fromisoformat(str(entry["filed"]))
+            except ValueError as error:
+                raise SourceAdapterError(
+                    f"unparseable XBRL filed date {entry['filed']!r}: {error}"
+                ) from error
+            facts.append(
+                XbrlFact(
+                    concept=concept, unit=str(unit), value=str(entry["val"]),
+                    period_start=_optional_xbrl_date(entry, "start"),
+                    period_end=_optional_xbrl_date(entry, "end"),
+                    filed_on=filed_on, accession=str(entry["accn"]),
+                    form=str(entry.get("form", "")),
+                )
+            )
+    return tuple(sorted(facts, key=lambda f: (f.filed_on, f.accession, f.unit, f.value)))
+
+
+def xbrl_facts_to_events(
+    facts: Sequence[XbrlFact],
+    *,
+    security_id: str,
+    source_id: str,
+    source_checksum: str,
+) -> tuple[CanonicalCorporateEvent, ...]:
+    """Turn reported XBRL facts into canonical events with real provenance.
+
+    Deliberately conservative:
+
+    * a dividend's EX-DATE is not published by XBRL, so ``effective_on`` stays
+      unset and the reported period is recorded as provenance instead. The
+      filing date is a real date and anchors the event on the timeline.
+    * a split ratio of exactly 1 is not a split and produces no event.
+    * duplicate facts (the same concept, value and accession restated across
+      filings) collapse to one event.
+    """
+    events: dict[str, CanonicalCorporateEvent] = {}
+    for fact in facts:
+        if fact.concept in XBRL_DIVIDEND_CONCEPTS:
+            try:
+                amount = Decimal(fact.value)
+            except (ArithmeticError, ValueError):
+                raise SourceAdapterError(
+                    f"unparseable XBRL dividend value {fact.value!r}"
+                ) from None
+            if amount <= 0:
+                continue
+            event_type = CorporateEventType.DIVIDEND
+            detail = f"{fact.concept}={amount} {fact.unit}"
+        elif fact.concept in XBRL_SPLIT_CONCEPTS:
+            try:
+                ratio = Decimal(fact.value)
+            except (ArithmeticError, ValueError):
+                raise SourceAdapterError(
+                    f"unparseable XBRL split ratio {fact.value!r}"
+                ) from None
+            if ratio == 1:
+                continue  # a 1:1 "split" is not an event
+            event_type = (
+                CorporateEventType.SPLIT if ratio > 1 else CorporateEventType.REVERSE_SPLIT
+            )
+            detail = f"{fact.concept} ratio={ratio}"
+        else:
+            continue
+        start = fact.period_start.isoformat() if fact.period_start else "?"
+        end = fact.period_end.isoformat() if fact.period_end else "?"
+        period = f" period {start}..{end}" if (fact.period_start or fact.period_end) else ""
+        event_id = f"xbrl:{fact.accession}:{fact.concept}:{fact.value}"
+        events[event_id] = CanonicalCorporateEvent(
+            event_id=event_id,
+            security_id=security_id,
+            event_type=event_type,
+            source_id=source_id,
+            source_authority=SourceAuthority.OFFICIAL_PUBLIC,
+            source_checksum=source_checksum,
+            provenance=(
+                f"SEC XBRL {detail} reported in {fact.form or 'filing'}"
+                f" accession {fact.accession}{period}"
+            ),
+            filing_date=fact.filed_on,
+        )
+    return tuple(sorted(events.values(), key=lambda event: event.event_id))
+
+
 def sec_filings_to_events(
     filings: Sequence[SecFilingRecord],
     *,
@@ -942,6 +1134,8 @@ __all__ = [
     "DELISTING_FORMS",
     "SEC_FORM_EVENTS",
     "SEC_MIN_REQUEST_INTERVAL_SECONDS",
+    "XBRL_DIVIDEND_CONCEPTS",
+    "XBRL_SPLIT_CONCEPTS",
     "SOURCES_VERSION",
     "AdjustmentCrossCheck",
     "CanonicalCorporateEvent",
@@ -961,6 +1155,7 @@ __all__ = [
     "SecEntityProfile",
     "SecFilingRecord",
     "SecTickerRecord",
+    "XbrlFact",
     "SourceAdapterError",
     "SourceAuthority",
     "SourcedFact",
@@ -974,8 +1169,10 @@ __all__ = [
     "parse_sec_entity_profile",
     "parse_sec_filing_shard",
     "parse_sec_submissions",
+    "parse_xbrl_concept",
     "reconcile_facts",
     "reconciliation_report",
     "sec_filing_shards",
     "sec_filings_to_events",
+    "xbrl_facts_to_events",
 ]
