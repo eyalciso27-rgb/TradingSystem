@@ -28,6 +28,13 @@ import sys
 from pathlib import Path
 
 from trading_market_data_core.dataset_v1 import CapabilityState, DatasetCapabilityMatrix
+from trading_market_data_core.dataset_v1_artifacts import (
+    ArtifactError,
+    ArtifactType,
+    load_and_verify_crosswalk,
+    load_artifact,
+    scan_evidence_dir,
+)
 from trading_market_data_core.dataset_v1_qualification import (
     CAPABILITY_CRITERIA,
     QUALIFIABLE_CAPABILITIES,
@@ -52,11 +59,15 @@ def _discover(config_path: Path, evidence_dir: Path) -> tuple[list[str], int]:
         notes.append(
             f"no source config at {config_path}: no real historical source is declared"
         )
-    found = sorted(evidence_dir.glob("*.json")) if evidence_dir.is_dir() else []
-    if found:
-        notes.append(f"{len(found)} evidence artifact(s) in {evidence_dir}")
-    else:
-        notes.append(f"no evidence artifacts in {evidence_dir}")
+    scan = scan_evidence_dir(evidence_dir)
+    found = scan.promotable
+    for artifact_type in sorted(scan.by_type):
+        paths = scan.by_type[artifact_type]
+        notes.append(f"{len(paths)} {artifact_type.value} artifact(s) in {evidence_dir}")
+    for path, reason in scan.unclassified:
+        notes.append(f"UNCLASSIFIED {path}: {reason}")
+    if not scan.by_type:
+        notes.append(f"no artifacts in {evidence_dir}")
     for capability in QUALIFIABLE_CAPABILITIES:
         artifact = evidence_dir / f"{capability}.json"
         notes.append(
@@ -95,6 +106,29 @@ def main(argv: list[str]) -> int:
         if args.evidence is None:
             print("verify requires --evidence <path>")
             return 2
+        # Dispatch on the artifact's REAL type. Parsing an auxiliary report
+        # with the qualification schema is what produced the false
+        # "evidence is missing a sha256 normalized_checksum" failure.
+        try:
+            artifact_type, _ = load_artifact(args.evidence)
+        except ArtifactError as error:
+            print(f"ARTIFACT_INVALID: {error}")
+            return 1
+        if artifact_type is not ArtifactType.QUALIFICATION_EVIDENCE:
+            if artifact_type is ArtifactType.IDENTITY_CROSSWALK:
+                try:
+                    crosswalk = load_and_verify_crosswalk(args.evidence)
+                except ArtifactError as error:
+                    print(f"CROSSWALK_INVALID: {error}")
+                    return 1
+                print(f"artifact_type        : {artifact_type.value}")
+                print(f"checksum verified    : {crosswalk.checksum}")
+                print(f"identity clean       : {crosswalk.clean}")
+                print("promotable           : no (auxiliary artifact)")
+                return 0
+            print(f"artifact_type        : {artifact_type.value}")
+            print("promotable           : no (auxiliary artifact); not parsed as evidence")
+            return 0
         try:
             evidence = load_and_verify_evidence(args.evidence)
         except QualificationError as error:
@@ -113,13 +147,28 @@ def main(argv: list[str]) -> int:
     # report
     notes, _ = _discover(args.config, args.evidence_dir)
     evidences = []
-    if args.evidence_dir.is_dir():
-        for path in sorted(args.evidence_dir.glob("*.json")):
-            try:
-                evidences.append(load_and_verify_evidence(path))
-            except QualificationError as error:
-                print(f"EVIDENCE_INVALID {path}: {error}")
-                return 1
+    scan = scan_evidence_dir(args.evidence_dir)
+    # ONLY qualification_evidence may reach the promotion path. Auxiliary
+    # artifacts are still verified, just with their own schema.
+    for path in scan.promotable:
+        try:
+            evidences.append(load_and_verify_evidence(path))
+        except QualificationError as error:
+            print(f"EVIDENCE_INVALID {path}: {error}")
+            return 1
+    for path in scan.paths(ArtifactType.IDENTITY_CROSSWALK):
+        try:
+            crosswalk = load_and_verify_crosswalk(path)
+        except ArtifactError as error:
+            print(f"CROSSWALK_INVALID {path}: {error}")
+            return 1
+        notes.append(
+            f"identity crosswalk verified: {path} (clean={crosswalk.clean},"
+            f" checksum={crosswalk.checksum})"
+        )
+    for path, reason in scan.unclassified:
+        print(f"ARTIFACT_UNCLASSIFIED {path}: {reason}")
+        return 1
     # Seed the six IBKR historical capabilities from their own AUTHENTICATED
     # evidence so this report tells the truth about the whole required set
     # instead of under-claiming cells this harness does not govern.

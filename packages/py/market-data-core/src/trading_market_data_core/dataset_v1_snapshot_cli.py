@@ -28,6 +28,13 @@ from trading_market_data_core.dataset_v1 import (
     DatasetCapabilityMatrix,
     DatasetV1,
 )
+from trading_market_data_core.dataset_v1_artifacts import (
+    ArtifactError,
+    ArtifactType,
+    load_and_verify_crosswalk,
+    scan_evidence_dir,
+    verify_identity_binding,
+)
 from trading_market_data_core.dataset_v1_builder import (
     AdjustmentPolicy,
     BuildConfig,
@@ -82,28 +89,31 @@ def main(argv: list[str]) -> int:
     evidences = []
     bindings: list[EvidenceBinding] = []
     sources: list[SourceBinding] = []
-    if args.evidence_dir.is_dir():
-        for path in sorted(args.evidence_dir.glob("*.json")):
-            if path.name == "identity-crosswalk.json":
-                continue  # a report, not capability evidence
-            try:
-                evidences.append(load_and_verify_evidence(path))
-            except QualificationError as error:
-                print(f"EVIDENCE_INVALID {path}: {error}")
-                return 2
-            bindings.append(
-                EvidenceBinding(name=path.stem, path=path, checksum=_file_checksum(path))
+    scan = scan_evidence_dir(args.evidence_dir)
+    for path, reason in scan.unclassified:
+        print(f"ARTIFACT_UNCLASSIFIED {path}: {reason}")
+        return 2
+    # Type-routed: an auxiliary artifact is never parsed as evidence, and the
+    # old filename-based exclusion is gone.
+    for path in scan.promotable:
+        try:
+            evidences.append(load_and_verify_evidence(path))
+        except QualificationError as error:
+            print(f"EVIDENCE_INVALID {path}: {error}")
+            return 2
+        bindings.append(
+            EvidenceBinding(name=path.stem, path=path, checksum=_file_checksum(path))
+        )
+        # The SOURCE digest the evidence itself authenticates — the raw
+        # artifact the data came from, not the evidence file.
+        descriptor = evidences[-1].source
+        sources.append(
+            SourceBinding(
+                name=descriptor.source_id,
+                version=descriptor.version,
+                checksum=descriptor.raw_checksum or _file_checksum(path),
             )
-            # The SOURCE digest the evidence itself authenticates — the raw
-            # artifact the data came from, not the evidence file.
-            descriptor = evidences[-1].source
-            sources.append(
-                SourceBinding(
-                    name=descriptor.source_id,
-                    version=descriptor.version,
-                    checksum=descriptor.raw_checksum or _file_checksum(path),
-                )
-            )
+        )
 
     # 2. seed the six IBKR capabilities from their own authenticated evidence
     base_states: dict[str, CapabilityState] = {}
@@ -132,6 +142,26 @@ def main(argv: list[str]) -> int:
             )
         )
 
+    # The identity artifact is bound to the build and RE-VERIFIED. A snapshot
+    # must not assert identities that its crosswalk never resolved, and a
+    # tampered crosswalk must invalidate the build rather than be ignored.
+    crosswalk = None
+    for path in scan.paths(ArtifactType.IDENTITY_CROSSWALK):
+        try:
+            crosswalk = load_and_verify_crosswalk(path)
+        except ArtifactError as error:
+            print(f"CROSSWALK_INVALID {path}: {error}")
+            return 2
+        bindings.append(
+            EvidenceBinding(name=path.stem, path=path, checksum=_file_checksum(path))
+        )
+        for source in crosswalk.sources:
+            sources.append(
+                SourceBinding(
+                    name=source.name, version=source.version, checksum=source.checksum
+                )
+            )
+
     states = capability_states_from_evidence(evidences, base_states=base_states)
 
     # 3. No reference rows are invented here. A dataset with no real priced
@@ -155,6 +185,15 @@ def main(argv: list[str]) -> int:
             evidence=bindings,
             capability_states=states,
         )
+        claimed = [identity.security_id for identity in snapshot.security_master]
+        if crosswalk is not None:
+            unbound = verify_identity_binding(claimed, crosswalk)
+            if unbound:
+                print(
+                    "SNAPSHOT_NOT_BUILT: security_ids not bound to the identity"
+                    f" crosswalk artifact: {list(unbound)}"
+                )
+                return 2
         snapshot_id = snapshot.manifest.snapshot_id
         fingerprint = snapshot.manifest.fingerprint
         readiness = snapshot.manifest.readiness
@@ -168,6 +207,8 @@ def main(argv: list[str]) -> int:
         "capability_blockers": list(blockers),
         "capability_states": {name: state.value for name, state in sorted(states.items())},
         "evidence": sorted(f"{b.name}={b.checksum}" for b in bindings),
+        "identity_crosswalk": crosswalk.checksum if crosswalk is not None else None,
+        "artifact_type": ArtifactType.SNAPSHOT_REPORT.value,
         "universe_size": 0,
         "priced_securities": 0,
         "backtest_eligible": readiness is ReadinessLevel.BACKTEST_ELIGIBLE,

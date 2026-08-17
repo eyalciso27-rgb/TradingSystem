@@ -3,8 +3,8 @@
 #
 # ONE command for the owner host. It:
 #   1. preflights the toolchain and repository layout;
-#   2. DISCOVERS whether a real historical source is configured;
-#   3. verifies every existing evidence artifact (recomputing its checksum);
+#   2. runs IBKR, SEC and (when configured) S&P ingestion + qualification;
+#   3. verifies every artifact against ITS OWN schema (recomputing checksums);
 #   4. prints PASS/PARTIAL/FAIL and the capability state for each of the four
 #      external Dataset V1 capabilities;
 #   5. prints the resulting readiness and the evidence paths/checksums.
@@ -13,9 +13,12 @@
 # capability by itself: promotion happens only through the authenticated
 # evidence produced by a configured REAL source.
 #
-# SCOPE NOTE (read this before believing the SEC line): this runner reports
-# whether SEC access is CONFIGURED. It performs no SEC request, no SEC
-# ingestion and no SEC qualification. See "SEC EDGAR" below.
+# SCOPE NOTE: this runner DOES exercise the approved real sources. The SEC
+# User-Agent check is a GATE, not a result; what each source actually produced
+# is reported under SOURCE EXECUTION and comes from real exit codes.
+#
+# Artifacts are verified BY TYPE: an auxiliary artifact (identity crosswalk,
+# coverage report) is never parsed with the qualification-evidence schema.
 #
 # The probe helpers below are pure and side-effect free so they can be sourced
 # and tested; main() runs only when this file is executed directly.
@@ -46,6 +49,7 @@ SEC_YEAR="${DATASET_V1_SEC_YEAR:-2023}"
 SEC_QUARTER="${DATASET_V1_SEC_QUARTER:-1}"
 SEC_LIMIT="${DATASET_V1_SEC_LIMIT:-5}"
 SP_MANIFEST="${DATASET_V1_SP_MANIFEST:-config/data-sources/sp500-announcements.json}"
+SP_DOCUMENTS="${DATASET_V1_SP_DOCUMENTS:-config/data-sources/sp500-documents}"
 SP_PRODUCTION_START="${DATASET_V1_SP_PRODUCTION_START:-}"
 SP_PRODUCTION_END="${DATASET_V1_SP_PRODUCTION_END:-}"
 SNAPSHOT_OUT="${DATASET_V1_SNAPSHOT_OUT:-docs/poi/evidence/dataset-v1-snapshot-report.json}"
@@ -280,12 +284,17 @@ main() {
         CROSSWALK_EXEC="$(run_stage "identity crosswalk"             uv run --no-sync python -m "$INGEST_CLI" crosswalk             --evidence-dir "$EVIDENCE_DIR" --year "$SEC_YEAR" --quarter "$SEC_QUARTER"             --limit "$SEC_LIMIT")"
     fi
 
-    SP_EXEC="$(run_stage "S&P official membership ingestion"         uv run --no-sync python -m "$INGEST_CLI" sp-membership         --evidence-dir "$EVIDENCE_DIR" --manifest "$SP_MANIFEST"         --production-start "$SP_PRODUCTION_START" --production-end "$SP_PRODUCTION_END")"
+    SP_EXEC="$(run_stage "S&P official membership ingestion"         uv run --no-sync python -m "$INGEST_CLI" sp-membership         --evidence-dir "$EVIDENCE_DIR" --manifest "$SP_MANIFEST"         --documents-dir "$SP_DOCUMENTS"         --production-start "$SP_PRODUCTION_START" --production-end "$SP_PRODUCTION_END")"
 
     GICS_EXEC="$(run_stage "as-of GICS free-source discovery"         uv run --no-sync python -m "$INGEST_CLI" gics)"
     echo
 
-    # -- 4. verify each evidence artifact individually ------------------------
+    # -- 4. verify each artifact BY ITS OWN TYPE ------------------------------
+    # The CLI classifies each file and applies the MATCHING schema. An auxiliary
+    # artifact (identity crosswalk, coverage report) is verified with its own
+    # rules and is never parsed as qualification evidence - that mismatch is
+    # what produced the false "missing a sha256 normalized_checksum" failure on
+    # the owner host.
     if [ -d "$EVIDENCE_DIR" ]; then
         shopt -s nullglob
         local artifact

@@ -268,6 +268,10 @@ class QualificationEvidence:
     def body(self) -> dict[str, Any]:
         """The canonical body the checksum authenticates (checksum excluded)."""
         return {
+            # Self-declared type so a verifier never has to guess what this
+            # file is. Auxiliary artifacts declare their own types and are
+            # routed away from the promotion path.
+            "artifact_type": "qualification_evidence",
             "schema_version": self.schema_version,
             "capability": self.capability,
             "source": {
