@@ -90,6 +90,10 @@ class SourceDescriptor:
     name: str
     version: str
     kind: SourceKind
+    #: How authoritative the source is (OWNER_PRIMARY / OFFICIAL_PUBLIC /
+    #: PUBLIC_SECONDARY / FIXTURE / SNAPSHOT_ONLY). A secondary dataset must
+    #: never be recorded as official.
+    authority: str = "PUBLIC_SECONDARY"
     raw_checksum: str | None = None
     raw_artifact: str | None = None
     access_note: str = ""
@@ -184,6 +188,22 @@ class DataQualityMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class SubCapabilityResult:
+    """One named sub-capability outcome, so PARTIAL is precise, not vague.
+
+    Example: corporate_actions may prove ``split`` and ``dividend`` while
+    ``merger`` remains unproven — the evidence lists each explicitly.
+    """
+
+    name: str
+    passed: bool
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {"name": self.name, "passed": self.passed, "detail": self.detail}
+
+
+@dataclass(frozen=True, slots=True)
 class CapabilityCriteria:
     """The acceptance criteria a capability demands of a real source."""
 
@@ -238,6 +258,7 @@ class QualificationEvidence:
     resolution: IdentityResolutionReport
     validation_errors: tuple[str, ...]
     proofs: tuple[str, ...]
+    sub_capabilities: tuple[SubCapabilityResult, ...]
     result: QualificationResult
     promotion_eligible: bool
     blocked_reasons: tuple[str, ...]
@@ -252,6 +273,7 @@ class QualificationEvidence:
             "source": {
                 "source_id": self.source.source_id, "name": self.source.name,
                 "version": self.source.version, "kind": self.source.kind.value,
+                "authority": self.source.authority,
                 "raw_checksum": self.source.raw_checksum,
                 "raw_artifact": self.source.raw_artifact,
                 "access_note": self.source.access_note,
@@ -274,6 +296,9 @@ class QualificationEvidence:
             "resolution": self.resolution.to_dict(),
             "validation_errors": list(self.validation_errors),
             "proofs": sorted(self.proofs),
+            "sub_capabilities": [
+                sub.to_dict() for sub in sorted(self.sub_capabilities, key=lambda s: s.name)
+            ],
             "result": self.result.value,
             "promotion_eligible": self.promotion_eligible,
             "blocked_reasons": list(self.blocked_reasons),
@@ -336,6 +361,7 @@ def _from_body(body: Mapping[str, Any], checksum: str) -> QualificationEvidence:
         source=SourceDescriptor(
             source_id=str(source["source_id"]), name=str(source["name"]),
             version=str(source["version"]), kind=SourceKind(str(source["kind"])),
+            authority=str(source.get("authority", "PUBLIC_SECONDARY")),
             raw_checksum=source.get("raw_checksum"), raw_artifact=source.get("raw_artifact"),
             access_note=str(source.get("access_note", "")),
         ),
@@ -359,6 +385,13 @@ def _from_body(body: Mapping[str, Any], checksum: str) -> QualificationEvidence:
         ),
         validation_errors=tuple(body.get("validation_errors", ())),
         proofs=tuple(body.get("proofs", ())),
+        sub_capabilities=tuple(
+            SubCapabilityResult(
+                name=str(sub["name"]), passed=bool(sub["passed"]),
+                detail=str(sub.get("detail", "")),
+            )
+            for sub in body.get("sub_capabilities", ())
+        ),
         result=QualificationResult(str(body["result"])),
         promotion_eligible=bool(body["promotion_eligible"]),
         blocked_reasons=tuple(body.get("blocked_reasons", ())),
@@ -381,6 +414,7 @@ def qualify_source(
     resolution: IdentityResolutionReport,
     validation_errors: Sequence[str] = (),
     proofs: Sequence[str] = (),
+    sub_capabilities: Sequence[SubCapabilityResult] = (),
     observed_at: datetime,
 ) -> QualificationEvidence:
     """Evaluate one source against a capability's criteria. Fail-closed.
@@ -434,6 +468,9 @@ def qualify_source(
     missing_proofs = sorted(set(criteria.required_proofs) - set(proofs))
     if missing_proofs:
         blocked.append(f"missing required proofs: {missing_proofs}")
+    failed_subs = sorted(sub.name for sub in sub_capabilities if not sub.passed)
+    if failed_subs:
+        blocked.append(f"sub-capabilities not proven: {failed_subs}")
 
     if not blocked:
         result = QualificationResult.PASS
@@ -446,7 +483,8 @@ def qualify_source(
         schema_version=QUALIFICATION_SCHEMA_VERSION, capability=capability, source=source,
         coverage=coverage, temporal=temporal, identity=identity, metrics=metrics,
         resolution=resolution, validation_errors=tuple(validation_errors),
-        proofs=tuple(proofs), result=result, promotion_eligible=not blocked,
+        proofs=tuple(proofs), sub_capabilities=tuple(sub_capabilities),
+        result=result, promotion_eligible=not blocked,
         blocked_reasons=tuple(blocked), observed_at=observed_at,
     )
     return evidence.sealed()
@@ -560,6 +598,7 @@ __all__ = [
     "QualificationRun",
     "SourceDescriptor",
     "SourceKind",
+    "SubCapabilityResult",
     "TemporalSemantics",
     "capability_states_from_evidence",
     "load_and_verify_evidence",

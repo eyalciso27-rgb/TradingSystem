@@ -1,0 +1,564 @@
+"""Dataset V1 real source adapters: IBKR-first + free official public sources.
+
+Owner decision (2026-08-17): **IBKR is the primary approved data source**, and
+FREE, PUBLIC, LEGALLY ACCESSIBLE official sources may supplement capabilities
+IBKR cannot supply. No paid provider may be integrated.
+
+This module holds the provider-specific edges — SEC EDGAR parsing, S&P public
+announcement parsing, the IBKR reference probe, the identity crosswalk and
+multi-source reconciliation — so Dataset V1 core stays provider-neutral.
+
+Access-rule compliance (non-negotiable):
+
+* SEC automated access REQUIRES a declared User-Agent carrying a real contact.
+  ``SecEdgarClient`` therefore reads ``SEC_EDGAR_USER_AGENT`` from the
+  environment and **fails closed** when it is absent — this package never
+  fabricates a contact identity to pull from a government service, and never
+  bypasses a paywall or authentication.
+* Requests are rate-limited below SEC's published ceiling.
+* No network call is ever made in unit tests: transport is an injected port and
+  the tests drive recorded, schema-shaped fixtures.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
+from enum import StrEnum
+from typing import Protocol, runtime_checkable
+
+SOURCES_VERSION = "dataset-v1-sources-1.0.0"
+
+#: SEC publishes a 10 requests/second ceiling for automated access.
+SEC_MIN_REQUEST_INTERVAL_SECONDS = 0.12
+
+
+class SourceAdapterError(Exception):
+    """Fail-closed source-adapter failure (access rules, parsing, ambiguity)."""
+
+
+class SourceAuthority(StrEnum):
+    """How authoritative a source is. Never let a secondary masquerade as official."""
+
+    #: The owner's approved primary broker/data environment (IBKR).
+    OWNER_PRIMARY = "OWNER_PRIMARY"
+    #: A regulator or index owner's official public material (SEC, S&P DJI).
+    OFFICIAL_PUBLIC = "OFFICIAL_PUBLIC"
+    #: A free third-party/community dataset — usable, but labelled honestly.
+    PUBLIC_SECONDARY = "PUBLIC_SECONDARY"
+    #: A test/synthetic source.
+    FIXTURE = "FIXTURE"
+    #: A real source exposing only today's state.
+    SNAPSHOT_ONLY = "SNAPSHOT_ONLY"
+
+
+# -- SEC EDGAR ----------------------------------------------------------------
+
+
+@runtime_checkable
+class HttpFetcher(Protocol):
+    """Minimal read-only transport seam. Tests inject a recorded fixture."""
+
+    def get_json(self, url: str, *, headers: Mapping[str, str]) -> tuple[bytes, object]: ...
+
+
+class SecEdgarClient:
+    """Read-only SEC EDGAR client that honours SEC's automated-access rules.
+
+    The raw response bytes are retained so a genuine artifact checksum can be
+    bound into the evidence (never a checksum of a re-serialized object).
+    """
+
+    BASE = "https://data.sec.gov"
+
+    def __init__(
+        self,
+        fetcher: HttpFetcher,
+        *,
+        user_agent: str | None = None,
+        min_interval_seconds: float = SEC_MIN_REQUEST_INTERVAL_SECONDS,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        agent = user_agent if user_agent is not None else os.environ.get("SEC_EDGAR_USER_AGENT")
+        if not (agent or "").strip():
+            raise SourceAdapterError(
+                "SEC automated access requires a User-Agent with a real contact; set"
+                " SEC_EDGAR_USER_AGENT (e.g. 'Owner Name owner@example.com')."
+                " Refusing to contact SEC without one (fail closed)."
+            )
+        self._agent = agent or ""
+        self._min_interval = min_interval_seconds
+        self._fetcher = fetcher
+        self._sleep: Callable[[float], None] = sleep if sleep is not None else time.sleep
+        self._last_request: float | None = None
+
+    def _headers(self) -> dict[str, str]:
+        return {"User-Agent": self._agent, "Accept-Encoding": "gzip, deflate"}
+
+    def submissions(self, cik: str) -> tuple[bytes, object]:
+        """Company submission history. Returns (raw_bytes, parsed)."""
+        padded = str(cik).strip().lstrip("CIK").zfill(10)
+        if not padded.isdigit():
+            raise SourceAdapterError(f"invalid CIK {cik!r}")
+        # rate limit below SEC's published ceiling
+        if self._last_request is not None:
+            elapsed = time.monotonic() - self._last_request
+            if elapsed < self._min_interval:
+                self._sleep(self._min_interval - elapsed)
+        self._last_request = time.monotonic()
+        return self._fetcher.get_json(
+            f"{self.BASE}/submissions/CIK{padded}.json", headers=self._headers()
+        )
+
+
+#: SEC forms that evidence an exchange delisting / registration removal.
+DELISTING_FORMS = frozenset({"25", "25-NSE", "15-12B", "15-12G", "15-15D"})
+
+
+@dataclass(frozen=True, slots=True)
+class SecFilingRecord:
+    """One SEC filing normalized to the fields Dataset V1 actually uses."""
+
+    cik: str
+    accession: str
+    form: str
+    filing_date: date
+    #: SEC exposes the acceptance datetime for many filings; knowledge time.
+    accepted_at: datetime | None = None
+    primary_document: str | None = None
+
+    @property
+    def is_delisting_form(self) -> bool:
+        return self.form in DELISTING_FORMS
+
+
+def parse_sec_submissions(raw: bytes, parsed: object) -> tuple[SecFilingRecord, ...]:
+    """Normalize a data.sec.gov submissions payload. Fail closed on bad shape.
+
+    Only fields SEC genuinely provides are read; nothing is inferred. A filing
+    whose date cannot be parsed is rejected rather than guessed.
+    """
+    if not isinstance(parsed, dict):
+        raise SourceAdapterError("SEC submissions payload must be a JSON object")
+    cik = str(parsed.get("cik", "")).strip()
+    if not cik:
+        raise SourceAdapterError("SEC submissions payload has no cik")
+    recent = parsed.get("filings", {})
+    if not isinstance(recent, dict):
+        raise SourceAdapterError("SEC submissions payload has no filings object")
+    block = recent.get("recent")
+    if not isinstance(block, dict):
+        raise SourceAdapterError("SEC submissions payload has no filings.recent block")
+    columns: dict[str, list[object]] = {}
+    for name in ("form", "accessionNumber", "filingDate", "acceptanceDateTime", "primaryDocument"):
+        column = block.get(name)
+        if column is None:
+            columns[name] = []
+            continue
+        if not isinstance(column, list):
+            raise SourceAdapterError(
+                f"SEC filings.recent.{name} must be an array, got {type(column).__name__}"
+            )
+        columns[name] = column
+    forms = columns["form"]
+    accessions = columns["accessionNumber"]
+    dates = columns["filingDate"]
+    accepted = columns["acceptanceDateTime"]
+    documents = columns["primaryDocument"]
+    if not (len(forms) == len(accessions) == len(dates)):
+        raise SourceAdapterError("SEC submissions arrays are not aligned; fail closed")
+    records: list[SecFilingRecord] = []
+    for index, form in enumerate(forms):
+        try:
+            filing_date = date.fromisoformat(str(dates[index]))
+        except ValueError as error:
+            raise SourceAdapterError(
+                f"unparseable SEC filingDate {dates[index]!r}: {error}"
+            ) from error
+        accepted_at: datetime | None = None
+        if index < len(accepted) and accepted[index]:
+            try:
+                stamp = datetime.fromisoformat(str(accepted[index]))
+                accepted_at = stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
+            except ValueError:
+                accepted_at = None  # absent/odd acceptance time is recorded as unknown
+        records.append(
+            SecFilingRecord(
+                cik=cik, accession=str(accessions[index]), form=str(form),
+                filing_date=filing_date, accepted_at=accepted_at,
+                primary_document=(
+                    str(documents[index]) if index < len(documents) and documents[index] else None
+                ),
+            )
+        )
+    del raw  # the caller binds the raw checksum; parsing must not depend on it
+    return tuple(records)
+
+
+def artifact_checksum(raw: bytes) -> str:
+    """Checksum of the RAW source bytes (never of a re-serialized object)."""
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+# -- S&P public announcements (official index-owner material) -----------------
+
+
+@dataclass(frozen=True, slots=True)
+class IndexChangeAnnouncement:
+    """One official index-change announcement, as published.
+
+    ``announced_on`` is the knowledge time (what was publicly known, and when);
+    ``effective_on`` is the event time. Both are required: an announcement
+    without an effective date cannot support point-in-time membership.
+    """
+
+    index_id: str
+    announced_on: date
+    effective_on: date
+    added_ticker: str | None
+    removed_ticker: str | None
+    source_url: str
+    source_document_checksum: str
+
+    def __post_init__(self) -> None:
+        if self.added_ticker is None and self.removed_ticker is None:
+            raise SourceAdapterError("an index-change announcement must add or remove a name")
+        if self.effective_on < self.announced_on:
+            raise SourceAdapterError(
+                "effective_on precedes announced_on; a change cannot take effect before"
+                " it was announced (fail closed)"
+            )
+        digest = self.source_document_checksum.removeprefix("sha256:")
+        if digest == self.source_document_checksum or len(digest) != 64:
+            raise SourceAdapterError("announcement requires a sha256 source checksum")
+        if any(character not in "0123456789abcdef" for character in digest):
+            raise SourceAdapterError("announcement source checksum is not a hex sha256 digest")
+
+
+# -- IBKR reference probe -----------------------------------------------------
+
+
+class IbkrReferenceCapability(StrEnum):
+    """Reference capabilities an IBKR probe can empirically confirm or deny."""
+
+    CONTRACT_IDENTITY_CONID = "CONTRACT_IDENTITY_CONID"
+    HISTORICAL_BARS_TRADES = "HISTORICAL_BARS_TRADES"
+    ADJUSTED_LAST = "ADJUSTED_LAST"
+    INACTIVE_CONTRACT_DISCOVERY = "INACTIVE_CONTRACT_DISCOVERY"
+    CORPORATE_EVENT_FEED = "CORPORATE_EVENT_FEED"
+    INDEX_MEMBERSHIP_HISTORY = "INDEX_MEMBERSHIP_HISTORY"
+    CLASSIFICATION_HISTORY = "CLASSIFICATION_HISTORY"
+
+
+class ProbeOutcome(StrEnum):
+    AVAILABLE = "AVAILABLE"
+    UNAVAILABLE = "UNAVAILABLE"
+    #: Present in the API but gated behind an entitlement the account lacks.
+    ENTITLEMENT_REQUIRED = "ENTITLEMENT_REQUIRED"
+    NOT_TESTED = "NOT_TESTED"
+
+
+@dataclass(frozen=True, slots=True)
+class IbkrCapabilityProbe:
+    """What an owner-host IBKR run actually observed. Never assumed."""
+
+    capability: IbkrReferenceCapability
+    outcome: ProbeOutcome
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "capability": self.capability.value, "outcome": self.outcome.value,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AdjustmentCrossCheck:
+    """TRADES vs ADJUSTED_LAST comparison around a known corporate action.
+
+    This characterizes the provider's adjustment behaviour so the Builder can
+    avoid double adjustment. It is explicitly NOT an event ledger: a divergence
+    is evidence that an adjustment happened, not proof of the event's terms.
+    """
+
+    symbol: str
+    observed_on: date
+    trades_close: str
+    adjusted_last_close: str
+    diverges: bool
+    #: Recorded so nobody later mistakes this for event-level corporate-action data.
+    inference_boundary: str = (
+        "adjusted-price divergence indicates provider adjustment only; it is NOT"
+        " event-level corporate-action evidence"
+    )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "symbol": self.symbol, "observed_on": self.observed_on.isoformat(),
+            "trades_close": self.trades_close, "adjusted_last_close": self.adjusted_last_close,
+            "diverges": self.diverges, "inference_boundary": self.inference_boundary,
+        }
+
+
+# -- identity crosswalk -------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CrosswalkEntry:
+    """A stable identity and the external identifiers that map to it."""
+
+    security_id: str
+    ibkr_con_id: int | None = None
+    sec_cik: str | None = None
+    current_ticker: str | None = None
+    historical_tickers: tuple[str, ...] = ()
+    primary_exchange: str | None = None
+
+    @property
+    def has_stable_identifier(self) -> bool:
+        """Ticker alone is never a stable identity."""
+        return self.ibkr_con_id is not None or bool((self.sec_cik or "").strip())
+
+
+@dataclass(frozen=True, slots=True)
+class CrosswalkResolution:
+    resolved: dict[str, str] = field(default_factory=dict)
+    ambiguous: tuple[str, ...] = ()
+    unresolved: tuple[str, ...] = ()
+    conflicting: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "resolved": dict(sorted(self.resolved.items())),
+            "ambiguous": list(self.ambiguous), "unresolved": list(self.unresolved),
+            "conflicting": list(self.conflicting),
+        }
+
+
+class IdentityCrosswalk:
+    """Deterministic identity resolution across IBKR conId / SEC CIK / tickers."""
+
+    def __init__(self, entries: Sequence[CrosswalkEntry]) -> None:
+        self._entries = tuple(entries)
+        self._by_conid: dict[int, list[str]] = {}
+        self._by_cik: dict[str, list[str]] = {}
+        self._by_ticker: dict[str, list[str]] = {}
+        for entry in entries:
+            if not entry.has_stable_identifier:
+                raise SourceAdapterError(
+                    f"crosswalk entry {entry.security_id!r} has no stable identifier;"
+                    " ticker alone is never historical identity"
+                )
+            if entry.ibkr_con_id is not None:
+                self._by_conid.setdefault(entry.ibkr_con_id, []).append(entry.security_id)
+            if entry.sec_cik:
+                self._by_cik.setdefault(entry.sec_cik.zfill(10), []).append(entry.security_id)
+            tickers = set(entry.historical_tickers)
+            if entry.current_ticker:
+                tickers.add(entry.current_ticker)
+            for ticker in tickers:
+                self._by_ticker.setdefault(ticker, []).append(entry.security_id)
+
+    @staticmethod
+    def _lookup[K](index: Mapping[K, list[str]], key: K) -> tuple[str | None, str]:
+        matches = index.get(key, [])
+        if not matches:
+            return None, "unresolved"
+        if len(set(matches)) > 1:
+            return None, "ambiguous"
+        return matches[0], "resolved"
+
+    def resolve_by_cik(self, ciks: Sequence[str]) -> CrosswalkResolution:
+        resolved: dict[str, str] = {}
+        ambiguous: list[str] = []
+        unresolved: list[str] = []
+        for cik in ciks:
+            security_id, status = IdentityCrosswalk._lookup(self._by_cik, str(cik).zfill(10))
+            if status == "resolved" and security_id is not None:
+                resolved[str(cik)] = security_id
+            elif status == "ambiguous":
+                ambiguous.append(str(cik))
+            else:
+                unresolved.append(str(cik))
+        return CrosswalkResolution(
+            resolved=resolved, ambiguous=tuple(ambiguous), unresolved=tuple(unresolved)
+        )
+
+    def resolve_by_conid(self, con_ids: Sequence[int]) -> CrosswalkResolution:
+        resolved: dict[str, str] = {}
+        ambiguous: list[str] = []
+        unresolved: list[str] = []
+        for con_id in con_ids:
+            security_id, status = IdentityCrosswalk._lookup(self._by_conid, con_id)
+            if status == "resolved" and security_id is not None:
+                resolved[str(con_id)] = security_id
+            elif status == "ambiguous":
+                ambiguous.append(str(con_id))
+            else:
+                unresolved.append(str(con_id))
+        return CrosswalkResolution(
+            resolved=resolved, ambiguous=tuple(ambiguous), unresolved=tuple(unresolved)
+        )
+
+    def resolve_ticker_as_of(self, ticker: str) -> CrosswalkResolution:
+        """Ticker resolution is ADVISORY: ambiguity is reported, never guessed."""
+        security_id, status = IdentityCrosswalk._lookup(self._by_ticker, ticker)
+        if status == "resolved" and security_id is not None:
+            return CrosswalkResolution(resolved={ticker: security_id})
+        if status == "ambiguous":
+            return CrosswalkResolution(ambiguous=(ticker,))
+        return CrosswalkResolution(unresolved=(ticker,))
+
+
+# -- multi-source reconciliation ---------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SourcedFact:
+    """One assertion of a fact by one source."""
+
+    fact_key: str
+    value: str
+    source_id: str
+    authority: SourceAuthority
+    source_checksum: str
+    observed_at: datetime
+    known_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciledFact:
+    fact_key: str
+    value: str | None
+    primary_source: str | None
+    supporting_sources: tuple[str, ...]
+    disagreements: tuple[str, ...]
+    resolved: bool
+    resolution_note: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "fact_key": self.fact_key, "value": self.value,
+            "primary_source": self.primary_source,
+            "supporting_sources": list(self.supporting_sources),
+            "disagreements": list(self.disagreements), "resolved": self.resolved,
+            "resolution_note": self.resolution_note,
+        }
+
+
+#: Documented, owner-approved precedence: the index owner / regulator outranks a
+#: secondary dataset; the owner's primary broker outranks a secondary dataset.
+#: Precedence NEVER silently overrides a disagreement between two sources of the
+#: SAME authority — that stays unresolved (fail closed).
+_AUTHORITY_RANK: Mapping[SourceAuthority, int] = {
+    SourceAuthority.OFFICIAL_PUBLIC: 3,
+    SourceAuthority.OWNER_PRIMARY: 2,
+    SourceAuthority.PUBLIC_SECONDARY: 1,
+    SourceAuthority.SNAPSHOT_ONLY: 0,
+    SourceAuthority.FIXTURE: 0,
+}
+
+
+def reconcile_facts(facts: Sequence[SourcedFact]) -> tuple[ReconciledFact, ...]:
+    """Deterministically reconcile multi-source facts. Fail closed on ties.
+
+    Agreement across sources is a corroborated fact. A disagreement is resolved
+    ONLY by a strictly higher authority; equal-authority disagreement is left
+    explicitly UNRESOLVED rather than silently picking a winner.
+    """
+    grouped: dict[str, list[SourcedFact]] = {}
+    for fact in facts:
+        grouped.setdefault(fact.fact_key, []).append(fact)
+    out: list[ReconciledFact] = []
+    for fact_key, group in sorted(grouped.items()):
+        values = {fact.value for fact in group}
+        ordered = sorted(group, key=lambda f: (-_AUTHORITY_RANK[f.authority], f.source_id))
+        if len(values) == 1:
+            out.append(
+                ReconciledFact(
+                    fact_key=fact_key, value=ordered[0].value,
+                    primary_source=ordered[0].source_id,
+                    # deterministic: derived from the ORDERED list, never input order
+                    supporting_sources=tuple(sorted(f.source_id for f in ordered[1:])),
+                    disagreements=(), resolved=True,
+                    resolution_note=(
+                        "all sources agree" if len(group) > 1 else "single source"
+                    ),
+                )
+            )
+            continue
+        top_rank = _AUTHORITY_RANK[ordered[0].authority]
+        top = [f for f in ordered if _AUTHORITY_RANK[f.authority] == top_rank]
+        disagreements = tuple(
+            sorted(f"{f.source_id}={f.value}" for f in group)
+        )
+        if len({f.value for f in top}) == 1 and len(top) < len(group):
+            out.append(
+                ReconciledFact(
+                    fact_key=fact_key, value=top[0].value, primary_source=top[0].source_id,
+                    supporting_sources=tuple(sorted(f.source_id for f in top[1:])),
+                    disagreements=disagreements, resolved=True,
+                    resolution_note=(
+                        "resolved by documented authority precedence"
+                        f" ({top[0].authority.value} outranks the dissenting source)"
+                    ),
+                )
+            )
+        else:
+            out.append(
+                ReconciledFact(
+                    fact_key=fact_key, value=None, primary_source=None,
+                    supporting_sources=(), disagreements=disagreements, resolved=False,
+                    resolution_note=(
+                        "equal-authority disagreement; left UNRESOLVED (fail closed)"
+                    ),
+                )
+            )
+    return tuple(out)
+
+
+def reconciliation_report(reconciled: Sequence[ReconciledFact]) -> dict[str, object]:
+    return {
+        "sources_version": SOURCES_VERSION,
+        "total_facts": len(reconciled),
+        "resolved": sum(1 for fact in reconciled if fact.resolved),
+        "unresolved": sum(1 for fact in reconciled if not fact.resolved),
+        "facts": [fact.to_dict() for fact in reconciled],
+    }
+
+
+def canonical_json(payload: object) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+__all__ = [
+    "DELISTING_FORMS",
+    "SEC_MIN_REQUEST_INTERVAL_SECONDS",
+    "SOURCES_VERSION",
+    "AdjustmentCrossCheck",
+    "CrosswalkEntry",
+    "CrosswalkResolution",
+    "HttpFetcher",
+    "IbkrCapabilityProbe",
+    "IbkrReferenceCapability",
+    "IdentityCrosswalk",
+    "IndexChangeAnnouncement",
+    "ProbeOutcome",
+    "ReconciledFact",
+    "SecEdgarClient",
+    "SecFilingRecord",
+    "SourceAdapterError",
+    "SourceAuthority",
+    "SourcedFact",
+    "artifact_checksum",
+    "canonical_json",
+    "parse_sec_submissions",
+    "reconcile_facts",
+    "reconciliation_report",
+]
