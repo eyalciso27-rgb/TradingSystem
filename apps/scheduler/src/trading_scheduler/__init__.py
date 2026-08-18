@@ -3,6 +3,12 @@
 This app is the canonical home for periodic work, so the automatic monthly
 universe refresh lives here rather than in a scheduler invented for it.
 
+The runnable process is :mod:`trading_scheduler.__main__` — ``python -m
+trading_scheduler`` — which the deployment starts (``deploy/Dockerfile.scheduler``,
+the ``scheduler`` service in ``deploy/compose.yaml``). That process is what makes
+the refresh automatic; the functions below are the units it drives, and calling
+them from somewhere else does not schedule anything.
+
 Two entry points, both cheap to call:
 
 * :func:`run_startup_maintenance` on application boot — it also covers the case

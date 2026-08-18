@@ -14,6 +14,10 @@ services:
       # lives in a versioned subdirectory, enabling pg_upgrade --link).
       - pg-data-dev:/var/lib/postgresql
 
+  scheduler:
+    volumes:
+      - universe-data-dev:/data/sp500-current
+
   nats:
     ports:
       - "127.0.0.1:4222:4222"
@@ -28,3 +32,4 @@ networks:
 volumes:
   pg-data-dev:
   nats-data-dev:
+  universe-data-dev:

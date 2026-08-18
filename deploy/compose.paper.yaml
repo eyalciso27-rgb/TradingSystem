@@ -21,6 +21,15 @@ services:
       # lives in a versioned subdirectory, enabling pg_upgrade --link).
       - pg-data-paper:/var/lib/postgresql
 
+  # The scheduler runs in PAPER with its own volume, sharing no universe
+  # history with dev/test. Start it with `--profile apps` (see deploy/README.md);
+  # without it the monthly refresh does not happen automatically.
+  scheduler:
+    environment:
+      TRADING_MODE: PAPER
+    volumes:
+      - universe-data-paper:/data/sp500-current
+
   nats:
     volumes:
       - nats-data-paper:/data
@@ -32,3 +41,4 @@ networks:
 volumes:
   pg-data-paper:
   nats-data-paper:
+  universe-data-paper:

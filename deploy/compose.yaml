@@ -37,6 +37,36 @@ services:
     networks:
       - trading
 
+  # The scheduler process (apps/scheduler). This is what makes the monthly
+  # S&P 500 universe refresh automatic; it is not a cron job and not a CLI the
+  # owner has to remember. Behind the "apps" profile so an ephemeral test/CI
+  # `up` still starts infrastructure only.
+  scheduler:
+    profiles: ["apps"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.scheduler
+    environment:
+      # PAPER unless LIVE is named explicitly; an unknown value fails closed.
+      TRADING_MODE: ${TRADING_MODE:-PAPER}
+      # Where accepted monthly snapshots are kept permanently.
+      TRADING_UNIVERSE_ROOT: /data/sp500-current
+      TRADING_SCHEDULER_TICK_HOURS: ${TRADING_SCHEDULER_TICK_HOURS:-6}
+      TRADING_LOG_LEVEL: ${TRADING_LOG_LEVEL:-INFO}
+    # The refresh must survive a restart, so the snapshot history is a volume
+    # rather than container-local state.
+    volumes:
+      - universe-data:/data/sp500-current
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks:
+      - trading
+
 networks:
   trading:
     name: trading-test
+
+volumes:
+  # Ephemeral test/CI: the scheduler profile is off by default, and this volume
+  # exists only so the service definition is complete. Dev and paper override it.
+  universe-data:
