@@ -653,6 +653,12 @@ requires-dist = [
 name = "trading-scheduler"
 version = "0.1.0"
 source = { editable = "apps/scheduler" }
+dependencies = [
+    { name = "trading-market-data-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "trading-market-data-core", editable = "packages/py/market-data-core" }]
 
 [[package]]
 name = "trading-system"

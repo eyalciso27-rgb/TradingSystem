@@ -220,7 +220,12 @@ class UniverseStore:
     def snapshots(self) -> tuple[Path, ...]:
         if not self.root.is_dir():
             return ()
-        return tuple(sorted(self.root.glob("*.json")))
+        return tuple(
+            path
+            for path in sorted(self.root.glob("*.json"))
+            # sidecar files (maintenance state) are not snapshots
+            if not path.name.startswith("maintenance-")
+        )
 
     def latest(self) -> ConstituentSnapshot | None:
         """The most recent accepted snapshot — the last-known-good list."""
@@ -253,6 +258,13 @@ def load_snapshot(path: Path) -> ConstituentSnapshot:
         raise SourceAdapterError(f"unreadable universe snapshot {path}: {error}") from error
     if not isinstance(payload, dict):
         raise SourceAdapterError("universe snapshot must be a JSON object")
+    missing = {"index_id", "as_of", "fetched_at", "source_id"} - payload.keys()
+    if missing:
+        # Not a snapshot at all (e.g. the maintenance state file living
+        # alongside). Reported as a source error so the store can skip it.
+        raise SourceAdapterError(
+            f"{path} is not a universe snapshot; missing {sorted(missing)}"
+        )
     declared = payload.get("checksum")
     snapshot = ConstituentSnapshot(
         index_id=str(payload["index_id"]),
