@@ -183,6 +183,14 @@ def validate_snapshot(snapshot: ConstituentSnapshot) -> tuple[str, ...]:
         findings.append(
             "a CURRENT snapshot must never claim to be point-in-time history"
         )
+    # Integrity: a candidate carrying a checksum that does not authenticate its
+    # own body has been corrupted or tampered with somewhere between the source
+    # and here. It must never replace a good list.
+    if snapshot.checksum and snapshot.checksum != snapshot.compute_checksum():
+        findings.append(
+            "snapshot checksum does not authenticate its body (corrupt or tampered):"
+            f" declared {snapshot.checksum}, recomputed {snapshot.compute_checksum()}"
+        )
     return tuple(findings)
 
 

@@ -223,6 +223,23 @@ def test_a_duplicate_ticker_snapshot_is_rejected(tmp_path: Path) -> None:
     assert store.latest() is not None and store.latest().count == 500  # type: ignore[union-attr]
 
 
+def test_a_snapshot_with_a_broken_checksum_is_rejected(tmp_path: Path) -> None:
+    """Spec section 6: a checksum/integrity problem must never be accepted."""
+    from dataclasses import replace
+
+    corrupted = replace(
+        _snapshot(as_of=date(2026, 8, 17)), checksum="sha256:" + "0" * 64
+    )
+    source = _Source(corrupted)
+    maintenance, store = _maintenance(tmp_path, source)
+    store.accept(_snapshot(as_of=date(2026, 5, 1)))
+    outcome = maintenance.run_startup(now=NOW)
+    assert not outcome.refreshed
+    current = store.latest()
+    assert current is not None and current.as_of == date(2026, 5, 1)
+    assert any("does not authenticate" in finding for finding in outcome.findings)
+
+
 def test_failures_are_recorded_and_backoff_prevents_hammering(tmp_path: Path) -> None:
     source = _Source(raises=SourceAdapterError("down"))
     maintenance, store = _maintenance(tmp_path, source)
