@@ -23,7 +23,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
-from test_ibkr_paper_adapter import (  # type: ignore[import-not-found]  # sibling module
+from tests.broker.test_ibkr_paper_adapter import (
     ALIASES,
     PAPER_ACCOUNT,
     FakePaperTransport,

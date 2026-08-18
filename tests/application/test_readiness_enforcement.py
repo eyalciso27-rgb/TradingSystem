@@ -4,19 +4,28 @@ These matter more than another unit test of the evaluator. They drive
 ``submit_order`` — the single surface every order must cross — and assert on
 what the *broker* saw, not on what the report said.
 
-Three properties:
+The test double here is deliberately not hand-shaped. It returns the canonical
+``BrokerInstrument`` / ``AccountSnapshot`` / ``OrderPreview`` dataclasses and
+implements the whole ``BrokerPort`` surface, and ``test_the_double_is_a_real_
+broker_port`` pins that. An earlier version invented ``con_id``, ``security_type``
+and ``tradable`` on its own instrument class; every test passed, and the guard
+was reading fields the real port has never had. A double that is more generous
+than the contract does not test the contract.
+
+Four properties:
 
 * a failed mandatory gate => BLOCKED, the refusal is audited, and the broker's
   ``submit_order`` is NEVER called;
 * all gates satisfied => the pre-trade record is persisted BEFORE submission;
-* audit persistence failure => submission refused, broker never called.
+* audit persistence failure => submission refused, broker never called;
+* an unprovable fact (no what-if surface) blocks — UNKNOWN is not optimism.
 
 Offline and deterministic.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -31,13 +40,26 @@ from trading_application.readiness_guarded_broker import (
 )
 from trading_application.trading_readiness_runtime import MarketDataRules, QuoteState
 from trading_broker_core.port import (
+    AccountSnapshot,
     BrokerCapabilities,
     BrokerCapabilityMode,
+    BrokerErrorCode,
+    BrokerInstrument,
+    BrokerOrderEvent,
+    BrokerOrderReceipt,
+    BrokerPort,
+    BrokerPortError,
+    BrokerPosition,
+    CancelOrderRequest,
+    CancelReceipt,
+    InstrumentQuery,
     IntegrationHealth,
     OrderIntent,
+    OrderPreview,
     OrderSide,
+    ReconciliationResult,
 )
-from trading_contracts.enums import Environment, OrderType
+from trading_contracts.enums import Environment, OrderState, OrderType
 from trading_market_data_core.trading_readiness import (
     StrategyDataRequirements,
     TradingMode,
@@ -48,50 +70,65 @@ from trading_market_data_core.trading_readiness import (
 
 NOW = datetime(2026, 8, 18, 15, 30, tzinfo=UTC)
 
-
-@dataclass
-class _Instrument:
-    symbol: str = "AAPL"
-    con_id: int = 265598
-    security_type: str = "STK"
-    exchange: str = "SMART"
-    currency: str = "USD"
-    tradable: bool = True
-
-
-@dataclass
-class _Account:
-    account_id: str = "DU1234567"
+CANONICAL_INSTRUMENT = BrokerInstrument(
+    broker_instrument_ref="ibkr-paper:265598",
+    symbol="AAPL",
+    exchange="SMART",
+    currency="USD",
+)
 
 
 class _Broker:
-    """A stand-in BrokerPort that RECORDS whether submit was ever reached."""
+    """A stand-in ``BrokerPort`` that RECORDS whether submit was ever reached.
+
+    Everything it returns is a canonical port dataclass, so it cannot supply a
+    field the real contract lacks.
+    """
 
     def __init__(
         self,
         *,
         healthy: bool = True,
         checked_at: datetime | None = None,
-        account_id: str = "DU1234567",
-        instrument: _Instrument | None = None,
+        environment: Environment = Environment.PAPER,
+        instrument: BrokerInstrument | None = None,
+        resolve_error: BrokerPortError | None = None,
+        preview_error: BrokerPortError | None = None,
+        what_if: BrokerCapabilityMode = BrokerCapabilityMode.NATIVE,
         stop_capability: BrokerCapabilityMode = BrokerCapabilityMode.NATIVE,
     ) -> None:
         self.submitted: list[OrderIntent] = []
+        self.cancelled: list[CancelOrderRequest] = []
+        self.previewed: list[OrderIntent] = []
         self._healthy = healthy
         self._checked_at = checked_at or (NOW - timedelta(seconds=5))
-        self._account_id = account_id
-        self._instrument = instrument or _Instrument()
+        self._environment = environment
+        self._instrument = instrument or CANONICAL_INSTRUMENT
+        self._resolve_error = resolve_error
+        self._preview_error = preview_error
+        self._what_if = what_if
         self._stop_capability = stop_capability
+
+    # -- the surface the guard actually observes ------------------------------
 
     def health_check(self) -> IntegrationHealth:
         return IntegrationHealth(
             healthy=self._healthy, detail="ok", checked_at=self._checked_at
         )
 
-    def get_account_snapshot(self, account_alias: str) -> _Account:
-        return _Account(account_id=self._account_id)
+    def get_account_snapshot(self, account_alias: str) -> AccountSnapshot:
+        return AccountSnapshot(
+            account_alias=account_alias,
+            environment=self._environment,
+            net_liquidation_value=Decimal("100000"),
+            cash=Decimal("100000"),
+            buying_power=Decimal("200000"),
+            observed_at=NOW - timedelta(seconds=5),
+        )
 
-    def resolve_instrument(self, query: Any) -> _Instrument:
+    def resolve_instrument(self, query: InstrumentQuery) -> BrokerInstrument:
+        if self._resolve_error is not None:
+            raise self._resolve_error
         return self._instrument
 
     def capabilities(self) -> BrokerCapabilities:
@@ -102,13 +139,64 @@ class _Broker:
             trailing=BrokerCapabilityMode.UNSUPPORTED,
             fractional=BrokerCapabilityMode.UNSUPPORTED,
             outside_rth=BrokerCapabilityMode.UNSUPPORTED,
-            what_if=BrokerCapabilityMode.NATIVE,
+            what_if=self._what_if,
             streaming_events=BrokerCapabilityMode.NATIVE,
         )
 
-    def submit_order(self, intent: OrderIntent) -> str:
+    def preview_order(self, intent: OrderIntent) -> OrderPreview:
+        if self._preview_error is not None:
+            raise self._preview_error
+        self.previewed.append(intent)
+        return OrderPreview(
+            client_order_id=intent.client_order_id,
+            estimated_notional=intent.quantity * (intent.limit_price or Decimal(0)),
+            correlation_id=intent.correlation_id,
+        )
+
+    def submit_order(self, intent: OrderIntent) -> BrokerOrderReceipt:
         self.submitted.append(intent)
-        return f"receipt-{intent.client_order_id}"
+        return BrokerOrderReceipt(
+            client_order_id=intent.client_order_id,
+            broker_order_ref=f"receipt-{intent.client_order_id}",
+            state=OrderState.ACKNOWLEDGED,
+            authorization_ref=intent.authorization_ref,
+            correlation_id=intent.correlation_id,
+            received_at=NOW,
+        )
+
+    def cancel_order(self, request: CancelOrderRequest) -> CancelReceipt:
+        self.cancelled.append(request)
+        return CancelReceipt(
+            client_order_id=request.client_order_id,
+            broker_order_ref="cancelled",
+            state=OrderState.CANCELLED,
+            correlation_id=request.correlation_id,
+            received_at=NOW,
+        )
+
+    # -- the rest of the port, so the double really is one --------------------
+
+    def connect(self) -> None: ...
+
+    def disconnect(self) -> None: ...
+
+    def get_positions(self, account_alias: str) -> tuple[BrokerPosition, ...]:
+        return ()
+
+    def get_open_orders(self, account_alias: str) -> tuple[BrokerOrderReceipt, ...]:
+        return ()
+
+    def order_events(self) -> Iterator[BrokerOrderEvent]:
+        return iter(())
+
+    def reconcile(self, account_alias: str) -> ReconciliationResult:
+        return ReconciliationResult(
+            account_alias=account_alias,
+            snapshot=self.get_account_snapshot(account_alias),
+            positions=(),
+            open_orders=(),
+            reconciled_at=NOW,
+        )
 
 
 class _Quotes:
@@ -125,20 +213,33 @@ class _Quotes:
         return self._quote
 
 
+@dataclass(frozen=True)
+class _Outcome:
+    value: str
+
+
+@dataclass(frozen=True)
+class _RiskResult:
+    """Mirrors the real RiskResult shape (outcome + approved_quantity)."""
+
+    outcome: _Outcome
+    approved_quantity: Decimal
+    reason_codes: tuple[str, ...]
+
+
 class _Risk:
     def __init__(self, outcome: str = "APPROVE", quantity: Decimal = Decimal(10)) -> None:
         self._outcome = outcome
         self._quantity = quantity
 
-    def risk_result_for(self, intent: Any) -> Any:
-        """Mirrors the real RiskResult shape (outcome + approved_quantity)."""
+    def risk_result_for(self, intent: OrderIntent) -> object | None:
         if self._outcome == "NONE":
             return None
-        result: Any = type("R", (), {})()
-        result.outcome = type("O", (), {"value": self._outcome})()
-        result.approved_quantity = self._quantity
-        result.reason_codes = () if self._outcome == "APPROVE" else ("RISK_VETO",)
-        return result
+        return _RiskResult(
+            outcome=_Outcome(self._outcome),
+            approved_quantity=self._quantity,
+            reason_codes=() if self._outcome == "APPROVE" else ("RISK_VETO",),
+        )
 
 
 class _Audit:
@@ -209,13 +310,59 @@ def _guard(
     return guard, real, sink
 
 
+# == the double must not be more generous than the contract ===================
+
+
+def test_the_double_is_a_real_broker_port() -> None:
+    """If the double drifts from ``BrokerPort``, this stops being a test."""
+    port: BrokerPort = _Broker()
+    assert port.capabilities().what_if is BrokerCapabilityMode.NATIVE
+    # mypy accepts this assignment, which is the point: the guard IS the port.
+    guarded: BrokerPort = ReadinessGuardedBroker(
+        _Broker(),
+        config=GuardConfig(
+            mode=TradingMode.PAPER,
+            requirements=StrategyDataRequirements(strategy_id="s"),
+            rules=MarketDataRules(),
+            account_alias="paper-poi",
+        ),
+        quotes=_Quotes(),
+        risk=_Risk(),
+        audit=_Audit(),
+    )
+    # The guard is itself a drop-in port: wrapping changes behaviour, not shape.
+    assert isinstance(guarded, ReadinessGuardedBroker)
+
+
+def test_the_guard_never_reads_a_field_the_port_does_not_define() -> None:
+    """The canonical instrument has never carried these fields.
+
+    So ``getattr(instrument, "tradable", True)`` could only ever return its
+    default, on every instrument, forever. That default was ``True``: an unknown
+    fact became permission, and no test could see it because the double invented
+    the field. The assertion below is the defect, reproduced.
+    """
+    assert not hasattr(CANONICAL_INSTRUMENT, "con_id")
+    assert not hasattr(CANONICAL_INSTRUMENT, "security_type")
+    assert not hasattr(CANONICAL_INSTRUMENT, "tradable")
+    assert getattr(CANONICAL_INSTRUMENT, "tradable", True) is True
+    assert not hasattr(
+        AccountSnapshot(
+            account_alias="paper-poi", environment=Environment.PAPER,
+            net_liquidation_value=Decimal(1), cash=Decimal(1),
+            buying_power=Decimal(1), observed_at=NOW,
+        ),
+        "account_id",
+    )
+
+
 # == the happy path: audit BEFORE submit ======================================
 
 
 def test_a_ready_order_reaches_the_broker() -> None:
     guard, broker, audit = _guard()
     receipt = guard.submit_order(_intent())
-    assert receipt == "receipt-ord-1"
+    assert receipt.broker_order_ref == "receipt-ord-1"
     assert len(broker.submitted) == 1
     assert guard.last_report is not None
     assert guard.last_report.readiness is TradingReadiness.PAPER_READY
@@ -235,7 +382,7 @@ def test_the_pre_trade_record_is_persisted_before_submission() -> None:
     audit.persist = _tracking_persist  # type: ignore[method-assign]
     original_submit = broker.submit_order
 
-    def _tracking_submit(intent: OrderIntent) -> str:
+    def _tracking_submit(intent: OrderIntent) -> BrokerOrderReceipt:
         order.append("submit")
         return original_submit(intent)
 
@@ -256,6 +403,15 @@ def test_the_persisted_record_identifies_the_order_and_checkpoint() -> None:
     assert len(record["gates"]) == 11  # type: ignore[arg-type]
 
 
+def test_the_record_carries_the_opaque_broker_ref_not_a_decoded_id() -> None:
+    guard, _, audit = _guard()
+    guard.submit_order(_intent())
+    refs = audit.records[0]["runtime_refs"]
+    assert isinstance(refs, dict)
+    assert refs["broker_instrument_ref"] == "ibkr-paper:265598"
+    assert "con_id" not in refs
+
+
 # == a failed gate must never reach the broker ================================
 
 
@@ -264,18 +420,59 @@ def test_the_persisted_record_identifies_the_order_and_checkpoint() -> None:
     [
         ("unhealthy session", {"broker": _Broker(healthy=False)}),
         ("stale session", {"broker": _Broker(checked_at=NOW - timedelta(minutes=30))}),
-        ("live account in paper mode", {"broker": _Broker(account_id="U7654321")}),
         (
-            "unresolved contract",
-            {"broker": _Broker(instrument=_Instrument(con_id=None))},  # type: ignore[arg-type]
+            "live environment in paper mode",
+            {"broker": _Broker(environment=Environment.LIVE)},
         ),
         (
-            "not tradable",
-            {"broker": _Broker(instrument=_Instrument(tradable=False))},
+            "non-trading environment",
+            {"broker": _Broker(environment=Environment.RESEARCH)},
+        ),
+        (
+            "unresolved contract",
+            {
+                "broker": _Broker(
+                    resolve_error=BrokerPortError(
+                        BrokerErrorCode.INSTRUMENT_NOT_FOUND, "unknown instrument"
+                    )
+                )
+            },
+        ),
+        (
+            "broker refuses the what-if",
+            {
+                "broker": _Broker(
+                    preview_error=BrokerPortError(
+                        BrokerErrorCode.BROKER_REJECTED, "instrument not tradable now"
+                    )
+                )
+            },
+        ),
+        (
+            "no what-if surface at all",
+            {"broker": _Broker(what_if=BrokerCapabilityMode.UNSUPPORTED)},
         ),
         (
             "wrong routing",
-            {"broker": _Broker(instrument=_Instrument(exchange="ARCA"))},
+            {
+                "broker": _Broker(
+                    instrument=BrokerInstrument(
+                        broker_instrument_ref="ibkr-paper:1", symbol="AAPL",
+                        exchange="ARCA", currency="USD",
+                    )
+                )
+            },
+        ),
+        (
+            "wrong currency",
+            {
+                "broker": _Broker(
+                    instrument=BrokerInstrument(
+                        broker_instrument_ref="ibkr-paper:1", symbol="AAPL",
+                        exchange="SMART", currency="EUR",
+                    )
+                )
+            },
         ),
         ("risk veto", {"risk": _Risk(outcome="VETO")}),
         ("no risk evaluation", {"risk": _Risk(outcome="NONE")}),
@@ -305,6 +502,27 @@ def test_a_failed_gate_blocks_and_the_broker_is_never_called(
     with pytest.raises(ReadinessBlockedError):
         guard.submit_order(_intent())
     assert broker.submitted == [], f"{label}: submit_order must NEVER be reached"
+
+
+def test_an_unprovable_tradability_blocks_rather_than_defaulting_open() -> None:
+    """The exact defect: UNKNOWN must never become optimism.
+
+    A broker with no what-if surface has told us nothing about whether this
+    security can be traded right now. The only safe reading of silence is no.
+    """
+    guard, broker, _ = _guard(broker=_Broker(what_if=BrokerCapabilityMode.UNSUPPORTED))
+    with pytest.raises(ReadinessBlockedError) as error:
+        guard.submit_order(_intent())
+    assert broker.submitted == []
+    assert any("security_currently_tradable" in b for b in error.value.report.blockers)
+    assert any("UNKNOWN" in gate.detail for gate in error.value.report.gates)
+
+
+def test_the_what_if_used_to_prove_tradability_places_nothing() -> None:
+    guard, broker, _ = _guard()
+    guard.submit_order(_intent())
+    assert len(broker.previewed) == 1, "tradability is proven by a what-if"
+    assert len(broker.submitted) == 1, "and exactly one real order follows"
 
 
 def test_a_plan_without_a_protective_stop_never_reaches_the_broker() -> None:
@@ -377,29 +595,17 @@ def test_an_index_strategy_without_a_current_list_is_blocked() -> None:
 
 def test_cancel_is_never_gated() -> None:
     """Reducing exposure must not be blocked by a readiness failure."""
-
-    class _CancelBroker(_Broker):
-        def __init__(self) -> None:
-            super().__init__(healthy=False)
-            self.cancelled: list[object] = []
-
-        def cancel_order(self, request: object) -> str:
-            self.cancelled.append(request)
-            return "cancelled"
-
-    real = _CancelBroker()
+    real = _Broker(healthy=False)
     guard, _, _ = _guard(broker=real)
-    assert guard.cancel_order(object()) == "cancelled"
-    assert real.cancelled
+    request = CancelOrderRequest(client_order_id="ord-1", correlation_id="corr-1")
+    assert guard.cancel_order(request).state is OrderState.CANCELLED
+    assert real.cancelled == [request]
 
 
 def test_preview_places_nothing_and_is_not_gated() -> None:
-    class _PreviewBroker(_Broker):
-        def preview_order(self, intent: object) -> str:
-            return "preview-only"
-
-    guard, real, _ = _guard(broker=_PreviewBroker(healthy=False))
-    assert guard.preview_order(_intent()) == "preview-only"
+    guard, real, _ = _guard(broker=_Broker(healthy=False))
+    preview = guard.preview_order(_intent())
+    assert preview.client_order_id == "ord-1"
     assert real.submitted == []
 
 

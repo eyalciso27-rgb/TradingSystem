@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from test_ibkr_paper_adapter import (  # type: ignore[import-not-found]  # sibling module
+from tests.broker.test_ibkr_paper_adapter import (
     ALIASES,
     FakePaperTransport,
     deterministic_clock,

@@ -21,7 +21,7 @@ from collections.abc import Callable, Mapping
 from decimal import Decimal
 
 import pytest
-from test_ibkr_paper_adapter import (  # type: ignore[import-not-found]  # sibling module
+from tests.broker.test_ibkr_paper_adapter import (
     ALIASES,
     PAPER_ACCOUNT,
     FakePaperTransport,
@@ -183,7 +183,7 @@ def test_capabilities_and_order_events_cannot_fail() -> None:
 
 def test_submit_and_cancel_failures_are_also_normalized() -> None:
     """Not a read path, but the same boundary rule must hold."""
-    from test_ibkr_paper_adapter import make_intent  # noqa: PLC0415 - test-local
+    from tests.broker.test_ibkr_paper_adapter import make_intent  # noqa: PLC0415
 
     adapter = exploding_adapter()
     with pytest.raises(BrokerPortError):
@@ -216,7 +216,7 @@ def test_every_public_adapter_method_is_covered_by_this_audit() -> None:
 
 def test_preview_order_does_not_touch_the_transport() -> None:
     """preview_order is a what-if: it must never reach the broker."""
-    from test_ibkr_paper_adapter import make_intent  # noqa: PLC0415 - test-local
+    from tests.broker.test_ibkr_paper_adapter import make_intent  # noqa: PLC0415
 
     adapter = exploding_adapter()
     preview = adapter.preview_order(make_intent("ord-preview"))

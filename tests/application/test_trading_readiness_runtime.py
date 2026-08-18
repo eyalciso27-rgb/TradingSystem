@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -28,6 +28,7 @@ from trading_application.trading_readiness_runtime import (
     QuoteState,
     RuntimeInputs,
     RuntimeReadinessError,
+    TradabilityState,
     evaluate_runtime_readiness,
     persist_readiness_decision,
 )
@@ -74,13 +75,14 @@ def _inputs(**kw: object) -> RuntimeInputs:
         "mode": TradingMode.PAPER,
         "requirements": StrategyDataRequirements(strategy_id="baseline-trend-breakout-v1"),
         "broker": BrokerSessionState(
-            connected=True, account_id="DU1234567", account_alias="paper-poi",
+            connected=True, account_alias="paper-poi",
             session_mode=TradingMode.PAPER, observed_at=NOW - timedelta(seconds=2),
         ),
         "contract": ContractState(
-            resolved=True, con_id=265598, symbol="AAPL", security_type="STK",
-            exchange="SMART", currency="USD", tradable=True,
+            resolved=True, broker_instrument_ref="ibkr-paper:265598", symbol="AAPL",
+            exchange="SMART", currency="USD",
         ),
+        "tradability": TradabilityState(proven_tradable=True),
         "quote": QuoteState(
             bid=Decimal("100.00"), ask=Decimal("100.05"),
             observed_at=NOW - timedelta(seconds=1),
@@ -131,7 +133,7 @@ def test_a_naive_timestamp_is_refused() -> None:
 
 def test_a_disconnected_broker_blocks() -> None:
     report = evaluate_runtime_readiness(
-        _inputs(broker=BrokerSessionState(False, "DU1", "paper-poi", TradingMode.PAPER, NOW))
+        _inputs(broker=BrokerSessionState(False, "paper-poi", TradingMode.PAPER, NOW))
     )
     assert report.readiness is TradingReadiness.BLOCKED
     assert any("ibkr_connectivity" in b for b in report.blockers)
@@ -139,39 +141,37 @@ def test_a_disconnected_broker_blocks() -> None:
 
 def test_unknown_session_state_blocks() -> None:
     report = evaluate_runtime_readiness(
-        _inputs(broker=BrokerSessionState(True, None, None, None, None))
+        _inputs(broker=BrokerSessionState(True, None, None, None))
     )
     assert report.readiness is TradingReadiness.BLOCKED
 
 
-def test_paper_mode_requires_a_paper_account() -> None:
+def test_paper_mode_requires_the_broker_to_report_paper() -> None:
+    """The session's own environment decides the mode, not the caller's wish."""
     report = evaluate_runtime_readiness(
         _inputs(
-            broker=BrokerSessionState(
-                True, "U7654321", "paper-poi", TradingMode.PAPER, NOW
-            )
+            mode=TradingMode.PAPER,
+            broker=BrokerSessionState(True, "paper-poi", TradingMode.LIVE, NOW),
         )
     )
     assert report.readiness is TradingReadiness.BLOCKED
     assert any("account_mode_safety" in b for b in report.blockers)
 
 
-def test_live_mode_refuses_a_paper_prefixed_account() -> None:
+def test_an_environment_the_broker_cannot_state_blocks() -> None:
+    """RESEARCH, or any non-trading environment, arrives here as None."""
     report = evaluate_runtime_readiness(
-        _inputs(
-            mode=TradingMode.LIVE,
-            broker=BrokerSessionState(True, "DU1234567", "live", TradingMode.LIVE, NOW),
-        )
+        _inputs(broker=BrokerSessionState(True, "paper-poi", None, NOW))
     )
     assert report.readiness is TradingReadiness.BLOCKED
-    assert any("paper-prefixed" in gate.detail for gate in report.gates)
+    assert any("account_mode_safety" in b for b in report.blockers)
 
 
 def test_a_session_in_the_wrong_mode_blocks() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
             mode=TradingMode.LIVE,
-            broker=BrokerSessionState(True, "U1", "live", TradingMode.PAPER, NOW),
+            broker=BrokerSessionState(True, "live", TradingMode.PAPER, NOW),
         )
     )
     assert report.readiness is TradingReadiness.BLOCKED
@@ -187,7 +187,7 @@ def test_a_mismatched_account_alias_blocks() -> None:
 
 def test_an_unresolved_contract_blocks() -> None:
     report = evaluate_runtime_readiness(
-        _inputs(contract=ContractState(False, None, None, None, None, None))
+        _inputs(contract=ContractState(False, None, None, None, None))
     )
     assert report.readiness is TradingReadiness.BLOCKED
     assert any("contract_identity_valid" in b for b in report.blockers)
@@ -199,24 +199,56 @@ def test_a_symbol_mismatch_blocks_even_though_a_contract_resolved() -> None:
     assert any("does not match" in gate.detail for gate in report.gates)
 
 
-def test_a_disallowed_security_type_or_currency_blocks() -> None:
-    base = ContractState(True, 1, "AAPL", "STK", "SMART", "USD", True)
-    for contract in (
-        replace(base, security_type="OPT"),
-        replace(base, currency="EUR"),
-    ):
-        report = evaluate_runtime_readiness(_inputs(contract=contract))
-        assert report.readiness is TradingReadiness.BLOCKED, contract
+def test_a_disallowed_currency_blocks() -> None:
+    base = ContractState(True, "ibkr-paper:1", "AAPL", "SMART", "USD")
+    report = evaluate_runtime_readiness(_inputs(contract=replace(base, currency="EUR")))
+    assert report.readiness is TradingReadiness.BLOCKED
 
 
-def test_a_not_tradable_security_blocks() -> None:
+def test_the_contract_state_mirrors_the_canonical_broker_instrument() -> None:
+    """No field here may be one the canonical port does not define.
+
+    This is the test that would have caught reading ``con_id``/``security_type``/
+    ``tradable`` off a ``BrokerInstrument`` that has none of them.
+    """
+    from trading_broker_core.port import BrokerInstrument
+
+    canonical = {field.name for field in fields(BrokerInstrument)}
+    observed = {field.name for field in fields(ContractState)}
+    # ``resolved`` and ``detail`` describe the observation itself, not the
+    # instrument; everything else must exist on the canonical contract.
+    assert observed - {"resolved", "detail"} <= canonical
+
+
+def test_an_unproven_security_blocks_because_unknown_is_not_optimism() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
-            contract=ContractState(True, 1, "AAPL", "STK", "SMART", "USD", tradable=False)
+            tradability=TradabilityState(
+                proven_tradable=False, evidence_available=False,
+            )
         )
     )
     assert report.readiness is TradingReadiness.BLOCKED
     assert any("security_currently_tradable" in b for b in report.blockers)
+    assert any("UNKNOWN" in gate.detail for gate in report.gates)
+
+
+def test_a_refused_what_if_blocks() -> None:
+    report = evaluate_runtime_readiness(
+        _inputs(
+            tradability=TradabilityState(
+                proven_tradable=False, detail="broker refused the what-if"
+            )
+        )
+    )
+    assert report.readiness is TradingReadiness.BLOCKED
+    assert any("security_currently_tradable" in b for b in report.blockers)
+
+
+def test_tradability_defaults_to_nothing_at_all() -> None:
+    """``TradabilityState`` has no default that means "tradable"."""
+    with pytest.raises(TypeError):
+        TradabilityState()  # type: ignore[call-arg]
 
 
 # == market data is RUNTIME state, not a past qualification ===================
@@ -472,7 +504,7 @@ def test_live_readiness_uses_the_same_mandatory_gates() -> None:
         _inputs(
             mode=TradingMode.LIVE,
             broker=BrokerSessionState(
-                True, "U7654321", "live", TradingMode.LIVE, NOW - timedelta(seconds=1)
+                True, "live", TradingMode.LIVE, NOW - timedelta(seconds=1)
             ),
         )
     )
@@ -488,8 +520,7 @@ def test_a_stale_session_observation_cannot_prove_connectivity() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
             broker=BrokerSessionState(
-                True, "DU1234567", "paper-poi", TradingMode.PAPER,
-                NOW - timedelta(hours=2),
+                True, "paper-poi", TradingMode.PAPER, NOW - timedelta(hours=2),
             )
         )
     )
@@ -501,7 +532,7 @@ def test_an_unhealthy_broker_health_check_blocks() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
             broker=BrokerSessionState(
-                True, "DU1234567", "paper-poi", TradingMode.PAPER,
+                True, "paper-poi", TradingMode.PAPER,
                 NOW - timedelta(seconds=1), health_ok=False,
             )
         )
@@ -553,7 +584,7 @@ def test_a_satisfied_bid_size_passes() -> None:
 def test_routing_outside_the_canonical_policy_blocks() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
-            contract=ContractState(True, 1, "AAPL", "STK", "ARCA", "USD", True)
+            contract=ContractState(True, "ibkr-paper:1", "AAPL", "ARCA", "USD")
         )
     )
     assert report.readiness is TradingReadiness.BLOCKED

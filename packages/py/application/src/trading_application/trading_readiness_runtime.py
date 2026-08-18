@@ -64,9 +64,12 @@ class BrokerSessionState:
     """Observed broker session. Every field is an observation, not a claim."""
 
     connected: bool
-    account_id: str | None
+    #: The canonical account identity the port exposes. ``AccountSnapshot`` has
+    #: no ``account_id`` -- the IBKR adapter deliberately keeps the raw account
+    #: number inside itself -- so none is invented here.
     account_alias: str | None
-    #: The mode the SESSION is really in, as reported by the broker.
+    #: Derived from the canonical ``AccountSnapshot.environment``: the port's
+    #: own statement of which environment this session is in.
     session_mode: TradingMode | None
     #: When the broker's own health check last succeeded. A stale observation
     #: cannot prove CURRENT connectivity, so this is checked for age rather
@@ -79,15 +82,40 @@ class BrokerSessionState:
 
 @dataclass(frozen=True, slots=True)
 class ContractState:
-    """Resolved instrument, as the broker actually resolved it."""
+    """Resolved instrument, mirroring the canonical ``BrokerInstrument``.
+
+    That contract carries ``broker_instrument_ref``, ``symbol``, ``exchange``
+    and ``currency``, and nothing else: no ``con_id``, no ``security_type``, no
+    ``tradable``. Reading fields the port does not define would either block a
+    healthy order or, worse, let an unknown safety fact default to True.
+
+    ``broker_instrument_ref`` is OPAQUE. It is carried as the broker identity
+    and is never parsed to recover a broker-specific id.
+    """
 
     resolved: bool
-    con_id: int | None
+    #: The opaque canonical identity. Never parsed, never decoded.
+    broker_instrument_ref: str | None
     symbol: str | None
-    security_type: str | None
     exchange: str | None
     currency: str | None
-    tradable: bool = False
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TradabilityState:
+    """Whether the security is CURRENTLY tradable -- proven, not asserted.
+
+    ``BrokerInstrument`` has no tradability flag, so this is established through
+    the broker's own order-validation surface (``preview_order``, a what-if that
+    places nothing) rather than an invented attribute. When the broker offers no
+    such surface the answer is UNKNOWN, and UNKNOWN blocks: an unproven safety
+    fact is never optimism.
+    """
+
+    proven_tradable: bool
+    #: False when no canonical surface was available to prove it either way.
+    evidence_available: bool = True
     detail: str = ""
 
 
@@ -161,6 +189,7 @@ class RuntimeInputs:
     requirements: StrategyDataRequirements
     broker: BrokerSessionState
     contract: ContractState
+    tradability: TradabilityState
     quote: QuoteState
     rules: MarketDataRules
     protection: ProtectionState
@@ -171,10 +200,8 @@ class RuntimeInputs:
     universe_status: UniverseListStatus | None = None
     gics_sector: str | None = None
     pit_membership_available: bool = False
-    expected_account_prefix: str = "DU"
     expected_account_alias: str | None = None
     expected_symbol: str | None = None
-    allowed_security_types: tuple[str, ...] = ("STK",)
     allowed_currencies: tuple[str, ...] = ("USD",)
     #: The IBKR adapter routes via SMART (paper_adapter sets contract.exchange
     #: to SMART), so that is the canonical routing rather than an invented
@@ -256,9 +283,10 @@ def _gate_ibkr_connectivity(inputs: RuntimeInputs) -> GateOutcome:
             f" {inputs.rules.max_session_age_seconds}s; a stale observation cannot"
             " prove current connectivity",
         )
-    if not broker.account_id:
+    if not broker.account_alias:
         return GateOutcome(
-            "ibkr_connectivity_account_safety", False, "no account id reported by the session"
+            "ibkr_connectivity_account_safety", False,
+            "no account alias reported by the session",
         )
     if inputs.expected_account_alias and broker.account_alias != inputs.expected_account_alias:
         return GateOutcome(
@@ -276,33 +304,27 @@ def _gate_account_mode(inputs: RuntimeInputs) -> GateOutcome:
     """Paper must PROVE paper; Live must prove live. Unknown never passes."""
     broker = inputs.broker
     name = "account_mode_safety"
-    if broker.session_mode is None or not broker.account_id:
-        return GateOutcome(name, False, "session mode or account id is unknown")
+    if broker.session_mode is None or not broker.account_alias:
+        return GateOutcome(name, False, "session environment or account alias is unknown")
     if broker.session_mode is not inputs.mode:
+        # The port's own environment disagreeing with the requested mode is a
+        # wiring error, and the port's word wins.
         return GateOutcome(
             name, False,
-            f"session is {broker.session_mode.value} but readiness was requested for"
-            f" {inputs.mode.value}",
+            f"broker reports environment {broker.session_mode.value} but readiness"
+            f" was requested for {inputs.mode.value}",
         )
-    if inputs.mode is TradingMode.PAPER:
-        if not broker.account_id.startswith(inputs.expected_account_prefix):
-            return GateOutcome(
-                name, False,
-                f"paper mode requires an account starting {inputs.expected_account_prefix!r}",
-            )
-        return GateOutcome(name, True, "paper account confirmed")
-    # LIVE: a paper-prefixed account in live mode is a wiring error, not live.
-    if broker.account_id.startswith(inputs.expected_account_prefix):
-        return GateOutcome(
-            name, False, "live mode reported a paper-prefixed account; refusing"
-        )
-    return GateOutcome(name, True, "live account confirmed")
+    return GateOutcome(
+        name, True,
+        f"canonical account environment confirms {inputs.mode.value}"
+        f" (alias {broker.account_alias})",
+    )
 
 
 def _gate_contract_identity(inputs: RuntimeInputs) -> GateOutcome:
     contract = inputs.contract
     name = "contract_identity_valid"
-    if not contract.resolved or contract.con_id is None:
+    if not contract.resolved or not contract.broker_instrument_ref:
         return GateOutcome(name, False, contract.detail or "contract did not resolve")
     if inputs.expected_symbol and contract.symbol != inputs.expected_symbol:
         return GateOutcome(
@@ -310,10 +332,9 @@ def _gate_contract_identity(inputs: RuntimeInputs) -> GateOutcome:
             f"resolved symbol {contract.symbol!r} does not match the expected"
             f" {inputs.expected_symbol!r}",
         )
-    if contract.security_type not in inputs.allowed_security_types:
-        return GateOutcome(
-            name, False, f"security type {contract.security_type!r} is not allowed"
-        )
+    # Security TYPE is not on the canonical contract. The IBKR adapter is its
+    # authority and resolves equities only, so that invariant stays where it is
+    # enforced instead of being re-tested here against a field the port lacks.
     if contract.currency not in inputs.allowed_currencies:
         return GateOutcome(name, False, f"currency {contract.currency!r} is not allowed")
     if inputs.allowed_exchanges and contract.exchange not in inputs.allowed_exchanges:
@@ -322,18 +343,30 @@ def _gate_contract_identity(inputs: RuntimeInputs) -> GateOutcome:
             f"routing {contract.exchange!r} is outside the canonical"
             f" {list(inputs.allowed_exchanges)}",
         )
-    return GateOutcome(name, True, f"conId={contract.con_id} {contract.symbol}")
+    return GateOutcome(
+        name, True,
+        f"{contract.symbol} resolved to broker ref {contract.broker_instrument_ref}"
+        f" on {contract.exchange}",
+    )
 
 
 def _gate_tradable(inputs: RuntimeInputs) -> GateOutcome:
     name = "security_currently_tradable"
     if not inputs.contract.resolved:
         return GateOutcome(name, False, "contract unresolved, so tradability is unknown")
-    if not inputs.contract.tradable:
+    tradability = inputs.tradability
+    if not tradability.evidence_available:
         return GateOutcome(
-            name, False, inputs.contract.detail or "broker reports the security as not tradable"
+            name, False,
+            tradability.detail
+            or "no canonical surface proved current tradability, and UNKNOWN"
+            " never becomes optimism",
         )
-    return GateOutcome(name, True, "broker reports the security as tradable")
+    if not tradability.proven_tradable:
+        return GateOutcome(
+            name, False, tradability.detail or "the broker refused to validate this order"
+        )
+    return GateOutcome(name, True, tradability.detail or "validated by the broker")
 
 
 def _gate_market_data(inputs: RuntimeInputs) -> GateOutcome:
@@ -527,7 +560,9 @@ def evaluate_runtime_readiness(inputs: RuntimeInputs) -> TradingReadinessRuntime
     outcome, quantity = _risk_outcome(inputs)
     runtime_refs = {
         "broker_account_alias": str(inputs.broker.account_alias or "unknown"),
-        "con_id": str(inputs.contract.con_id or "unresolved"),
+        "broker_instrument_ref": str(
+            inputs.contract.broker_instrument_ref or "unresolved"
+        ),
         "risk_outcome": str(outcome or "none"),
         "approved_quantity": str(quantity if quantity is not None else "none"),
         "quote_observed_at": (
@@ -539,9 +574,7 @@ def evaluate_runtime_readiness(inputs: RuntimeInputs) -> TradingReadinessRuntime
         mode=inputs.mode,
         strategy_id=inputs.requirements.strategy_id,
         readiness=contract_report.readiness,
-        security_id=(
-            f"ibkr-conid:{inputs.contract.con_id}" if inputs.contract.con_id else None
-        ),
+        security_id=inputs.contract.broker_instrument_ref,
         symbol=inputs.contract.symbol,
         gates=tuple(outcomes),
         blockers=contract_report.blockers,
@@ -579,6 +612,7 @@ __all__ = [
     "ContractState",
     "MarketDataRules",
     "ProtectionState",
+    "TradabilityState",
     "QuoteState",
     "RuntimeInputs",
     "RuntimeReadinessError",
