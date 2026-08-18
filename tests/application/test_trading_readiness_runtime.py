@@ -79,7 +79,7 @@ def _inputs(**kw: object) -> RuntimeInputs:
         ),
         "contract": ContractState(
             resolved=True, con_id=265598, symbol="AAPL", security_type="STK",
-            exchange="NASDAQ", currency="USD", tradable=True,
+            exchange="SMART", currency="USD", tradable=True,
         ),
         "quote": QuoteState(
             bid=Decimal("100.00"), ask=Decimal("100.05"),
@@ -200,7 +200,7 @@ def test_a_symbol_mismatch_blocks_even_though_a_contract_resolved() -> None:
 
 
 def test_a_disallowed_security_type_or_currency_blocks() -> None:
-    base = ContractState(True, 1, "AAPL", "STK", "NASDAQ", "USD", True)
+    base = ContractState(True, 1, "AAPL", "STK", "SMART", "USD", True)
     for contract in (
         replace(base, security_type="OPT"),
         replace(base, currency="EUR"),
@@ -212,7 +212,7 @@ def test_a_disallowed_security_type_or_currency_blocks() -> None:
 def test_a_not_tradable_security_blocks() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
-            contract=ContractState(True, 1, "AAPL", "STK", "NASDAQ", "USD", tradable=False)
+            contract=ContractState(True, 1, "AAPL", "STK", "SMART", "USD", tradable=False)
         )
     )
     assert report.readiness is TradingReadiness.BLOCKED
@@ -478,3 +478,83 @@ def test_live_readiness_uses_the_same_mandatory_gates() -> None:
     )
     assert report.readiness is TradingReadiness.LIVE_READY
     assert {g.name for g in report.gates} == set(MANDATORY_TRADING_GATES)
+
+
+# == the defects architectural review found ===================================
+
+
+def test_a_stale_session_observation_cannot_prove_connectivity() -> None:
+    """observed_at merely EXISTING is not proof the session is up now."""
+    report = evaluate_runtime_readiness(
+        _inputs(
+            broker=BrokerSessionState(
+                True, "DU1234567", "paper-poi", TradingMode.PAPER,
+                NOW - timedelta(hours=2),
+            )
+        )
+    )
+    assert report.readiness is TradingReadiness.BLOCKED
+    assert any("stale" in gate.detail for gate in report.gates)
+
+
+def test_an_unhealthy_broker_health_check_blocks() -> None:
+    report = evaluate_runtime_readiness(
+        _inputs(
+            broker=BrokerSessionState(
+                True, "DU1234567", "paper-poi", TradingMode.PAPER,
+                NOW - timedelta(seconds=1), health_ok=False,
+            )
+        )
+    )
+    assert report.readiness is TradingReadiness.BLOCKED
+
+
+def test_a_configured_min_bid_size_is_actually_evaluated() -> None:
+    """It used to be configurable and silently ignored."""
+    report = evaluate_runtime_readiness(
+        _inputs(
+            rules=MarketDataRules(min_bid_size=1000),
+            quote=QuoteState(
+                Decimal("100"), Decimal("100.05"), NOW - timedelta(seconds=1),
+                bid_size=10,
+            ),
+        )
+    )
+    assert report.readiness is TradingReadiness.BLOCKED
+    assert any("bid size" in gate.detail for gate in report.gates)
+
+
+def test_an_unknown_bid_size_fails_a_configured_rule_closed() -> None:
+    report = evaluate_runtime_readiness(
+        _inputs(
+            rules=MarketDataRules(min_bid_size=100),
+            quote=QuoteState(
+                Decimal("100"), Decimal("100.05"), NOW - timedelta(seconds=1)
+            ),
+        )
+    )
+    assert report.readiness is TradingReadiness.BLOCKED
+    assert any("refusing to ignore a configured rule" in g.detail for g in report.gates)
+
+
+def test_a_satisfied_bid_size_passes() -> None:
+    report = evaluate_runtime_readiness(
+        _inputs(
+            rules=MarketDataRules(min_bid_size=100),
+            quote=QuoteState(
+                Decimal("100"), Decimal("100.05"), NOW - timedelta(seconds=1),
+                bid_size=500,
+            ),
+        )
+    )
+    assert report.readiness is TradingReadiness.PAPER_READY
+
+
+def test_routing_outside_the_canonical_policy_blocks() -> None:
+    report = evaluate_runtime_readiness(
+        _inputs(
+            contract=ContractState(True, 1, "AAPL", "STK", "ARCA", "USD", True)
+        )
+    )
+    assert report.readiness is TradingReadiness.BLOCKED
+    assert any("routing" in gate.detail for gate in report.gates)

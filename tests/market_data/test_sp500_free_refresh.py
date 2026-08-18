@@ -228,3 +228,102 @@ def test_status_is_stricter_for_live_than_paper(
     capsys.readouterr()
     assert paper == 1, "stale but usable for paper"
     assert live == 2, "unavailable for live"
+
+
+# == identity honesty and automatic monthly refresh ===========================
+
+
+def test_a_constituent_without_a_cik_is_marked_unresolved() -> None:
+    """A ticker can change; it must never be promoted to stable identity."""
+    table = (
+        '{| class="wikitable"' + chr(10)
+        + "! Symbol !! Security" + chr(10)
+        + "|-" + chr(10) + "| NOCIK" + chr(10) + "| No Cik Corp" + chr(10) + "|}"
+    )
+    snapshot = parse_wikitext_constituents(
+        _payload({"parse": {"wikitext": table}}), as_of=date(2026, 8, 1), fetched_at=NOW
+    )
+    entry = snapshot.constituents[0]
+    assert entry.identity_resolved is False
+    assert entry.security_id.startswith("unresolved-ticker:")
+    assert entry.identity_kind == "ticker_operational_unresolved"
+    assert not entry.security_id.startswith("sp-ticker:")
+
+
+def test_a_constituent_with_a_cik_is_stable() -> None:
+    snapshot = parse_wikitext_constituents(
+        _payload(WIKITEXT), as_of=date(2026, 8, 1), fetched_at=NOW
+    )
+    apple = next(c for c in snapshot.constituents if c.ticker == "AAPL")
+    assert apple.identity_resolved is True
+    assert apple.identity_kind == "sec_cik"
+
+
+def test_the_snapshot_states_the_identity_limitation() -> None:
+    snapshot = parse_wikitext_constituents(
+        _payload(WIKITEXT), as_of=date(2026, 8, 1), fetched_at=NOW
+    )
+    assert any("UNRESOLVED identity" in note for note in snapshot.notes)
+
+
+def test_automatic_refresh_does_no_fetch_when_fresh(tmp_path: Path) -> None:
+    """Normal operation must not require a manual monthly command."""
+    from trading_market_data_core.sp500_current_universe import ensure_current_universe
+
+    store = UniverseStore(tmp_path)
+    store.accept(_good(as_of=date(2026, 8, 15)))
+    calls: list[int] = []
+
+    def _fetch() -> ConstituentSnapshot:
+        calls.append(1)
+        raise AssertionError("must not fetch when the snapshot is fresh")
+
+    current, status, findings = ensure_current_universe(
+        store, now=NOW, policy=DEFAULT_FRESHNESS[TradingMode.PAPER], fetch=_fetch
+    )
+    assert calls == []
+    assert current is not None
+    assert status.value == "CURRENT_LIST_VALID"
+    assert any("not due" in finding for finding in findings)
+
+
+def test_automatic_refresh_fetches_when_due(tmp_path: Path) -> None:
+    from trading_market_data_core.sp500_current_universe import ensure_current_universe
+
+    store = UniverseStore(tmp_path)
+    store.accept(_good(as_of=date(2026, 6, 1)))
+    current, status, findings = ensure_current_universe(
+        store, now=NOW, policy=DEFAULT_FRESHNESS[TradingMode.PAPER],
+        fetch=lambda: _good(as_of=date(2026, 8, 17)),
+    )
+    assert current is not None and current.as_of == date(2026, 8, 17)
+    assert status.value == "CURRENT_LIST_VALID"
+    assert findings == ()
+
+
+def test_automatic_refresh_keeps_last_known_good_on_failure(tmp_path: Path) -> None:
+    from trading_market_data_core.sp500_current_universe import ensure_current_universe
+
+    store = UniverseStore(tmp_path)
+    store.accept(_good(as_of=date(2026, 6, 1)))
+
+    def _failing() -> ConstituentSnapshot:
+        raise SourceAdapterError("source unreachable")
+
+    current, _, findings = ensure_current_universe(
+        store, now=NOW, policy=DEFAULT_FRESHNESS[TradingMode.PAPER], fetch=_failing
+    )
+    assert current is not None and current.as_of == date(2026, 6, 1)
+    assert any("fetch failed" in finding for finding in findings)
+
+
+def test_automatic_refresh_without_a_fetcher_keeps_the_cached_list(tmp_path: Path) -> None:
+    from trading_market_data_core.sp500_current_universe import ensure_current_universe
+
+    store = UniverseStore(tmp_path)
+    store.accept(_good(as_of=date(2026, 6, 1)))
+    current, _, findings = ensure_current_universe(
+        store, now=NOW, policy=DEFAULT_FRESHNESS[TradingMode.PAPER]
+    )
+    assert current is not None
+    assert any("no fetcher" in finding for finding in findings)

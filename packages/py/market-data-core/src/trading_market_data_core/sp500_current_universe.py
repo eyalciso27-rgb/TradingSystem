@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -56,10 +57,20 @@ class Constituent:
     gics_sector: str | None = None
     gics_sub_industry: str | None = None
     date_added: date | None = None
+    #: True only when a STABLE identifier (CIK) backed the security_id. A
+    #: ticker can change, so a ticker-derived id is operational routing only
+    #: and is never promoted to stable identity.
+    identity_resolved: bool = True
+
+    @property
+    def identity_kind(self) -> str:
+        return "sec_cik" if self.identity_resolved else "ticker_operational_unresolved"
 
     def to_dict(self) -> dict[str, object]:
         return {
             "ticker": self.ticker, "name": self.name, "security_id": self.security_id,
+            "identity_resolved": self.identity_resolved,
+            "identity_kind": self.identity_kind,
             "cik": self.cik, "gics_sector": self.gics_sector,
             "gics_sub_industry": self.gics_sub_industry,
             "date_added": self.date_added.isoformat() if self.date_added else None,
@@ -167,7 +178,7 @@ def validate_snapshot(snapshot: ConstituentSnapshot) -> tuple[str, ...]:
     if len(set(tickers)) != len(tickers):
         findings.append("snapshot contains duplicate tickers")
     if any(not c.security_id.strip() for c in snapshot.constituents):
-        findings.append("a constituent has no stable security_id")
+        findings.append("a constituent has no security_id at all")
     if snapshot.is_point_in_time_history:
         findings.append(
             "a CURRENT snapshot must never claim to be point-in-time history"
@@ -330,7 +341,10 @@ def parse_constituent_table(
                 ticker=ticker,
                 name=cells[1],
                 # A stable, non-ticker identity: CIK when the source carries it.
-                security_id=f"sec-cik:{cik.zfill(10)}" if cik else f"sp-ticker:{ticker}",
+                security_id=(
+                    f"sec-cik:{cik.zfill(10)}" if cik else f"unresolved-ticker:{ticker}"
+                ),
+                identity_resolved=cik is not None,
                 cik=cik.zfill(10) if cik else None,
                 gics_sector=cells[2] if len(cells) > 2 and cells[2] else None,
                 gics_sub_industry=cells[3] if len(cells) > 3 and cells[3] else None,
@@ -341,6 +355,8 @@ def parse_constituent_table(
         "PUBLIC_SECONDARY free dataset: CURRENT membership only.",
         "This is NOT point-in-time history and must never be used as such.",
         "Sector context here is CURRENT classification (FREE_RECONSTRUCTED).",
+        "A constituent without a CIK carries an UNRESOLVED identity: the ticker"
+        " is operational routing only and is never a stable security_id.",
     ]
     if skipped:
         notes.append(f"{skipped} row(s) skipped: no parseable ticker")
@@ -378,6 +394,44 @@ def refresh_universe(
     return current, classify_freshness(current, now=now, policy=policy), tuple(findings)
 
 
+def ensure_current_universe(
+    store: UniverseStore,
+    *,
+    now: datetime,
+    policy: FreshnessPolicy,
+    fetch: Callable[[], ConstituentSnapshot] | None = None,
+) -> tuple[ConstituentSnapshot | None, UniverseListStatus, tuple[str, ...]]:
+    """Fresh? use the cache. Due? refresh. Failed? keep the last-known-good.
+
+    Cheap by design so it can run at startup or universe initialisation rather
+    than on every trade: when the stored snapshot is inside the monthly
+    interval this performs NO fetch at all. The owner never has to remember a
+    manual monthly command; the CLI stays available for diagnostics and a
+    forced refresh.
+    """
+    if not store.due_for_refresh(now=now):
+        current = store.latest()
+        return current, classify_freshness(current, now=now, policy=policy), (
+            "refresh not due; using the stored snapshot",
+        )
+    if fetch is None:
+        current = store.latest()
+        return current, classify_freshness(current, now=now, policy=policy), (
+            "refresh is due but no fetcher was supplied; keeping the"
+            " last-known-good list",
+        )
+    candidate: ConstituentSnapshot | None = None
+    findings: list[str] = []
+    try:
+        candidate = fetch()
+    except SourceAdapterError as error:
+        findings.append(f"refresh fetch failed: {error}")
+    current, status, refresh_findings = refresh_universe(
+        store, candidate, now=now, policy=policy
+    )
+    return current, status, tuple(findings) + refresh_findings
+
+
 def sector_context(
     snapshot: ConstituentSnapshot | None, ticker: str, *, gics_mode: GicsMode
 ) -> tuple[str | None, str]:
@@ -409,6 +463,7 @@ __all__ = [
     "ConstituentSnapshot",
     "UniverseStore",
     "classify_freshness",
+    "ensure_current_universe",
     "load_snapshot",
     "parse_constituent_table",
     "refresh_universe",
@@ -482,7 +537,10 @@ def parse_wikitext_constituents(
             Constituent(
                 ticker=ticker,
                 name=cells[1],
-                security_id=f"sec-cik:{cik.zfill(10)}" if cik else f"sp-ticker:{ticker}",
+                security_id=(
+                    f"sec-cik:{cik.zfill(10)}" if cik else f"unresolved-ticker:{ticker}"
+                ),
+                identity_resolved=cik is not None,
                 cik=cik.zfill(10) if cik else None,
                 gics_sector=cells[2] if len(cells) > 2 and cells[2] else None,
                 gics_sub_industry=cells[3] if len(cells) > 3 and cells[3] else None,
@@ -493,6 +551,8 @@ def parse_wikitext_constituents(
         "PUBLIC_SECONDARY free dataset: CURRENT membership only.",
         "This is NOT point-in-time history and must never be used as such.",
         "Sector context here is CURRENT classification (FREE_RECONSTRUCTED).",
+        "A constituent without a CIK carries an UNRESOLVED identity: the ticker"
+        " is operational routing only and is never a stable security_id.",
     ]
     if skipped:
         notes.append(f"{skipped} row(s) skipped: no parseable ticker")

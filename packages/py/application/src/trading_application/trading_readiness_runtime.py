@@ -48,6 +48,9 @@ RUNTIME_READINESS_VERSION = "trading-readiness-runtime-1.0.0"
 #: A quote older than this cannot describe the market you are about to trade.
 DEFAULT_MAX_QUOTE_AGE_SECONDS = 15.0
 
+#: A health observation older than this cannot prove the session is up NOW.
+DEFAULT_MAX_SESSION_AGE_SECONDS = 60.0
+
 
 class RuntimeReadinessError(Exception):
     """Fail-closed runtime readiness failure."""
@@ -65,7 +68,12 @@ class BrokerSessionState:
     account_alias: str | None
     #: The mode the SESSION is really in, as reported by the broker.
     session_mode: TradingMode | None
+    #: When the broker's own health check last succeeded. A stale observation
+    #: cannot prove CURRENT connectivity, so this is checked for age rather
+    #: than mere presence.
     observed_at: datetime | None = None
+    #: The canonical BrokerPort.health_check() verdict.
+    health_ok: bool = True
     detail: str = ""
 
 
@@ -90,6 +98,10 @@ class QuoteState:
     bid: Decimal | None
     ask: Decimal | None
     observed_at: datetime | None
+    #: Sizes are OPTIONAL on the quote surface, but a configured size rule may
+    #: never be silently ignored: an unknown size fails the rule closed.
+    bid_size: int | None = None
+    ask_size: int | None = None
     detail: str = ""
 
     @property
@@ -114,6 +126,9 @@ class MarketDataRules:
     min_bid_size: int | None = None
     allow_crossed_or_locked: bool = False
     max_quote_age_seconds: float = DEFAULT_MAX_QUOTE_AGE_SECONDS
+    #: How old the broker health observation may be. Sourced from the canonical
+    #: BrokerPort.health_check(), not invented per call site.
+    max_session_age_seconds: float = DEFAULT_MAX_SESSION_AGE_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +176,10 @@ class RuntimeInputs:
     expected_symbol: str | None = None
     allowed_security_types: tuple[str, ...] = ("STK",)
     allowed_currencies: tuple[str, ...] = ("USD",)
+    #: The IBKR adapter routes via SMART (paper_adapter sets contract.exchange
+    #: to SMART), so that is the canonical routing rather than an invented
+    #: allow-list. An empty tuple disables the check.
+    allowed_exchanges: tuple[str, ...] = ("SMART",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +238,23 @@ def _gate_ibkr_connectivity(inputs: RuntimeInputs) -> GateOutcome:
     if broker.observed_at is None:
         return GateOutcome(
             "ibkr_connectivity_account_safety", False, "session state has no observation time"
+        )
+    if not broker.health_ok:
+        return GateOutcome(
+            "ibkr_connectivity_account_safety", False,
+            broker.detail or "broker health_check reports unhealthy",
+        )
+    age = (inputs.evaluated_at - broker.observed_at).total_seconds()
+    if age < 0:
+        return GateOutcome(
+            "ibkr_connectivity_account_safety", False, "session observation is in the future"
+        )
+    if age > inputs.rules.max_session_age_seconds:
+        return GateOutcome(
+            "ibkr_connectivity_account_safety", False,
+            f"session observation is stale: {age:.1f}s >"
+            f" {inputs.rules.max_session_age_seconds}s; a stale observation cannot"
+            " prove current connectivity",
         )
     if not broker.account_id:
         return GateOutcome(
@@ -280,6 +316,12 @@ def _gate_contract_identity(inputs: RuntimeInputs) -> GateOutcome:
         )
     if contract.currency not in inputs.allowed_currencies:
         return GateOutcome(name, False, f"currency {contract.currency!r} is not allowed")
+    if inputs.allowed_exchanges and contract.exchange not in inputs.allowed_exchanges:
+        return GateOutcome(
+            name, False,
+            f"routing {contract.exchange!r} is outside the canonical"
+            f" {list(inputs.allowed_exchanges)}",
+        )
     return GateOutcome(name, True, f"conId={contract.con_id} {contract.symbol}")
 
 
@@ -334,6 +376,21 @@ def _gate_price_spread_liquidity(inputs: RuntimeInputs) -> GateOutcome:
         return GateOutcome(
             name, False, f"midpoint {midpoint} is below the configured minimum {rules.min_price}"
         )
+    if rules.min_bid_size is not None:
+        # A configured safety rule that cannot be evaluated must BLOCK, never
+        # pass silently. Previously this field existed and was never read.
+        if quote.bid_size is None:
+            return GateOutcome(
+                name, False,
+                "a minimum bid size is configured but the quote carries no size;"
+                " refusing to ignore a configured rule",
+            )
+        if quote.bid_size < rules.min_bid_size:
+            return GateOutcome(
+                name, False,
+                f"bid size {quote.bid_size} is below the configured minimum"
+                f" {rules.min_bid_size}",
+            )
     if rules.max_spread_fraction is not None:
         fraction = spread / midpoint if midpoint else None
         if fraction is None or fraction > rules.max_spread_fraction:
@@ -515,6 +572,7 @@ def within_freshness(observed_at: datetime | None, now: datetime, max_age: timed
 
 __all__ = [
     "DEFAULT_MAX_QUOTE_AGE_SECONDS",
+    "DEFAULT_MAX_SESSION_AGE_SECONDS",
     "RUNTIME_READINESS_VERSION",
     "AuditSink",
     "BrokerSessionState",
