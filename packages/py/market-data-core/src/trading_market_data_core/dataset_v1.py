@@ -964,6 +964,13 @@ IBKR_HISTORICAL_CAPABILITIES = frozenset(
     }
 )
 
+#: The capability set a STRICT (point-in-time) backtest requires.
+#:
+#: ADR-0017: this is NOT the trading gate. `asof_gics` and
+#: `pit_sp500_membership` stay here because a PIT_STRICT backtest genuinely
+#: needs them, but neither can block Paper or Live - trading readiness is
+#: decided by MANDATORY_TRADING_GATES in `trading_readiness`, and requirements
+#: are derived from the selected strategy and mode.
 DATASET_V1_REQUIRED_CAPABILITIES = frozenset(
     {
         *IBKR_HISTORICAL_CAPABILITIES,

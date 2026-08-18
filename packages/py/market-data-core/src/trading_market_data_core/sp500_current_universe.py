@@ -1,0 +1,412 @@
+"""CURRENT S&P 500 universe: monthly refresh, freshness, last-known-good.
+
+ADR-0017 separates the CURRENT constituent list from HISTORICAL point-in-time
+membership. This module owns the current list only.
+
+The distinction is load-bearing and enforced by type, not by convention: a
+``ConstituentSnapshot`` describes the index **as of one date**, and nothing here
+can be substituted for PIT membership. Collecting a snapshot each month does
+build a genuine forward history from the day collection starts — that is a
+by-product, and it is never presented as reconstructed past history.
+
+Safety rules:
+
+* a failed, empty or malformed refresh NEVER replaces a valid last-known-good
+  snapshot;
+* freshness is explicit — ``CURRENT_LIST_VALID`` / ``CURRENT_LIST_STALE`` /
+  ``CURRENT_LIST_UNAVAILABLE`` — and a stale list is usable only when the
+  configured policy for that mode allows it;
+* the free constituent dataset is recorded as ``PUBLIC_SECONDARY`` and is never
+  labelled official or point-in-time.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from pathlib import Path
+
+from trading_market_data_core.dataset_v1_sources import SourceAdapterError, SourceAuthority
+from trading_market_data_core.trading_readiness import (
+    FreshnessPolicy,
+    GicsMode,
+    UniverseListStatus,
+)
+
+UNIVERSE_SCHEMA_VERSION = "sp500-current-universe-1.0.0"
+
+#: Roughly monthly, per the owner decision. Not a hard schedule: freshness is
+#: what matters, and it is evaluated against the configured policy.
+REFRESH_INTERVAL_DAYS = 30
+
+
+@dataclass(frozen=True, slots=True)
+class Constituent:
+    """One current index member. ``security_id`` is never the ticker alone."""
+
+    ticker: str
+    name: str
+    security_id: str
+    cik: str | None = None
+    #: Sector context when the source carries it. OPTIONAL and, from a free
+    #: source, CURRENT classification only - never point-in-time.
+    gics_sector: str | None = None
+    gics_sub_industry: str | None = None
+    date_added: date | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "ticker": self.ticker, "name": self.name, "security_id": self.security_id,
+            "cik": self.cik, "gics_sector": self.gics_sector,
+            "gics_sub_industry": self.gics_sub_industry,
+            "date_added": self.date_added.isoformat() if self.date_added else None,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ConstituentSnapshot:
+    """The index membership AS OF one date. NOT point-in-time history."""
+
+    index_id: str
+    as_of: date
+    fetched_at: datetime
+    source_id: str
+    source_authority: str
+    constituents: tuple[Constituent, ...]
+    checksum: str = ""
+    #: Stated on the artifact so no reader can mistake it for PIT evidence.
+    is_point_in_time_history: bool = False
+    gics_mode: str = GicsMode.FREE_RECONSTRUCTED.value
+    notes: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def count(self) -> int:
+        return len(self.constituents)
+
+    def body(self) -> dict[str, object]:
+        return {
+            "schema_version": UNIVERSE_SCHEMA_VERSION,
+            "index_id": self.index_id,
+            "as_of": self.as_of.isoformat(),
+            "fetched_at": self.fetched_at.isoformat(),
+            "source_id": self.source_id,
+            "source_authority": self.source_authority,
+            "constituent_count": self.count,
+            "is_point_in_time_history": self.is_point_in_time_history,
+            "gics_mode": self.gics_mode,
+            "constituents": [c.to_dict() for c in sorted(self.constituents, key=_sort_key)],
+            "notes": list(self.notes),
+        }
+
+    def compute_checksum(self) -> str:
+        serialized = json.dumps(
+            self.body(), sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str
+        )
+        return "sha256:" + hashlib.sha256(serialized.encode("ascii")).hexdigest()
+
+    def to_dict(self) -> dict[str, object]:
+        payload = self.body()
+        payload["checksum"] = self.checksum or self.compute_checksum()
+        return payload
+
+    def age_days(self, now: datetime) -> int:
+        return max(0, (now.date() - self.as_of).days)
+
+    def tickers(self) -> frozenset[str]:
+        return frozenset(c.ticker for c in self.constituents)
+
+    def sector_of(self, ticker: str) -> str | None:
+        """Optional sector context. UNKNOWN (None) is a valid, safe answer."""
+        for constituent in self.constituents:
+            if constituent.ticker == ticker:
+                return constituent.gics_sector
+        return None
+
+
+def _sort_key(constituent: Constituent) -> tuple[str, str]:
+    return (constituent.ticker, constituent.security_id)
+
+
+def classify_freshness(
+    snapshot: ConstituentSnapshot | None, *, now: datetime, policy: FreshnessPolicy
+) -> UniverseListStatus:
+    """Explicit freshness. A stale list is never silently treated as valid."""
+    if snapshot is None or snapshot.count == 0:
+        return UniverseListStatus.CURRENT_LIST_UNAVAILABLE
+    age = snapshot.age_days(now)
+    if age <= policy.max_age_days:
+        return UniverseListStatus.CURRENT_LIST_VALID
+    if policy.allow_stale and age <= policy.max_age_days + policy.stale_grace_days:
+        return UniverseListStatus.CURRENT_LIST_STALE
+    return (
+        UniverseListStatus.CURRENT_LIST_STALE
+        if policy.allow_stale
+        else UniverseListStatus.CURRENT_LIST_UNAVAILABLE
+    )
+
+
+#: A refresh must look like an index, not like a parse accident.
+MIN_PLAUSIBLE_CONSTITUENTS = 400
+MAX_PLAUSIBLE_CONSTITUENTS = 600
+
+
+def validate_snapshot(snapshot: ConstituentSnapshot) -> tuple[str, ...]:
+    """Findings that make a snapshot unfit to replace a known-good one."""
+    findings: list[str] = []
+    if snapshot.count == 0:
+        findings.append("snapshot is empty")
+    elif not (MIN_PLAUSIBLE_CONSTITUENTS <= snapshot.count <= MAX_PLAUSIBLE_CONSTITUENTS):
+        findings.append(
+            f"constituent count {snapshot.count} is outside the plausible range"
+            f" {MIN_PLAUSIBLE_CONSTITUENTS}..{MAX_PLAUSIBLE_CONSTITUENTS}"
+        )
+    tickers = [c.ticker for c in snapshot.constituents]
+    if len(set(tickers)) != len(tickers):
+        findings.append("snapshot contains duplicate tickers")
+    if any(not c.security_id.strip() for c in snapshot.constituents):
+        findings.append("a constituent has no stable security_id")
+    if snapshot.is_point_in_time_history:
+        findings.append(
+            "a CURRENT snapshot must never claim to be point-in-time history"
+        )
+    return tuple(findings)
+
+
+class UniverseStore:
+    """Monthly snapshots on disk, with an explicit last-known-good.
+
+    ``accept`` is the ONLY way a snapshot becomes current, and it refuses a
+    snapshot that fails validation — so a failed or malformed refresh cannot
+    quietly replace a good list.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def _path(self, snapshot: ConstituentSnapshot) -> Path:
+        return self.root / f"{snapshot.index_id}-{snapshot.as_of.isoformat()}.json"
+
+    def accept(self, snapshot: ConstituentSnapshot) -> tuple[Path | None, tuple[str, ...]]:
+        """Persist a snapshot if it validates. Returns (path, findings)."""
+        findings = validate_snapshot(snapshot)
+        if findings:
+            return None, findings
+        sealed = (
+            snapshot
+            if snapshot.checksum
+            else _with_checksum(snapshot)
+        )
+        self.root.mkdir(parents=True, exist_ok=True)
+        path = self._path(sealed)
+        path.write_text(
+            json.dumps(sealed.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+        )
+        return path, ()
+
+    def snapshots(self) -> tuple[Path, ...]:
+        if not self.root.is_dir():
+            return ()
+        return tuple(sorted(self.root.glob("*.json")))
+
+    def latest(self) -> ConstituentSnapshot | None:
+        """The most recent accepted snapshot — the last-known-good list."""
+        best: ConstituentSnapshot | None = None
+        for path in self.snapshots():
+            try:
+                candidate = load_snapshot(path)
+            except SourceAdapterError:
+                continue
+            if best is None or candidate.as_of > best.as_of:
+                best = candidate
+        return best
+
+    def due_for_refresh(self, *, now: datetime) -> bool:
+        latest = self.latest()
+        return latest is None or latest.age_days(now) >= REFRESH_INTERVAL_DAYS
+
+
+def _with_checksum(snapshot: ConstituentSnapshot) -> ConstituentSnapshot:
+    from dataclasses import replace
+
+    return replace(snapshot, checksum=snapshot.compute_checksum())
+
+
+def load_snapshot(path: Path) -> ConstituentSnapshot:
+    """Load a snapshot, RECOMPUTING its checksum."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise SourceAdapterError(f"unreadable universe snapshot {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise SourceAdapterError("universe snapshot must be a JSON object")
+    declared = payload.get("checksum")
+    snapshot = ConstituentSnapshot(
+        index_id=str(payload["index_id"]),
+        as_of=date.fromisoformat(str(payload["as_of"])),
+        fetched_at=datetime.fromisoformat(str(payload["fetched_at"])),
+        source_id=str(payload["source_id"]),
+        source_authority=str(payload.get("source_authority", SourceAuthority.PUBLIC_SECONDARY)),
+        constituents=tuple(
+            Constituent(
+                ticker=str(item["ticker"]), name=str(item.get("name", "")),
+                security_id=str(item["security_id"]),
+                cik=str(item["cik"]) if item.get("cik") else None,
+                gics_sector=str(item["gics_sector"]) if item.get("gics_sector") else None,
+                gics_sub_industry=(
+                    str(item["gics_sub_industry"]) if item.get("gics_sub_industry") else None
+                ),
+                date_added=(
+                    date.fromisoformat(str(item["date_added"])) if item.get("date_added") else None
+                ),
+            )
+            for item in payload.get("constituents", ())
+        ),
+        is_point_in_time_history=bool(payload.get("is_point_in_time_history", False)),
+        gics_mode=str(payload.get("gics_mode", GicsMode.FREE_RECONSTRUCTED.value)),
+        notes=tuple(str(note) for note in payload.get("notes", ())),
+    )
+    recomputed = snapshot.compute_checksum()
+    if isinstance(declared, str) and declared and declared != recomputed:
+        raise SourceAdapterError(
+            f"{path}: universe snapshot checksum mismatch (tampered or stale):"
+            f" declared {declared}, recomputed {recomputed}"
+        )
+    return _with_checksum(snapshot)
+
+
+# -- free constituent dataset (approved PUBLIC_SECONDARY source) --------------
+
+_ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
+_CELL_RE = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]+>")
+_HEADER_CELL_RE = re.compile(r"<th[\s>]", re.IGNORECASE)
+
+
+def _clean(cell: str) -> str:
+    text = _TAG_RE.sub(" ", cell)
+    text = text.replace("&amp;", "&").replace("&nbsp;", " ").replace("&#160;", " ")
+    return " ".join(text.split())
+
+
+def parse_constituent_table(
+    raw: bytes,
+    *,
+    index_id: str = "SP500",
+    as_of: date,
+    fetched_at: datetime,
+    source_id: str,
+) -> ConstituentSnapshot:
+    """Parse a free public constituent table into a CURRENT snapshot.
+
+    Marked ``PUBLIC_SECONDARY`` and ``is_point_in_time_history=False``: it is an
+    operational universe filter, never historical evidence. Rows missing a
+    ticker are skipped and reported rather than invented.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    constituents: list[Constituent] = []
+    skipped = 0
+    for row in _ROW_RE.findall(text):
+        # A header row is not a constituent. "Symbol" happens to match the
+        # ticker shape, so headers must be excluded structurally rather than by
+        # hoping the pattern rejects them.
+        if _HEADER_CELL_RE.search(row):
+            continue
+        cells = [_clean(cell) for cell in _CELL_RE.findall(row)]
+        if len(cells) < 2:
+            continue
+        ticker = cells[0].upper()
+        if not re.fullmatch(r"[A-Z][A-Z.\-]{0,6}", ticker):
+            skipped += 1
+            continue
+        cik = next((c for c in cells if re.fullmatch(r"\d{7,10}", c)), None)
+        added = next(
+            (c for c in cells if re.fullmatch(r"\d{4}-\d{2}-\d{2}", c)), None
+        )
+        constituents.append(
+            Constituent(
+                ticker=ticker,
+                name=cells[1],
+                # A stable, non-ticker identity: CIK when the source carries it.
+                security_id=f"sec-cik:{cik.zfill(10)}" if cik else f"sp-ticker:{ticker}",
+                cik=cik.zfill(10) if cik else None,
+                gics_sector=cells[2] if len(cells) > 2 and cells[2] else None,
+                gics_sub_industry=cells[3] if len(cells) > 3 and cells[3] else None,
+                date_added=date.fromisoformat(added) if added else None,
+            )
+        )
+    notes = [
+        "PUBLIC_SECONDARY free dataset: CURRENT membership only.",
+        "This is NOT point-in-time history and must never be used as such.",
+        "Sector context here is CURRENT classification (FREE_RECONSTRUCTED).",
+    ]
+    if skipped:
+        notes.append(f"{skipped} row(s) skipped: no parseable ticker")
+    return _with_checksum(
+        ConstituentSnapshot(
+            index_id=index_id, as_of=as_of, fetched_at=fetched_at, source_id=source_id,
+            source_authority=SourceAuthority.PUBLIC_SECONDARY.value,
+            constituents=tuple(constituents), notes=tuple(notes),
+        )
+    )
+
+
+def refresh_universe(
+    store: UniverseStore,
+    candidate: ConstituentSnapshot | None,
+    *,
+    now: datetime,
+    policy: FreshnessPolicy,
+) -> tuple[ConstituentSnapshot | None, UniverseListStatus, tuple[str, ...]]:
+    """Apply a refresh safely and report the resulting freshness.
+
+    A failed (``None``) or invalid candidate leaves the last-known-good snapshot
+    in place; it is never overwritten by a bad fetch.
+    """
+    findings: list[str] = []
+    if candidate is None:
+        findings.append("refresh produced no snapshot; keeping the last-known-good list")
+    else:
+        _, problems = store.accept(candidate)
+        if problems:
+            findings.append(
+                "refresh rejected, last-known-good retained: " + "; ".join(problems)
+            )
+    current = store.latest()
+    return current, classify_freshness(current, now=now, policy=policy), tuple(findings)
+
+
+def sector_context(
+    snapshot: ConstituentSnapshot | None, ticker: str, *, gics_mode: GicsMode
+) -> tuple[str | None, str]:
+    """Optional sector context and its provenance. UNKNOWN is always safe."""
+    if gics_mode is GicsMode.DISABLED:
+        return None, "GICS is DISABLED; sector is not consulted"
+    if snapshot is None:
+        return None, "UNKNOWN: no current universe snapshot"
+    sector = snapshot.sector_of(ticker)
+    if sector is None:
+        return None, f"UNKNOWN: {ticker} carries no sector in the current snapshot"
+    return sector, (
+        "FREE_RECONSTRUCTED: current classification from a PUBLIC_SECONDARY"
+        " dataset; non-authoritative and not point-in-time"
+    )
+
+
+__all__ = [
+    "MAX_PLAUSIBLE_CONSTITUENTS",
+    "MIN_PLAUSIBLE_CONSTITUENTS",
+    "REFRESH_INTERVAL_DAYS",
+    "UNIVERSE_SCHEMA_VERSION",
+    "Constituent",
+    "ConstituentSnapshot",
+    "UniverseStore",
+    "classify_freshness",
+    "load_snapshot",
+    "parse_constituent_table",
+    "refresh_universe",
+    "sector_context",
+    "validate_snapshot",
+]

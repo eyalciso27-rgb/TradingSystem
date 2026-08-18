@@ -55,6 +55,10 @@ from trading_market_data_core.dataset_v1_run import (
     load_and_verify_run_manifest,
     verify_manifest_artifacts,
 )
+from trading_market_data_core.trading_readiness import (
+    OPTIONAL_FOR_TRADING,
+    OptionalCapabilityState,
+)
 
 DEFAULT_EVIDENCE_DIR = Path("docs/poi/evidence/dataset-v1")
 DEFAULT_IBKR_EVIDENCE = Path("docs/poi/evidence/POI-IBKR-HIST.json")
@@ -258,7 +262,28 @@ def main(argv: list[str]) -> int:
     except BuilderError as error:
         print(f"SNAPSHOT_NOT_BUILT: {error}")
 
+    # ADR-0017: historical sector and PIT membership are OPTIONAL. They stay in
+    # the diagnostics for strict-backtest use, but they are reported separately
+    # and never presented as things that stop trading.
+    trading_blockers = tuple(
+        name for name in blockers if name not in OPTIONAL_FOR_TRADING
+    )
+    optional_diagnostics = {
+        name: (
+            OptionalCapabilityState.OPTIONAL_AVAILABLE.value
+            if states.get(name) is CapabilityState.EMPIRICALLY_VERIFIED
+            else OptionalCapabilityState.OPTIONAL_UNAVAILABLE.value
+        )
+        for name in OPTIONAL_FOR_TRADING
+    }
+
     payload = {
+        "optional_capabilities": optional_diagnostics,
+        "trading_blockers": list(trading_blockers),
+        "optional_capabilities_note": (
+            "Optional historical data. Unavailable here does NOT block Paper or"
+            " Live trading (ADR-0017); it only limits strict backtests."
+        ),
         "snapshot_id": snapshot_id,
         "fingerprint": fingerprint,
         "snapshot_readiness": readiness.value,

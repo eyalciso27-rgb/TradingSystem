@@ -1,0 +1,35 @@
+{
+  "_README": [
+    "Owner-approved defaults (ADR-0017). Historical GICS and historical PIT S&P",
+    "membership are OPTIONAL context and never block Paper or Live trading.",
+    "No paid data source is required."
+  ],
+  "gics": {
+    "mode": "DISABLED",
+    "_modes": ["DISABLED", "FREE_RECONSTRUCTED", "LICENSED"],
+    "_note": "FREE_RECONSTRUCTED is non-authoritative, current-only, and may inform analytics only. It can never become a trading veto."
+  },
+  "universe": {
+    "default_type": "ALL_ELIGIBLE_US_EQUITIES",
+    "_types": ["ALL_ELIGIBLE_US_EQUITIES", "SP500_CURRENT"],
+    "current_list_refresh_interval_days": 30,
+    "freshness": {
+      "PAPER": {"max_age_days": 45, "allow_stale": true, "stale_grace_days": 45},
+      "LIVE": {"max_age_days": 35, "allow_stale": false}
+    },
+    "_note": "A CURRENT list is required only for SP500_CURRENT strategies. Historical PIT membership is never substituted for it."
+  },
+  "historical_pit_membership": {
+    "required_for_trading": false,
+    "required_for_backtest": "PIT_STRICT only, and only for index-restricted strategies"
+  },
+  "backtest": {
+    "default_quality": "APPROXIMATE",
+    "_qualities": ["APPROXIMATE", "PIT_STRICT", "INCOMPLETE"],
+    "_note": "An APPROXIMATE run reports its survivorship and look-ahead limitations. A PIT_STRICT request that cannot be met returns INCOMPLETE rather than a quietly downgraded run."
+  },
+  "paid_sources": {
+    "required": false,
+    "_note": "Licensed GICS and any paid feed remain optional future upgrades."
+  }
+}
