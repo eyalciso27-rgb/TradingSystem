@@ -142,6 +142,24 @@ def primary_document_url(filing: SecFilingRecord) -> str:
     )
 
 
+
+def assert_document_correlates(url: str, filing: SecFilingRecord) -> None:
+    """A document must belong to the filing it is being attached to.
+
+    Attaching another filing's document would bind a lifecycle assertion to the
+    wrong security, so the archive path is checked against the filing's own CIK,
+    accession folder and primaryDocument name.
+    """
+    folder = filing.accession.replace("-", "")
+    cik_plain = filing.cik.lstrip("0") or "0"
+    expected = f"/data/{cik_plain}/{folder}/{filing.primary_document}"
+    if not url.endswith(expected):
+        raise SourceAdapterError(
+            f"document {url} does not correlate with filing {filing.accession}"
+            f" (CIK {filing.cik}); expected path ending {expected}"
+        )
+
+
 def _parse_date(raw: str) -> date | None:
     """Parse only unambiguous published formats. An odd value is NOT guessed."""
     from datetime import datetime as _dt
@@ -200,6 +218,15 @@ def parse_form25_document(
     """
     if not raw:
         raise SourceAdapterError(f"empty Form 25 document for {filing.accession}")
+    if not filing.primary_document:
+        raise SourceAdapterError(
+            f"filing {filing.accession} declares no primaryDocument; a document"
+            " cannot be correlated to it (fail closed)"
+        )
+    if not filing.cik.strip():
+        raise SourceAdapterError(
+            f"filing {filing.accession} has no CIK; refusing to attach a document"
+        )
 
     checksum = artifact_checksum(raw)
     root = _parse_xml(raw)
@@ -310,10 +337,28 @@ class Form25Coverage:
     unparsed_documents: int
     observed_elements: tuple[str, ...] = ()
     findings: tuple[str, ...] = field(default_factory=tuple)
+    xml_documents: int = 0
+    non_xml_documents: int = 0
+    failures_by_reason: Mapping[str, int] = field(default_factory=dict)
+    #: Element names seen that look like a date field but are NOT in the
+    #: allow-list. This is the actionable signal for widening it from REAL data.
+    unmatched_date_candidates: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
         return self.documents > 0 and self.with_effective_date == self.documents
+
+    def summary_lines(self) -> tuple[str, ...]:
+        """A concise human summary the owner run prints."""
+        return (
+            f"documents fetched            : {self.documents}",
+            f"documents parsed as XML      : {self.xml_documents}",
+            f"documents not XML            : {self.non_xml_documents}",
+            f"effective-date matches       : {self.with_effective_date}/{self.documents}",
+            f"last-trading-date matches    : {self.with_last_trading_date}/{self.documents}",
+            f"parse failures               : {sum(self.failures_by_reason.values())}",
+            f"unmatched date-like elements : {list(self.unmatched_date_candidates)}",
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -321,7 +366,11 @@ class Form25Coverage:
             "with_effective_date": self.with_effective_date,
             "with_last_trading_date": self.with_last_trading_date,
             "unparsed_documents": self.unparsed_documents,
+            "xml_documents": self.xml_documents,
+            "non_xml_documents": self.non_xml_documents,
             "complete": self.complete,
+            "failures_by_reason": dict(sorted(self.failures_by_reason.items())),
+            "unmatched_date_candidates": list(self.unmatched_date_candidates),
             "observed_elements": list(self.observed_elements),
             "findings": list(self.findings),
         }
@@ -331,17 +380,50 @@ def summarize_form25(documents: Sequence[Form25Document]) -> Form25Coverage:
     """Coverage of the parsed population — the input to PARTIAL semantics."""
     observed: set[str] = set()
     findings: list[str] = []
+    failures: dict[str, int] = {}
     for document in documents:
         observed.update(document.observed_elements)
         findings.extend(document.findings)
+        for finding in document.findings:
+            reason = _failure_reason(finding)
+            failures[reason] = failures.get(reason, 0) + 1
+    known = {tag.lower() for tag in (*EFFECTIVE_DATE_TAGS, *LAST_TRADING_DATE_TAGS)}
+    unmatched = sorted(
+        name for name in observed if name not in known and _looks_like_a_date_field(name)
+    )
+    non_xml = sum(1 for d in documents if not d.observed_elements)
     return Form25Coverage(
         documents=len(documents),
         with_effective_date=sum(1 for d in documents if d.effective_on is not None),
         with_last_trading_date=sum(1 for d in documents if d.last_trading_on is not None),
-        unparsed_documents=sum(1 for d in documents if not d.observed_elements),
+        unparsed_documents=non_xml,
+        xml_documents=len(documents) - non_xml,
+        non_xml_documents=non_xml,
+        failures_by_reason=failures,
+        unmatched_date_candidates=tuple(unmatched),
         observed_elements=tuple(sorted(observed)),
         findings=tuple(sorted(set(findings))),
     )
+
+
+#: Element names that look like they carry a date. Used ONLY to report
+#: candidates for review - never to extract a value. Widening the allow-list
+#: stays a deliberate decision made against a real document.
+_DATE_HINTS = ("date", "dt", "effective", "delist", "trading")
+
+
+def _looks_like_a_date_field(name: str) -> bool:
+    return any(hint in name for hint in _DATE_HINTS)
+
+
+def _failure_reason(finding: str) -> str:
+    if "not XML" in finding:
+        return "not_xml"
+    if "unparseable" in finding:
+        return "unparseable_date_value"
+    if "publishes no delisting effective date" in finding:
+        return "no_effective_date_element"
+    return "other"
 
 
 #: 8-K item codes are published metadata, but several are ambiguous about what
@@ -380,6 +462,7 @@ __all__ = [
     "candidate_signals",
     "effective_dates_by_accession",
     "parse_form25_document",
+    "assert_document_correlates",
     "primary_document_url",
     "summarize_form25",
 ]

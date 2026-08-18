@@ -49,6 +49,9 @@ class ArtifactType(StrEnum):
     AUXILIARY_DATA_QUALITY_REPORT = "auxiliary_data_quality_report"
     #: A declaration of sources/documents supplied by the owner.
     SOURCE_MANIFEST = "source_manifest"
+    #: The authenticated record of ONE owner run: stages, outcomes, artifacts.
+    #: Readiness is computed from this, never from a directory glob.
+    RUN_MANIFEST = "run_manifest"
 
 
 #: Only this type may be handed to the capability promotion path.
@@ -94,6 +97,8 @@ def classify_payload(payload: object, *, source: str = "artifact") -> ArtifactTy
         return ArtifactType.IDENTITY_CROSSWALK
     if "snapshot_readiness" in payload or "capability_blockers" in payload:
         return ArtifactType.SNAPSHOT_REPORT
+    if "run_id" in payload and "stages" in payload:
+        return ArtifactType.RUN_MANIFEST
     raise ArtifactError(
         f"{source}: artifact declares no artifact_type and its shape matches no"
         " known type; refusing to guess (fail closed)"

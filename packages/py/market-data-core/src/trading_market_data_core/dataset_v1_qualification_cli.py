@@ -83,6 +83,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--evidence-dir", type=Path, default=DEFAULT_EVIDENCE_DIR)
     parser.add_argument("--evidence", type=Path, default=None)
     parser.add_argument("--ibkr-evidence", type=Path, default=DEFAULT_IBKR_EVIDENCE)
+    parser.add_argument("--manifest", type=Path, default=None)
     args = parser.parse_args(argv[1:])
 
     if args.command == "criteria":
@@ -145,6 +146,34 @@ def main(argv: list[str]) -> int:
         return 0 if evidence.promotion_eligible else 1
 
     # report
+    #
+    # Readiness is NEVER computed from a directory glob. The real owner run had
+    # a FAILED corporate-action stage while a previous run's artifact was still
+    # on disk, and directory-wide discovery treated it as available. Current
+    # readiness comes from the authenticated run manifest, so this command
+    # refuses to answer without one.
+    if args.manifest is None:
+        print(
+            "READINESS_REQUIRES_A_RUN_MANIFEST: current readiness is computed from"
+            " the authenticated run manifest, not from the evidence directory."
+        )
+        print(
+            "  run: uv run --no-sync python -m"
+            " trading_market_data_core.dataset_v1_run_cli report --manifest <run-manifest.json>"
+        )
+        print(
+            "  (this command still supports 'discover', 'criteria' and 'verify'"
+            " for inspecting individual artifacts)"
+        )
+        return 2
+
+    from trading_market_data_core.dataset_v1_run_cli import cmd_report
+
+    return cmd_report(args)
+
+
+def _legacy_directory_report(args: argparse.Namespace) -> int:
+    """Retained for inspection only; never used to decide current readiness."""
     notes, _ = _discover(args.config, args.evidence_dir)
     evidences = []
     scan = scan_evidence_dir(args.evidence_dir)

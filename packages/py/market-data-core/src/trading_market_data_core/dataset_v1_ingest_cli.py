@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
@@ -38,6 +39,7 @@ from trading_market_data_core.dataset_v1_artifacts import (
     CrosswalkSourceBinding,
 )
 from trading_market_data_core.dataset_v1_form25 import (
+    assert_document_correlates,
     candidate_signals,
     effective_dates_by_accession,
     parse_form25_document,
@@ -60,6 +62,10 @@ from trading_market_data_core.dataset_v1_real_ingestion import (
     qualify_delisted_security_history,
     qualify_pit_membership,
     real_source_descriptor,
+)
+from trading_market_data_core.dataset_v1_run import (
+    StageOutcome,
+    file_checksum,
 )
 from trading_market_data_core.dataset_v1_sources import (
     XBRL_DIVIDEND_CONCEPTS,
@@ -84,7 +90,13 @@ from trading_market_data_core.dataset_v1_sources import (
     parse_sec_submissions,
     parse_xbrl_concept,
     sec_filings_to_events,
-    xbrl_facts_to_events,
+)
+from trading_market_data_core.dataset_v1_xbrl import (
+    NormalizationReport,
+    XbrlObservation,
+    normalize_observations,
+    observations_from_facts,
+    observations_to_events,
 )
 
 DEFAULT_EVIDENCE_DIR = Path("docs/poi/evidence/dataset-v1")
@@ -127,6 +139,44 @@ def _force_utf8_stdout() -> None:
             reconfigure(encoding="utf-8", errors="replace")
 
 
+
+def _staged_path(args: argparse.Namespace, filename: str) -> Path:
+    """Where a stage writes before its artifact is accepted.
+
+    With no run id the command behaves as before (direct write), so the module
+    stays usable outside an owner run.
+    """
+    evidence_dir: Path = args.evidence_dir
+    if not getattr(args, "run_id", ""):
+        return evidence_dir / filename
+    run_root: Path = args.run_root
+    staging = run_root / str(args.run_id) / "staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    return staging / filename
+
+
+def _publish(args: argparse.Namespace, filename: str, outcome: StageOutcome) -> Path | None:
+    """Publish a staged artifact ONLY when its stage completed normally.
+
+    A FAILED stage publishes nothing, which is what stops a previous run's
+    artifact from standing in for this run's missing output.
+    """
+    staged = _staged_path(args, filename)
+    if not staged.is_file():
+        return None
+    if not outcome.may_publish:
+        staged.unlink(missing_ok=True)
+        return None
+    evidence_dir: Path = args.evidence_dir
+    if staged.parent == evidence_dir:
+        return staged
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    target = evidence_dir / filename
+    shutil.move(str(staged), str(target))
+    print(f"published: {target} ({file_checksum(target)})")
+    return target
+
+
 def _now() -> datetime:
     return datetime.now(tz=UTC)
 
@@ -163,8 +213,17 @@ def _discover_and_fetch(
 
     filings: list[SecFilingRecord] = []
     profiles: list[SecEntityProfile] = []
+    # ROOT CAUSE of the real run's duplicate ids: a filer that filed more than
+    # one Form 25 in the quarter appeared as several candidate ROWS, so its
+    # submissions and XBRL facts were ingested once per row. Identity is the
+    # FILER, not the filing, so each CIK is fetched exactly once.
+    seen_ciks: set[str] = set()
     for row in candidates:
-        raw, parsed = client.submissions(row.cik)
+        cik = row.cik.zfill(10)
+        if cik in seen_ciks:
+            continue
+        seen_ciks.add(cik)
+        raw, parsed = client.submissions(cik)
         consumed.append(raw)
         profiles.append(parse_sec_entity_profile(raw, parsed))
         filings.extend(parse_sec_submissions(raw, parsed))
@@ -196,6 +255,8 @@ def _fetch_form25_documents(
             notes.append(f"{filing.accession}: {error}")
             continue
         try:
+            # a document from another filing must never be attached to this one
+            assert_document_correlates(url, filing)
             client.pace()  # shared throttle: one budget for the whole run
             raw = fetcher.get_bytes(url, headers={"User-Agent": _sec_user_agent()})
         except SourceAdapterError as error:
@@ -284,7 +345,11 @@ def cmd_sec_delisting(args: argparse.Namespace) -> int:
             " allow-list from data rather than assumptions:",
             ", ".join(coverage_report.observed_elements) or "(none)",
         ),
-    ).write(args.evidence_dir / "form25-coverage.json")
+    ).write(_staged_path(args, "form25-coverage.json"))
+    print("== Form 25 primary-document coverage ==")
+    for line in coverage_report.summary_lines():
+        print(f"  {line}")
+    _publish(args, "form25-coverage.json", StageOutcome.PARTIAL)
 
     evidence = qualify_delisted_security_history(
         filings,
@@ -307,11 +372,17 @@ def cmd_sec_delisting(args: argparse.Namespace) -> int:
         coverage=CoverageWindow(start=dates[0], end=dates[-1]),
         observed_at=_now(),
     )
-    path = args.evidence_dir / "delisted_security_history.json"
+    path = _staged_path(args, "delisted_security_history.json")
     checksum = evidence.write(path)
     _report(evidence)
-    _write(args.evidence_dir, "delisted_security_history", checksum)
-    return _exit_code(evidence)
+    code = _exit_code(evidence)
+    outcome = StageOutcome.SUCCEEDED if code == EXIT_PASS else (
+        StageOutcome.PARTIAL if code == EXIT_PARTIAL else StageOutcome.FAILED
+    )
+    published = _publish(args, "delisted_security_history.json", outcome)
+    if published is not None:
+        _write(published.parent, "delisted_security_history", checksum)
+    return code
 
 
 def _load_ibkr_probes(
@@ -387,20 +458,47 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
     # reported returns 404 and is recorded as unavailable, never invented.
     xbrl_notes: list[str] = []
     _, client = _sec_transport()
+    normalizations: list[NormalizationReport] = []
     for profile in profiles:
+        # Observations for ONE filer are normalized together, so a restatement
+        # in a later filing folds into the same observation instead of becoming
+        # a second event.
+        observations: list[XbrlObservation] = []
         for concept in (*XBRL_DIVIDEND_CONCEPTS, *XBRL_SPLIT_CONCEPTS):
             try:
                 raw, parsed = client.company_concept(profile.cik, "us-gaap", concept)
             except SourceAdapterError as error:
                 xbrl_notes.append(f"{profile.cik} {concept}: unavailable ({error})")
                 continue
-            events.extend(
-                xbrl_facts_to_events(
+            observations.extend(
+                observations_from_facts(
                     parse_xbrl_concept(raw, parsed),
-                    security_id=profile.security_id,
-                    source_id="sec-xbrl",
+                    cik=profile.cik,
+                    taxonomy="us-gaap",
                     source_checksum=combined_artifact_checksum([raw]),
                 )
+            )
+        if not observations:
+            continue
+        try:
+            report = normalize_observations(observations)
+        except SourceAdapterError as error:
+            # An irreconcilable pair of facts is a real finding, not a reason to
+            # abandon the whole filer set.
+            xbrl_notes.append(f"{profile.cik}: {error}")
+            continue
+        normalizations.append(report)
+        events.extend(
+            observations_to_events(
+                report, security_id=profile.security_id, source_id="sec-xbrl"
+            )
+        )
+        if report.duplicates_collapsed or report.revisions or report.repeats:
+            xbrl_notes.append(
+                f"{profile.cik}: {report.total_rows} fact row(s) ->"
+                f" {len(report.observations)} observation(s)"
+                f" (collapsed={report.duplicates_collapsed},"
+                f" repeats={report.repeats}, revisions={report.revisions})"
             )
 
     candidates = sorted(
@@ -410,14 +508,23 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
         name="sec-corporate-action-candidates",
         observed_at=_now(),
         findings=tuple(xbrl_notes),
-        counts={"candidate_signals": len(candidates), "events_minted": len(events)},
+        counts={
+            "candidate_signals": len(candidates),
+            "events_minted": len(events),
+            "xbrl_fact_rows": sum(r.total_rows for r in normalizations),
+            "xbrl_observations": sum(len(r.observations) for r in normalizations),
+            "xbrl_duplicates_collapsed": sum(r.duplicates_collapsed for r in normalizations),
+            "xbrl_repeats": sum(r.repeats for r in normalizations),
+            "xbrl_revisions": sum(r.revisions for r in normalizations),
+        },
         notes=(
             "8-K item codes are published metadata but are AMBIGUOUS about what"
             " occurred; they are review leads and qualify NOTHING. Only parsed"
             " document/XBRL evidence mints an event.",
             *candidates,
         ),
-    ).write(args.evidence_dir / "corporate-action-candidates.json")
+    ).write(_staged_path(args, "corporate-action-candidates.json"))
+    _publish(args, "corporate-action-candidates.json", StageOutcome.PARTIAL)
 
     if not events:
         print("NO_REAL_EVENTS: nothing ingested; capability stays blocked")
@@ -446,11 +553,17 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
         ),
         observed_at=_now(),
     )
-    path = args.evidence_dir / "corporate_actions.json"
+    path = _staged_path(args, "corporate_actions.json")
     checksum = evidence.write(path)
     _report(evidence)
-    _write(args.evidence_dir, "corporate_actions", checksum)
-    return _exit_code(evidence)
+    code = _exit_code(evidence)
+    outcome = StageOutcome.SUCCEEDED if code == EXIT_PASS else (
+        StageOutcome.PARTIAL if code == EXIT_PARTIAL else StageOutcome.FAILED
+    )
+    published = _publish(args, "corporate_actions.json", outcome)
+    if published is not None:
+        _write(published.parent, "corporate_actions", checksum)
+    return code
 
 
 def cmd_sp_membership(args: argparse.Namespace) -> int:
@@ -483,11 +596,17 @@ def cmd_sp_membership(args: argparse.Namespace) -> int:
         observed_at=_now(),
         production_window_required=production,
     )
-    path = args.evidence_dir / "pit_sp500_membership.json"
+    path = _staged_path(args, "pit_sp500_membership.json")
     checksum = evidence.write(path)
     _report(evidence)
-    _write(args.evidence_dir, "pit_sp500_membership", checksum)
-    return _exit_code(evidence)
+    code = _exit_code(evidence)
+    outcome = StageOutcome.SUCCEEDED if code == EXIT_PASS else (
+        StageOutcome.PARTIAL if code == EXIT_PARTIAL else StageOutcome.FAILED
+    )
+    published = _publish(args, "pit_sp500_membership.json", outcome)
+    if published is not None:
+        _write(published.parent, "pit_sp500_membership", checksum)
+    return code
 
 
 def cmd_crosswalk(args: argparse.Namespace) -> int:
@@ -499,7 +618,7 @@ def cmd_crosswalk(args: argparse.Namespace) -> int:
         crosswalk, ciks=[p.cik for p in profiles], entry_count=len(profiles)
     )
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
-    path = args.evidence_dir / "identity-crosswalk.json"
+    path = _staged_path(args, "identity-crosswalk.json")
     artifact = CrosswalkArtifact(
         entries=report.entries,
         resolved=report.resolved,
@@ -519,7 +638,12 @@ def cmd_crosswalk(args: argparse.Namespace) -> int:
     print(f"crosswalk written: {path}")
     print(f"crosswalk artifact_type: {ArtifactType.IDENTITY_CROSSWALK.value}")
     print(f"crosswalk checksum: {checksum}")
-    return EXIT_PASS if report.clean else EXIT_PARTIAL
+    code = EXIT_PASS if report.clean else EXIT_PARTIAL
+    _publish(
+        args, "identity-crosswalk.json",
+        StageOutcome.SUCCEEDED if code == EXIT_PASS else StageOutcome.PARTIAL,
+    )
+    return code
 
 
 def cmd_gics(args: argparse.Namespace) -> int:
@@ -544,6 +668,10 @@ def main(argv: list[str]) -> int:
         "--manifest", type=Path, default=Path("config/data-sources/sp500-announcements.json")
     )
     parser.add_argument("--documents-dir", type=Path, default=None)
+    parser.add_argument("--run-id", default="")
+    parser.add_argument(
+        "--run-root", type=Path, default=Path("docs/poi/evidence/dataset-v1-runs")
+    )
     parser.add_argument("--production-start", default="")
     parser.add_argument("--production-end", default="")
     _force_utf8_stdout()

@@ -328,14 +328,21 @@ def test_cli_verify_rejects_tampered_evidence(
     assert "EVIDENCE_INVALID" in capsys.readouterr().out
 
 
-def test_cli_report_is_non_zero_while_the_contract_is_not_ready(
+def test_cli_report_refuses_to_judge_readiness_without_a_run_manifest(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Readiness must never be decided by scanning a directory.
+
+    The real owner run had a FAILED corporate-action stage while a previous
+    run's artifact was still on disk; directory-wide discovery treated it as
+    available. Current readiness now comes from the authenticated run manifest.
+    """
     rc = cli_main(
         ["prog", "report", "--config", str(tmp_path / "none.yaml"),
          "--evidence-dir", str(tmp_path / "empty"),
          "--ibkr-evidence", str(tmp_path / "no-ibkr.json")]
     )
-    assert rc == 1  # an owner run cannot be mistaken for success
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["full_dataset_contract_ready"] is False
+    assert rc == 2, "an owner run cannot be mistaken for success"
+    out = capsys.readouterr().out
+    assert "READINESS_REQUIRES_A_RUN_MANIFEST" in out
+    assert "dataset_v1_run_cli report" in out
