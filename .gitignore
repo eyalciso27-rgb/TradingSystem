@@ -43,3 +43,7 @@ config.ini
 *.credentials
 ibc-credentials*
 .config/ibc/
+
+# Owner-supplied official S&P documents: never commit the documents themselves
+config/data-sources/sp500-documents/*
+!config/data-sources/sp500-documents/README.md

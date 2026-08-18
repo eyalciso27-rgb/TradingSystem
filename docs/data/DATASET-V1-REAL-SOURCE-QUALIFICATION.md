@@ -567,6 +567,62 @@ authenticate. The capability report now carries both dimensions per stage:
 `artifact_status` is one of `BOUND` / `PARTIALLY_BOUND` /
 `FAILED_AUTHENTICATION` / `NO_ARTIFACTS` / `NOT_APPLICABLE`.
 
+## Empirical closure work (after the clean PR #88 run)
+
+The manifest architecture is settled; the remaining blockers are data-source
+problems. This package attacks them.
+
+### Split concepts are DISCOVERED, not guessed
+
+The run reported `StockholdersEquityNoteStockSplitConversionRatio1
+requested=2 http_ok=0 rows=0`. That is a **404 for a guessed name**, which says
+nothing about whether the filers reported a split.
+
+The runner now reads `/api/xbrl/companyfacts` - every concept a filer actually
+reported - and then selects from a **reviewed** table:
+
+| Bucket | Meaning |
+|---|---|
+| `accepted` | concept + semantics reviewed and written down; mints events |
+| `rejected` | reviewed and deliberately NOT an event (with the reason) |
+| `unmapped_candidates` | the name looks split-ish but semantics are unreviewed - **review lead only** |
+
+A name containing "split" is never sufficient:
+`SplitAdjustedWeightedAverageSharesOutstanding` is a measure, not an event, and
+`StockholdersEquityReverseStockSplit` is prose with no ratio or date. Split
+DIRECTION comes from the ratio value, never from the concept name.
+
+The run prints concepts discovered / accepted / rejected / candidates, so the
+next iteration is driven by data.
+
+### S&P membership: drop documents in one directory
+
+`config/data-sources/sp500-documents/` -> run the single owner command. The
+runner discovers the documents, checksums them, parses announcement and
+effective dates and the added/removed securities, **generates the manifest
+itself**, resolves identities and replays bounded PIT membership.
+
+Formats: HTML, text, CSV/TSV, JSON, and PDF **with a text layer**. A scanned PDF
+is reported as unparsed, never guessed at. Extraction uses explicit labels only,
+and two different dates under one label fail closed.
+
+The documents themselves are gitignored: only the sha256 digest, the filename
+and the parsed fields travel into the evidence.
+
+When the directory is empty the run prints an **actionable** instruction rather
+than a bare `NOT_AVAILABLE`.
+
+### as-of GICS: final decision
+
+`ASOF_GICS_BLOCKER` records the outcome of a final free-source review as
+machine-readable data: `blocker_class = LICENSE_REQUIRED`, every approved source
+reviewed with the reason it does not qualify, what a licensed provider must
+supply, and the minimum acceptance criteria for qualifying one.
+
+SIC is not GICS - a different taxonomy from a different body. Current GICS is
+not as-of GICS: using it for a historical date is look-ahead. **This is the one
+remaining paid-source decision.**
+
 ## Current status
 
 
