@@ -68,6 +68,7 @@ from trading_market_data_core.trading_readiness import (
     UniverseListStatus,
 )
 
+from trading_application.risk_engine import RiskResult
 from trading_application.trading_readiness_runtime import (
     AuditSink,
     BrokerSessionState,
@@ -125,7 +126,7 @@ class RiskSource(Protocol):
     through the port: it is fetched here, from the component that owns it.
     """
 
-    def risk_result_for(self, intent: OrderIntent) -> object | None: ...
+    def risk_result_for(self, intent: OrderIntent) -> RiskResult | None: ...
 
 
 @dataclass(frozen=True, slots=True)

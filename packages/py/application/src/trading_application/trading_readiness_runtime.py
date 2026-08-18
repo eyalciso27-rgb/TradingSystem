@@ -31,6 +31,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Protocol, runtime_checkable
 
+from trading_contracts.enums import RiskDecisionOutcome
 from trading_market_data_core.trading_readiness import (
     MANDATORY_TRADING_GATES,
     GateOutcome,
@@ -42,6 +43,8 @@ from trading_market_data_core.trading_readiness import (
     UniverseListStatus,
     evaluate_trading_readiness,
 )
+
+from trading_application.risk_engine import RiskResult
 
 RUNTIME_READINESS_VERSION = "trading-readiness-runtime-1.0.0"
 
@@ -193,8 +196,11 @@ class RuntimeInputs:
     quote: QuoteState
     rules: MarketDataRules
     protection: ProtectionState
-    #: The REAL risk outcome, produced by RiskEngine.evaluate(...).
-    risk_result: object | None
+    #: The REAL risk outcome, produced by RiskEngine.evaluate(...). Typed,
+    #: because ``RiskResult`` lives in this very package: reading it through
+    #: ``getattr`` would be the same mistake as reading a broker field that does
+    #: not exist, with the same failure mode of a default nobody chose.
+    risk_result: RiskResult | None
     audit: AuditSink | None
     evaluated_at: datetime
     universe_status: UniverseListStatus | None = None
@@ -435,14 +441,22 @@ def _gate_price_spread_liquidity(inputs: RuntimeInputs) -> GateOutcome:
     return GateOutcome(name, True, "configured price/spread/liquidity rules satisfied")
 
 
-def _risk_outcome(inputs: RuntimeInputs) -> tuple[str | None, Decimal | None]:
-    """Read the REAL RiskResult without importing a second risk implementation."""
+#: Risk verdicts that permit an order. REDUCE still permits one, at the
+#: quantity the engine approved rather than the quantity requested.
+_PERMITTING_RISK_OUTCOMES = (
+    RiskDecisionOutcome.APPROVE,
+    RiskDecisionOutcome.REDUCE,
+)
+
+
+def _risk_outcome(
+    inputs: RuntimeInputs,
+) -> tuple[RiskDecisionOutcome | None, Decimal | None]:
+    """Read the REAL RiskResult. One risk implementation, read directly."""
     result = inputs.risk_result
     if result is None:
         return None, None
-    outcome = getattr(getattr(result, "outcome", None), "value", None)
-    quantity = getattr(result, "approved_quantity", None)
-    return (str(outcome) if outcome is not None else None), quantity
+    return result.outcome, result.approved_quantity
 
 
 def _gate_position_sizing(inputs: RuntimeInputs) -> GateOutcome:
@@ -464,10 +478,12 @@ def _gate_risk_limits(inputs: RuntimeInputs) -> GateOutcome:
     outcome, _ = _risk_outcome(inputs)
     if outcome is None:
         return GateOutcome(name, False, "no risk evaluation was supplied")
-    if outcome not in ("APPROVE", "REDUCE"):
-        reasons = getattr(inputs.risk_result, "reason_codes", ())
-        return GateOutcome(name, False, f"risk outcome {outcome}: {list(reasons)}")
-    return GateOutcome(name, True, f"risk outcome {outcome}")
+    if outcome not in _PERMITTING_RISK_OUTCOMES:
+        reasons = inputs.risk_result.reason_codes if inputs.risk_result else ()
+        return GateOutcome(
+            name, False, f"risk outcome {outcome.value}: {list(reasons)}"
+        )
+    return GateOutcome(name, True, f"risk outcome {outcome.value}")
 
 
 def _gate_broker_protection(inputs: RuntimeInputs) -> GateOutcome:
@@ -563,7 +579,7 @@ def evaluate_runtime_readiness(inputs: RuntimeInputs) -> TradingReadinessRuntime
         "broker_instrument_ref": str(
             inputs.contract.broker_instrument_ref or "unresolved"
         ),
-        "risk_outcome": str(outcome or "none"),
+        "risk_outcome": outcome.value if outcome else "none",
         "approved_quantity": str(quantity if quantity is not None else "none"),
         "quote_observed_at": (
             inputs.quote.observed_at.isoformat() if inputs.quote.observed_at else "none"

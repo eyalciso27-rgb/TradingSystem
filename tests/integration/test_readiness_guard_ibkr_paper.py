@@ -21,7 +21,7 @@ Nothing here authorizes Paper Auto or Live.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
+from dataclasses import fields
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -31,6 +31,7 @@ from trading_application.readiness_guarded_broker import (
     ReadinessBlockedError,
     ReadinessGuardedBroker,
 )
+from trading_application.risk_engine import RiskResult
 from trading_application.trading_readiness_runtime import MarketDataRules, QuoteState
 from trading_broker_core.port import (
     BrokerPort,
@@ -41,7 +42,12 @@ from trading_broker_core.port import (
     TimeInForce,
 )
 from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter
-from trading_contracts.enums import Environment, OrderState, OrderType
+from trading_contracts.enums import (
+    Environment,
+    OrderState,
+    OrderType,
+    RiskDecisionOutcome,  # noqa: I001
+)
 from trading_market_data_core.trading_readiness import (
     StrategyDataRequirements,
     TradingMode,
@@ -71,30 +77,41 @@ class _Quotes:
         return self._quote
 
 
-@dataclass(frozen=True)
-class _Outcome:
-    value: str
-
-
-@dataclass(frozen=True)
-class _RiskResult:
-    """Mirrors the real RiskResult shape (outcome + approved_quantity)."""
-
-    outcome: _Outcome
-    approved_quantity: Decimal
-    reason_codes: tuple[str, ...]
-
-
 class _Risk:
-    def __init__(self, outcome: str = "APPROVE", quantity: Decimal = Decimal(10)) -> None:
+    """Supplies a REAL ``RiskResult``.
+
+    Not a stand-in shaped like one: the readiness path reads the risk verdict
+    through its declared type, so a fake with a convenient ``outcome`` string
+    would be exactly the kind of over-generous double this suite exists to
+    avoid.
+    """
+
+    def __init__(
+        self,
+        outcome: RiskDecisionOutcome | str = RiskDecisionOutcome.APPROVE,
+        quantity: Decimal = Decimal(10),
+    ) -> None:
         self._outcome = outcome
         self._quantity = quantity
 
-    def risk_result_for(self, intent: OrderIntent) -> object | None:
-        return _RiskResult(
-            outcome=_Outcome(self._outcome),
+    def risk_result_for(self, intent: OrderIntent) -> RiskResult | None:
+        if self._outcome == "NONE":
+            return None
+        outcome = RiskDecisionOutcome(self._outcome)
+        return RiskResult(
+            outcome=outcome,
             approved_quantity=self._quantity,
-            reason_codes=() if self._outcome == "APPROVE" else ("RISK_VETO",),
+            approved_risk_amount=Decimal("500"),
+            max_loss_amount=Decimal("500"),
+            risk_budget_equity=Decimal("100000"),
+            decision_ref="decision-1",
+            policy_ref="policy-1",
+            engine_version="test",
+            checks=(),
+            reason_codes=(
+                () if outcome is RiskDecisionOutcome.APPROVE else ("RISK_VETO",)
+            ),
+            input_refs=(),
         )
 
 

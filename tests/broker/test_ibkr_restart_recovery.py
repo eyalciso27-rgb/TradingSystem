@@ -23,13 +23,6 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
-from tests.broker.test_ibkr_paper_adapter import (
-    ALIASES,
-    PAPER_ACCOUNT,
-    FakePaperTransport,
-    make_adapter,
-    make_intent,
-)
 from trading_broker_core.port import (
     BrokerErrorCode,
     BrokerPortError,
@@ -43,6 +36,14 @@ from trading_broker_ibkr.paper_adapter import (
     encode_order_ref,
 )
 from trading_contracts.enums import OrderState
+
+from tests.broker.test_ibkr_paper_adapter import (
+    ALIASES,
+    PAPER_ACCOUNT,
+    FakePaperTransport,
+    make_adapter,
+    make_intent,
+)
 
 LIFECYCLE_ID = "poi-ibkr-001-2026-07-21-cancel-path-F-05D0E19B631C2548"
 OTHER_CLIENT_ID = DEFAULT_CLIENT_ID + 5

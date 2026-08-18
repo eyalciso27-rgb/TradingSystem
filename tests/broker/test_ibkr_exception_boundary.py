@@ -21,12 +21,6 @@ from collections.abc import Callable, Mapping
 from decimal import Decimal
 
 import pytest
-from tests.broker.test_ibkr_paper_adapter import (
-    ALIASES,
-    PAPER_ACCOUNT,
-    FakePaperTransport,
-    deterministic_clock,
-)
 from trading_broker_core.port import (
     BrokerInstrument,
     BrokerPortError,
@@ -35,6 +29,13 @@ from trading_broker_core.port import (
     OrderIntent,
 )
 from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter, RawOpenOrder
+
+from tests.broker.test_ibkr_paper_adapter import (
+    ALIASES,
+    PAPER_ACCOUNT,
+    FakePaperTransport,
+    deterministic_clock,
+)
 
 
 class Boom(Exception):

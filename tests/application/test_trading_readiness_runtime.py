@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from trading_application.risk_engine import RiskResult
 from trading_application.trading_readiness_runtime import (
     BrokerSessionState,
     ContractState,
@@ -32,6 +33,7 @@ from trading_application.trading_readiness_runtime import (
     evaluate_runtime_readiness,
     persist_readiness_decision,
 )
+from trading_contracts.enums import RiskDecisionOutcome
 from trading_market_data_core.trading_readiness import (
     MANDATORY_TRADING_GATES,
     GicsMode,
@@ -45,13 +47,30 @@ from trading_market_data_core.trading_readiness import (
 NOW = datetime(2026, 8, 18, 15, 30, tzinfo=UTC)
 
 
-class _RiskResult:
-    """Stands in for the real RiskResult shape (outcome + approved_quantity)."""
+def _risk(
+    outcome: RiskDecisionOutcome | str = RiskDecisionOutcome.APPROVE,
+    quantity: Decimal = Decimal(10),
+) -> RiskResult:
+    """A REAL ``RiskResult``, not something shaped like one.
 
-    def __init__(self, outcome: str = "APPROVE", quantity: Decimal = Decimal(10)) -> None:
-        self.outcome = type("O", (), {"value": outcome})()
-        self.approved_quantity = quantity
-        self.reason_codes: tuple[str, ...] = () if outcome == "APPROVE" else ("RISK_VETO",)
+    The runtime path reads the verdict through its declared type, so a fake
+    carrying a convenient ``outcome`` string would test nothing about the
+    component that actually vetoes.
+    """
+    resolved = RiskDecisionOutcome(outcome)
+    return RiskResult(
+        outcome=resolved,
+        approved_quantity=quantity,
+        approved_risk_amount=Decimal("500"),
+        max_loss_amount=Decimal("500"),
+        risk_budget_equity=Decimal("100000"),
+        decision_ref="decision-1",
+        policy_ref="policy-1",
+        engine_version="test",
+        checks=(),
+        reason_codes=() if resolved is RiskDecisionOutcome.APPROVE else ("RISK_VETO",),
+        input_refs=(),
+    )
 
 
 class _Audit:
@@ -93,7 +112,7 @@ def _inputs(**kw: object) -> RuntimeInputs:
         "protection": ProtectionState(
             protective_order_supported=True, plan_has_protective_stop=True
         ),
-        "risk_result": _RiskResult(),
+        "risk_result": _risk(),
         "audit": _Audit(),
         "evaluated_at": NOW,
     }
@@ -356,7 +375,7 @@ def test_unset_rules_are_not_invented() -> None:
 
 
 def test_a_risk_veto_blocks() -> None:
-    report = evaluate_runtime_readiness(_inputs(risk_result=_RiskResult(outcome="VETO")))
+    report = evaluate_runtime_readiness(_inputs(risk_result=_risk(outcome="VETO")))
     assert report.readiness is TradingReadiness.BLOCKED
     assert any("risk_limits" in b for b in report.blockers)
 
@@ -370,7 +389,7 @@ def test_a_missing_risk_evaluation_blocks_both_sizing_and_risk() -> None:
 
 def test_a_zero_approved_quantity_blocks_sizing() -> None:
     report = evaluate_runtime_readiness(
-        _inputs(risk_result=_RiskResult(quantity=Decimal(0)))
+        _inputs(risk_result=_risk(quantity=Decimal(0)))
     )
     assert report.readiness is TradingReadiness.BLOCKED
     assert any("position_sizing" in b for b in report.blockers)
@@ -378,14 +397,14 @@ def test_a_zero_approved_quantity_blocks_sizing() -> None:
 
 def test_a_reduced_risk_outcome_is_acceptable() -> None:
     report = evaluate_runtime_readiness(
-        _inputs(risk_result=_RiskResult(outcome="REDUCE", quantity=Decimal(3)))
+        _inputs(risk_result=_risk(outcome="REDUCE", quantity=Decimal(3)))
     )
     assert report.readiness is TradingReadiness.PAPER_READY
 
 
 def test_sizing_is_read_from_the_risk_engine_not_recomputed() -> None:
     report = evaluate_runtime_readiness(
-        _inputs(risk_result=_RiskResult(quantity=Decimal(7)))
+        _inputs(risk_result=_risk(quantity=Decimal(7)))
     )
     assert report.runtime_refs["approved_quantity"] == "7"
     gate = next(g for g in report.gates if g.name == "position_sizing")
