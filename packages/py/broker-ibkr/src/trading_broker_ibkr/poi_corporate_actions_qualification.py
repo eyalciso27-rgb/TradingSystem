@@ -127,6 +127,20 @@ class CorporateQualificationEvidence:
     notes: list[str] = field(default_factory=list)
     evidence_checksum: str = ""
 
+    #: See the historical writer: literal strings mirroring ArtifactType.
+    ARTIFACT_TYPE = "ibkr_corporate_evidence"
+    ARTIFACT_SCHEMA_VERSION = "dataset-v1-ibkr-evidence-1.0.0"
+
+    def typing_fields(self) -> dict[str, object]:
+        return {
+            "artifact_type": self.ARTIFACT_TYPE,
+            "schema_version": self.ARTIFACT_SCHEMA_VERSION,
+            "producer": CORPORATE_QUALIFICATION_VERSION,
+            # This artifact qualifies NOTHING by itself: it contributes
+            # adjustment behaviour and probe outcomes to corporate-actions.
+            "capability_scope": [],
+        }
+
     def body_for_checksum(self) -> dict[str, object]:
         return {
             "version": CORPORATE_QUALIFICATION_VERSION,
@@ -141,8 +155,11 @@ class CorporateQualificationEvidence:
         }
 
     def to_dict(self) -> dict[str, object]:
-        body = self.body_for_checksum()
+        # See the historical writer: typing is an envelope, not part of the
+        # digest that authenticates the observations.
+        body = {**self.body_for_checksum(), **self.typing_fields()}
         body["evidence_checksum"] = self.evidence_checksum
+        body["normalized_checksum"] = self.evidence_checksum
         return body
 
 

@@ -457,6 +457,16 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
     # value, a period, an accession and a filing date. A concept the filer never
     # reported returns 404 and is recorded as unavailable, never invented.
     xbrl_notes: list[str] = []
+    # Per-concept accounting so "0 splits" is answerable from the run itself:
+    # was the concept requested, did SEC serve it, how many rows came back, how
+    # many were accepted, and why were the rest rejected?
+    concept_stats: dict[str, dict[str, int]] = {}
+
+    def _stat(concept: str, key: str, amount: int = 1) -> None:
+        concept_stats.setdefault(
+            concept, {"requested": 0, "http_ok": 0, "rows": 0, "accepted": 0, "rejected": 0}
+        )[key] += amount
+
     _, client = _sec_transport()
     normalizations: list[NormalizationReport] = []
     for profile in profiles:
@@ -465,14 +475,18 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
         # a second event.
         observations: list[XbrlObservation] = []
         for concept in (*XBRL_DIVIDEND_CONCEPTS, *XBRL_SPLIT_CONCEPTS):
+            _stat(concept, "requested")
             try:
                 raw, parsed = client.company_concept(profile.cik, "us-gaap", concept)
             except SourceAdapterError as error:
                 xbrl_notes.append(f"{profile.cik} {concept}: unavailable ({error})")
                 continue
+            _stat(concept, "http_ok")
+            facts = parse_xbrl_concept(raw, parsed)
+            _stat(concept, "rows", len(facts))
             observations.extend(
                 observations_from_facts(
-                    parse_xbrl_concept(raw, parsed),
+                    facts,
                     cik=profile.cik,
                     taxonomy="us-gaap",
                     source_checksum=combined_artifact_checksum([raw]),
@@ -488,11 +502,17 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
             xbrl_notes.append(f"{profile.cik}: {error}")
             continue
         normalizations.append(report)
-        events.extend(
-            observations_to_events(
-                report, security_id=profile.security_id, source_id="sec-xbrl"
-            )
+        minted = observations_to_events(
+            report, security_id=profile.security_id, source_id="sec-xbrl"
         )
+        events.extend(minted)
+        for entry in report.observations:
+            concept = entry.observation.concept
+            if any(concept in event.provenance for event in minted):
+                _stat(concept, "accepted")
+            else:
+                # e.g. a zero dividend or a 1:1 ratio: reported, never an event
+                _stat(concept, "rejected")
         if report.duplicates_collapsed or report.revisions or report.repeats:
             xbrl_notes.append(
                 f"{profile.cik}: {report.total_rows} fact row(s) ->"
@@ -501,8 +521,16 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
                 f" repeats={report.repeats}, revisions={report.revisions})"
             )
 
+    # Leads carry enough context to act on: accession, item code, filing date
+    # and WHY they are not promotable. They never become canonical events.
     candidates = sorted(
-        {signal for filing in filings for signal in candidate_signals(filing.items)}
+        {
+            f"{filing.accession} | filed {filing.filing_date.isoformat()}"
+            f" | CIK {filing.cik} | {signal}"
+            " | NOT PROMOTABLE: the item code does not establish the event"
+            for filing in filings
+            for signal in candidate_signals(filing.items)
+        }
     )
     AuxiliaryReport(
         name="sec-corporate-action-candidates",
@@ -522,10 +550,23 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
             " occurred; they are review leads and qualify NOTHING. Only parsed"
             " document/XBRL evidence mints an event.",
             *candidates,
+            "--- XBRL concept accounting (why a concept produced no events) ---",
+            *(
+                f"{concept}: requested={stat['requested']} http_ok={stat['http_ok']}"
+                f" rows={stat['rows']} accepted={stat['accepted']}"
+                f" rejected={stat['rejected']}"
+                for concept, stat in sorted(concept_stats.items())
+            ),
         ),
     ).write(_staged_path(args, "corporate-action-candidates.json"))
     _publish(args, "corporate-action-candidates.json", StageOutcome.PARTIAL)
 
+    print("== SEC XBRL concept accounting ==")
+    for concept, stat in sorted(concept_stats.items()):
+        print(
+            f"  {concept}: requested={stat['requested']} http_ok={stat['http_ok']}"
+            f" rows={stat['rows']} accepted={stat['accepted']} rejected={stat['rejected']}"
+        )
     if not events:
         print("NO_REAL_EVENTS: nothing ingested; capability stays blocked")
         return EXIT_FAIL

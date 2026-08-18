@@ -431,6 +431,81 @@ on an entitlement the contract does not depend on. It is still reported, as are
 `adjustment_behaviour_characterised` and `ibkr_sec_reconciled` - all
 informational. Only failed **required** sub-capabilities block promotion.
 
+## Manifest binding is the only authority (after the third owner run)
+
+The run after PR #86 completed far more work but reported:
+
+```
+run manifest: stages: 1 · artifacts bound: 0
+POI-IBKR-HIST.json: artifact declares no artifact_type ...
+```
+
+while the report still labelled the IBKR capabilities `CURRENT_RUN_EVIDENCE` and
+the snapshot still listed `POI-IBKR-HIST=sha256:...`. Three defects:
+
+1. **Only one stage ever registered.** The runner's stage-registration edits had
+   silently no-oped, so seven of eight stages never reached the ledger, and the
+   ingest commands never received `--run-id` either. Every runner edit is now
+   asserted, and a test lists the expected stage names.
+2. **The IBKR artifacts were untyped**, so nothing could bind them.
+3. **`CURRENT_RUN_EVIDENCE` keyed off the stage's declared outputs**, not off
+   what was actually accepted - so a rejected artifact still read as current.
+
+### Typed IBKR artifacts
+
+`POI-IBKR-HIST.json` and `POI-IBKR-CORP.json` now carry `artifact_type`,
+`schema_version`, `producer`, `capability_scope` and `observed_at`.
+
+Typing is an **envelope**: it sits outside `evidence_checksum`, so migrating a
+legacy artifact adds typing **without invalidating the digest that authenticates
+the recorded observations**. `normalized_checksum` authenticates the full typed
+body.
+
+Legacy files are never classified by shape. They are refused until migrated by
+an explicit command, which the runner performs once, automatically, and reports:
+
+```
+uv run --no-sync python -m trading_market_data_core.dataset_v1_ibkr_cli     migrate --path docs/poi/evidence/POI-IBKR-HIST.json
+```
+
+### Current vs global
+
+| Field | Meaning |
+|---|---|
+| `capability_state` | what THIS run established |
+| `current_run` | `CURRENT_RUN_EVIDENCE` / `CURRENT_RUN_FAILED` / `NO_CURRENT_EVIDENCE` |
+| `global_state` | what a previous owner run established; never called current |
+
+`CURRENT_RUN_EVIDENCE` is emitted **only** when the capability's stage has an
+artifact bound into this manifest. A stage that ran and declared outputs that
+were then rejected reports `CURRENT_RUN_FAILED`.
+
+### Snapshot
+
+With a run manifest the snapshot has **no direct-file fallback and no
+directory fallback**. It binds only manifest-listed artifacts, refuses a
+substituted artifact under the same filename, and refuses to build if the run
+produced an identity crosswalk that is not bound.
+
+## Form 25 documents are HTML
+
+The run answered it with data: **5 fetched, 0 XML, 5 non-XML**, with no
+unmatched XML date-like elements. So the gap was never a missing XML tag.
+
+`dataset_v1_form25_html.py` parses HTML and text documents under strict rules:
+only a date beside an **explicit** lifecycle label is used; two different dates
+under one label **fail closed**; statutory Rule 12d2-2 dates are never computed;
+active content is stripped before matching; and every field keeps its matched
+label and source snippet. Documents that are well-formed XHTML are routed to the
+HTML parser, since their elements are HTML tags rather than the EDGAR schema.
+
+## Why 155 dividends but 0 splits
+
+Rather than guess, the run now reports per-concept accounting - requested,
+`http_ok`, rows returned, accepted, rejected - so the next iteration is driven by
+the answer rather than a hypothesis. A 1:1 ratio and a zero dividend are counted
+as *rejected*, not missing.
+
 ## Current status
 
 

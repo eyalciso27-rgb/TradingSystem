@@ -159,6 +159,9 @@ class RunManifest:
     artifacts: tuple[RunArtifact, ...] = ()
     capability_results: Mapping[str, str] = field(default_factory=dict)
     snapshot_result: Mapping[str, str] = field(default_factory=dict)
+    #: What the snapshot bound (artifact names -> checksums). Authenticated with
+    #: the rest of the body, so a changed binding changes the manifest checksum.
+    snapshot_binding: Mapping[str, str] = field(default_factory=dict)
     failure_reasons: tuple[str, ...] = ()
     schema_version: str = RUN_MANIFEST_SCHEMA_VERSION
     checksum: str = ""
@@ -180,6 +183,7 @@ class RunManifest:
             ],
             "capability_results": dict(sorted(self.capability_results.items())),
             "snapshot_result": dict(sorted(self.snapshot_result.items())),
+            "snapshot_binding": dict(sorted(self.snapshot_binding.items())),
             "failure_reasons": sorted(self.failure_reasons),
         }
 
@@ -248,6 +252,9 @@ def load_and_verify_run_manifest(path: Path) -> RunManifest:
             str(k): str(v) for k, v in payload.get("capability_results", {}).items()
         },
         snapshot_result={str(k): str(v) for k, v in payload.get("snapshot_result", {}).items()},
+        snapshot_binding={
+            str(k): str(v) for k, v in payload.get("snapshot_binding", {}).items()
+        },
         failure_reasons=tuple(str(r) for r in payload.get("failure_reasons", ())),
         schema_version=str(payload.get("schema_version", RUN_MANIFEST_SCHEMA_VERSION)),
         checksum=declared,
@@ -367,7 +374,15 @@ class RunStager:
 def current_run_status(
     manifest: RunManifest, capability: str, *, stage_by_capability: Mapping[str, str]
 ) -> CurrentRunStatus:
-    """Stale-versus-current for one capability, from the manifest alone."""
+    """Stale-versus-current for one capability, from the manifest alone.
+
+    INVARIANT (the real run violated it): ``CURRENT_RUN_EVIDENCE`` may only be
+    emitted when the capability's stage produced an artifact that is
+    ACCEPTED AND BOUND into this manifest. The previous version keyed off the
+    stage's declared artifact list, so a stage whose artifacts were rejected at
+    binding time still reported current evidence while the manifest bound zero
+    artifacts - a contradiction the report happily printed.
+    """
     stage_name = stage_by_capability.get(capability)
     if stage_name is None:
         return CurrentRunStatus.NO_CURRENT_EVIDENCE
@@ -376,9 +391,19 @@ def current_run_status(
         return CurrentRunStatus.NO_CURRENT_EVIDENCE
     if stage.outcome is StageOutcome.FAILED:
         return CurrentRunStatus.CURRENT_RUN_FAILED
-    if not stage.artifacts:
+    bound = [artifact for artifact in manifest.artifacts if artifact.stage == stage_name]
+    if not bound:
+        # The stage may have run and even declared outputs, but nothing of its
+        # was accepted into the ledger, so nothing of its is current evidence.
+        if stage.artifacts:
+            return CurrentRunStatus.CURRENT_RUN_FAILED
         return CurrentRunStatus.NO_CURRENT_EVIDENCE
     return CurrentRunStatus.CURRENT_RUN_EVIDENCE
+
+
+def bound_artifacts_for_stage(manifest: RunManifest, stage_name: str) -> tuple[RunArtifact, ...]:
+    """Artifacts the manifest ACCEPTED from one stage. The only current truth."""
+    return tuple(a for a in manifest.artifacts if a.stage == stage_name)
 
 
 __all__ = [
@@ -389,6 +414,7 @@ __all__ = [
     "RunStager",
     "StageOutcome",
     "StageRecord",
+    "bound_artifacts_for_stage",
     "current_run_status",
     "file_checksum",
     "git_sha",

@@ -37,6 +37,10 @@ from trading_market_data_core.dataset_v1_artifacts import (
     load_and_verify_crosswalk,
 )
 from trading_market_data_core.dataset_v1_builder import BUILDER_VERSION
+from trading_market_data_core.dataset_v1_ibkr_artifacts import (
+    IbkrArtifactError,
+    load_and_verify_ibkr_evidence,
+)
 from trading_market_data_core.dataset_v1_qualification import (
     QUALIFICATION_SCHEMA_VERSION,
     QualificationError,
@@ -63,20 +67,20 @@ DEFAULT_RUN_ROOT = Path("docs/poi/evidence/dataset-v1-runs")
 #: Which stage is responsible for each qualifiable capability. Used to report
 #: CURRENT_RUN_FAILED vs NO_CURRENT_EVIDENCE precisely.
 STAGE_BY_CAPABILITY = {
-    "delisted_security_history": "sec-delisting",
-    "corporate_actions": "sec-corporate",
-    "pit_sp500_membership": "sp-membership",
-    "asof_gics": "gics",
+    "delisted_security_history": "sec_delisted",
+    "corporate_actions": "sec_corporate_actions",
+    "pit_sp500_membership": "sp500_membership",
+    "asof_gics": "asof_gics_discovery",
     # The six IBKR historical capabilities come from POI-IBKR-HIST.json. That
     # file persists between runs, so without this mapping a run in which the
     # IBKR stage never executed would still report CURRENT_RUN_EVIDENCE for
     # them - the same stale-evidence defect, on the IBKR path.
-    "bid_ask_midpoint": "ibkr",
-    "connectivity_paper_du_gate": "ibkr",
-    "contract_identity_conid": "ibkr",
-    "daily_trades_rth_schema": "ibkr",
-    "head_timestamp_coverage": "ibkr",
-    "symbol_change_discovery": "ibkr",
+    "bid_ask_midpoint": "ibkr_historical",
+    "connectivity_paper_du_gate": "ibkr_historical",
+    "contract_identity_conid": "ibkr_historical",
+    "daily_trades_rth_schema": "ibkr_historical",
+    "head_timestamp_coverage": "ibkr_historical",
+    "symbol_change_discovery": "ibkr_historical",
 }
 
 
@@ -166,6 +170,17 @@ def cmd_manifest(args: argparse.Namespace) -> int:
                 failures.append(f"{stage.name}: {error}")
                 continue
             source_digest: str | None = None
+            if artifact_type in (
+                ArtifactType.IBKR_HISTORICAL_EVIDENCE,
+                ArtifactType.IBKR_CORPORATE_EVIDENCE,
+            ):
+                # A typed IBKR artifact must authenticate before it is bound;
+                # an untyped legacy file is refused here, never guessed.
+                try:
+                    load_and_verify_ibkr_evidence(path)
+                except IbkrArtifactError as error:
+                    failures.append(f"{stage.name}: {error}")
+                    continue
             if artifact_type is ArtifactType.QUALIFICATION_EVIDENCE:
                 try:
                     evidence = load_and_verify_evidence(path)
@@ -241,18 +256,31 @@ def cmd_report(args: argparse.Namespace) -> int:
             print(f"CROSSWALK_INVALID {artifact.path}: {error}")
             return 2
 
-    # IBKR capabilities may only be seeded when THIS run's IBKR stage produced
-    # evidence. A persisted artifact from an earlier run is not current.
-    ibkr_stage = manifest.stage("ibkr")
-    ibkr_is_current = ibkr_stage is not None and ibkr_stage.outcome.may_publish
+    # CURRENT-RUN IBKR: only artifacts this manifest BOUND may seed the six IBKR
+    # capabilities. A stage that ran but whose artifact was rejected binds
+    # nothing, and therefore contributes nothing current.
     base_states: dict[str, CapabilityState] = {}
-    if ibkr_is_current and args.ibkr_evidence.is_file():
+    for artifact in manifest.artifacts_of_type(ArtifactType.IBKR_HISTORICAL_EVIDENCE):
         try:
-            matrix = DatasetCapabilityMatrix.from_ibkr_historical_evidence(args.ibkr_evidence)
+            matrix = DatasetCapabilityMatrix.from_ibkr_historical_evidence(Path(artifact.path))
         except ValueError as error:
-            print(f"IBKR_EVIDENCE_INVALID: {error}")
+            print(f"IBKR_EVIDENCE_INVALID {artifact.path}: {error}")
             return 2
-        base_states = dict(matrix.states)
+        base_states.update(matrix.states)
+
+    # GLOBAL (historical) truth is read separately and is NEVER reported as
+    # current-run evidence. A prior owner run's verified capability stays known
+    # even when today's refresh failed.
+    global_states: dict[str, CapabilityState] = {}
+    if args.ibkr_evidence.is_file():
+        try:
+            global_states.update(
+                DatasetCapabilityMatrix.from_ibkr_historical_evidence(
+                    args.ibkr_evidence
+                ).states
+            )
+        except ValueError:
+            global_states = {}
 
     states = capability_states_from_evidence(evidences, base_states=base_states)
     rows: dict[str, dict[str, str]] = {}
@@ -263,10 +291,14 @@ def cmd_report(args: argparse.Namespace) -> int:
             else CurrentRunStatus.NO_CURRENT_EVIDENCE
         )
         evidence = next((e for e in evidences if e.capability == name), None)
+        global_state = global_states.get(name, states[name])
         rows[name] = {
+            # what THIS run established
             "capability_state": states[name].value,
             "current_run": status.value,
             "result": evidence.result.value if evidence is not None else "NONE",
+            # what is known historically; never conflated with the above
+            "global_state": global_state.value,
         }
 
     ready = all(

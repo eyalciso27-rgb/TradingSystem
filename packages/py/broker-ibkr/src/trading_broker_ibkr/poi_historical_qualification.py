@@ -79,6 +79,28 @@ class QualificationEvidence:
     observed_at: str = ""
     evidence_checksum: str = ""
 
+    #: Machine-readable typing so the run manifest can BIND this artifact.
+    #: The literal strings mirror ArtifactType in market-data-core; a test
+    #: asserts they agree, which avoids a package dependency here.
+    ARTIFACT_TYPE = "ibkr_historical_evidence"
+    ARTIFACT_SCHEMA_VERSION = "dataset-v1-ibkr-evidence-1.0.0"
+    CAPABILITY_SCOPE = (
+        "bid_ask_midpoint",
+        "connectivity_paper_du_gate",
+        "contract_identity_conid",
+        "daily_trades_rth_schema",
+        "head_timestamp_coverage",
+        "symbol_change_discovery",
+    )
+
+    def typing_fields(self) -> dict[str, object]:
+        return {
+            "artifact_type": self.ARTIFACT_TYPE,
+            "schema_version": self.ARTIFACT_SCHEMA_VERSION,
+            "producer": QUALIFICATION_VERSION,
+            "capability_scope": list(self.CAPABILITY_SCOPE),
+        }
+
     def body_for_checksum(self) -> dict[str, object]:
         return {
             "poi_id": self.poi_id,
@@ -108,8 +130,15 @@ class QualificationEvidence:
         }
 
     def to_dict(self) -> dict[str, object]:
-        body = self.body_for_checksum()
+        # Typing is an ENVELOPE around the observation body. Keeping it out of
+        # `evidence_checksum` means migrating a legacy artifact adds typing
+        # WITHOUT invalidating the digest that authenticates the observations.
+        body = {**self.body_for_checksum(), **self.typing_fields()}
+        # `normalized_checksum` is the name every typed artifact uses for a
+        # canonical-BODY digest; `evidence_checksum` is retained so existing
+        # readers keep working.
         body["evidence_checksum"] = self.evidence_checksum
+        body["normalized_checksum"] = self.evidence_checksum
         return body
 
 

@@ -939,7 +939,16 @@ def _recompute_evidence_checksum(payload: Mapping[str, Any]) -> str:
     keys, tight separators and ASCII encoding. Kept here (rather than importing
     the broker package) so market-data-core has no broker dependency.
     """
-    body = {key: value for key, value in payload.items() if key != "evidence_checksum"}
+    # The typing ENVELOPE (artifact_type, schema_version, producer,
+    # capability_scope, normalized_checksum, run_id) is authenticated separately
+    # by `normalized_checksum`. Excluding it here means migrating a legacy
+    # artifact adds typing WITHOUT invalidating the digest that authenticates
+    # the recorded observations.
+    envelope = {
+        "evidence_checksum", "artifact_type", "schema_version", "producer",
+        "capability_scope", "normalized_checksum", "run_id",
+    }
+    body = {key: value for key, value in payload.items() if key not in envelope}
     serialized = json.dumps(body, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(serialized.encode("ascii")).hexdigest()
 
