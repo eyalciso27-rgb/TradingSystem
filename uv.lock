@@ -531,6 +531,12 @@ source = { editable = "packages/py/broker-core" }
 name = "trading-broker-ibkr"
 version = "0.1.0"
 source = { editable = "packages/py/broker-ibkr" }
+dependencies = [
+    { name = "trading-market-data-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "trading-market-data-core", editable = "packages/py/market-data-core" }]
 
 [[package]]
 name = "trading-config"

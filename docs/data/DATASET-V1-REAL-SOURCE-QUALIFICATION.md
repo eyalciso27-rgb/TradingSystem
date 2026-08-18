@@ -506,6 +506,67 @@ Rather than guess, the run now reports per-concept accounting - requested,
 the answer rather than a hypothesis. A 1:1 ratio and a zero dividend are counted
 as *rejected*, not missing.
 
+## Typed IBKR artifacts: three checksum layers
+
+The run after PR #87 bound 4 artifacts and correctly refused the two IBKR ones:
+
+```
+declared   sha256:c1e5c794...   recomputed sha256:3bd352d7...
+```
+
+Root cause: the writer assigned the **INNER** digest to the **OUTER** field
+(`body["normalized_checksum"] = self.evidence_checksum`), so every verifier
+recomputed a different value. The fail-closed refusal was correct; the checksum
+was the bug.
+
+| Layer | Field | Authenticates | Verified by |
+|---|---|---|---|
+| **A. INNER** | `evidence_checksum` | the qualification body only (the recorded observations) | the qualification reader |
+| **B. OUTER** | `normalized_checksum` | the COMPLETE typed envelope, excluding itself | run manifest, snapshot, CLI |
+| **C. BYTES** | `file_checksum` | the serialized file | the run manifest only (never stored inside) |
+
+The layers are **never cross-compared**. The inner digest is deliberately stable
+across typing and migration, so adding envelope metadata never invalidates the
+digest that authenticates the observations.
+
+### One implementation
+
+`seal_typed_ibkr_artifact` / `verify_typed_ibkr_payload` /
+`outer_envelope_checksum` in `dataset_v1_ibkr_artifacts` are the ONLY place the
+outer digest is produced or checked. Both broker writers, the manifest binder,
+the snapshot and the CLI go through them; there is no second canonicalization.
+`debug_canonical_body` prints the exact canonical text and digest a verifier
+will use, so a future mismatch is diagnosed by comparing texts rather than by
+guessing which body a checksum covers.
+
+### Writer lifecycle
+
+1. build the qualification body;
+2. compute the INNER `evidence_checksum` over it;
+3. construct the full typed envelope;
+4. **seal last** - the OUTER digest is computed over the final envelope;
+5. write;
+6. **read back and verify immediately** - a writer must never emit an artifact
+   the manifest binder would later reject.
+
+Nothing that participates in the outer digest changes after step 4.
+
+### Execution status is not artifact status
+
+The owner report said `IBKR PASS` while the artifacts had failed to
+authenticate. The capability report now carries both dimensions per stage:
+
+```json
+"ibkr_historical": {
+  "execution_status": "SUCCEEDED",
+  "artifact_status": "FAILED_AUTHENTICATION",
+  "current_run_evidence": false
+}
+```
+
+`artifact_status` is one of `BOUND` / `PARTIALLY_BOUND` /
+`FAILED_AUTHENTICATION` / `NO_ARTIFACTS` / `NOT_APPLICABLE`.
+
 ## Current status
 
 
