@@ -787,6 +787,63 @@ def qualify_pit_membership(
 # -- as-of GICS: discovery outcome, never fabricated --------------------------
 
 #: Exactly what is missing for `asof_gics`, recorded so the gap is actionable.
+#: The formal, machine-readable blocker for as-of GICS after a final free-source
+#: review. This is a LICENSE decision, not an engineering gap.
+ASOF_GICS_BLOCKER: Mapping[str, object] = {
+    "capability": "asof_gics",
+    "state": "BLOCKED_EXTERNAL",
+    "blocker_class": "LICENSE_REQUIRED",
+    "data_requirement": (
+        "A company-level HISTORICAL GICS assignment series: security_id -> GICS"
+        " sub-industry code -> effective date -> knowledge date, revision-safe,"
+        " covering the backtest window."
+    ),
+    "sources_reviewed": {
+        "ibkr": (
+            "No classification history is exposed through the read-only API."
+            " Contract details carry no GICS field and no as-of dimension."
+        ),
+        "sec": (
+            "SEC assigns SIC, not GICS. SIC is a different taxonomy maintained by"
+            " a different body with different boundaries; mapping SIC to GICS is"
+            " an approximation, not the published assignment."
+        ),
+        "sp_dji_public": (
+            "S&P DJI publishes the GICS STRUCTURE (the code hierarchy) publicly,"
+            " but company-level assignments - and their history - are licensed."
+        ),
+        "issuer_exchange_public": (
+            "Issuer and exchange material states a sector in prose; it is neither"
+            " the official GICS assignment nor dated as a revision-safe series."
+        ),
+        "free_secondary": (
+            "Free datasets republish CURRENT classifications without effective or"
+            " knowledge dates, so they cannot answer an as-of question and would"
+            " back-project today's sector onto history."
+        ),
+    },
+    "why_current_gics_is_insufficient": (
+        "Using today's classification for a historical date is look-ahead: GICS"
+        " assignments change, and a security reclassified in 2023 would appear to"
+        " have held that classification in 2018."
+    ),
+    "licensed_provider_must_supply": [
+        "company-level GICS assignment per security",
+        "effective date for each assignment",
+        "knowledge/announcement date for each assignment (revision-safe)",
+        "a stable, non-ticker security identifier",
+        "coverage across the full backtest window",
+        "redistribution terms compatible with storing derived evidence",
+    ],
+    "minimum_qualification_acceptance": [
+        "at least one real historical classification CHANGE",
+        "both time axes present on every row",
+        "stable identity resolution with zero ambiguity",
+        "a bounded, declared coverage window",
+        "a raw source checksum bound into the evidence",
+    ],
+}
+
 ASOF_GICS_MISSING_REQUIREMENT = (
     "A company-level HISTORICAL GICS classification series (security -> GICS code ->"
     " effective date -> knowledge date). Checked and rejected: IBKR exposes no"
@@ -822,6 +879,7 @@ def real_source_descriptor(
 
 
 __all__ = [
+    "ASOF_GICS_BLOCKER",
     "ASOF_GICS_MISSING_REQUIREMENT",
     "CORPORATE_ACTION_TYPES",
     "REQUIRED_CORPORATE_EVENTS",

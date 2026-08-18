@@ -150,6 +150,21 @@ class SecEdgarClient:
             headers=self._headers(),
         )
 
+    def company_facts(self, cik: str) -> tuple[bytes, object]:
+        """EVERY XBRL concept a filer reported.
+
+        Asking for one guessed concept name returns 404 and answers nothing;
+        this returns what the filer actually reported so concept selection can
+        be driven by data instead of by a hypothesis.
+        """
+        padded = str(cik).strip().lstrip("CIK").zfill(10)
+        if not padded.isdigit():
+            raise SourceAdapterError(f"invalid CIK {cik!r}")
+        self._throttle()
+        return self._fetcher.get_json(
+            f"{self.BASE}/api/xbrl/companyfacts/CIK{padded}.json", headers=self._headers()
+        )
+
     def full_index(self, year: int, quarter: int, *, fetcher: HttpBytesFetcher) -> bytes:
         """One quarter of SEC's official filing catalogue (``master.idx``).
 

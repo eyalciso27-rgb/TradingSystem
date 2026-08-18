@@ -67,9 +67,14 @@ from trading_market_data_core.dataset_v1_run import (
     StageOutcome,
     file_checksum,
 )
+from trading_market_data_core.dataset_v1_sec_concepts import (
+    ConceptSelection,
+    parse_company_facts,
+    select_corporate_concepts,
+    semantics_for,
+)
 from trading_market_data_core.dataset_v1_sources import (
     XBRL_DIVIDEND_CONCEPTS,
-    XBRL_SPLIT_CONCEPTS,
     AdjustmentCrossCheck,
     CanonicalCorporateEvent,
     CrosswalkEntry,
@@ -90,6 +95,11 @@ from trading_market_data_core.dataset_v1_sources import (
     parse_sec_submissions,
     parse_xbrl_concept,
     sec_filings_to_events,
+)
+from trading_market_data_core.dataset_v1_sp_documents import (
+    OWNER_INPUT_MESSAGE,
+    build_manifest_payload,
+    discover_sp_documents,
 )
 from trading_market_data_core.dataset_v1_xbrl import (
     NormalizationReport,
@@ -175,6 +185,21 @@ def _publish(args: argparse.Namespace, filename: str, outcome: StageOutcome) -> 
     shutil.move(str(staged), str(target))
     print(f"published: {target} ({file_checksum(target)})")
     return target
+
+
+def _semantics_notes(selections: Sequence[ConceptSelection]) -> tuple[str, ...]:
+    """The reviewed mapping actually used, so the choice can be audited."""
+    notes: list[str] = []
+    for selection in selections:
+        for item in selection.accepted:
+            semantics = semantics_for(item.taxonomy, item.concept)
+            if semantics is None or semantics.event_type is None:
+                continue
+            notes.append(
+                f"{item.taxonomy}:{item.concept} -> {semantics.event_type.value}"
+                f" ({semantics.value_meaning}); {semantics.rationale}"
+            )
+    return tuple(sorted(set(notes)))
 
 
 def _now() -> datetime:
@@ -469,12 +494,30 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
 
     _, client = _sec_transport()
     normalizations: list[NormalizationReport] = []
+    selections: list[ConceptSelection] = []
     for profile in profiles:
         # Observations for ONE filer are normalized together, so a restatement
         # in a later filing folds into the same observation instead of becoming
         # a second event.
         observations: list[XbrlObservation] = []
-        for concept in (*XBRL_DIVIDEND_CONCEPTS, *XBRL_SPLIT_CONCEPTS):
+        # DISCOVERY FIRST. The owner run asked for one guessed split concept and
+        # got http_ok=0, which answered nothing. Read what the filer actually
+        # reported, then use only concepts whose semantics are reviewed.
+        concepts_to_fetch: list[str] = list(XBRL_DIVIDEND_CONCEPTS)
+        try:
+            facts_raw, facts_parsed = client.company_facts(profile.cik)
+            selection = select_corporate_concepts(parse_company_facts(facts_raw, facts_parsed))
+            selections.append(selection)
+            concepts_to_fetch = [item.concept for item in selection.accepted]
+            for item, reason in selection.unmapped_candidates:
+                xbrl_notes.append(
+                    f"{profile.cik} CANDIDATE {item.taxonomy}:{item.concept}"
+                    f" ({item.fact_count} facts): {reason}"
+                )
+        except SourceAdapterError as error:
+            xbrl_notes.append(f"{profile.cik} companyfacts: unavailable ({error})")
+
+        for concept in concepts_to_fetch:
             _stat(concept, "requested")
             try:
                 raw, parsed = client.company_concept(profile.cik, "us-gaap", concept)
@@ -544,12 +587,19 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
             "xbrl_duplicates_collapsed": sum(r.duplicates_collapsed for r in normalizations),
             "xbrl_repeats": sum(r.repeats for r in normalizations),
             "xbrl_revisions": sum(r.revisions for r in normalizations),
+            "concepts_discovered": sum(len(s.discovered) for s in selections),
+            "concepts_accepted": sum(len(s.accepted) for s in selections),
+            "concepts_unmapped_candidates": sum(
+                len(s.unmapped_candidates) for s in selections
+            ),
         },
         notes=(
             "8-K item codes are published metadata but are AMBIGUOUS about what"
             " occurred; they are review leads and qualify NOTHING. Only parsed"
             " document/XBRL evidence mints an event.",
             *candidates,
+            "--- reviewed concept semantics used (name matching is never enough) ---",
+            *_semantics_notes(selections),
             "--- XBRL concept accounting (why a concept produced no events) ---",
             *(
                 f"{concept}: requested={stat['requested']} http_ok={stat['http_ok']}"
@@ -561,6 +611,10 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
     ).write(_staged_path(args, "corporate-action-candidates.json"))
     _publish(args, "corporate-action-candidates.json", StageOutcome.PARTIAL)
 
+    print("== SEC XBRL concept discovery ==")
+    for selection in selections:
+        for line in selection.summary_lines():
+            print(f"  {line}")
     print("== SEC XBRL concept accounting ==")
     for concept, stat in sorted(concept_stats.items()):
         print(
@@ -608,8 +662,31 @@ def cmd_sec_corporate(args: argparse.Namespace) -> int:
 
 
 def cmd_sp_membership(args: argparse.Namespace) -> int:
+    # Owner experience: drop official documents in one directory. The manifest
+    # is generated here rather than authored by hand.
+    documents_dir = args.documents_dir if args.documents_dir else args.manifest.parent
+    discovery = discover_sp_documents(documents_dir)
+    if discovery.documents:
+        print("== official S&P documents discovered ==")
+        for line in discovery.summary_lines():
+            print(f"  {line}")
+    if discovery.usable and not args.manifest.is_file():
+        payload = build_manifest_payload(discovery, index_id=args.index_id)
+        args.manifest.parent.mkdir(parents=True, exist_ok=True)
+        args.manifest.write_text(
+            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        print(f"manifest generated from official documents: {args.manifest}")
+
     if not args.manifest.is_file():
         print(f"NOT_AVAILABLE: no official announcement manifest at {args.manifest}")
+        if discovery.documents:
+            print(
+                "  documents were found but none were usable; see the findings"
+                " above for the exact reason per document."
+            )
+        else:
+            print(f"  {OWNER_INPUT_MESSAGE}")
         print(SP_AUTOMATED_ACCESS_NOTE)
         return EXIT_NOT_AVAILABLE
     # Official documents may live beside the manifest or in their own directory;
@@ -688,9 +765,21 @@ def cmd_crosswalk(args: argparse.Namespace) -> int:
 
 
 def cmd_gics(args: argparse.Namespace) -> int:
-    del args
-    print("asof_gics: BLOCKED_EXTERNAL")
+    """Final free-source decision: a LICENSE blocker, not an engineering gap."""
+    from trading_market_data_core.dataset_v1_real_ingestion import ASOF_GICS_BLOCKER
+
+    print(f"asof_gics: {ASOF_GICS_BLOCKER['state']} ({ASOF_GICS_BLOCKER['blocker_class']})")
     print(ASOF_GICS_MISSING_REQUIREMENT)
+    AuxiliaryReport(
+        name="asof-gics-blocker",
+        observed_at=_now(),
+        findings=(str(ASOF_GICS_BLOCKER["data_requirement"]),),
+        counts={"sources_reviewed": len(ASOF_GICS_BLOCKER["sources_reviewed"])},  # type: ignore[arg-type]
+        notes=(
+            json.dumps(ASOF_GICS_BLOCKER, indent=2, sort_keys=True, default=str),
+        ),
+    ).write(_staged_path(args, "asof-gics-blocker.json"))
+    _publish(args, "asof-gics-blocker.json", StageOutcome.PARTIAL)
     return EXIT_NOT_AVAILABLE
 
 
@@ -709,6 +798,7 @@ def main(argv: list[str]) -> int:
         "--manifest", type=Path, default=Path("config/data-sources/sp500-announcements.json")
     )
     parser.add_argument("--documents-dir", type=Path, default=None)
+    parser.add_argument("--index-id", default="SP500")
     parser.add_argument("--run-id", default="")
     parser.add_argument(
         "--run-root", type=Path, default=Path("docs/poi/evidence/dataset-v1-runs")

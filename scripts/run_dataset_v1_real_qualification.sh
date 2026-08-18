@@ -374,6 +374,17 @@ main() {
         --production-start "$SP_PRODUCTION_START" --production-end "$SP_PRODUCTION_END")"
     record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "sp500_membership" "$SP_EXEC" \
         "$EVIDENCE_DIR/pit_sp500_membership.json"
+    if [ "$SP_EXEC" = "NOT_AVAILABLE" ]; then
+        echo
+        echo "S&P MEMBERSHIP INPUT REQUIRED:"
+        echo "  place official S&P announcement documents (HTML, text, CSV or a"
+        echo "  text-layer PDF downloaded from the official source) in:"
+        echo "      $SP_DOCUMENTS/"
+        echo "  then rerun: bash scripts/run_dataset_v1_real_qualification.sh"
+        echo "  The runner checksums, parses and builds the manifest itself -"
+        echo "  no manifest authoring and no cleanup step."
+        echo
+    fi
 
     GICS_EXEC="$(run_stage "as-of GICS free-source discovery" \
         uv run --no-sync python -m "$INGEST_CLI" gics)"
