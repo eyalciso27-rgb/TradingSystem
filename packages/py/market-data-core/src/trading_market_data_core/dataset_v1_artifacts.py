@@ -52,6 +52,10 @@ class ArtifactType(StrEnum):
     #: The authenticated record of ONE owner run: stages, outcomes, artifacts.
     #: Readiness is computed from this, never from a directory glob.
     RUN_MANIFEST = "run_manifest"
+    #: Read-only IBKR historical qualification produced by broker-ibkr.
+    IBKR_HISTORICAL_EVIDENCE = "ibkr_historical_evidence"
+    #: Read-only IBKR corporate probe/adjustment observations.
+    IBKR_CORPORATE_EVIDENCE = "ibkr_corporate_evidence"
 
 
 #: Only this type may be handed to the capability promotion path.
@@ -99,6 +103,14 @@ def classify_payload(payload: object, *, source: str = "artifact") -> ArtifactTy
         return ArtifactType.SNAPSHOT_REPORT
     if "run_id" in payload and "stages" in payload:
         return ArtifactType.RUN_MANIFEST
+    if {"qualification_version", "poi_id", "capabilities"} <= payload.keys() or {
+        "probes", "adjustment_observations"
+    } <= payload.keys():
+        raise ArtifactError(
+            f"{source}: untyped legacy IBKR evidence. It is deliberately NOT"
+            " classified by shape - migrate it explicitly or regenerate it in an"
+            " owner run, so it can never be bound to a run it did not come from."
+        )
     raise ArtifactError(
         f"{source}: artifact declares no artifact_type and its shape matches no"
         " known type; refusing to guess (fail closed)"

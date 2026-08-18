@@ -149,30 +149,45 @@ def main(argv: list[str]) -> int:
             )
         )
 
-    # 2. seed the six IBKR capabilities from their own authenticated evidence
+    # 2. IBKR capabilities may ONLY be seeded from evidence the CURRENT run
+    # manifest binds. The real run bound zero artifacts yet the snapshot still
+    # listed POI-IBKR-HIST, because this read the file directly. With a manifest
+    # there is no direct-file fallback and no global-directory fallback.
     base_states: dict[str, CapabilityState] = {}
-    if args.ibkr_evidence.is_file():
+    ibkr_paths: list[Path] = []
+    if manifest is not None:
+        ibkr_paths = [
+            Path(artifact.path)
+            for artifact in manifest.artifacts_of_type(ArtifactType.IBKR_HISTORICAL_EVIDENCE)
+        ]
+        if not ibkr_paths:
+            print(
+                "IBKR_EVIDENCE_NOT_BOUND: the current run manifest binds no IBKR"
+                " historical evidence; the snapshot will not use any."
+            )
+    elif args.ibkr_evidence.is_file():
+        # legacy path, only when no run manifest is supplied at all
+        ibkr_paths = [args.ibkr_evidence]
+    for ibkr_path in ibkr_paths:
         try:
-            matrix = DatasetCapabilityMatrix.from_ibkr_historical_evidence(args.ibkr_evidence)
+            matrix = DatasetCapabilityMatrix.from_ibkr_historical_evidence(ibkr_path)
         except ValueError as error:
             print(f"IBKR_EVIDENCE_INVALID: {error}")
             return 2
-        base_states = dict(matrix.states)
+        base_states.update(matrix.states)
         # The six IBKR capabilities are claimed EMPIRICALLY_VERIFIED from THIS
         # artifact, so it must be bound and re-verified like any other evidence.
         # Without the binding the builder correctly refuses the claim.
         bindings.append(
             EvidenceBinding(
-                name="POI-IBKR-HIST",
-                path=args.ibkr_evidence,
-                checksum=_file_checksum(args.ibkr_evidence),
+                name=ibkr_path.stem, path=ibkr_path, checksum=_file_checksum(ibkr_path)
             )
         )
         sources.append(
             SourceBinding(
                 name="ibkr-paper-historical",
-                version="POI-IBKR-HIST",
-                checksum=_file_checksum(args.ibkr_evidence),
+                version=ibkr_path.stem,
+                checksum=_file_checksum(ibkr_path),
             )
         )
 
@@ -220,6 +235,15 @@ def main(argv: list[str]) -> int:
             capability_states=states,
         )
         claimed = [identity.security_id for identity in snapshot.security_master]
+        if crosswalk is None and manifest is not None:
+            produced = manifest.artifacts_of_type(ArtifactType.IDENTITY_CROSSWALK)
+            if produced:
+                print(
+                    "CROSSWALK_NOT_BOUND: the run produced an identity crosswalk"
+                    f" ({produced[0].path}) but the snapshot did not bind it;"
+                    " refusing to assert SEC-derived identities unbound."
+                )
+                return 2
         if crosswalk is not None:
             unbound = verify_identity_binding(claimed, crosswalk)
             if unbound:

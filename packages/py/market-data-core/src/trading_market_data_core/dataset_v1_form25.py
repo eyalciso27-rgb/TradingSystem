@@ -99,6 +99,10 @@ class Form25Document:
     #: allow-list from real filings rather than from assumptions.
     observed_elements: tuple[str, ...] = ()
     findings: tuple[str, ...] = ()
+    #: "xml" | "html" | "text" | "empty". Recorded explicitly: inferring it from
+    #: whether elements were observed breaks as soon as HTML labels populate
+    #: that field.
+    content_kind: str = "xml"
 
     @property
     def publishes_effective_date(self) -> bool:
@@ -121,6 +125,7 @@ class Form25Document:
             "provenance": [item.to_dict() for item in self.provenance],
             "observed_elements": list(self.observed_elements),
             "findings": list(self.findings),
+            "content_kind": self.content_kind,
             "parser_version": FORM25_PARSER_VERSION,
         }
 
@@ -179,6 +184,17 @@ def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].strip().lower()
 
 
+#: Markers that make a document HTML regardless of XML well-formedness. A
+#: strict-XHTML Form 25 would otherwise parse as XML and yield nothing, because
+#: its elements are HTML tags rather than the EDGAR schema.
+_HTML_MARKERS = (b"<html", b"<!doctype html", b"<body", b"<table", b"<div")
+
+
+def _looks_like_html(raw: bytes) -> bool:
+    head = raw[:4096].lower()
+    return any(marker in head for marker in _HTML_MARKERS)
+
+
 def _parse_xml(raw: bytes) -> ElementTree.Element | None:
     """Parse XML defensively, or return None when the payload is not XML.
 
@@ -188,6 +204,8 @@ def _parse_xml(raw: bytes) -> ElementTree.Element | None:
     head = raw[:4096].lstrip()
     if not head.startswith(b"<"):
         return None
+    if _looks_like_html(raw):
+        return None  # route to the HTML parser, which understands these
     lowered = raw[:8192].lower()
     if b"<!entity" in lowered or b"<!doctype" in lowered:
         raise SourceAdapterError(
@@ -236,14 +254,28 @@ def parse_form25_document(
     observed: list[str] = []
 
     if root is None:
-        findings.append(
-            "primary document is not XML; no structured field was extracted"
-            " (no date is inferred from an unparsed document)"
-        )
+        # The real owner run proved these documents are HTML, not XML, so this
+        # is the normal path rather than an error path.
+        from trading_market_data_core.dataset_v1_form25_html import parse_form25_html
+
+        html = parse_form25_html(raw)
+        findings.extend(html.findings)
+        findings.append(f"primary document parsed as {html.content_kind}, not XML")
         return Form25Document(
             cik=filing.cik, accession=filing.accession, form=filing.form,
             primary_document=filing.primary_document or "", document_checksum=checksum,
+            effective_on=html.effective_on,
+            last_trading_on=html.last_trading_on,
+            issuer_name=html.issuer_name,
+            exchange=html.exchange,
+            rule_provision=html.rule_provision,
+            provenance=tuple(
+                FieldProvenance(m.field_name, f"html-label:{m.label}", m.snippet)
+                for m in html.matches
+            ),
+            observed_elements=tuple(f"html-label:{label}" for label in html.labels_seen),
             findings=tuple(findings),
+            content_kind=html.content_kind,
         )
 
     for element in root.iter():
@@ -391,12 +423,14 @@ def summarize_form25(documents: Sequence[Form25Document]) -> Form25Coverage:
     unmatched = sorted(
         name for name in observed if name not in known and _looks_like_a_date_field(name)
     )
-    non_xml = sum(1 for d in documents if not d.observed_elements)
+    non_xml = sum(1 for d in documents if d.content_kind != "xml")
     return Form25Coverage(
         documents=len(documents),
         with_effective_date=sum(1 for d in documents if d.effective_on is not None),
         with_last_trading_date=sum(1 for d in documents if d.last_trading_on is not None),
-        unparsed_documents=non_xml,
+        unparsed_documents=sum(
+            1 for d in documents if d.content_kind not in ("xml", "html", "text")
+        ),
         xml_documents=len(documents) - non_xml,
         non_xml_documents=non_xml,
         failures_by_reason=failures,

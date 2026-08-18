@@ -302,7 +302,7 @@ def test_a_failed_stage_publishes_nothing(tmp_path: Path) -> None:
     staged = stager.stage_path("corporate_actions.json")
     _evidence().write(staged)
     published = stager.publish(
-        stage="sec-corporate", outcome=StageOutcome.FAILED,
+        stage="sec_corporate_actions", outcome=StageOutcome.FAILED,
         filenames=["corporate_actions.json"],
     )
     assert published == ()
@@ -315,7 +315,7 @@ def test_a_partial_stage_may_publish(tmp_path: Path) -> None:
     )
     _evidence().write(stager.stage_path("corporate_actions.json"))
     published = stager.publish(
-        stage="sec-corporate", outcome=StageOutcome.PARTIAL,
+        stage="sec_corporate_actions", outcome=StageOutcome.PARTIAL,
         filenames=["corporate_actions.json"],
     )
     assert len(published) == 1
@@ -331,14 +331,14 @@ def test_run_b_failure_does_not_inherit_run_a_evidence(tmp_path: Path) -> None:
     run_a = RunStager(run_id="run-A", staging_root=runs, published_root=evidence_dir)
     _evidence().write(run_a.stage_path("corporate_actions.json"))
     a_artifacts = run_a.publish(
-        stage="sec-corporate", outcome=StageOutcome.PARTIAL,
+        stage="sec_corporate_actions", outcome=StageOutcome.PARTIAL,
         filenames=["corporate_actions.json"],
     )
     manifest_a = _manifest(
         run_id="run-A", artifacts=a_artifacts,
         stages=(
             StageRecord(
-                name="sec-corporate", outcome=StageOutcome.PARTIAL,
+                name="sec_corporate_actions", outcome=StageOutcome.PARTIAL,
                 artifacts=(a_artifacts[0].path,),
             ),
         ),
@@ -348,18 +348,27 @@ def test_run_b_failure_does_not_inherit_run_a_evidence(tmp_path: Path) -> None:
     # Run B fails. Run A's file is STILL on disk - that is allowed for audit.
     run_b = RunStager(run_id="run-B", staging_root=runs, published_root=evidence_dir)
     b_artifacts = run_b.publish(
-        stage="sec-corporate", outcome=StageOutcome.FAILED,
+        stage="sec_corporate_actions", outcome=StageOutcome.FAILED,
         filenames=["corporate_actions.json"],
     )
     manifest_b = _manifest(
         run_id="run-B", artifacts=b_artifacts,
-        stages=(StageRecord(name="sec-corporate", outcome=StageOutcome.FAILED),),
+        stages=(StageRecord(name="sec_corporate_actions", outcome=StageOutcome.FAILED),),
     )
     assert (evidence_dir / "corporate_actions.json").is_file(), "history is retained"
     assert manifest_b.artifacts_of_type(ArtifactType.QUALIFICATION_EVIDENCE) == ()
     assert (
-        current_run_status(manifest_b, "corporate_actions", stage_by_capability=STAGE_BY_CAPABILITY)
+        current_run_status(
+            manifest_b, "corporate_actions", stage_by_capability=STAGE_BY_CAPABILITY
+        )
         is CurrentRunStatus.CURRENT_RUN_FAILED
+    )
+    # and A, whose artifact IS bound, reports current evidence
+    assert (
+        current_run_status(
+            manifest_a, "corporate_actions", stage_by_capability=STAGE_BY_CAPABILITY
+        )
+        is CurrentRunStatus.CURRENT_RUN_EVIDENCE
     )
 
 
@@ -370,19 +379,19 @@ def test_run_c_success_uses_only_its_own_artifacts(tmp_path: Path) -> None:
     )
     _evidence().write(run_c.stage_path("corporate_actions.json"))
     artifacts = run_c.publish(
-        stage="sec-corporate", outcome=StageOutcome.SUCCEEDED,
+        stage="sec_corporate_actions", outcome=StageOutcome.SUCCEEDED,
         filenames=["corporate_actions.json"],
     )
     manifest = _manifest(
         run_id="run-C", artifacts=artifacts,
         stages=(
             StageRecord(
-                name="sec-corporate", outcome=StageOutcome.SUCCEEDED,
+                name="sec_corporate_actions", outcome=StageOutcome.SUCCEEDED,
                 artifacts=(artifacts[0].path,),
             ),
         ),
     )
-    assert [a.stage for a in manifest.artifacts] == ["sec-corporate"]
+    assert [a.stage for a in manifest.artifacts] == ["sec_corporate_actions"]
     assert (
         current_run_status(manifest, "corporate_actions", stage_by_capability=STAGE_BY_CAPABILITY)
         is CurrentRunStatus.CURRENT_RUN_EVIDENCE
@@ -390,7 +399,9 @@ def test_run_c_success_uses_only_its_own_artifacts(tmp_path: Path) -> None:
 
 
 def test_a_stage_that_never_ran_is_no_current_evidence() -> None:
-    manifest = _manifest(stages=(StageRecord(name="sp-membership", outcome=StageOutcome.NOT_RUN),))
+    manifest = _manifest(
+        stages=(StageRecord(name="sp500_membership", outcome=StageOutcome.NOT_RUN),)
+    )
     assert (
         current_run_status(
             manifest, "pit_sp500_membership", stage_by_capability=STAGE_BY_CAPABILITY
@@ -440,7 +451,8 @@ def test_a_substituted_artifact_is_detected(tmp_path: Path) -> None:
         artifacts=(
             RunArtifact(
                 name="corporate_actions", artifact_type=ArtifactType.QUALIFICATION_EVIDENCE,
-                path=str(evidence), file_checksum=file_checksum(evidence), stage="sec-corporate",
+                path=str(evidence), file_checksum=file_checksum(evidence),
+                stage="sec_corporate_actions",
             ),
         )
     )
@@ -473,7 +485,9 @@ def test_run_ids_are_unique_enough_to_separate_runs() -> None:
 
 def test_ibkr_capabilities_are_not_current_when_the_ibkr_stage_did_not_run() -> None:
     """POI-IBKR-HIST.json persists between runs; that is not current evidence."""
-    manifest = _manifest(stages=(StageRecord(name="ibkr", outcome=StageOutcome.NOT_RUN),))
+    manifest = _manifest(
+        stages=(StageRecord(name="ibkr_historical", outcome=StageOutcome.NOT_RUN),)
+    )
     for capability in ("bid_ask_midpoint", "daily_trades_rth_schema"):
         assert (
             current_run_status(
@@ -486,12 +500,24 @@ def test_ibkr_capabilities_are_not_current_when_the_ibkr_stage_did_not_run() -> 
 def test_ibkr_capabilities_are_current_when_the_stage_published(tmp_path: Path) -> None:
     artifact = tmp_path / "POI-IBKR-HIST.json"
     artifact.write_text("{}", encoding="utf-8")
+    from trading_market_data_core.dataset_v1_run import RunArtifact
+
     manifest = _manifest(
         stages=(
             StageRecord(
-                name="ibkr", outcome=StageOutcome.SUCCEEDED, artifacts=(str(artifact),)
+                name="ibkr_historical", outcome=StageOutcome.SUCCEEDED,
+                artifacts=(str(artifact),),
             ),
-        )
+        ),
+        # CURRENT_RUN_EVIDENCE requires the artifact to be BOUND, not merely
+        # declared by the stage - that contradiction is what the real run hit.
+        artifacts=(
+            RunArtifact(
+                name="POI-IBKR-HIST",
+                artifact_type=ArtifactType.IBKR_HISTORICAL_EVIDENCE,
+                path=str(artifact), file_checksum=DIGEST, stage="ibkr_historical",
+            ),
+        ),
     )
     assert (
         current_run_status(
@@ -508,3 +534,64 @@ def test_an_unmapped_capability_defaults_to_no_current_evidence() -> None:
         current_run_status(manifest, "something_new", stage_by_capability=STAGE_BY_CAPABILITY)
         is CurrentRunStatus.NO_CURRENT_EVIDENCE
     )
+
+
+# == the exact real-run contradiction: stages ran, artifacts bound = 0 ========
+
+
+def test_a_stage_whose_artifact_was_rejected_is_not_current_evidence() -> None:
+    """The real run: IBKR ran, its artifacts were rejected, and the manifest
+    bound zero - yet the report said CURRENT_RUN_EVIDENCE. Now impossible."""
+    manifest = _manifest(
+        stages=(
+            StageRecord(
+                name="ibkr_historical", outcome=StageOutcome.SUCCEEDED,
+                artifacts=("docs/poi/evidence/POI-IBKR-HIST.json",),
+            ),
+        ),
+        artifacts=(),  # nothing was accepted into the ledger
+        failure_reasons=("ibkr_historical: artifact declares no artifact_type",),
+    )
+    assert (
+        current_run_status(
+            manifest, "bid_ask_midpoint", stage_by_capability=STAGE_BY_CAPABILITY
+        )
+        is CurrentRunStatus.CURRENT_RUN_FAILED
+    )
+
+
+def test_bound_artifacts_for_stage_is_the_only_current_truth() -> None:
+    from trading_market_data_core.dataset_v1_run import (
+        RunArtifact,
+        bound_artifacts_for_stage,
+    )
+
+    bound = RunArtifact(
+        name="corporate_actions", artifact_type=ArtifactType.QUALIFICATION_EVIDENCE,
+        path="corporate_actions.json", file_checksum=DIGEST,
+        stage="sec_corporate_actions",
+    )
+    manifest = _manifest(artifacts=(bound,))
+    assert bound_artifacts_for_stage(manifest, "sec_corporate_actions") == (bound,)
+    assert bound_artifacts_for_stage(manifest, "ibkr_historical") == ()
+
+
+def test_manifest_checksum_covers_the_artifact_list() -> None:
+    from trading_market_data_core.dataset_v1_run import RunArtifact
+
+    empty = _manifest().to_dict()["checksum"]
+    with_one = _manifest(
+        artifacts=(
+            RunArtifact(
+                name="x", artifact_type=ArtifactType.QUALIFICATION_EVIDENCE,
+                path="x.json", file_checksum=DIGEST, stage="s",
+            ),
+        )
+    ).to_dict()["checksum"]
+    assert empty != with_one, "a changed artifact list must change the checksum"
+
+
+def test_manifest_checksum_covers_the_snapshot_binding() -> None:
+    plain = _manifest().to_dict()["checksum"]
+    bound = _manifest(snapshot_binding={"POI-IBKR-HIST": DIGEST}).to_dict()["checksum"]
+    assert plain != bound

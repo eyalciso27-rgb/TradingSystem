@@ -55,6 +55,7 @@ SP_PRODUCTION_END="${DATASET_V1_SP_PRODUCTION_END:-}"
 SNAPSHOT_OUT="${DATASET_V1_SNAPSHOT_OUT:-docs/poi/evidence/dataset-v1-snapshot-report.json}"
 RUN_CLI="trading_market_data_core.dataset_v1_run_cli"
 RUN_ROOT="${DATASET_V1_RUN_ROOT:-docs/poi/evidence/dataset-v1-runs}"
+IBKR_CLI="trading_market_data_core.dataset_v1_ibkr_cli"
 
 # -- TCP preflight ------------------------------------------------------------
 # Each probe returns: 0 = port open, 1 = port closed/unreachable, 2 = this probe
@@ -241,6 +242,16 @@ main() {
     RUN_ID="$(uv run --no-sync python -m "$RUN_CLI" new-id)"
     RUN_STARTED="$(date -u +%Y-%m-%dT%H:%M:%S+00:00 2>/dev/null || echo "")"
     echo "run_id: $RUN_ID"
+
+    # One-time, EXPLICIT migration of committed pre-typing IBKR evidence so the
+    # manifest can bind it. A no-op once migrated, so normal operation stays a
+    # single command with no cleanup and no manual steps.
+    local legacy
+    for legacy in "docs/poi/evidence/POI-IBKR-HIST.json" "$IBKR_CORPORATE_ARTIFACT"; do
+        if [ -f "$legacy" ]; then
+            uv run --no-sync python -m "$IBKR_CLI" migrate --path "$legacy" || true
+        fi
+    done
     echo
 
     # -- 1b. IBKR (OWNER_PRIMARY) preflight -----------------------------------
@@ -294,39 +305,79 @@ main() {
     echo
 
     # -- 3b. REAL SOURCE EXECUTION -------------------------------------------
-    # Everything below actually exercises the approved sources. A stage that
-    # cannot run reports NOT_RUN/NOT_AVAILABLE; it never reports PASS.
+    # Everything below actually exercises the approved sources, and EVERY stage
+    # registers with the run manifest. A stage that cannot run reports
+    # NOT_RUN/NOT_AVAILABLE and binds nothing; it never reports PASS.
     local IBKR_EXEC="NOT_RUN" SEC_EXEC="NOT_RUN" SP_EXEC="NOT_RUN" GICS_EXEC="NOT_RUN"
-    local CROSSWALK_EXEC="NOT_RUN"
+    local CROSSWALK_EXEC="NOT_RUN" SEC_CORP_EXEC="NOT_RUN"
 
     if [ "$IBKR_STATUS" = "GATEWAY_REACHABLE" ] && [ "$RUN_IBKR" = "1" ]; then
-        local ibkr_rc=0
+        local hist_rc=0 corp_rc=0
         echo "== IBKR read-only historical qualification ==" >&2
-        uv run --no-sync python -m trading_broker_ibkr.poi_historical_qualification             --host "$IB_HOST" --port "$IB_PORT" --account-alias "$IB_ACCOUNT_ALIAS"             --out docs/poi/evidence/POI-IBKR-HIST.json >&2 || ibkr_rc=$?
+        uv run --no-sync python -m trading_broker_ibkr.poi_historical_qualification \
+            --host "$IB_HOST" --port "$IB_PORT" --account-alias "$IB_ACCOUNT_ALIAS" \
+            --out docs/poi/evidence/POI-IBKR-HIST.json >&2 || hist_rc=$?
         echo "== IBKR read-only corporate-action qualification ==" >&2
-        uv run --no-sync python -m trading_broker_ibkr.poi_corporate_actions_qualification             --host "$IB_HOST" --port "$IB_PORT" --account-alias "$IB_ACCOUNT_ALIAS"             --out "$IBKR_CORPORATE_ARTIFACT" >&2 || ibkr_rc=$?
-        if [ "$ibkr_rc" -eq 0 ]; then IBKR_EXEC="PASS"; else IBKR_EXEC="PARTIAL"; fi
+        uv run --no-sync python -m trading_broker_ibkr.poi_corporate_actions_qualification \
+            --host "$IB_HOST" --port "$IB_PORT" --account-alias "$IB_ACCOUNT_ALIAS" \
+            --out "$IBKR_CORPORATE_ARTIFACT" >&2 || corp_rc=$?
+        if [ "$hist_rc" -eq 0 ]; then IBKR_EXEC="PASS"; else IBKR_EXEC="PARTIAL"; fi
+        if [ "$corp_rc" -eq 0 ]; then SEC_CORP_EXEC="PASS"; else SEC_CORP_EXEC="PARTIAL"; fi
     fi
-    # Bind the IBKR artifacts to THIS run; a persisted file from an earlier run
-    # must not seed the six IBKR capabilities.
-    record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "ibkr" "$IBKR_EXEC"         "docs/poi/evidence/POI-IBKR-HIST.json" "$IBKR_CORPORATE_ARTIFACT"
+    # Each IBKR artifact is registered under its OWN stage, so a rejected
+    # artifact cannot be mistaken for a bound one.
+    record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "ibkr_historical" "$IBKR_EXEC" \
+        "docs/poi/evidence/POI-IBKR-HIST.json"
+    record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "ibkr_corporate" "$SEC_CORP_EXEC" \
+        "$IBKR_CORPORATE_ARTIFACT"
 
     if [ "$SEC_CONFIGURED" = "YES" ]; then
-        SEC_EXEC="$(run_stage "SEC delisting ingestion + qualification"             uv run --no-sync python -m "$INGEST_CLI" sec-delisting             --evidence-dir "$EVIDENCE_DIR" --year "$SEC_YEAR" --quarter "$SEC_QUARTER"             --limit "$SEC_LIMIT")"
+        SEC_EXEC="$(run_stage "SEC delisting ingestion + qualification" \
+            uv run --no-sync python -m "$INGEST_CLI" sec-delisting \
+            --evidence-dir "$EVIDENCE_DIR" --year "$SEC_YEAR" --quarter "$SEC_QUARTER" \
+            --limit "$SEC_LIMIT" --run-id "$RUN_ID" --run-root "$RUN_ROOT")"
+        record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "sec_delisted" "$SEC_EXEC" \
+            "$EVIDENCE_DIR/delisted_security_history.json"
+
         local sec_corp
-        sec_corp="$(run_stage "SEC corporate-action ingestion + qualification"             uv run --no-sync python -m "$INGEST_CLI" sec-corporate             --evidence-dir "$EVIDENCE_DIR" --year "$SEC_YEAR" --quarter "$SEC_QUARTER"             --limit "$SEC_LIMIT" --ibkr-artifact "$IBKR_CORPORATE_ARTIFACT")"
+        sec_corp="$(run_stage "SEC corporate-action ingestion + qualification" \
+            uv run --no-sync python -m "$INGEST_CLI" sec-corporate \
+            --evidence-dir "$EVIDENCE_DIR" --year "$SEC_YEAR" --quarter "$SEC_QUARTER" \
+            --limit "$SEC_LIMIT" --ibkr-artifact "$IBKR_CORPORATE_ARTIFACT" \
+            --run-id "$RUN_ID" --run-root "$RUN_ROOT")"
+        record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "sec_corporate_actions" \
+            "$sec_corp" "$EVIDENCE_DIR/corporate_actions.json"
+
+        CROSSWALK_EXEC="$(run_stage "identity crosswalk" \
+            uv run --no-sync python -m "$INGEST_CLI" crosswalk \
+            --evidence-dir "$EVIDENCE_DIR" --year "$SEC_YEAR" --quarter "$SEC_QUARTER" \
+            --limit "$SEC_LIMIT" --run-id "$RUN_ID" --run-root "$RUN_ROOT")"
+        record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "identity_crosswalk" \
+            "$CROSSWALK_EXEC" "$EVIDENCE_DIR/identity-crosswalk.json"
+
         # the weaker of the two SEC stages is the honest SEC status
         if [ "$sec_corp" = "FAIL" ] || [ "$SEC_EXEC" = "FAIL" ]; then
             SEC_EXEC="FAIL"
         elif [ "$sec_corp" = "PARTIAL" ] || [ "$SEC_EXEC" = "PARTIAL" ]; then
             SEC_EXEC="PARTIAL"
         fi
-        CROSSWALK_EXEC="$(run_stage "identity crosswalk"             uv run --no-sync python -m "$INGEST_CLI" crosswalk             --evidence-dir "$EVIDENCE_DIR" --year "$SEC_YEAR" --quarter "$SEC_QUARTER"             --limit "$SEC_LIMIT")"
+    else
+        record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "sec_delisted" "NOT_RUN"
+        record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "sec_corporate_actions" "NOT_RUN"
+        record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "identity_crosswalk" "NOT_RUN"
     fi
 
-    SP_EXEC="$(run_stage "S&P official membership ingestion"         uv run --no-sync python -m "$INGEST_CLI" sp-membership         --evidence-dir "$EVIDENCE_DIR" --manifest "$SP_MANIFEST"         --documents-dir "$SP_DOCUMENTS"         --production-start "$SP_PRODUCTION_START" --production-end "$SP_PRODUCTION_END")"
+    SP_EXEC="$(run_stage "S&P official membership ingestion" \
+        uv run --no-sync python -m "$INGEST_CLI" sp-membership \
+        --evidence-dir "$EVIDENCE_DIR" --manifest "$SP_MANIFEST" \
+        --documents-dir "$SP_DOCUMENTS" --run-id "$RUN_ID" --run-root "$RUN_ROOT" \
+        --production-start "$SP_PRODUCTION_START" --production-end "$SP_PRODUCTION_END")"
+    record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "sp500_membership" "$SP_EXEC" \
+        "$EVIDENCE_DIR/pit_sp500_membership.json"
 
-    GICS_EXEC="$(run_stage "as-of GICS free-source discovery"         uv run --no-sync python -m "$INGEST_CLI" gics)"
+    GICS_EXEC="$(run_stage "as-of GICS free-source discovery" \
+        uv run --no-sync python -m "$INGEST_CLI" gics)"
+    record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "asof_gics_discovery" "$GICS_EXEC"
     echo
 
     # -- 4. verify each artifact BY ITS OWN TYPE ------------------------------
@@ -397,6 +448,12 @@ main() {
         --out "$SNAPSHOT_OUT"
     local SNAP_RC=$?
     set -e
+    local SNAP_STATUS="PARTIAL"
+    if [ "$SNAP_RC" -eq 0 ]; then SNAP_STATUS="PASS"; fi
+    if [ "$SNAP_RC" -ge 2 ]; then SNAP_STATUS="FAIL"; fi
+    record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "snapshot" "$SNAP_STATUS" "$SNAPSHOT_OUT"
+    echo "== run manifest (final, including the snapshot stage) =="
+    uv run --no-sync python -m "$RUN_CLI" manifest --run-id "$RUN_ID"         --run-root "$RUN_ROOT" --started-at "$RUN_STARTED" || true
     if [ "$SNAP_RC" -ne 0 ]; then
         echo "snapshot_readiness is below BACKTEST_ELIGIBLE (expected while any"
         echo "required capability is blocked). Readiness is NEVER forced here."
