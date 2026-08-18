@@ -400,6 +400,9 @@ def qualify_corporate_actions(
                 f"{len(by_type.get(event_type, []))} event(s) with full provenance"
                 f"{' [REQUIRED]' if event_type in required else ' [optional]'}"
             ),
+            # The aggregate `required_event_types_proven` is the blocking gate;
+            # per-type rows are reported so PARTIAL is precise.
+            required=False,
         )
         for event_type in CORPORATE_ACTION_TYPES
     ]
@@ -419,6 +422,7 @@ def qualify_corporate_actions(
     )
     subs.append(
         SubCapabilityResult(
+            required=False,  # corroboration, not a contract requirement
             name="adjustment_behaviour_characterised",
             passed=bool(adjustment_checks),
             detail=(
@@ -432,6 +436,12 @@ def qualify_corporate_actions(
     )
     subs.append(
         SubCapabilityResult(
+            # CONTRACT DECISION: the required event set is satisfiable from
+            # authenticated official SEC data alone, so the absence of an IBKR
+            # corporate-event feed is recorded but must not block promotion.
+            # Requiring it would block `corporate_actions` forever on an
+            # entitlement the contract does not depend on.
+            required=False,
             name="ibkr_event_feed_available",
             passed=feed_probe is not None and feed_probe.outcome is ProbeOutcome.AVAILABLE,
             detail=(
@@ -446,6 +456,7 @@ def qualify_corporate_actions(
     disagreements = [item for item in reconciliation if not item.corroborated]
     subs.append(
         SubCapabilityResult(
+            required=False,  # corroboration; disagreement is recorded, not fatal
             name="ibkr_sec_reconciled",
             passed=bool(reconciliation) and not disagreements,
             detail=(

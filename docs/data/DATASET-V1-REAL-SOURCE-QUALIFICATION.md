@@ -346,6 +346,91 @@ divergence, corroboration is recorded. Where they disagree, the disagreement is
 recorded explicitly and **never silently resolved**. IBKR observations never
 create an event: the event count is identical with and without them.
 
+## Run isolation (added after the second owner-host run)
+
+The real run had its SEC corporate-action stage FAIL, yet a
+`corporate_actions.json` left behind by the PREVIOUS run was still discovered by
+a directory glob and treated as available. A failed stage silently inherited
+stale empirical evidence.
+
+**Invariant now enforced:** a capability report for run X may only consume
+evidence that run X's own manifest binds. Nothing is discovered by globbing.
+
+* every run gets a `run_id` and its own **staging** directory;
+* stages write into staging and **publish only when they complete normally** -
+  a FAILED / NOT_RUN / NOT_AVAILABLE stage publishes nothing;
+* the authenticated **run manifest** records `run_id`, timestamps, git SHA,
+  versions, every stage outcome, and every artifact produced in that run with
+  its `file_checksum` and `source_artifact_checksum`;
+* the snapshot binds the manifest, and a tampered manifest or a substituted
+  artifact invalidates the build.
+
+Historical artifacts may remain on disk for audit - they cannot influence
+readiness, because readiness comes from the manifest.
+
+The capability report distinguishes `CURRENT_RUN_EVIDENCE`,
+`CURRENT_RUN_FAILED` and `NO_CURRENT_EVIDENCE` alongside the capability state,
+so stale-versus-current is unmistakable. This applies to the six IBKR
+capabilities too: `POI-IBKR-HIST.json` persists between runs, so it seeds them
+only when **this** run's IBKR stage published it.
+
+## Two checksums, named apart
+
+| Name | Digest of | Used by |
+|---|---|---|
+| `normalized_checksum` | the canonical evidence **body** | evidence authentication, promotion |
+| `file_checksum` | the artifact's **bytes** | run manifest, builder bindings |
+| `source_artifact_checksum` | the raw upstream **source** material | provenance |
+
+They are never compared against one another.
+
+**One canonicalization.** `write`, `load`, standalone `verify`, promotion and
+snapshot binding all authenticate through the same function. The real run showed
+per-file verification passing and then promotion raising *"evidence checksum does
+not authenticate its body"* for the SAME artifact: verification authenticated the
+bytes on disk, while promotion re-derived a body from the reconstructed object,
+and a body key added by a newer build (`artifact_type`) made the two differ.
+Evidence now carries the body that was actually verified, and the schema version
+gates artifacts written by an older build.
+
+## XBRL observation identity
+
+`xbrl:<accession>:<concept>:<value>` was not the identity of an XBRL fact: one
+filing reports a concept for MANY periods and the same value recurs, so distinct
+observations collided while restatements looked like separate events. The real
+run failed with a long list of duplicate event ids.
+
+Identity now follows the fact:
+
+* **observation key** = `cik + taxonomy + concept + unit + period + dimensions`
+  (excludes value, accession and filed date, because a restatement is the same
+  observation);
+* **fact key** = observation key + value + accession + filed date.
+
+| Situation | Outcome |
+|---|---|
+| identical fact rows | collapse |
+| same observation re-reported later, same value | one event; repeats recorded |
+| different period / unit / dimensions | distinct events |
+| same observation, changed value later | revision - latest supersedes, earlier recorded |
+| two values filed the same day | **conflict, fail closed** |
+
+The other half of the real failure was upstream: a filer that filed two Form 25s
+in one quarter was fetched once per FILING. Identity is the filer, so each CIK is
+now fetched exactly once.
+
+## Corporate-action contract decision
+
+`corporate_actions` PASS requires the production set - split, reverse split,
+dividend, merger, symbol change, delisting - proven with event-level evidence.
+
+**Decision:** `ibkr_event_feed_available` is **not** required. The required set
+is satisfiable from authenticated official SEC data alone, and the owner account
+has no corporate-event feed, so requiring it would block the capability forever
+on an entitlement the contract does not depend on. It is still reported, as are
+`adjustment_behaviour_characterised` and `ibkr_sec_reconciled` - all
+informational. Only failed **required** sub-capabilities block promotion.
+
 ## Current status
 
 

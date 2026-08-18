@@ -31,7 +31,6 @@ Hard rules (tested):
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -44,8 +43,21 @@ from trading_market_data_core.dataset_v1 import (
     DATASET_V1_REQUIRED_CAPABILITIES,
     CapabilityState,
 )
+from trading_market_data_core.dataset_v1_artifacts import (
+    ARTIFACT_TYPE_KEY,
+    ArtifactType,
+    canonical_bytes,
+)
+from trading_market_data_core.dataset_v1_artifacts import (
+    compute_checksum as compute_body_checksum,
+)
 
-QUALIFICATION_SCHEMA_VERSION = "dataset-v1-qualification-evidence-1.0.0"
+#: Bumped when the canonical BODY changes. 1.1.0 adds `artifact_type`, which
+#: 1.0.0 artifacts lack - loading one of those with this build would authenticate
+#: a different body than promotion re-derived, which is exactly the defect the
+#: real owner run hit. A body change without a version bump is the trap; the
+#: version gate makes such an artifact fail loudly at load instead.
+QUALIFICATION_SCHEMA_VERSION = "dataset-v1-qualification-evidence-1.1.0"
 
 
 class QualificationError(Exception):
@@ -198,9 +210,20 @@ class SubCapabilityResult:
     name: str
     passed: bool
     detail: str = ""
+    #: Whether failing this sub-capability BLOCKS promotion.
+    #:
+    #: Not everything worth reporting is a requirement. The owner account has no
+    #: IBKR corporate-event feed, and the production contract is satisfiable from
+    #: authenticated official SEC data alone, so that probe is tracked but must
+    #: not block forever. Requirements default to True: a sub-capability is
+    #: blocking unless it is deliberately declared informational.
+    required: bool = True
 
     def to_dict(self) -> dict[str, object]:
-        return {"name": self.name, "passed": self.passed, "detail": self.detail}
+        return {
+            "name": self.name, "passed": self.passed, "detail": self.detail,
+            "required": self.required,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,10 +261,11 @@ CAPABILITY_CRITERIA: Mapping[str, CapabilityCriteria] = {
 }
 
 
+#: The ONE canonicalization used by write, load, standalone verify, promotion
+#: and snapshot binding. Defined once in dataset_v1_artifacts so no second
+#: implementation can drift away from it.
 def _canonical(body: Mapping[str, Any]) -> bytes:
-    return json.dumps(
-        body, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str
-    ).encode("ascii")
+    return canonical_bytes(body)
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +288,16 @@ class QualificationEvidence:
     blocked_reasons: tuple[str, ...]
     observed_at: datetime
     normalized_checksum: str = ""
+    #: The EXACT body authenticated when this artifact was loaded from disk.
+    #:
+    #: Root cause this closes: `load_and_verify_evidence` authenticated the
+    #: bytes on disk, while `promote_capability` re-derived a body from the
+    #: reconstructed dataclass. Any schema evolution (a new key such as
+    #: `artifact_type`, or a defaulted field such as `authority`) made those two
+    #: bodies differ, so the same artifact verified standalone and then failed
+    #: promotion. Promotion now authenticates the body that was actually
+    #: verified, never a re-derivation of it.
+    authenticated_body: Mapping[str, Any] | None = None
 
     def body(self) -> dict[str, Any]:
         """The canonical body the checksum authenticates (checksum excluded)."""
@@ -309,8 +343,19 @@ class QualificationEvidence:
             "observed_at": self.observed_at.isoformat(),
         }
 
+    def authoritative_body(self) -> dict[str, Any]:
+        """The single body every checksum path authenticates.
+
+        For an artifact loaded from disk this is the body that was verified;
+        for an in-memory artifact it is the freshly built body. There is no
+        third variant, so verify and promote can never disagree.
+        """
+        if self.authenticated_body is not None:
+            return dict(self.authenticated_body)
+        return self.body()
+
     def compute_checksum(self) -> str:
-        return "sha256:" + hashlib.sha256(_canonical(self.body())).hexdigest()
+        return compute_body_checksum(self.authoritative_body())
 
     def sealed(self) -> QualificationEvidence:
         """Return a copy carrying its authenticated checksum."""
@@ -318,8 +363,12 @@ class QualificationEvidence:
 
         return replace(self, normalized_checksum=self.compute_checksum())
 
+    @property
+    def was_loaded_from_disk(self) -> bool:
+        return self.authenticated_body is not None
+
     def to_dict(self) -> dict[str, Any]:
-        payload = self.body()
+        payload = self.authoritative_body()
         payload["normalized_checksum"] = self.normalized_checksum or self.compute_checksum()
         return payload
 
@@ -343,11 +392,27 @@ def load_and_verify_evidence(path: Path) -> QualificationEvidence:
     if not isinstance(declared, str) or not declared.startswith("sha256:"):
         raise QualificationError("evidence is missing a sha256 normalized_checksum")
     body = {key: value for key, value in payload.items() if key != "normalized_checksum"}
-    recomputed = "sha256:" + hashlib.sha256(_canonical(body)).hexdigest()
+    recomputed = compute_body_checksum(body)
     if recomputed != declared:
         raise QualificationError(
             f"evidence checksum mismatch (tampered or stale): declared {declared},"
             f" recomputed {recomputed}"
+        )
+    declared_type = body.get(ARTIFACT_TYPE_KEY)
+    if (
+        declared_type is not None
+        and str(declared_type) != ArtifactType.QUALIFICATION_EVIDENCE.value
+    ):
+        raise QualificationError(
+            f"{path} is {declared_type!r}, not qualification evidence;"
+            " refusing to parse it with the evidence schema"
+        )
+    declared_schema = str(body.get("schema_version", ""))
+    if declared_schema != QUALIFICATION_SCHEMA_VERSION:
+        raise QualificationError(
+            f"{path} was written by schema {declared_schema!r} but this build"
+            f" expects {QUALIFICATION_SCHEMA_VERSION!r}. A stale artifact from an"
+            " earlier run is never reused: regenerate it in the current run."
         )
     return _from_body(body, declared)
 
@@ -393,6 +458,7 @@ def _from_body(body: Mapping[str, Any], checksum: str) -> QualificationEvidence:
             SubCapabilityResult(
                 name=str(sub["name"]), passed=bool(sub["passed"]),
                 detail=str(sub.get("detail", "")),
+                required=bool(sub.get("required", True)),
             )
             for sub in body.get("sub_capabilities", ())
         ),
@@ -401,6 +467,8 @@ def _from_body(body: Mapping[str, Any], checksum: str) -> QualificationEvidence:
         blocked_reasons=tuple(body.get("blocked_reasons", ())),
         observed_at=datetime.fromisoformat(str(body["observed_at"])),
         normalized_checksum=checksum,
+        # the body that was verified, carried forward so promotion cannot drift
+        authenticated_body=dict(body),
     )
 
 
@@ -472,9 +540,14 @@ def qualify_source(
     missing_proofs = sorted(set(criteria.required_proofs) - set(proofs))
     if missing_proofs:
         blocked.append(f"missing required proofs: {missing_proofs}")
-    failed_subs = sorted(sub.name for sub in sub_capabilities if not sub.passed)
+    failed_subs = sorted(
+        sub.name for sub in sub_capabilities if not sub.passed and sub.required
+    )
     if failed_subs:
-        blocked.append(f"sub-capabilities not proven: {failed_subs}")
+        blocked.append(f"required sub-capabilities not proven: {failed_subs}")
+    # Unmet INFORMATIONAL sub-capabilities are visible in the evidence body
+    # (each row carries `required`), but they never enter `blocked`: they are
+    # not part of the production contract's required set.
 
     if not blocked:
         result = QualificationResult.PASS

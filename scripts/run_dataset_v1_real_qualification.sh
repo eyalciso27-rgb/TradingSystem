@@ -53,6 +53,8 @@ SP_DOCUMENTS="${DATASET_V1_SP_DOCUMENTS:-config/data-sources/sp500-documents}"
 SP_PRODUCTION_START="${DATASET_V1_SP_PRODUCTION_START:-}"
 SP_PRODUCTION_END="${DATASET_V1_SP_PRODUCTION_END:-}"
 SNAPSHOT_OUT="${DATASET_V1_SNAPSHOT_OUT:-docs/poi/evidence/dataset-v1-snapshot-report.json}"
+RUN_CLI="trading_market_data_core.dataset_v1_run_cli"
+RUN_ROOT="${DATASET_V1_RUN_ROOT:-docs/poi/evidence/dataset-v1-runs}"
 
 # -- TCP preflight ------------------------------------------------------------
 # Each probe returns: 0 = port open, 1 = port closed/unreachable, 2 = this probe
@@ -181,6 +183,31 @@ run_stage() {
     classify_execution "$rc"
 }
 
+record_stage() {
+    # record_stage <cli> <run_id> <run_root> <stage> <status> [artifact...]
+    # Maps a SOURCE EXECUTION status to a run-manifest stage outcome. A FAILED
+    # stage records NO artifacts, which is what prevents a previous run's file
+    # from being bound into this run.
+    local cli="$1" run_id="$2" run_root="$3" stage="$4" status="$5"
+    shift 5
+    local outcome
+    case "$status" in
+        PASS) outcome="SUCCEEDED" ;;
+        PARTIAL) outcome="PARTIAL" ;;
+        NOT_AVAILABLE) outcome="NOT_AVAILABLE" ;;
+        NOT_RUN) outcome="NOT_RUN" ;;
+        *) outcome="FAILED" ;;
+    esac
+    local -a artifact_args=()
+    local artifact
+    for artifact in "$@"; do
+        artifact_args+=(--artifact "$artifact")
+    done
+    uv run --no-sync python -m "$cli" stage --run-id "$run_id" --run-root "$run_root" \
+        --stage-name "$stage" --outcome "$outcome" "${artifact_args[@]+"${artifact_args[@]}"}" \
+        >/dev/null || true
+}
+
 main() {
     set -euo pipefail
 
@@ -204,6 +231,16 @@ main() {
         exit 2
     fi
     echo "preflight: OK"
+
+    # -- RUN ISOLATION -------------------------------------------------------
+    # Every run gets its own id and staging area. Stages write into staging and
+    # publish only on success, so a FAILED stage cannot inherit a previous
+    # run's artifact. Readiness is computed from this run's manifest, never
+    # from a directory glob.
+    local RUN_ID RUN_STARTED
+    RUN_ID="$(uv run --no-sync python -m "$RUN_CLI" new-id)"
+    RUN_STARTED="$(date -u +%Y-%m-%dT%H:%M:%S+00:00 2>/dev/null || echo "")"
+    echo "run_id: $RUN_ID"
     echo
 
     # -- 1b. IBKR (OWNER_PRIMARY) preflight -----------------------------------
@@ -270,6 +307,9 @@ main() {
         uv run --no-sync python -m trading_broker_ibkr.poi_corporate_actions_qualification             --host "$IB_HOST" --port "$IB_PORT" --account-alias "$IB_ACCOUNT_ALIAS"             --out "$IBKR_CORPORATE_ARTIFACT" >&2 || ibkr_rc=$?
         if [ "$ibkr_rc" -eq 0 ]; then IBKR_EXEC="PASS"; else IBKR_EXEC="PARTIAL"; fi
     fi
+    # Bind the IBKR artifacts to THIS run; a persisted file from an earlier run
+    # must not seed the six IBKR capabilities.
+    record_stage "$RUN_CLI" "$RUN_ID" "$RUN_ROOT" "ibkr" "$IBKR_EXEC"         "docs/poi/evidence/POI-IBKR-HIST.json" "$IBKR_CORPORATE_ARTIFACT"
 
     if [ "$SEC_CONFIGURED" = "YES" ]; then
         SEC_EXEC="$(run_stage "SEC delisting ingestion + qualification"             uv run --no-sync python -m "$INGEST_CLI" sec-delisting             --evidence-dir "$EVIDENCE_DIR" --year "$SEC_YEAR" --quarter "$SEC_QUARTER"             --limit "$SEC_LIMIT")"
@@ -308,12 +348,17 @@ main() {
         shopt -u nullglob
     fi
 
-    # -- 5. consolidated report + readiness -----------------------------------
-    echo "== capability report =="
+    # -- 5. run manifest + CURRENT-RUN capability report -----------------------
+    echo "== run manifest =="
+    local RUN_MANIFEST="$RUN_ROOT/$RUN_ID/run-manifest.json"
+    uv run --no-sync python -m "$RUN_CLI" manifest --run-id "$RUN_ID" \
+        --run-root "$RUN_ROOT" --started-at "$RUN_STARTED" || true
+    echo
+
+    echo "== capability report (CURRENT RUN ONLY) =="
     local STATUS
     set +e
-    uv run --no-sync python -m "$CLI" report \
-        --config "$SOURCE_CONFIG" --evidence-dir "$EVIDENCE_DIR"
+    uv run --no-sync python -m "$RUN_CLI" report --manifest "$RUN_MANIFEST"
     STATUS=$?
     set -e
 
@@ -328,6 +373,8 @@ main() {
     printf '%-28s %s\n' "IDENTITY CROSSWALK" "$CROSSWALK_EXEC"
     printf '%-28s %s\n' "AS-OF GICS DISCOVERY" "$GICS_EXEC"
     echo
+    echo "run_id             $RUN_ID"
+    echo "run_manifest       $RUN_ROOT/$RUN_ID/run-manifest.json"
     echo "gateway_preflight  $IBKR_STATUS"
     echo "evidence_dir       $EVIDENCE_DIR"
     echo
@@ -346,7 +393,8 @@ main() {
     echo "== snapshot attempt =="
     set +e
     uv run --no-sync python -m "$SNAPSHOT_CLI" \
-        --evidence-dir "$EVIDENCE_DIR" --out "$SNAPSHOT_OUT"
+        --evidence-dir "$EVIDENCE_DIR" --run-manifest "$RUN_MANIFEST" \
+        --out "$SNAPSHOT_OUT"
     local SNAP_RC=$?
     set -e
     if [ "$SNAP_RC" -ne 0 ]; then

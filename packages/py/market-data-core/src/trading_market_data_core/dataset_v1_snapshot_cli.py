@@ -30,6 +30,7 @@ from trading_market_data_core.dataset_v1 import (
 )
 from trading_market_data_core.dataset_v1_artifacts import (
     ArtifactError,
+    ArtifactScan,
     ArtifactType,
     load_and_verify_crosswalk,
     scan_evidence_dir,
@@ -50,6 +51,10 @@ from trading_market_data_core.dataset_v1_qualification import (
     capability_states_from_evidence,
     load_and_verify_evidence,
 )
+from trading_market_data_core.dataset_v1_run import (
+    load_and_verify_run_manifest,
+    verify_manifest_artifacts,
+)
 
 DEFAULT_EVIDENCE_DIR = Path("docs/poi/evidence/dataset-v1")
 DEFAULT_IBKR_EVIDENCE = Path("docs/poi/evidence/POI-IBKR-HIST.json")
@@ -68,6 +73,17 @@ def _force_utf8_stdout() -> None:
             reconfigure(encoding="utf-8", errors="replace")
 
 
+def _scan_from_manifest(manifest: object) -> ArtifactScan:
+    """An ArtifactScan containing exactly what the current run produced."""
+    from trading_market_data_core.dataset_v1_run import RunManifest
+
+    assert isinstance(manifest, RunManifest)
+    grouped: dict[ArtifactType, list[Path]] = {}
+    for artifact in manifest.artifacts:
+        grouped.setdefault(artifact.artifact_type, []).append(Path(artifact.path))
+    return ArtifactScan(by_type={k: tuple(sorted(v)) for k, v in grouped.items()})
+
+
 def _file_checksum(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -79,6 +95,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--index-id", default="SP500")
     parser.add_argument("--as-of", default="")
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--run-manifest", type=Path, default=None)
     _force_utf8_stdout()
     args = parser.parse_args(argv[1:])
 
@@ -89,7 +106,24 @@ def main(argv: list[str]) -> int:
     evidences = []
     bindings: list[EvidenceBinding] = []
     sources: list[SourceBinding] = []
-    scan = scan_evidence_dir(args.evidence_dir)
+    # CURRENT-RUN BINDING. With a run manifest the snapshot uses ONLY artifacts
+    # that manifest binds, so a stale artifact left in the directory by an
+    # earlier run can never be substituted into this build.
+    manifest = None
+    if args.run_manifest is not None:
+        try:
+            manifest = load_and_verify_run_manifest(args.run_manifest)
+        except ArtifactError as error:
+            print(f"RUN_MANIFEST_INVALID: {error}")
+            return 2
+        findings = verify_manifest_artifacts(manifest, root=Path.cwd())
+        if findings:
+            for finding in findings:
+                print(f"ARTIFACT_FINDING: {finding}")
+            return 2
+        scan = _scan_from_manifest(manifest)
+    else:
+        scan = scan_evidence_dir(args.evidence_dir)
     for path, reason in scan.unclassified:
         print(f"ARTIFACT_UNCLASSIFIED {path}: {reason}")
         return 2
@@ -208,6 +242,8 @@ def main(argv: list[str]) -> int:
         "capability_states": {name: state.value for name, state in sorted(states.items())},
         "evidence": sorted(f"{b.name}={b.checksum}" for b in bindings),
         "identity_crosswalk": crosswalk.checksum if crosswalk is not None else None,
+        "run_id": manifest.run_id if manifest is not None else None,
+        "run_manifest_checksum": manifest.checksum if manifest is not None else None,
         "artifact_type": ArtifactType.SNAPSHOT_REPORT.value,
         "universe_size": 0,
         "priced_securities": 0,
