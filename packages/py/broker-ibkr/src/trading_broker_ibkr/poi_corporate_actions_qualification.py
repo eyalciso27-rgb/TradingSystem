@@ -29,6 +29,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from trading_market_data_core.dataset_v1_ibkr_artifacts import (
+    IbkrArtifactError,
+    load_and_verify_ibkr_evidence,
+)
+
 from trading_broker_ibkr.paper_adapter import PAPER_ACCOUNT_PREFIX, mask_account_id
 from trading_broker_ibkr.poi_historical_data_client import (
     HistoricalSeries,
@@ -155,12 +160,19 @@ class CorporateQualificationEvidence:
         }
 
     def to_dict(self) -> dict[str, object]:
-        # See the historical writer: typing is an envelope, not part of the
-        # digest that authenticates the observations.
+        """The FINAL typed artifact, sealed with the outer envelope digest.
+
+        See the historical writer: ``evidence_checksum`` authenticates the
+        qualification body, ``normalized_checksum`` authenticates the complete
+        typed envelope. They are never interchanged.
+        """
+        from trading_market_data_core.dataset_v1_ibkr_artifacts import (
+            seal_typed_ibkr_artifact,
+        )
+
         body = {**self.body_for_checksum(), **self.typing_fields()}
         body["evidence_checksum"] = self.evidence_checksum
-        body["normalized_checksum"] = self.evidence_checksum
-        return body
+        return seal_typed_ibkr_artifact(body)
 
 
 def _now_iso() -> str:
@@ -316,7 +328,17 @@ def main(argv: list[str]) -> int:
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(evidence.to_dict(), indent=2), encoding="utf-8")
+        # READ BACK and verify immediately: a writer must never emit an artifact
+        # that the manifest binder would later reject. Failing here is loud and
+        # local instead of surfacing as an unbindable artifact mid-run.
+        try:
+            verified = load_and_verify_ibkr_evidence(args.out)
+        except IbkrArtifactError as error:
+            print(f"ARTIFACT_SELF_CHECK_FAILED: {error}")
+            return 1
         print(f"evidence written: {args.out}")
+        print(f"artifact_type      : {verified.artifact_type.value}")
+        print(f"normalized_checksum: {verified.normalized_checksum}")
     return 0
 
 

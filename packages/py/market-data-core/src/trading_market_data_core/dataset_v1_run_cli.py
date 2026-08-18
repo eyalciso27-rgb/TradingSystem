@@ -305,7 +305,34 @@ def cmd_report(args: argparse.Namespace) -> int:
         states.get(name) is CapabilityState.EMPIRICALLY_VERIFIED
         for name in DATASET_V1_REQUIRED_CAPABILITIES
     )
+
+    # SOURCE EXECUTION vs ARTIFACT AUTHENTICATION are different questions. The
+    # owner report said "IBKR PASS" while the IBKR artifacts had failed to
+    # authenticate, which read as though the whole IBKR path had succeeded.
+    stage_rows: dict[str, dict[str, object]] = {}
+    for stage in sorted(manifest.stages, key=lambda item: item.name):
+        bound = [a for a in manifest.artifacts if a.stage == stage.name]
+        declared = len(stage.artifacts)
+        if not stage.outcome.may_publish:
+            artifact_status = "NOT_APPLICABLE"
+        elif declared and not bound:
+            artifact_status = "FAILED_AUTHENTICATION"
+        elif declared and len(bound) < declared:
+            artifact_status = "PARTIALLY_BOUND"
+        elif bound:
+            artifact_status = "BOUND"
+        else:
+            artifact_status = "NO_ARTIFACTS"
+        stage_rows[stage.name] = {
+            "execution_status": stage.outcome.value,
+            "artifact_status": artifact_status,
+            "artifacts_declared": declared,
+            "artifacts_bound": len(bound),
+            "current_run_evidence": bool(bound),
+        }
+
     payload = {
+        "stages": stage_rows,
         "run_id": manifest.run_id,
         "manifest_checksum": manifest.checksum,
         "capabilities": rows,

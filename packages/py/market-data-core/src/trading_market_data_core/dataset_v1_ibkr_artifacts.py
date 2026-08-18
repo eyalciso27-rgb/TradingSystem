@@ -25,6 +25,7 @@ guess:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ from trading_market_data_core.dataset_v1_artifacts import (
     ARTIFACT_TYPE_KEY,
     ArtifactError,
     ArtifactType,
+    canonical_bytes,
     compute_checksum,
 )
 
@@ -108,11 +110,11 @@ class IbkrEvidenceArtifact:
         """A copy carrying its authenticated body checksum."""
         from dataclasses import replace
 
-        return replace(self, normalized_checksum=compute_checksum(self.body()))
+        return replace(self, normalized_checksum=outer_envelope_checksum(self.body()))
 
     def to_dict(self) -> dict[str, Any]:
         payload = self.body()
-        payload["normalized_checksum"] = self.normalized_checksum or compute_checksum(
+        payload["normalized_checksum"] = self.normalized_checksum or outer_envelope_checksum(
             self.body()
         )
         return payload
@@ -164,16 +166,8 @@ def load_and_verify_ibkr_evidence(path: Path) -> IbkrEvidenceArtifact:
     ):
         raise IbkrArtifactError(f"{path} is {artifact_type.value}, not IBKR evidence")
 
-    declared = payload.get("normalized_checksum")
-    if not isinstance(declared, str) or not declared.startswith("sha256:"):
-        raise IbkrArtifactError(f"{path}: IBKR artifact is missing a sha256 checksum")
+    declared = verify_typed_ibkr_payload(payload, source=str(path))
     body = {key: value for key, value in payload.items() if key != "normalized_checksum"}
-    recomputed = compute_checksum(body)
-    if recomputed != declared:
-        raise IbkrArtifactError(
-            f"{path}: IBKR artifact checksum mismatch (tampered or stale):"
-            f" declared {declared}, recomputed {recomputed}"
-        )
     return IbkrEvidenceArtifact(
         artifact_type=artifact_type,
         schema_version=str(payload.get("schema_version", "")),
@@ -260,9 +254,104 @@ __all__ = [
     "IBKR_EVIDENCE_SCHEMA_VERSION",
     "IBKR_HISTORICAL_ARTIFACT_TYPE",
     "IBKR_HISTORICAL_CAPABILITY_SCOPE",
+    "ENVELOPE_KEYS",
     "IbkrArtifactError",
     "IbkrEvidenceArtifact",
+    "debug_canonical_body",
+    "inner_evidence_checksum",
     "is_legacy_ibkr_evidence",
     "load_and_verify_ibkr_evidence",
     "migrate_legacy_ibkr_evidence",
+    "outer_envelope_checksum",
+    "seal_typed_ibkr_artifact",
+    "verify_typed_ibkr_payload",
 ]
+
+
+# -- THE authoritative seal/verify implementation -----------------------------
+#
+# THREE checksum layers, each authenticating exactly one thing. No field is ever
+# allowed to mean more than one of these, and they are never cross-compared:
+#
+#   A. INNER  `evidence_checksum`     -> the original qualification body ONLY
+#                                        (the recorded observations). Stable
+#                                        across typing/migration.
+#   B. OUTER  `normalized_checksum`   -> the COMPLETE typed envelope body,
+#                                        excluding itself. This is what the run
+#                                        manifest, the snapshot and the CLI
+#                                        verify before binding.
+#   C. BYTES  `file_checksum`         -> the serialized file, computed by the
+#                                        run manifest (dataset_v1_run), never
+#                                        stored inside the artifact.
+#
+# The real owner run failed because the writer assigned the INNER digest to the
+# OUTER field, so every verifier recomputed a different value:
+#     declared sha256:c1e5c794...  recomputed sha256:3bd352d7...
+
+#: Fields that belong to the typing envelope rather than the qualification body.
+ENVELOPE_KEYS: frozenset[str] = frozenset(
+    {
+        ARTIFACT_TYPE_KEY, "schema_version", "producer", "capability_scope",
+        "normalized_checksum", "run_id",
+    }
+)
+
+
+def inner_evidence_checksum(qualification_body: Mapping[str, Any]) -> str:
+    """(A) Digest of the qualification body ONLY.
+
+    Mirrors the historical broker serialization exactly, so migrating a legacy
+    artifact never invalidates it.
+    """
+    serialized = json.dumps(
+        {k: v for k, v in qualification_body.items() if k not in ENVELOPE_KEYS | {
+            "evidence_checksum"
+        }},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "sha256:" + hashlib.sha256(serialized.encode("ascii")).hexdigest()
+
+
+def outer_envelope_checksum(envelope_body: Mapping[str, Any]) -> str:
+    """(B) Digest of the COMPLETE typed envelope, excluding the field itself."""
+    return compute_checksum(
+        {key: value for key, value in envelope_body.items() if key != "normalized_checksum"}
+    )
+
+
+def seal_typed_ibkr_artifact(envelope_body: Mapping[str, Any]) -> dict[str, Any]:
+    """Seal a typed IBKR artifact: the ONE way `normalized_checksum` is set.
+
+    The caller passes the FINAL envelope body. Nothing that participates in the
+    digest may change afterwards, which is why sealing is the last step before
+    serialization and why ``verify_typed_ibkr_payload`` is run on read-back.
+    """
+    body = {key: value for key, value in envelope_body.items() if key != "normalized_checksum"}
+    sealed = dict(body)
+    sealed["normalized_checksum"] = outer_envelope_checksum(body)
+    return sealed
+
+
+def verify_typed_ibkr_payload(payload: Mapping[str, Any], *, source: str = "artifact") -> str:
+    """Verify (B) for an in-memory payload. Returns the authenticated digest."""
+    declared = payload.get("normalized_checksum")
+    if not isinstance(declared, str) or not declared.startswith("sha256:"):
+        raise IbkrArtifactError(f"{source}: IBKR artifact is missing a sha256 checksum")
+    recomputed = outer_envelope_checksum(payload)
+    if recomputed != declared:
+        raise IbkrArtifactError(
+            f"{source}: IBKR artifact checksum mismatch (tampered or stale):"
+            f" declared {declared}, recomputed {recomputed}"
+        )
+    return declared
+
+
+def debug_canonical_body(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """The exact canonical text and digest a verifier will use.
+
+    Provided so a mismatch can be diagnosed by comparing texts rather than by
+    guessing which body a checksum covers.
+    """
+    body = {key: value for key, value in payload.items() if key != "normalized_checksum"}
+    return canonical_bytes(body).decode("ascii"), outer_envelope_checksum(body)
