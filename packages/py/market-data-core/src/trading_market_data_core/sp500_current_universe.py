@@ -25,12 +25,19 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 from trading_market_data_core.dataset_v1_sources import SourceAdapterError, SourceAuthority
+from trading_market_data_core.sp500_wikitable import (
+    ConstituentRow,
+    ParseDiagnostics,
+    TableParseError,
+    parse_html_table,
+    parse_wikitext_table,
+)
 from trading_market_data_core.trading_readiness import (
     FreshnessPolicy,
     GicsMode,
@@ -258,6 +265,36 @@ def _with_checksum(snapshot: ConstituentSnapshot) -> ConstituentSnapshot:
     return replace(snapshot, checksum=snapshot.compute_checksum())
 
 
+def _constituent_from_dict(item: Mapping[str, object]) -> Constituent:
+    """Rebuild one constituent, INCLUDING whether its identity was resolved.
+
+    Restoring this mattered more than it looks: ``identity_resolved`` is part of
+    the checksummed body, so dropping it made any stored list containing a
+    CIK-less constituent fail its own integrity check on the way back in — and a
+    last-known-good list that cannot be loaded is not a last-known-good list.
+
+    The stored value is reproduced verbatim rather than re-derived. A loader
+    that "corrects" a field on the way in cannot round-trip, which would defeat
+    the checksum that is the actual integrity mechanism here. Producing the flag
+    correctly is the parser's job; proving the file is unaltered is this one's.
+    Only a file that never carried the field at all falls back to deriving it.
+    """
+    cik = str(item["cik"]) if item.get("cik") else None
+    date_added = item.get("date_added")
+    return Constituent(
+        ticker=str(item["ticker"]),
+        name=str(item.get("name", "")),
+        security_id=str(item["security_id"]),
+        cik=cik,
+        gics_sector=str(item["gics_sector"]) if item.get("gics_sector") else None,
+        gics_sub_industry=(
+            str(item["gics_sub_industry"]) if item.get("gics_sub_industry") else None
+        ),
+        date_added=date.fromisoformat(str(date_added)) if date_added else None,
+        identity_resolved=bool(item.get("identity_resolved", cik is not None)),
+    )
+
+
 def load_snapshot(path: Path) -> ConstituentSnapshot:
     """Load a snapshot, RECOMPUTING its checksum."""
     try:
@@ -281,19 +318,7 @@ def load_snapshot(path: Path) -> ConstituentSnapshot:
         source_id=str(payload["source_id"]),
         source_authority=str(payload.get("source_authority", SourceAuthority.PUBLIC_SECONDARY)),
         constituents=tuple(
-            Constituent(
-                ticker=str(item["ticker"]), name=str(item.get("name", "")),
-                security_id=str(item["security_id"]),
-                cik=str(item["cik"]) if item.get("cik") else None,
-                gics_sector=str(item["gics_sector"]) if item.get("gics_sector") else None,
-                gics_sub_industry=(
-                    str(item["gics_sub_industry"]) if item.get("gics_sub_industry") else None
-                ),
-                date_added=(
-                    date.fromisoformat(str(item["date_added"])) if item.get("date_added") else None
-                ),
-            )
-            for item in payload.get("constituents", ())
+            _constituent_from_dict(item) for item in payload.get("constituents", ())
         ),
         is_point_in_time_history=bool(payload.get("is_point_in_time_history", False)),
         gics_mode=str(payload.get("gics_mode", GicsMode.FREE_RECONSTRUCTED.value)),
@@ -410,6 +435,11 @@ def refresh_universe(
             findings.append(
                 "refresh rejected, last-known-good retained: " + "; ".join(problems)
             )
+            # A rejection that only says "snapshot is empty" is safe and
+            # undiagnosable; the parse already knows what it saw, so say it.
+            findings.extend(
+                f"diagnostic: {line}" for line in diagnostic_notes(candidate)
+            )
     current = store.latest()
     return current, classify_freshness(current, now=now, policy=policy), tuple(findings)
 
@@ -472,7 +502,9 @@ def sector_context(
 __all__ = [
     "parse_wikitext_constituents",
     "fetch_current_constituents",
+    "DIAGNOSTIC_NOTE_PREFIX",
     "WIKIPEDIA_API_URL",
+    "WIKIPEDIA_HTML_API_URL",
     "FREE_SOURCE_ID",
     "DEFAULT_USER_AGENT",
     "MAX_PLAUSIBLE_CONSTITUENTS",
@@ -485,7 +517,9 @@ __all__ = [
     "classify_freshness",
     "ensure_current_universe",
     "load_snapshot",
+    "diagnostic_notes",
     "parse_constituent_table",
+    "parse_html_constituents",
     "refresh_universe",
     "sector_context",
     "validate_snapshot",
@@ -503,11 +537,126 @@ WIKIPEDIA_API_URL = (
     "?action=parse&page=List_of_S%26P_500_companies&prop=wikitext&format=json"
     "&formatversion=2"
 )
+
+#: The SAME page through MediaWiki's other documented representation: its own
+#: rendered HTML. Used only as a fallback, and deliberately not a second source
+#: -- same endpoint, same page, same PUBLIC_SECONDARY provenance, same
+#: CURRENT-only meaning. Nothing here scrapes an unrelated site.
+WIKIPEDIA_HTML_API_URL = (
+    "https://en.wikipedia.org/w/api.php"
+    "?action=parse&page=List_of_S%26P_500_companies&prop=text&format=json"
+    "&formatversion=2"
+)
 FREE_SOURCE_ID = "wikipedia:List_of_S&P_500_companies"
 
 #: Sent so the source can identify us, per normal API etiquette. It carries no
 #: credential and no personal data.
 DEFAULT_USER_AGENT = "TradingSystem-DatasetV1/1.0 (current-universe refresh; contact via repo)"
+
+
+#: Diagnostic notes carry this prefix so a rejected refresh can surface them
+#: without the caller having to know anything about parsing.
+DIAGNOSTIC_NOTE_PREFIX = "parse diagnostic: "
+
+_CIK_DIGITS_RE = re.compile(r"\d+")
+
+
+def diagnostic_notes(snapshot: ConstituentSnapshot) -> tuple[str, ...]:
+    """The parse diagnostics carried by a snapshot, if any."""
+    return tuple(
+        note[len(DIAGNOSTIC_NOTE_PREFIX) :]
+        for note in snapshot.notes
+        if note.startswith(DIAGNOSTIC_NOTE_PREFIX)
+    )
+
+
+def _normalized_cik(text: str | None) -> str | None:
+    """The source writes CIKs zero-padded, bare, or not at all.
+
+    Anything that is not a plausible CIK becomes None, which keeps the identity
+    UNRESOLVED. A ticker is never promoted to a stable identity to fill the gap.
+    """
+    if not text:
+        return None
+    digits = "".join(_CIK_DIGITS_RE.findall(text))
+    if not digits or len(digits) > 10:
+        return None
+    return digits.zfill(10)
+
+
+def _parsed_date(text: str | None) -> date | None:
+    if not text:
+        return None
+    match = re.search(r"\d{4}-\d{2}-\d{2}", text)
+    if match is None:
+        return None
+    try:
+        return date.fromisoformat(match.group(0))
+    except ValueError:
+        return None
+
+
+def _snapshot_from_rows(
+    rows: tuple[ConstituentRow, ...],
+    diagnostics: ParseDiagnostics,
+    *,
+    index_id: str,
+    as_of: date,
+    fetched_at: datetime,
+    source_id: str,
+) -> ConstituentSnapshot:
+    """Turn parsed rows into a snapshot, making the identity decision here.
+
+    The parser deals in text; this is where a CIK becomes a stable SEC identity
+    and its absence becomes an explicitly unresolved one.
+    """
+    constituents = tuple(
+        Constituent(
+            ticker=row.ticker,
+            name=row.name,
+            security_id=(
+                f"sec-cik:{cik}" if (cik := _normalized_cik(row.cik))
+                else f"unresolved-ticker:{row.ticker}"
+            ),
+            identity_resolved=_normalized_cik(row.cik) is not None,
+            cik=_normalized_cik(row.cik),
+            gics_sector=row.gics_sector,
+            gics_sub_industry=row.gics_sub_industry,
+            date_added=_parsed_date(row.date_added),
+        )
+        for row in rows
+    )
+    notes = [
+        "PUBLIC_SECONDARY free dataset: CURRENT membership only.",
+        "This is NOT point-in-time history and must never be used as such.",
+        "Sector context here is CURRENT classification (FREE_RECONSTRUCTED).",
+        "A constituent without a CIK carries an UNRESOLVED identity: the ticker"
+        " is operational routing only and is never a stable security_id.",
+    ]
+    # Recorded on every parse, not only on failure: knowing which representation
+    # and which schema produced a stored list is what makes the next upstream
+    # format change diagnosable from the snapshot itself.
+    notes.extend(DIAGNOSTIC_NOTE_PREFIX + line for line in diagnostics.lines())
+    return _with_checksum(
+        ConstituentSnapshot(
+            index_id=index_id, as_of=as_of, fetched_at=fetched_at, source_id=source_id,
+            source_authority=SourceAuthority.PUBLIC_SECONDARY.value,
+            constituents=constituents, notes=tuple(notes),
+        )
+    )
+
+
+def _mediawiki_payload(raw: bytes) -> dict[str, object]:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise SourceAdapterError(f"constituent source did not return JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise SourceAdapterError("constituent payload must be a JSON object")
+    parse = payload.get("parse")
+    if not isinstance(parse, dict):
+        raise SourceAdapterError("constituent payload carries no MediaWiki parse result")
+    return parse
 
 
 def parse_wikitext_constituents(
@@ -521,90 +670,70 @@ def parse_wikitext_constituents(
     """Parse the constituent table out of the API's wikitext payload.
 
     Rejects an unexpected payload rather than returning a thin snapshot that
-    might later overwrite a good list.
+    might later overwrite a good list. The table is read through its own header
+    row and its cells through a nesting-aware scanner, so a ticker wrapped in an
+    exchange template (``{{NasdaqSymbol|AAPL}}``) is read as a ticker rather
+    than torn in half -- the defect an owner-host run surfaced as an empty
+    snapshot.
     """
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as error:
-        raise SourceAdapterError(f"constituent source did not return JSON: {error}") from error
-    if not isinstance(payload, dict):
-        raise SourceAdapterError("constituent payload must be a JSON object")
-    parse = payload.get("parse")
-    wikitext = parse.get("wikitext") if isinstance(parse, dict) else None
+    parse = _mediawiki_payload(raw)
+    wikitext = parse.get("wikitext")
+    if isinstance(wikitext, dict):  # formatversion=1 wraps the text
+        wikitext = wikitext.get("*")
     if not isinstance(wikitext, str) or "{|" not in wikitext:
         raise SourceAdapterError(
             "constituent payload carries no wikitext table; refusing to parse"
         )
-
-    constituents: list[Constituent] = []
-    skipped = 0
-    for block in wikitext.split("|-"):
-        cells = [
-            _clean(cell).strip()
-            for cell in re.split(r"\n\s*\|", block)
-            if cell.strip()
-        ]
-        cells = [re.sub(r"^\[\[|\]\]$", "", cell).split("|")[-1].strip() for cell in cells]
-        if len(cells) < 2:
-            continue
-        ticker = cells[0].upper()
-        if not re.fullmatch(r"[A-Z][A-Z.\-]{0,6}", ticker):
-            skipped += 1
-            continue
-        cik = next((c for c in cells if re.fullmatch(r"\d{7,10}", c)), None)
-        added = next((c for c in cells if re.fullmatch(r"\d{4}-\d{2}-\d{2}", c)), None)
-        constituents.append(
-            Constituent(
-                ticker=ticker,
-                name=cells[1],
-                security_id=(
-                    f"sec-cik:{cik.zfill(10)}" if cik else f"unresolved-ticker:{ticker}"
-                ),
-                identity_resolved=cik is not None,
-                cik=cik.zfill(10) if cik else None,
-                gics_sector=cells[2] if len(cells) > 2 and cells[2] else None,
-                gics_sub_industry=cells[3] if len(cells) > 3 and cells[3] else None,
-                date_added=date.fromisoformat(added) if added else None,
-            )
-        )
-    notes = [
-        "PUBLIC_SECONDARY free dataset: CURRENT membership only.",
-        "This is NOT point-in-time history and must never be used as such.",
-        "Sector context here is CURRENT classification (FREE_RECONSTRUCTED).",
-        "A constituent without a CIK carries an UNRESOLVED identity: the ticker"
-        " is operational routing only and is never a stable security_id.",
-    ]
-    if skipped:
-        notes.append(f"{skipped} row(s) skipped: no parseable ticker")
-    return _with_checksum(
-        ConstituentSnapshot(
-            index_id=index_id, as_of=as_of, fetched_at=fetched_at, source_id=source_id,
-            source_authority=SourceAuthority.PUBLIC_SECONDARY.value,
-            constituents=tuple(constituents), notes=tuple(notes),
-        )
+    try:
+        rows, diagnostics = parse_wikitext_table(wikitext)
+    except TableParseError as error:
+        raise SourceAdapterError(f"constituent wikitext is unreadable: {error}") from error
+    return _snapshot_from_rows(
+        rows, diagnostics, index_id=index_id, as_of=as_of,
+        fetched_at=fetched_at, source_id=source_id,
     )
 
 
-def fetch_current_constituents(
+def parse_html_constituents(
+    raw: bytes,
     *,
-    url: str = WIKIPEDIA_API_URL,
-    timeout_seconds: float = 30.0,
-    user_agent: str = DEFAULT_USER_AGENT,
-    as_of: date | None = None,
-    now: datetime | None = None,
+    index_id: str = "SP500",
+    as_of: date,
+    fetched_at: datetime,
+    source_id: str = FREE_SOURCE_ID,
 ) -> ConstituentSnapshot:
-    """Fetch the free CURRENT constituent list over HTTPS.
+    """Parse the SAME page from MediaWiki's own rendered HTML.
 
-    Owner-host only; unit tests parse recorded payloads and never call this.
-    Content type and payload shape are validated before parsing, so a captive
-    portal or error page cannot masquerade as an index.
+    Second documented representation of one page, not a second source: same
+    endpoint, same provenance, same CURRENT-only meaning. MediaWiki has already
+    expanded the ticker templates here, which is exactly why this path survives
+    the template drift that broke the wikitext parse.
     """
+    parse = _mediawiki_payload(raw)
+    text = parse.get("text")
+    if isinstance(text, dict):  # formatversion=1 wraps the markup
+        text = text.get("*")
+    if not isinstance(text, str) or "<table" not in text.lower():
+        raise SourceAdapterError(
+            "constituent payload carries no rendered HTML table; refusing to parse"
+        )
+    try:
+        rows, diagnostics = parse_html_table(text)
+    except TableParseError as error:
+        raise SourceAdapterError(f"constituent HTML is unreadable: {error}") from error
+    return _snapshot_from_rows(
+        rows, diagnostics, index_id=index_id, as_of=as_of,
+        fetched_at=fetched_at, source_id=source_id,
+    )
+
+
+def _fetch_json(url: str, *, timeout_seconds: float, user_agent: str) -> bytes:
+    """One validated HTTPS GET. Shape is checked before anything is parsed."""
     import urllib.error
     import urllib.request
 
     if not url.lower().startswith("https://"):
         raise SourceAdapterError("the constituent source must be fetched over HTTPS")
-    fetched_at = now or datetime.now(tz=UTC)
     request = urllib.request.Request(url, headers={"User-Agent": user_agent})  # noqa: S310
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310
@@ -621,6 +750,56 @@ def fetch_current_constituents(
         raise SourceAdapterError(
             f"unexpected content type {content_type!r}; refusing to parse"
         )
-    return parse_wikitext_constituents(
-        raw, as_of=as_of or fetched_at.date(), fetched_at=fetched_at
-    )
+    return raw
+
+
+def fetch_current_constituents(
+    *,
+    url: str = WIKIPEDIA_API_URL,
+    html_url: str | None = WIKIPEDIA_HTML_API_URL,
+    timeout_seconds: float = 30.0,
+    user_agent: str = DEFAULT_USER_AGENT,
+    as_of: date | None = None,
+    now: datetime | None = None,
+) -> ConstituentSnapshot:
+    """Fetch the free CURRENT constituent list over HTTPS.
+
+    Owner-host only; unit tests parse recorded payloads and never call this.
+    Content type and payload shape are validated before parsing, so a captive
+    portal or error page cannot masquerade as an index.
+
+    Two representations of ONE page, in order:
+
+    1. **wikitext** -- the article's own source. Exact, and what we parse first.
+    2. **rendered HTML** -- MediaWiki's other documented representation of the
+       same page, tried only if the first yields an implausible list.
+
+    The second exists because of how the first failed empirically: the article
+    changed how it wraps ticker cells, and wikitext exposes that change while
+    rendered HTML does not (MediaWiki has already expanded the templates). The
+    fallback is a different *view* of the same source, never a different source,
+    so provenance, authority and CURRENT-only semantics are identical either
+    way. Passing ``html_url=None`` disables it.
+    """
+    fetched_at = now or datetime.now(tz=UTC)
+    stamp = as_of or fetched_at.date()
+    raw = _fetch_json(url, timeout_seconds=timeout_seconds, user_agent=user_agent)
+    snapshot = parse_wikitext_constituents(raw, as_of=stamp, fetched_at=fetched_at)
+    if html_url is None or not validate_snapshot(snapshot):
+        return snapshot
+
+    # The primary view produced something a validator would refuse. Rather than
+    # store nothing, ask the same page for its other representation.
+    try:
+        fallback_raw = _fetch_json(
+            html_url, timeout_seconds=timeout_seconds, user_agent=user_agent
+        )
+        fallback = parse_html_constituents(fallback_raw, as_of=stamp, fetched_at=fetched_at)
+    except SourceAdapterError:
+        # The fallback failing must never hide what the primary said.
+        return snapshot
+    if validate_snapshot(fallback):
+        # Both views are unusable. Return the primary, whose diagnostics
+        # describe the representation that is actually authoritative.
+        return snapshot
+    return fallback
