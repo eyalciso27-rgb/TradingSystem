@@ -14,15 +14,28 @@ has, rather than growing a parallel JSON-file subsystem beside it:
   payload never bloats the chain and the reference cannot silently point at
   different bytes than were audited.
 
-The split matters for one property in particular: the payload is written
-*first*, and only then is the chain row appended inside the caller's
-transaction. A crash between them leaves an unreferenced object, which is
-harmless. The reverse order would leave a chain row pointing at nothing, which
-would look like tampering.
+**This sink owns its transactions, and that is the whole point.** It takes an
+``Engine``, not a connection, and every append runs inside its own
+``engine.begin()`` block. ``persist`` therefore returns a reference only after
+a COMMIT has succeeded.
 
-``can_persist`` is a real probe, not a constant. Readiness must be able to
-refuse *before* a decision is made because audit is down, and a sink that
-answers "yes" and then throws has told the gate nothing.
+An earlier version took a caller's ``Connection`` and appended "inside the
+caller's transaction" — which meant ``persist`` could return a chain hash, the
+order could go to the broker, and the process could die before anyone committed,
+losing the supposedly durable pre-submit record. The invariant is *no broker
+submit until the pre-submit audit is durably committed*, and a reference handed
+back from an uncommitted transaction does not establish it. Nothing about the
+append-only chain semantics changed; only who owns the commit.
+
+The split between payload and chain matters too: the payload is written *first*,
+then the chain row is committed. A crash between them leaves an unreferenced
+object, which is harmless. The reverse order would leave a committed chain row
+pointing at nothing, which is indistinguishable from tampering.
+
+``can_persist`` is a real probe, not a constant, and it leaves no transaction
+open. Readiness must be able to refuse *before* a decision is made because audit
+is down, and a sink that answers "yes" and then throws has told the gate
+nothing.
 
 No secrets: the chain's own validation rejects credential-shaped detail, and
 only references, identifiers and market observations are ever written here.
@@ -36,7 +49,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
 
-from sqlalchemy import Connection, select
+from sqlalchemy import Connection, Engine, select
 from trading_contracts.enums import Environment
 
 from trading_persistence.audit import append_audit_record
@@ -111,13 +124,16 @@ class DurableExecutionAuditSink:
 
     def __init__(
         self,
-        connection: Connection,
+        engine: Engine,
         objects: ObjectStore,
         *,
         environment: Environment,
         actor_ref: str = "execution-service",
     ) -> None:
-        self._connection = connection
+        # An ENGINE, deliberately. Handing this a live connection would put the
+        # commit in someone else's hands, and "durable" would mean "durable if
+        # the caller remembers".
+        self._engine = engine
         self._objects = objects
         self._environment = environment
         self._actor_ref = actor_ref
@@ -131,9 +147,15 @@ class DurableExecutionAuditSink:
         discovering that at submit time is exactly what this must prevent.
         """
         try:
-            self._connection.execute(
-                select(AuditEvent.sequence_no).order_by(AuditEvent.sequence_no.desc()).limit(1)
-            ).one_or_none()
+            # `with` closes the connection and its implicit transaction; a probe
+            # that leaks an open transaction would hold locks for the life of
+            # the process.
+            with self._engine.connect() as connection:
+                connection.execute(
+                    select(AuditEvent.sequence_no)
+                    .order_by(AuditEvent.sequence_no.desc())
+                    .limit(1)
+                ).one_or_none()
             probe = canonical_payload({"probe": EXECUTION_AUDIT_VERSION})
             stored = self._objects.put(probe)
         except Exception:  # noqa: BLE001 - any failure means "cannot persist"
@@ -141,7 +163,11 @@ class DurableExecutionAuditSink:
         return bool(getattr(stored, "ref", None))
 
     def persist(self, record: Mapping[str, object]) -> str:
-        """Write the payload, then chain it. Returns the chain hash."""
+        """Write the payload, then COMMIT the chain row. Returns the chain hash.
+
+        The return value is a durability claim: by the time it exists, the
+        record is committed and a brand-new connection can see it.
+        """
         return self._append(record, action=ACTION_PRE_SUBMIT)
 
     # -- post-submit ----------------------------------------------------------
@@ -172,20 +198,24 @@ class DurableExecutionAuditSink:
         occurred_raw = record.get("evaluated_at")
         occurred_at = _aware(occurred_raw) or datetime.now(tz=UTC)
         try:
-            return append_audit_record(
-                self._connection,
-                actor_ref=self._actor_ref,
-                action=action,
-                environment=self._environment,
-                occurred_at=occurred_at,
-                target_ref=_target_ref(record),
-                detail=summarize(record),
-                payload_ref=payload_ref,
-                correlation_id=_uuid_or_none(record.get("correlation_id")),
-            )
+            # One append, one transaction, committed on exit. A failure to
+            # commit propagates as ExecutionAuditError, which the execution path
+            # treats as "not recorded" -- and therefore as "do not submit".
+            with self._engine.begin() as connection:
+                return append_audit_record(
+                    connection,
+                    actor_ref=self._actor_ref,
+                    action=action,
+                    environment=self._environment,
+                    occurred_at=occurred_at,
+                    target_ref=_target_ref(record),
+                    detail=summarize(record),
+                    payload_ref=payload_ref,
+                    correlation_id=_uuid_or_none(record.get("correlation_id")),
+                )
         except Exception as error:  # noqa: BLE001
             raise ExecutionAuditError(
-                f"decision could not be chained ({type(error).__name__})"
+                f"decision could not be committed ({type(error).__name__})"
             ) from error
 
 
@@ -221,6 +251,28 @@ def _uuid_or_none(value: object) -> UUID | None:
     return None
 
 
+class DurableExecutionHistoryReader:
+    """The read side of the chain: what happened to a decision, across restarts.
+
+    In-process idempotency dies with the process, so a replayed decision after a
+    crash would otherwise submit a second time. The chain already recorded every
+    PRE_SUBMIT and POST_SUBMIT; this reads them back.
+
+    It opens and closes its own connection per query for the same reason the
+    sink owns its own transactions: a long-lived connection held by a
+    long-running service is a lock waiting to happen.
+    """
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def actions_for(self, decision_id: str) -> tuple[str, ...]:
+        with self._engine.connect() as connection:
+            return tuple(
+                action for action, _, _ in load_decision_records(connection, decision_id)
+            )
+
+
 def load_decision_records(
     connection: Connection, decision_id: str
 ) -> list[tuple[str, str, str | None]]:
@@ -243,6 +295,7 @@ __all__ = [
     "EXECUTION_AUDIT_VERSION",
     "MAX_DETAIL_CHARS",
     "DurableExecutionAuditSink",
+    "DurableExecutionHistoryReader",
     "ExecutionAuditError",
     "ObjectStore",
     "canonical_payload",

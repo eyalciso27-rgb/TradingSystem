@@ -254,6 +254,18 @@ class AccountSnapshot:
     cash: Decimal
     buying_power: Decimal
     observed_at: datetime
+    #: The broker's own SESSION (daily) profit and loss, when it reports one.
+    #:
+    #: Explicitly nullable, and ``None`` means "the broker did not tell us" —
+    #: never "zero". The risk engine uses session P&L for the daily soft and
+    #: hard halt limits, so an account that has lost money today and is
+    #: presented as flat would have its halt silently disabled. A missing value
+    #: must therefore fail the decision closed, not pass it.
+    #:
+    #: It is NOT derived from realized/unrealized totals: those are cumulative,
+    #: and calling a cumulative figure a daily one would be a fabrication with
+    #: the same consequence.
+    session_pnl: Decimal | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")

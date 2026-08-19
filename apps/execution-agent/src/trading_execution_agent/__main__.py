@@ -18,6 +18,12 @@ loosens a gate to make the report look better.
 
 Paper only: the adapter refuses any port but 4002 and any account that is not a
 paper account, and this entry point never offers a way to ask for Live.
+
+**Two IBKR client sessions, deliberately.** The order/account path uses the
+paper adapter's own client id and the quote path uses the market-data session's,
+because they are separate clients in the existing architecture and pretending
+otherwise would misdescribe what connects to the gateway. Both are disconnected
+before this process exits, and so is the database engine.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ import logging
 import os
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -42,7 +49,10 @@ from trading_market_data_core.trading_readiness import (
     TradingMode,
 )
 from trading_observability.logging import configure_logging
-from trading_persistence.execution_audit import DurableExecutionAuditSink
+from trading_persistence.execution_audit import (
+    DurableExecutionAuditSink,
+    DurableExecutionHistoryReader,
+)
 
 from trading_execution_agent.execution_service import (
     ExecutionConfig,
@@ -118,12 +128,48 @@ def probe_decision(symbol: str, now: datetime) -> EngineDecision:
     )
 
 
+@dataclass
+class ProbeResources:
+    """Everything the probe opened, so everything can be closed again.
+
+    A probe that leaves a gateway session or a database connection behind is a
+    probe that cannot be run twice on a schedule, and a leaked transaction holds
+    locks for the life of the process.
+    """
+
+    service: ExecutionService
+    adapter: object
+    session: object
+    engine: object
+
+    def close(self) -> None:
+        """Release everything, and never let one failure hide the others."""
+        for name, resource, method in (
+            ("market data session", self.session, "disconnect"),
+            ("broker adapter", self.adapter, "disconnect"),
+            ("database engine", self.engine, "dispose"),
+        ):
+            closer = getattr(resource, method, None)
+            if not callable(closer):
+                continue
+            try:
+                closer()
+            except Exception as error:  # noqa: BLE001 - closing is best effort
+                LOGGER.warning(
+                    "could not close the %s: %s", name, type(error).__name__
+                )
+
+
 def build_service(
     *, symbol: str, account_alias: str, host: str, port: int, equity_cap: Decimal
-) -> tuple[ExecutionService, object]:
+) -> ProbeResources:
     """Wire the REAL components. Imported lazily so --help never opens a socket."""
+    from pathlib import Path
+
     from trading_broker_ibkr.paper_adapter import build_paper_adapter
     from trading_broker_ibkr.poi_market_data_session import create_session
+    from trading_persistence.db import create_sync_engine
+    from trading_persistence.object_storage import FilesystemObjectStorage
 
     from trading_execution_agent.agent import ExecutionAgent
     from trading_execution_agent.ibkr_quote_source import IbkrQuoteSource
@@ -148,10 +194,19 @@ def build_service(
     session = create_session()
     session.connect(host, port)
 
+    engine = create_sync_engine()
+    objects = FilesystemObjectStorage(
+        Path(os.environ.get("TRADING_OBJECT_STORE", "var/objects"))
+    )
     service = ExecutionService(
         broker=adapter,
         quotes=IbkrQuoteSource(session),
-        audit=_audit_sink(),
+        # The sink owns its own committed transactions; the probe hands it an
+        # ENGINE and never holds a connection of its own.
+        audit=DurableExecutionAuditSink(
+            engine, objects, environment=Environment.PAPER
+        ),
+        history=DurableExecutionHistoryReader(engine),
         risk_engine=RiskEngine(PROBE_RISK_POLICY),
         config=ExecutionConfig(
             mode=TradingMode.PAPER,
@@ -170,22 +225,8 @@ def build_service(
         ),
         # No authorization argument: the production default DENIES.
     )
-    return service, session
-
-
-def _audit_sink() -> DurableExecutionAuditSink:
-    """The durable sink, bound to the real database and object store."""
-    from pathlib import Path
-
-    from trading_persistence.db import create_sync_engine
-    from trading_persistence.object_storage import FilesystemObjectStorage
-
-    engine = create_sync_engine()
-    connection = engine.connect()
-    connection.begin()
-    root = Path(os.environ.get("TRADING_OBJECT_STORE", "var/objects"))
-    return DurableExecutionAuditSink(
-        connection, FilesystemObjectStorage(root), environment=Environment.PAPER
+    return ProbeResources(
+        service=service, adapter=adapter, session=session, engine=engine
     )
 
 
@@ -292,7 +333,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     decision_id = f"probe-{now.strftime('%Y%m%dT%H%M%SZ')}-{args.symbol}"
 
     try:
-        service, session = build_service(
+        resources = build_service(
             symbol=args.symbol,
             account_alias=args.account_alias,
             host=args.host,
@@ -306,7 +347,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_ERROR
 
     try:
-        evaluation = service.evaluate(
+        evaluation = resources.service.evaluate(
             ExecutionIntent(
                 decision_id=decision_id,
                 strategy_id=args.strategy,
@@ -321,9 +362,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
     finally:
-        close = getattr(session, "disconnect", None)
-        if callable(close):
-            close()
+        # Everything opened above is released here, including on failure.
+        resources.close()
 
     for line in render(evaluation):
         print(line)

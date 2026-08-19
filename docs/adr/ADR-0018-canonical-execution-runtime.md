@@ -89,6 +89,58 @@ technical prerequisites hold; it is not permission to trade. Enabling submission
 means supplying an authority that mints a single-use authorization through the
 canonical pre-submit check — not loosening anything in the service.
 
+## Amendments after deep review (2026-08-19)
+
+Review of the first implementation found several defects that the tests did not
+catch. Each fix is an architectural commitment, not a patch.
+
+**The audit sink owns its transactions.** It takes an `Engine` and commits each
+append itself. Taking a caller's `Connection` meant `persist` could return a
+reference from an uncommitted transaction — the order could go to the broker and
+a crash before the caller's commit would lose the pre-submit record. "No submit
+until the pre-submit audit is durably committed" is only true if the sink is the
+one committing.
+
+**Session P&L is an explicitly nullable canonical fact.** `AccountSnapshot`
+gained `session_pnl: Decimal | None`. The risk engine computes both daily halts
+from it, so the previous `session_pnl=Decimal(0)` presented an account that had
+lost money today as flat and silently disabled them. IBKR's account summary has
+no canonical session-P&L tag, so on the owner host this is normally `None` — and
+`None` fails the decision closed. **That is a real Paper blocker**, and reporting
+it is correct.
+
+**Existing positions are classified `UNKNOWN`, never as the candidate.** Copying
+the new decision's sector, cluster, source and strategy onto every open position
+corrupts four risk caps at once. Unknown classification refuses by default
+(`require_classified_portfolio`); a portfolio authority satisfies it honestly.
+The open-risk *amount* remains an explicit estimate, which is the only part of
+this the ADR ever sanctioned.
+
+**Broker-side protection means the broker actually holds it.** A supported STOP
+order *type* proves nothing: the entry is one LIMIT order carrying a stop price,
+which the adapter maps to that order's aux price. Real protection for a new
+position requires the broker to establish it *atomically* — a native bracket or
+OCA. The IBKR paper adapter declares both `UNSUPPORTED`, so **a protected entry
+is not currently possible through it and is refused** (option B: fail closed).
+"Submit the entry, place the stop afterwards" is not a protection mechanism; it
+is a window of unbounded exposure. This is the second real Paper blocker.
+
+**Idempotency is durable, not in-memory.** The agent's outcome map and the
+adapter's client-order map both die with the process. A `DurableExecutionHistory`
+read over the audit chain answers, across restarts: a recorded terminal outcome
+returns without resubmitting; a pre-submit with no recorded outcome is
+`NEEDS_RECONCILIATION`, never a blind retry; unreadable history blocks.
+
+**The final quantity is bound to the risk approval.** The sizing gate checked
+`approved_quantity > 0` while the submitted quantity came from the
+authorization, so an authority minting 10 against an approval of 1 would have
+passed. The risk registry now refuses an order larger than the engine approved —
+at the last boundary before submission.
+
+**Configuration cannot disagree with itself.** Mode and environment must pair
+(PAPER↔PAPER, LIVE↔LIVE), and the configured risk policy version must match the
+policy the injected engine actually applies.
+
 **Rejected: a new `execution_decisions` table.** The append-only chain plus the
 object store already provide durability, tamper evidence, payload retrieval and
 query-by-decision. Adding a table would have meant a migration for no property

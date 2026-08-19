@@ -143,6 +143,17 @@ RISK_RESULT_ALLOWED_PATHS: tuple[str, ...] = (
 # Invariants that must remain literally true in the files that carry them.
 # Each is a property a future edit could quietly remove while every test still
 # passes, so the text itself is pinned.
+# Fabricated runtime facts. Each of these looked harmless in review and each
+# silently disabled a real safety limit: a zero session P&L turns off both daily
+# halts, and labelling existing positions with the candidate's classification
+# corrupts the sector, cluster and source caps at once.
+FORBIDDEN_FABRICATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "fabricated session P&L (UNKNOWN must never become zero)",
+        re.compile(r"session_pnl\s*=\s*Decimal\(\s*0\s*\)"),
+    ),
+)
+
 REQUIRED_INVARIANTS: tuple[tuple[str, str, str], ...] = (
     (
         "apps/execution-agent/src/trading_execution_agent/execution_service.py",
@@ -153,6 +164,16 @@ REQUIRED_INVARIANTS: tuple[tuple[str, str, str], ...] = (
         "apps/execution-agent/src/trading_execution_agent/execution_service.py",
         "self._agent.process(",
         "the execution service must submit only through the execution agent",
+    ),
+    (
+        "packages/py/persistence/src/trading_persistence/execution_audit.py",
+        "with self._engine.begin() as connection:",
+        "the audit sink must own its own COMMIT, not a caller's transaction",
+    ),
+    (
+        "apps/execution-agent/src/trading_execution_agent/execution_service.py",
+        "if snapshot.session_pnl is None:",
+        "a missing session P&L must fail the decision closed",
     ),
     (
         "packages/py/application/src/trading_application/readiness_guarded_broker.py",
@@ -265,6 +286,11 @@ def _check_imports(rel_path: str, tree: ast.AST) -> list[Violation]:
 def _check_text(rel_path: str, text: str) -> list[Violation]:
     violations: list[Violation] = []
     for line_number, line_text in enumerate(text.splitlines(), start=1):
+        for rule_name, pattern in FORBIDDEN_FABRICATION_PATTERNS:
+            if pattern.search(line_text):
+                violations.append(
+                    Violation(rel_path, line_number, "fabricated-runtime-fact", rule_name)
+                )
         for rule_name, pattern in FORBIDDEN_TEXT_PATTERNS:
             if pattern.search(line_text):
                 violations.append(
@@ -292,6 +318,42 @@ def _constructor_calls(tree: ast.AST, name: str) -> list[int]:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name:
             lines.append(node.lineno)
     return lines
+
+
+#: Attributes that describe the NEW candidate. Copying one onto an existing
+#: portfolio position is the fabrication: an open position's sector is not the
+#: candidate's sector, and assuming it is corrupts the sector, cluster and
+#: source caps in whichever direction happens to be wrong.
+_CANDIDATE_ATTRIBUTES: frozenset[str] = frozenset(
+    {"sector", "cluster", "source_id", "strategy_id"}
+)
+
+
+def _check_portfolio_fabrication(rel_path: str, tree: ast.AST) -> list[Violation]:
+    """A PositionExposure must never be classified from the candidate."""
+    violations: list[Violation] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "PositionExposure"
+        ):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg not in _CANDIDATE_ATTRIBUTES:
+                continue
+            value = keyword.value
+            if isinstance(value, ast.Attribute) and value.attr in _CANDIDATE_ATTRIBUTES:
+                violations.append(
+                    Violation(
+                        rel_path,
+                        keyword.value.lineno,
+                        "fabricated-runtime-fact",
+                        f"existing position's {keyword.arg} copied from the"
+                        " candidate; an unknown classification must be UNKNOWN",
+                    )
+                )
+    return violations
 
 
 def _check_execution_boundary(rel_path: str, tree: ast.AST) -> list[Violation]:
@@ -358,6 +420,7 @@ def scan_repository(repo_root: Path) -> list[Violation]:
         violations.extend(_check_imports(rel_path, tree))
         violations.extend(_check_text(rel_path, text))
         violations.extend(_check_execution_boundary(rel_path, tree))
+        violations.extend(_check_portfolio_fabrication(rel_path, tree))
     violations.extend(_check_invariants(repo_root))
     return violations
 

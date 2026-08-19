@@ -85,6 +85,11 @@ ALLOWED_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost"})
 PAPER_API_PORT = 4002
 LIVE_API_PORT = 4001
 PAPER_ACCOUNT_PREFIX = "DU"
+
+#: Account-summary key carrying the broker's SESSION (daily) P&L, when one is
+#: served. Absent from the tags this adapter requests today, so the value is
+#: normally missing -- which is reported as missing, never as zero.
+DAILY_PNL_TAG = "DailyPnL"
 DEFAULT_CLIENT_ID = 1
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
@@ -738,6 +743,13 @@ class IbkrPaperAdapter:
                 net_liquidation_value=values["NetLiquidation"],
                 cash=values["TotalCashValue"],
                 buying_power=values["BuyingPower"],
+                # Reported ONLY if the gateway actually served a daily P&L tag.
+                # IBKR's account summary has no canonical session-P&L tag (the
+                # daily figure comes from a separate reqPnL subscription, which
+                # this adapter does not yet hold), so on a live gateway this is
+                # normally None -- and None fails a trading decision closed
+                # rather than pretending the day is flat.
+                session_pnl=values.get(DAILY_PNL_TAG),
                 observed_at=self._now(),
             )
         except KeyError as missing:
@@ -1624,6 +1636,7 @@ __all__ = [
     "IbkrPaperAdapter",
     "OrderRefTooLongError",
     "OutgoingOrder",
+    "DAILY_PNL_TAG",
     "PaperTransport",
     "RawOpenOrder",
     "RecoveredIdentity",

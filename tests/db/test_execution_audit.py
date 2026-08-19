@@ -18,9 +18,11 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
-from sqlalchemy import Connection, Engine
+from sqlalchemy import Engine
+from sqlalchemy.pool import QueuePool
 from trading_contracts.enums import Environment
 from trading_persistence.audit import verify_audit_chain
 from trading_persistence.execution_audit import (
@@ -67,12 +69,22 @@ def objects(tmp_path: Path) -> FilesystemObjectStorage:
 
 
 @pytest.fixture()
-def sink(
-    connection: Connection, objects: FilesystemObjectStorage
-) -> DurableExecutionAuditSink:
-    return DurableExecutionAuditSink(
-        connection, objects, environment=Environment.PAPER
-    )
+def sink(engine: Engine, objects: FilesystemObjectStorage) -> DurableExecutionAuditSink:
+    """The sink owns its own transactions, so it takes the ENGINE.
+
+    These tests therefore COMMIT. They do not clean up: the chain is append-only
+    and hash-linked, so deleting rows afterwards would break the linkage for
+    everything appended later — which is precisely the tampering the chain
+    exists to detect. Extra rows in an ephemeral CI database are the correct
+    cost of proving durability, and unique decision ids keep them separable.
+    """
+    return DurableExecutionAuditSink(engine, objects, environment=Environment.PAPER)
+
+
+@pytest.fixture()
+def decision_id(request: pytest.FixtureRequest) -> str:
+    """A decision id unique to this test, so committed rows never collide."""
+    return f"decision-{request.node.name}-{uuid4().hex[:8]}"
 
 
 # == it really persists ========================================================
@@ -84,14 +96,26 @@ def test_the_sink_probes_its_real_dependencies(
     assert sink.can_persist() is True
 
 
-def test_a_pre_submit_record_is_chained_and_stored(
-    sink: DurableExecutionAuditSink, connection: Connection,
-    objects: FilesystemObjectStorage,
+def test_a_pre_submit_record_is_visible_from_a_brand_new_connection(
+    sink: DurableExecutionAuditSink, engine: Engine,
+    objects: FilesystemObjectStorage, decision_id: str,
 ) -> None:
-    reference = sink.persist(_record())
+    """THE durability test, and the one the previous design could not pass.
+
+    No caller transaction, no ``with engine.begin()`` wrapper around the sink,
+    no commit by this test. ``persist`` returns, a completely new connection
+    opens, and the record is already there — because the sink committed it.
+
+    Previously the sink appended inside a caller's transaction, so a reference
+    could be handed back, an order could reach the broker, and a crash before
+    the caller's commit would have lost the pre-submit record entirely.
+    """
+    reference = sink.persist(_record(decision_id=decision_id))
 
     assert reference.startswith("sha256:")
-    rows = load_decision_records(connection, "decision-abc")
+    with engine.connect() as fresh:
+        rows = load_decision_records(fresh, decision_id)
+
     assert [row[0] for row in rows] == [ACTION_PRE_SUBMIT]
     payload_ref = rows[0][2]
     assert payload_ref is not None
@@ -99,14 +123,14 @@ def test_a_pre_submit_record_is_chained_and_stored(
 
 
 def test_the_stored_payload_reconstructs_the_decision(
-    sink: DurableExecutionAuditSink, connection: Connection,
-    objects: FilesystemObjectStorage,
+    sink: DurableExecutionAuditSink, engine: Engine,
+    objects: FilesystemObjectStorage, decision_id: str,
 ) -> None:
     import json
 
-    record = _record()
-    sink.persist(record)
-    _, _, payload_ref = load_decision_records(connection, "decision-abc")[0]
+    sink.persist(_record(decision_id=decision_id))
+    with engine.connect() as fresh:
+        _, _, payload_ref = load_decision_records(fresh, decision_id)[0]
     assert payload_ref is not None
 
     restored = json.loads(objects.get(payload_ref))
@@ -117,31 +141,26 @@ def test_the_stored_payload_reconstructs_the_decision(
     assert restored["security_id"] == "conid:265598"
 
 
-def test_the_record_survives_a_new_connection(
-    engine: Engine, objects: FilesystemObjectStorage
+def test_the_sink_leaves_no_transaction_or_connection_open(
+    sink: DurableExecutionAuditSink, engine: Engine, decision_id: str
 ) -> None:
-    """Durability, stated plainly: a different connection still finds it.
+    """A leaked transaction holds locks for the life of the process."""
+    pool = engine.pool
+    assert isinstance(pool, QueuePool), "the checkout count is a QueuePool fact"
+    before = pool.checkedout()
 
-    This test commits, and deliberately does NOT clean up after itself. The
-    chain is append-only and hash-linked, so deleting the row afterwards would
-    not tidy anything — it would break the linkage for every record that came
-    after it, which is precisely the tampering the chain exists to detect.
-    One extra audit row in an ephemeral CI database is the correct cost.
-    """
-    with engine.begin() as written:
-        DurableExecutionAuditSink(
-            written, objects, environment=Environment.PAPER
-        ).persist(_record(decision_id="decision-durable"))
+    sink.can_persist()
+    sink.persist(_record(decision_id=decision_id))
+    sink.persist_outcome(
+        _record(decision_id=decision_id, checkpoint="POST_SUBMIT",
+                submission_outcome="SUBMITTED")
+    )
 
-    with engine.connect() as reader:
-        rows = load_decision_records(reader, "decision-durable")
-
-    assert rows, "a committed decision must outlive the connection that wrote it"
-    assert rows[0][0] == ACTION_PRE_SUBMIT
+    assert pool.checkedout() == before, "every connection was returned"
 
 
-def test_the_chain_still_verifies_after_a_committed_record(engine: Engine) -> None:
-    """And the committed row above left the chain intact."""
+def test_the_chain_still_verifies_after_committed_records(engine: Engine) -> None:
+    """The committed rows above left the chain intact."""
     with engine.connect() as reader:
         assert verify_audit_chain(reader) == []
 
@@ -150,55 +169,62 @@ def test_the_chain_still_verifies_after_a_committed_record(engine: Engine) -> No
 
 
 def test_the_post_submit_record_is_appended_beside_the_pre_submit_one(
-    sink: DurableExecutionAuditSink, connection: Connection
+    sink: DurableExecutionAuditSink, engine: Engine, decision_id: str
 ) -> None:
-    sink.persist(_record())
+    sink.persist(_record(decision_id=decision_id))
     sink.persist_outcome(
-        _record(checkpoint="POST_SUBMIT", submission_outcome="SUBMITTED")
+        _record(decision_id=decision_id, checkpoint="POST_SUBMIT",
+                submission_outcome="SUBMITTED")
     )
 
-    rows = load_decision_records(connection, "decision-abc")
+    with engine.connect() as fresh:
+        rows = load_decision_records(fresh, decision_id)
     assert [row[0] for row in rows] == [ACTION_PRE_SUBMIT, ACTION_POST_SUBMIT]
     assert rows[0][1] != rows[1][1], "two distinct chained records"
 
 
-def test_the_chain_still_verifies_after_execution_records(
-    sink: DurableExecutionAuditSink, connection: Connection
+def test_execution_records_keep_the_chain_verifiable(
+    sink: DurableExecutionAuditSink, engine: Engine, decision_id: str
 ) -> None:
-    sink.persist(_record())
-    sink.persist_outcome(_record(checkpoint="POST_SUBMIT", submission_outcome="SUBMITTED"))
+    sink.persist(_record(decision_id=decision_id))
+    sink.persist_outcome(
+        _record(decision_id=decision_id, checkpoint="POST_SUBMIT",
+                submission_outcome="SUBMITTED")
+    )
 
-    assert verify_audit_chain(connection) == []
+    with engine.connect() as fresh:
+        assert verify_audit_chain(fresh) == []
 
 
 def test_a_refused_decision_is_still_queryable(
-    sink: DurableExecutionAuditSink, connection: Connection
+    sink: DurableExecutionAuditSink, engine: Engine, decision_id: str
 ) -> None:
     """A refusal is a decision. Finding it later is the whole point."""
     sink.persist(
         _record(
-            decision_id="decision-refused",
+            decision_id=decision_id,
             trading_readiness="BLOCKED",
             blockers=["mandatory gate not satisfied: market_data_usable"],
         )
     )
 
-    rows = load_decision_records(connection, "decision-refused")
-    assert len(rows) == 1
+    with engine.connect() as fresh:
+        assert len(load_decision_records(fresh, decision_id)) == 1
 
 
 def test_one_decision_id_does_not_imply_a_second_submission(
-    sink: DurableExecutionAuditSink, connection: Connection
+    sink: DurableExecutionAuditSink, engine: Engine, decision_id: str
 ) -> None:
     """Recording twice records twice; it never submits anything.
 
     Identical content hashes to the same object, so a retry costs one chain row
     and no duplicate payload — and nothing here can reach a broker.
     """
-    first = sink.persist(_record())
-    second = sink.persist(_record())
+    first = sink.persist(_record(decision_id=decision_id))
+    second = sink.persist(_record(decision_id=decision_id))
 
-    rows = load_decision_records(connection, "decision-abc")
+    with engine.connect() as fresh:
+        rows = load_decision_records(fresh, decision_id)
     assert len(rows) == 2
     assert first != second, "each chain row is distinct"
     assert rows[0][2] == rows[1][2], "identical content is stored once"
@@ -208,7 +234,7 @@ def test_one_decision_id_does_not_imply_a_second_submission(
 
 
 def test_a_broken_object_store_refuses_rather_than_returning_a_reference(
-    connection: Connection,
+    engine: Engine,
 ) -> None:
     class _Broken:
         def put(self, data: bytes) -> object:
@@ -220,9 +246,7 @@ def test_a_broken_object_store_refuses_rather_than_returning_a_reference(
         def exists(self, ref: str) -> bool:
             return False
 
-    sink = DurableExecutionAuditSink(
-        connection, _Broken(), environment=Environment.PAPER
-    )
+    sink = DurableExecutionAuditSink(engine, _Broken(), environment=Environment.PAPER)
 
     assert sink.can_persist() is False
     with pytest.raises(ExecutionAuditError, match="payload could not be stored"):

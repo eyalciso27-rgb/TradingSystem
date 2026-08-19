@@ -20,6 +20,7 @@ Offline and deterministic: no ibapi, no socket, no network, no real order.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -27,14 +28,14 @@ from uuid import UUID
 import pytest
 from trading_application.decision_engine import DecisionExplanation, EngineDecision
 from trading_application.emergency import HaltRecord
-from trading_application.risk_engine import RiskEngine, RiskPolicy
+from trading_application.risk_engine import PositionExposure, RiskEngine, RiskPolicy
 from trading_application.trading_readiness_runtime import (
     MarketDataRules,
     MarketDataState,
     QuoteState,
 )
-from trading_broker_core.port import OrderSide
-from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter
+from trading_broker_core.port import BrokerCapabilityMode, OrderIntent, OrderSide
+from trading_broker_ibkr.paper_adapter import DAILY_PNL_TAG, IbkrPaperAdapter
 from trading_contracts.decision import DecisionResult
 from trading_contracts.enums import (
     ActionTier,
@@ -50,6 +51,7 @@ from trading_execution_agent.execution_service import (
     ExecutionConfig,
     ExecutionIntent,
     ExecutionService,
+    ExecutionServiceError,
     ExecutionStage,
 )
 from trading_execution_agent.reconciliation_latch import ALWAYS_PERMIT
@@ -154,16 +156,25 @@ class _Audit:
 class _TestOnlyAuthorization:
     """Explicit test seam. There is no production equivalent, on purpose."""
 
-    def __init__(self, *, allowed: bool = True, mint: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        allowed: bool = True,
+        mint: bool = True,
+        quantity: Decimal = Decimal("1"),
+    ) -> None:
         self._allowed = allowed
         self._mint = mint
+        self._quantity = quantity
         self.calls = 0
 
     def authorize(self, intent: object, report: object) -> AuthorizationDecision:
         self.calls += 1
         if not self._allowed:
             return AuthorizationDecision(allowed=False, reason="test denial")
-        pre_submit, authorization = (_authorization() if self._mint else (None, None))
+        pre_submit, authorization = (
+            _authorization(self._quantity) if self._mint else (None, None)
+        )
         return AuthorizationDecision(
             allowed=True,
             reason="test-only authorization",
@@ -172,7 +183,7 @@ class _TestOnlyAuthorization:
         )
 
 
-def _authorization() -> tuple[object, object]:
+def _authorization(quantity: Decimal = Decimal("1")) -> tuple[object, object]:
     """Mint a canonical single-use authorization through its real types."""
     from trading_application.pre_submit_check import (
         PreSubmitAction,
@@ -183,14 +194,14 @@ def _authorization() -> tuple[object, object]:
 
     submit = SubmitAuthorization(
         candidate_id="candidate-1",
-        authorized_quantity=Decimal("1"),
+        authorized_quantity=quantity,
         authorized_at=NOW,
         note="test-only authorization; no production path mints this",
     )
     result = PreSubmitCheckResult(
         candidate_id="candidate-1",
         action=PreSubmitAction.ALLOW,
-        authorized_quantity=Decimal("1"),
+        authorized_quantity=quantity,
         authorization=submit,
         allocation_ref="allocation-1",
         risk_ref="risk-1",
@@ -203,8 +214,44 @@ def _authorization() -> tuple[object, object]:
     return result, SingleUseAuthorization(submit)
 
 
+class PnlAwareTransport(FakePaperTransport):
+    """The real fake transport, plus the daily P&L a gateway may serve.
+
+    ``AccountSnapshot.session_pnl`` is explicitly nullable and the base
+    transport reports none, which is the honest default. This subclass supplies
+    one so the daily-halt limits can actually be exercised — and omitting it
+    exercises the case where they cannot.
+    """
+
+    def __init__(self, *, daily_pnl: Decimal | None = Decimal("0"), **kw: object) -> None:
+        super().__init__(**kw)  # type: ignore[arg-type]
+        self.daily_pnl = daily_pnl
+
+    def account_summary(self, account_id: str) -> Mapping[str, Decimal]:
+        values = dict(super().account_summary(account_id))
+        if self.daily_pnl is not None:
+            values[DAILY_PNL_TAG] = self.daily_pnl
+        return values
+
+
+def _classified_portfolio() -> tuple[PositionExposure, ...]:
+    """A real portfolio authority: positions classified as THEMSELVES.
+
+    Deliberately a different sector, cluster and source from the candidate, so a
+    regression that relabels existing exposure with the new decision's metadata
+    shows up as a changed risk verdict rather than passing silently.
+    """
+    return (
+        PositionExposure(
+            symbol="MSFT", sector="software", cluster="megacap-software",
+            source_id="other-source", strategy_id="other-strategy",
+            open_risk_amount=Decimal("50"), notional=Decimal("4000"),
+        ),
+    )
+
+
 def _adapter(transport: FakePaperTransport | None = None) -> IbkrPaperAdapter:
-    fake = transport or FakePaperTransport()
+    fake = transport or PnlAwareTransport()
     adapter = IbkrPaperAdapter(
         lambda: fake,
         account_aliases=dict(ALIASES),
@@ -233,6 +280,9 @@ def _universe(tickers: Sequence[str] = ("AAPL",)) -> ConstituentSnapshot:
 def _service(
     *,
     transport: FakePaperTransport | None = None,
+    portfolio: object | None = _classified_portfolio,
+    protection_required: bool = False,
+    history: object | None = None,
     quotes: _Quotes | None = None,
     audit: _Audit | None = None,
     authorization: object | None = None,
@@ -243,7 +293,7 @@ def _service(
     universe_status: UniverseListStatus | None = None,
     adapter: IbkrPaperAdapter | None = None,
 ) -> tuple[ExecutionService, FakePaperTransport, _Audit]:
-    fake = transport or FakePaperTransport()
+    fake = transport or PnlAwareTransport()
     broker = adapter or _adapter(fake)
     sink = audit or _Audit()
     service = ExecutionService(
@@ -264,10 +314,17 @@ def _service(
             order_type=OrderType.LIMIT,
             sector="tech",
             cluster="megacap",
+            # Most tests here are about the paths BEFORE protection. The real
+            # paper adapter cannot establish broker-side protection atomically
+            # (bracket and OCO are UNSUPPORTED), so a protected entry is
+            # correctly impossible through it -- proven by its own test below.
+            protection_required=protection_required,
         ),
         agent_factory=lambda port: ExecutionAgent(port, entry_gate=ALWAYS_PERMIT),
         authorization=authorization,  # type: ignore[arg-type]
         universe=(lambda: universe) if universe is not None else None,
+        portfolio=portfolio,  # type: ignore[arg-type]
+        history=history,  # type: ignore[arg-type]
         universe_status=(lambda: universe_status) if universe_status else None,
         halts=lambda: halts,
         now=lambda: NOW,
@@ -736,3 +793,383 @@ def test_cancel_is_not_gated_by_entry_readiness() -> None:
     # Refused because there is no such order — NOT because readiness blocked.
     assert outcome.status is ExecutionStatus.REFUSED
     assert "CANCEL_UNKNOWN_ORDER" in outcome.reason_codes
+
+
+# == the defects a deep review found, each with its own proof =================
+
+
+def test_a_missing_session_pnl_is_never_treated_as_zero() -> None:
+    """The daily halt limits are computed from session P&L.
+
+    Substituting zero would present an account that lost money today as flat and
+    silently disable both the soft and hard halts. The base transport reports no
+    daily P&L, which is the honest default for this adapter.
+    """
+    service, transport, audit = _service(transport=PnlAwareTransport(daily_pnl=None))
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.ACCOUNT_STATE_INCOMPLETE
+    assert "UNKNOWN is not zero" in evaluation.reasons[0]
+    assert _submits(transport) == []
+    assert audit.records, "the refusal is still recorded"
+
+
+def test_a_reported_session_pnl_reaches_the_risk_engine() -> None:
+    service, _, _ = _service(transport=PnlAwareTransport(daily_pnl=Decimal("-10")))
+
+    evaluation = service.evaluate(_intent())
+
+    assert evaluation.risk_result is not None
+    assert evaluation.stage is ExecutionStage.AUTHORIZATION_DENIED
+
+
+@pytest.mark.parametrize(
+    ("label", "daily_pnl", "expect_veto"),
+    [
+        # equity = min(100k NLV, 50k cap) = 50k. soft = 0.75%, hard = 1.00%.
+        ("below the soft threshold", Decimal("-100"), False),
+        ("beyond the soft threshold", Decimal("-400"), True),
+        ("beyond the hard threshold", Decimal("-600"), True),
+    ],
+)
+def test_the_daily_loss_halt_actually_blocks(
+    label: str, daily_pnl: Decimal, expect_veto: bool
+) -> None:
+    """A real loss, through the real engine, to a real refusal."""
+    service, transport, _ = _service(
+        transport=PnlAwareTransport(daily_pnl=daily_pnl)
+    )
+
+    evaluation = service.execute(_intent())
+
+    if expect_veto:
+        assert evaluation.stage is ExecutionStage.RISK_REFUSED, label
+        assert _submits(transport) == [], label
+    else:
+        assert evaluation.stage is ExecutionStage.AUTHORIZATION_DENIED, label
+
+
+def test_existing_positions_are_not_labelled_with_the_candidates_metadata() -> None:
+    """Without a portfolio authority, classification is UNKNOWN, not borrowed.
+
+    Labelling every open position with the new decision's sector, cluster,
+    source and strategy would corrupt four separate risk caps at once, in
+    whichever direction happened to be wrong.
+    """
+    from trading_execution_agent.execution_service import UNKNOWN_CLASSIFICATION
+
+    service, transport, _ = _service(portfolio=None)
+    positions = service._open_positions(_intent())  # noqa: SLF001 - the point
+
+    assert positions, "the fake transport holds a position"
+    for position in positions:
+        assert position.sector == UNKNOWN_CLASSIFICATION
+        assert position.cluster == UNKNOWN_CLASSIFICATION
+        assert position.source_id == UNKNOWN_CLASSIFICATION
+        assert position.strategy_id == UNKNOWN_CLASSIFICATION
+        assert position.sector != "tech", "never the candidate's sector"
+        assert position.source_id != "strategy", "never the candidate's source"
+
+
+def test_an_unclassified_portfolio_refuses_rather_than_guessing() -> None:
+    service, transport, _ = _service(portfolio=None)
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.PORTFOLIO_UNCLASSIFIED
+    assert "cannot be evaluated" in evaluation.reasons[0]
+    assert _submits(transport) == []
+
+
+def test_a_mixed_portfolio_keeps_each_position_its_own() -> None:
+    """Positions from different sectors and sources stay different."""
+    mixed = (
+        PositionExposure(
+            symbol="XOM", sector="energy", cluster="oil", source_id="src-a",
+            strategy_id="strat-a", open_risk_amount=Decimal("10"),
+            notional=Decimal("1000"),
+        ),
+        PositionExposure(
+            symbol="JPM", sector="financials", cluster="banks", source_id="src-b",
+            strategy_id="strat-b", open_risk_amount=Decimal("10"),
+            notional=Decimal("1000"),
+        ),
+    )
+    service, _, _ = _service(portfolio=lambda: mixed)
+
+    positions = service._open_positions(_intent())  # noqa: SLF001
+
+    assert {p.sector for p in positions} == {"energy", "financials"}
+    assert {p.source_id for p in positions} == {"src-a", "src-b"}
+    assert "tech" not in {p.sector for p in positions}
+
+
+# == protection must be REAL broker-side protection ==========================
+
+
+def test_a_required_protection_the_broker_cannot_hold_refuses_the_entry() -> None:
+    """THE fail-closed proof.
+
+    A supported STOP order TYPE is not a resting protective order. The entry is
+    a single LIMIT order carrying a stop price, which the adapter maps to the
+    order's aux price -- one order, nothing protecting it. The real paper
+    adapter declares bracket and OCO UNSUPPORTED, so a protected entry is not
+    currently possible through it, and the entry must not go out.
+    """
+    service, transport, _ = _service(
+        protection_required=True, authorization=_TestOnlyAuthorization()
+    )
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.PROTECTION_UNAVAILABLE
+    assert "not a resting protective order" in evaluation.reasons[0]
+    assert "bracket=UNSUPPORTED" in evaluation.reasons[0]
+    assert _submits(transport) == [], "an unprotected entry must never be sent"
+
+
+def test_the_real_adapter_cannot_currently_hold_atomic_protection() -> None:
+    """Pinned so flipping a capability flag without wiring it is caught."""
+    capabilities = _adapter().capabilities()
+
+    assert capabilities.bracket is BrokerCapabilityMode.UNSUPPORTED
+    assert capabilities.oco is BrokerCapabilityMode.UNSUPPORTED
+    assert capabilities.order_types[OrderType.STOP] is BrokerCapabilityMode.NATIVE, (
+        "a supported STOP order type is exactly the thing that must NOT be"
+        " mistaken for broker-side protection"
+    )
+
+
+def test_protection_passes_only_when_the_broker_can_establish_it_atomically() -> None:
+    """And when it can, the reason says which mechanism."""
+
+    class _BracketBroker(IbkrPaperAdapter):
+        def capabilities(self) -> object:  # type: ignore[override]
+            base = super().capabilities()
+            return replace(base, bracket=BrokerCapabilityMode.NATIVE)
+
+    adapter = _BracketBroker(
+        lambda: PnlAwareTransport(), account_aliases=dict(ALIASES),
+        host="127.0.0.1", port=4002, clock=lambda: ADAPTER_NOW,
+    )
+    adapter.connect()
+    service, _, _ = _service(adapter=adapter, protection_required=True)
+
+    capability = service._protection_state()  # noqa: SLF001
+
+    assert capability.can_protect is True
+    assert "bracket" in capability.detail
+
+
+# == the final quantity is bound to the real risk approval ===================
+
+
+def test_an_authorization_larger_than_the_risk_approval_is_blocked() -> None:
+    """Risk approves 1, the authority mints 10, nothing is submitted.
+
+    The sizing gate only ever checked ``approved_quantity > 0``, and the final
+    quantity comes from the authorization -- so this is the gap that mattered.
+    """
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(quantity=Decimal("10"))
+    )
+
+    # The strategy asks for 1, so the engine approves at most 1. The authority
+    # then mints 10 -- the exact mismatch a faulty future authorization makes.
+    evaluation = service.execute(_intent(requested_quantity=Decimal("1")))
+
+    assert evaluation.stage is ExecutionStage.READINESS_BLOCKED
+    assert any("risk_limits" in reason for reason in evaluation.reasons)
+    assert _submits(transport) == [], "an oversized order must never reach the broker"
+
+
+def test_the_risk_registry_refuses_an_order_bigger_than_it_approved() -> None:
+    from trading_execution_agent.execution_service import DecisionRiskRegistry
+
+    service, _, _ = _service()
+    evaluation = service.evaluate(_intent())
+    assert evaluation.risk_result is not None
+    approved = evaluation.risk_result.approved_quantity
+
+    registry = DecisionRiskRegistry()
+    registry.register("exec-ord-1", "AAPL", evaluation.risk_result)
+
+    assert registry.risk_result_for(_order(quantity=approved)) is not None
+    assert registry.risk_result_for(_order(quantity=approved + 1)) is None
+    assert registry.risk_result_for(_order(symbol="MSFT")) is None
+    assert registry.risk_result_for(_order(client_order_id="other")) is None
+
+
+def _order(
+    *,
+    client_order_id: str = "exec-ord-1",
+    symbol: str = "AAPL",
+    quantity: Decimal = Decimal("1"),
+) -> OrderIntent:
+    return OrderIntent(
+        client_order_id=client_order_id, authorization_ref="a", correlation_id="c",
+        environment=Environment.PAPER, account_alias="paper-main", symbol=symbol,
+        side=OrderSide.BUY, order_type=OrderType.LIMIT, quantity=quantity,
+        limit_price=Decimal("100"), stop_price=Decimal("98"),
+    )
+
+
+# == configuration invariants ================================================
+
+
+def test_a_mode_environment_mismatch_is_refused_at_construction() -> None:
+    with pytest.raises(ExecutionServiceError, match="requires environment"):
+        ExecutionConfig(
+            mode=TradingMode.PAPER,
+            environment=Environment.LIVE,
+            account_alias="paper-main",
+            requirements=StrategyDataRequirements(strategy_id="s"),
+            rules=MarketDataRules(),
+            risk_policy=POLICY,
+            simulation_equity_cap=Decimal("50000"),
+        )
+
+
+def test_a_risk_policy_mismatch_between_config_and_engine_is_refused() -> None:
+    """Config claiming policy A while the engine applies policy B."""
+    other = replace(POLICY, policy_version="a-different-policy")
+
+    with pytest.raises(ExecutionServiceError, match="risk policy mismatch"):
+        ExecutionService(
+            broker=_adapter(),
+            quotes=_Quotes(),
+            audit=_Audit(),
+            risk_engine=RiskEngine(other),
+            config=ExecutionConfig(
+                mode=TradingMode.PAPER,
+                environment=Environment.PAPER,
+                account_alias="paper-main",
+                requirements=StrategyDataRequirements(strategy_id="s"),
+                rules=MarketDataRules(),
+                risk_policy=POLICY,
+                simulation_equity_cap=Decimal("50000"),
+            ),
+            agent_factory=lambda port: ExecutionAgent(port, entry_gate=ALWAYS_PERMIT),
+        )
+
+
+# == restart-safe idempotency ================================================
+
+
+class _History:
+    """The durable read side, as the audit chain would answer it."""
+
+    def __init__(self, actions: dict[str, tuple[str, ...]] | None = None) -> None:
+        self.actions = actions or {}
+
+    def actions_for(self, decision_id: str) -> tuple[str, ...]:
+        return self.actions.get(decision_id, ())
+
+
+def test_a_restart_does_not_resubmit_a_decision_that_already_completed() -> None:
+    """The scenario in full: submit, lose the process, replay the decision."""
+    transport = PnlAwareTransport()
+    history = _History()
+
+    first_service, _, _ = _service(
+        transport=transport, authorization=_TestOnlyAuthorization(), history=history
+    )
+    first = first_service.execute(_intent())
+    assert first.stage is ExecutionStage.SUBMITTED
+    assert len(_submits(transport)) == 1
+
+    # The durable chain recorded both halves; the process now dies.
+    history.actions["decision-1"] = (
+        "EXECUTION_PRE_SUBMIT", "EXECUTION_POST_SUBMIT",
+    )
+    del first_service
+
+    # A brand-new service and a brand-new agent replay the same decision.
+    second_service, _, _ = _service(
+        transport=transport, authorization=_TestOnlyAuthorization(), history=history
+    )
+    second = second_service.execute(_intent())
+
+    assert second.stage is ExecutionStage.SUBMITTED
+    assert "already durably recorded" in second.reasons[0]
+    assert len(_submits(transport)) == 1, "at most one order, across the restart"
+
+
+def test_an_unresolved_pre_submit_after_restart_needs_reconciliation() -> None:
+    """Committed the intent, never recorded the outcome: UNKNOWN, not a retry."""
+    transport = PnlAwareTransport()
+    history = _History({"decision-1": ("EXECUTION_PRE_SUBMIT",)})
+
+    service, _, _ = _service(
+        transport=transport, authorization=_TestOnlyAuthorization(), history=history
+    )
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.NEEDS_RECONCILIATION
+    assert "never retry blindly" in evaluation.reasons[0]
+    assert _submits(transport) == []
+
+
+def test_unreadable_durable_history_blocks_rather_than_assuming_nothing_happened(
+) -> None:
+    class _Broken:
+        def actions_for(self, decision_id: str) -> tuple[str, ...]:
+            raise RuntimeError("database unreachable")
+
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), history=_Broken()
+    )
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.NEEDS_RECONCILIATION
+    assert _submits(transport) == []
+
+
+def test_no_durable_history_of_this_decision_permits_execution() -> None:
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), history=_History()
+    )
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED
+    assert len(_submits(transport)) == 1
+
+
+# == a failed commit must never be followed by a submission ==================
+
+
+def test_a_failed_audit_commit_means_zero_broker_submissions() -> None:
+    """The invariant, at its sharpest.
+
+    The sink raises the way a real COMMIT failure raises. Nothing reaches the
+    broker, because an order the system cannot prove it decided to send is an
+    order it must not send.
+    """
+    from trading_persistence.execution_audit import ExecutionAuditError
+
+    class _CommitFails:
+        def can_persist(self) -> bool:
+            return True
+
+        def persist(self, record: Mapping[str, object]) -> str:
+            raise ExecutionAuditError("decision could not be committed (OperationalError)")
+
+    service, transport, _ = _service(
+        audit=_CommitFails(),  # type: ignore[arg-type]
+        authorization=_TestOnlyAuthorization(),
+    )
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.AUDIT_UNAVAILABLE
+    assert _submits(transport) == []
+
+
+def test_an_audit_that_cannot_persist_blocks_before_anything_is_planned() -> None:
+    service, transport, _ = _service(
+        audit=_Audit(available=False), authorization=_TestOnlyAuthorization()
+    )
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.AUDIT_UNAVAILABLE
+    assert _submits(transport) == []

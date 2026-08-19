@@ -82,6 +82,7 @@ from trading_application.trading_readiness_runtime import (
     TradingReadinessRuntimeReport,
 )
 from trading_broker_core.port import (
+    BrokerCapabilityMode,
     BrokerInstrument,
     BrokerPort,
     BrokerPortError,
@@ -101,9 +102,27 @@ from trading_market_data_core.trading_readiness import (
 
 from trading_execution_agent.agent import ExecutionAgent, ExecutionOutcome, ExecutionRequest
 
+#: Chain action names, mirrored so the application layer can read its own
+#: history without importing the persistence package.
+ACTION_PRE_SUBMIT = "EXECUTION_PRE_SUBMIT"
+ACTION_POST_SUBMIT = "EXECUTION_POST_SUBMIT"
+
 EXECUTION_SERVICE_VERSION = "execution-service-1.0.0"
 
 LOGGER = logging.getLogger("trading_execution_agent.execution_service")
+
+#: The one legal pairing. A mode is a readiness axis and an environment is a
+#: deployment axis, but they are never independently chosen.
+MODE_ENVIRONMENT: Mapping[TradingMode, Environment] = {
+    TradingMode.PAPER: Environment.PAPER,
+    TradingMode.LIVE: Environment.LIVE,
+}
+
+#: Classification we could not establish. Modelled as a value rather than
+#: guessed from the candidate: an existing position's sector is not the new
+#: candidate's sector, and pretending otherwise corrupts every sector, cluster
+#: and source cap the risk engine computes.
+UNKNOWN_CLASSIFICATION = "UNKNOWN"
 
 
 class ExecutionStage(StrEnum):
@@ -115,16 +134,28 @@ class ExecutionStage(StrEnum):
     NO_QUOTE = "NO_QUOTE"
     PLAN_REFUSED = "PLAN_REFUSED"
     RISK_REFUSED = "RISK_REFUSED"
+    ACCOUNT_STATE_INCOMPLETE = "ACCOUNT_STATE_INCOMPLETE"
+    PORTFOLIO_UNCLASSIFIED = "PORTFOLIO_UNCLASSIFIED"
+    PROTECTION_UNAVAILABLE = "PROTECTION_UNAVAILABLE"
+    CONFIGURATION_INVALID = "CONFIGURATION_INVALID"
     READINESS_BLOCKED = "READINESS_BLOCKED"
     AUTHORIZATION_DENIED = "AUTHORIZATION_DENIED"
     AUDIT_UNAVAILABLE = "AUDIT_UNAVAILABLE"
     READY_NOT_AUTHORIZED = "READY_NOT_AUTHORIZED"
     SUBMITTED = "SUBMITTED"
     SUBMISSION_REFUSED = "SUBMISSION_REFUSED"
+    #: A prior attempt is durably recorded but its broker outcome is not. Never
+    #: retried blindly -- reconciliation resolves it, exactly as an UNKNOWN
+    #: broker state is resolved everywhere else in this system.
+    NEEDS_RECONCILIATION = "NEEDS_RECONCILIATION"
 
 
 class ExecutionServiceError(Exception):
     """Fail-closed execution failure."""
+
+
+class IncompleteAccountStateError(ExecutionServiceError):
+    """A fact the risk engine needs was not reported. Never substituted."""
 
 
 # -- what the caller may ask for ----------------------------------------------
@@ -200,9 +231,24 @@ class ExecutionConfig:
     allowed_currencies: tuple[str, ...] = ("USD",)
     allowed_exchanges: tuple[str, ...] = ("SMART",)
 
+    #: Refuse a decision whose existing portfolio cannot be classified. The
+    #: sector, cluster and source caps are meaningless over positions whose
+    #: sector, cluster and source are unknown, and passing them silently is
+    #: worse than refusing. Supply ``portfolio`` to satisfy this honestly.
+    require_classified_portfolio: bool = True
+
     def __post_init__(self) -> None:
         if self.stop_loss_fraction <= 0 or self.stop_loss_fraction >= 1:
             raise ExecutionServiceError("stop_loss_fraction must be within (0, 1)")
+        # Mode and environment are two names for one fact, and a configuration
+        # that disagrees with itself would evaluate PAPER readiness while acting
+        # in another environment. There is no valid mixed combination.
+        expected = MODE_ENVIRONMENT[self.mode]
+        if self.environment is not expected:
+            raise ExecutionServiceError(
+                f"mode {self.mode.value} requires environment {expected.value},"
+                f" not {self.environment.value}"
+            )
 
 
 # -- the authorization boundary -----------------------------------------------
@@ -223,6 +269,22 @@ class AuthorizationDecision:
     #: check's job, and consuming it is the execution agent's.
     pre_submit: object | None = None
     authorization: object | None = None
+
+
+@runtime_checkable
+class DurableExecutionHistory(Protocol):
+    """What the durable audit knows about a decision, across restarts.
+
+    In-process idempotency dies with the process. The agent's outcome map and
+    the adapter's client-order map are both memory, so a crash between submit
+    and acknowledgement leaves a system that has forgotten it ever acted — and
+    a replayed decision would submit a second time.
+
+    The durable chain already records every PRE_SUBMIT and POST_SUBMIT, so it
+    can answer that question after a restart. This is the read side of it.
+    """
+
+    def actions_for(self, decision_id: str) -> tuple[str, ...]: ...
 
 
 @runtime_checkable
@@ -301,10 +363,32 @@ class DecisionRiskRegistry:
         self._results[(client_order_id, symbol)] = result
 
     def risk_result_for(self, intent: OrderIntent) -> RiskResult | None:
-        return self._results.get((intent.client_order_id, intent.symbol))
+        """The result for THIS order, and only if the order still matches it.
+
+        Identity alone is not enough. The final ``OrderIntent.quantity`` comes
+        from the authorization, not from the risk engine, so an authority that
+        minted 10 against an approval of 1 would otherwise sail through a gate
+        that only checks ``approved_quantity > 0``. The size is bound here, at
+        the last boundary before submission: an order larger than the engine
+        approved is not this decision's order, and gets nothing.
+        """
+        result = self._results.get((intent.client_order_id, intent.symbol))
+        if result is None:
+            return None
+        if intent.quantity > result.approved_quantity:
+            return None
+        return result
 
 
 # -- observations -------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerProtectionCapability:
+    """Whether the broker can hold protection for a new entry, and why not."""
+
+    can_protect: bool
+    detail: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +506,7 @@ class ExecutionService:
         authorization: ExecutionAuthorization | None = None,
         universe: Callable[[], ConstituentSnapshot | None] | None = None,
         portfolio: Callable[[], tuple[PositionExposure, ...]] | None = None,
+        history: DurableExecutionHistory | None = None,
         universe_status: Callable[[], UniverseListStatus | None] | None = None,
         halts: Callable[[], Sequence[HaltRecord]] | None = None,
         now: Callable[[], datetime] | None = None,
@@ -431,6 +516,17 @@ class ExecutionService:
         self._audit = audit
         self._risk_engine = risk_engine
         self._config = config
+        # The configuration names a policy and the engine holds one. If they
+        # disagree, every limit reported in the audit belongs to a policy that
+        # was never applied.
+        engine_policy = getattr(risk_engine, "_policy", None)
+        engine_version = getattr(engine_policy, "policy_version", None)
+        if engine_version is not None and engine_version != config.risk_policy.policy_version:
+            raise ExecutionServiceError(
+                f"risk policy mismatch: configuration declares"
+                f" {config.risk_policy.policy_version!r} but the engine applies"
+                f" {engine_version!r}"
+            )
         self._agent_factory = agent_factory
         # DENY unless something explicitly says otherwise, and nothing in
         # production does.
@@ -460,6 +556,8 @@ class ExecutionService:
         #: Authoritative open-risk view when one exists; otherwise the estimate
         #: below is used and is documented as an estimate.
         self._portfolio = portfolio
+        #: Survives a restart, unlike the agent's in-memory outcome map.
+        self._history = history
         self._universe_status = universe_status
         self._halts = halts or (lambda: ())
         self._now = now or (lambda: datetime.now(tz=UTC))
@@ -480,6 +578,10 @@ class ExecutionService:
         Named so it cannot be mistaken for a probe. It still cannot submit
         without an authority that says yes, and the production authority says no.
         """
+        durable = self._durable_verdict(intent)
+        if durable is not None:
+            return durable
+
         settled = self._agent.outcome_for(intent.client_order_id)
         if settled is not None:
             # Idempotency FIRST. Re-planning a decision the broker has already
@@ -583,8 +685,25 @@ class ExecutionService:
                 universe_status=universe_status,
             )
 
+        unclassified = self._unclassified_positions()
+        if unclassified and self._config.require_classified_portfolio:
+            return self._refuse(
+                intent, ExecutionStage.PORTFOLIO_UNCLASSIFIED,
+                f"{len(unclassified)} open position(s) have no sector/cluster/source"
+                " classification, so the sector, cluster and source risk caps"
+                " cannot be evaluated; supply a portfolio authority",
+                instrument=instrument, quote=quote, entry_price=entry_price,
+                stop_price=stop_price, universe_status=universe_status,
+            )
+
         try:
             risk_result = self._evaluate_risk(intent, entry_price, stop_price)
+        except IncompleteAccountStateError as error:
+            return self._refuse(
+                intent, ExecutionStage.ACCOUNT_STATE_INCOMPLETE, str(error),
+                instrument=instrument, quote=quote, entry_price=entry_price,
+                stop_price=stop_price, universe_status=universe_status,
+            )
         except (RiskEngineError, BrokerPortError) as error:
             return self._refuse(
                 intent, ExecutionStage.RISK_REFUSED,
@@ -617,6 +736,19 @@ class ExecutionService:
                 intent, ExecutionStage.RISK_REFUSED,
                 f"approved quantity {approved} exceeds the requested"
                 f" {intent.requested_quantity}; refusing to size upward",
+                instrument=instrument, quote=quote, entry_price=entry_price,
+                stop_price=stop_price, risk_result=risk_result,
+                universe_status=universe_status,
+            )
+
+        protection = self._protection_state()
+        if self._config.protection_required and not protection.can_protect:
+            # FAIL CLOSED. The entry would rest at the broker with nothing
+            # protecting it, and "we will place the stop right after" is not a
+            # protection mechanism -- it is a window with unbounded exposure in
+            # it. See ADR-0018 and the note on IBKR paper capabilities.
+            return self._refuse(
+                intent, ExecutionStage.PROTECTION_UNAVAILABLE, protection.detail,
                 instrument=instrument, quote=quote, entry_price=entry_price,
                 stop_price=stop_price, risk_result=risk_result,
                 universe_status=universe_status,
@@ -663,6 +795,71 @@ class ExecutionService:
             intent_mode=self._config.mode.value,
         )
         return self._audit_evaluation(evaluation)
+
+    def _durable_verdict(self, intent: ExecutionIntent) -> ExecutionEvaluation | None:
+        """What the durable record says about this decision. None = no history.
+
+        Three answers matter, and only one of them permits continuing:
+
+        * a POST_SUBMIT exists -> this decision already reached a terminal
+          broker outcome. Return it; never submit again.
+        * a PRE_SUBMIT exists with no POST_SUBMIT -> we committed the intent to
+          act and never recorded what happened. The broker may or may not hold
+          the order. That is precisely the UNKNOWN state this system resolves by
+          RECONCILIATION and never by a blind retry.
+        * nothing recorded -> no prior submit occurred, and execution may
+          proceed.
+        """
+        if self._history is None:
+            return None
+        try:
+            actions = self._history.actions_for(intent.decision_id)
+        except Exception as error:  # noqa: BLE001 - unknown history blocks
+            return self._bare(
+                intent,
+                ExecutionStage.NEEDS_RECONCILIATION,
+                (
+                    f"durable execution history is unreadable"
+                    f" ({type(error).__name__}); refusing to act without knowing"
+                    " whether this decision already submitted",
+                ),
+            )
+        if not actions:
+            return None
+        if ACTION_POST_SUBMIT in actions:
+            LOGGER.info(
+                "durable history shows a terminal outcome; not submitting again",
+                extra=self._context(intent, stage="DURABLE_REPLAY"),
+            )
+            return self._bare(
+                intent,
+                ExecutionStage.SUBMITTED,
+                (
+                    "a terminal broker outcome for this decision is already"
+                    " durably recorded; returning it rather than submitting again",
+                ),
+            )
+        LOGGER.info(
+            "durable history shows an unresolved pre-submit; reconcile first",
+            extra=self._context(intent, stage="NEEDS_RECONCILIATION"),
+        )
+        return self._bare(
+            intent,
+            ExecutionStage.NEEDS_RECONCILIATION,
+            (
+                "a pre-submit record exists for this decision with no recorded"
+                " broker outcome; the broker may already hold this order."
+                " Reconcile before any further attempt -- never retry blindly.",
+            ),
+        )
+
+    def _bare(
+        self, intent: ExecutionIntent, stage: ExecutionStage, reasons: tuple[str, ...]
+    ) -> ExecutionEvaluation:
+        return ExecutionEvaluation(
+            intent=intent, stage=stage, reasons=reasons,
+            evaluated_at=self._now(), intent_mode=self._config.mode.value,
+        )
 
     # -- submission -----------------------------------------------------------
 
@@ -780,10 +977,18 @@ class ExecutionService:
     ) -> RiskResult:
         """Invoke the REAL engine with REAL account state for THIS decision."""
         snapshot = self._broker.get_account_snapshot(self._config.account_alias)
+        if snapshot.session_pnl is None:
+            # The risk engine computes the daily soft and hard halts from this.
+            # Substituting zero would present an account that lost money today
+            # as flat, and silently disable both halts.
+            raise IncompleteAccountStateError(
+                "the broker reported no session P&L; the daily halt limits"
+                " cannot be evaluated and UNKNOWN is not zero"
+            )
         account = AccountState(
             broker_net_liquidation_value=snapshot.net_liquidation_value,
             simulation_equity_cap=self._config.simulation_equity_cap,
-            session_pnl=Decimal(0),
+            session_pnl=snapshot.session_pnl,
             open_positions=self._open_positions(intent),
             observed_at=snapshot.observed_at,
         )
@@ -806,27 +1011,93 @@ class ExecutionService:
             as_of=self._now(),
         )
 
+    def _protection_state(self) -> BrokerProtectionCapability:
+        """Can the broker actually hold protection for a NEW entry?
+
+        A supported STOP *order type* proves nothing: it says the broker would
+        accept a stop order if one were sent, not that one will exist. The entry
+        this service builds is a single LIMIT order that happens to carry a stop
+        price, and the IBKR adapter maps that stop price to the order's aux
+        price -- one order, no resting protection behind it.
+
+        Real protection for a brand-new position requires the broker to
+        establish it ATOMICALLY with the entry: a native bracket or OCA. The
+        IBKR paper adapter declares both UNSUPPORTED (deliberately -- it has no
+        bracket wiring, and it refuses to claim NATIVE by promise), so a
+        protected entry is not currently possible through it and this returns
+        False. That is a real blocker, and reporting it is the point.
+        """
+        try:
+            capabilities = self._broker.capabilities()
+        except Exception as error:  # noqa: BLE001
+            return BrokerProtectionCapability(
+                False, f"broker capabilities unavailable ({type(error).__name__})"
+            )
+        atomic = {
+            "bracket": capabilities.bracket,
+            "oco": capabilities.oco,
+        }
+        supported = [
+            name
+            for name, mode in atomic.items()
+            if mode is BrokerCapabilityMode.NATIVE
+        ]
+        if supported:
+            return BrokerProtectionCapability(
+                True, f"broker can establish protection atomically via {supported}"
+            )
+        return BrokerProtectionCapability(
+            False,
+            "the broker cannot establish protection atomically with the entry"
+            f" (bracket={capabilities.bracket.value}, oco={capabilities.oco.value});"
+            " a supported STOP order TYPE is not a resting protective order, and"
+            " submitting an unprotected entry is refused",
+        )
+
     def _open_positions(self, intent: ExecutionIntent) -> tuple[PositionExposure, ...]:
-        """Existing exposure, from the authoritative source when there is one."""
+        """Existing exposure, from the authoritative source when there is one.
+
+        Without that authority the broker port gives a symbol, a quantity and an
+        average price — and nothing about sector, cluster, source or owning
+        strategy. Those are therefore ``UNKNOWN``, explicitly.
+
+        They are emphatically NOT the candidate's. Labelling every open position
+        with the new decision's sector and source would corrupt the sector cap,
+        the cluster cap, the source-risk cap and strategy attribution all at
+        once, in whichever direction happened to be wrong. An unknown
+        classification is refused by default (see
+        ``require_classified_portfolio``) rather than guessed.
+
+        The open-risk AMOUNT remains an explicit estimate (ADR-0018): the port
+        carries no protective stop for an existing position, so it is assumed to
+        be protected at the same distance this system enforces on new entries.
+        """
         if self._portfolio is not None:
             return self._portfolio()
         fraction = self._config.assumed_open_risk_fraction or self._config.stop_loss_fraction
         return tuple(
             PositionExposure(
                 symbol=position.symbol,
-                sector=self._config.sector,
-                cluster=self._config.cluster,
-                source_id=intent.source_id,
-                strategy_id=intent.strategy_id,
-                # ESTIMATE, and labelled as one: the port carries no stop for an
-                # existing position, so open risk is assumed to be the same
-                # fraction of notional this system enforces on new entries.
+                sector=UNKNOWN_CLASSIFICATION,
+                cluster=UNKNOWN_CLASSIFICATION,
+                source_id=UNKNOWN_CLASSIFICATION,
+                strategy_id=UNKNOWN_CLASSIFICATION,
                 open_risk_amount=(
                     abs(position.quantity * position.average_price) * fraction
                 ),
                 notional=abs(position.quantity * position.average_price),
             )
             for position in self._broker.get_positions(self._config.account_alias)
+        )
+
+    def _unclassified_positions(self) -> tuple[str, ...]:
+        """Symbols whose classification we cannot establish. Empty is good."""
+        if self._portfolio is not None:
+            return ()
+        return tuple(
+            position.symbol
+            for position in self._broker.get_positions(self._config.account_alias)
+            if position.quantity != 0
         )
 
     def _universe_refusal(
@@ -941,7 +1212,12 @@ def _with(evaluation: ExecutionEvaluation, **changes: object) -> ExecutionEvalua
 __all__ = [
     "EXECUTION_SERVICE_VERSION",
     "AuthorizationDecision",
+    "ACTION_POST_SUBMIT",
+    "ACTION_PRE_SUBMIT",
+    "BrokerProtectionCapability",
     "DecisionRiskRegistry",
+    "DurableExecutionHistory",
+    "IncompleteAccountStateError",
     "DecisionScopedRiskSource",
     "DenyAllExecutionAuthorization",
     "ExecutionAuthorization",
