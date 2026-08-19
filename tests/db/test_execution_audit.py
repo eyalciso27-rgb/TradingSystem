@@ -120,33 +120,30 @@ def test_the_stored_payload_reconstructs_the_decision(
 def test_the_record_survives_a_new_connection(
     engine: Engine, objects: FilesystemObjectStorage
 ) -> None:
-    """Durability, stated plainly: a different connection still finds it."""
-    written = engine.connect()
-    transaction = written.begin()
-    try:
+    """Durability, stated plainly: a different connection still finds it.
+
+    This test commits, and deliberately does NOT clean up after itself. The
+    chain is append-only and hash-linked, so deleting the row afterwards would
+    not tidy anything — it would break the linkage for every record that came
+    after it, which is precisely the tampering the chain exists to detect.
+    One extra audit row in an ephemeral CI database is the correct cost.
+    """
+    with engine.begin() as written:
         DurableExecutionAuditSink(
             written, objects, environment=Environment.PAPER
         ).persist(_record(decision_id="decision-durable"))
-        transaction.commit()
-    except Exception:  # pragma: no cover - only on a broken commit
-        transaction.rollback()
-        raise
-    finally:
-        written.close()
 
-    reader = engine.connect()
-    try:
+    with engine.connect() as reader:
         rows = load_decision_records(reader, "decision-durable")
-        assert rows, "a committed decision must outlive the connection that wrote it"
-    finally:
-        # Leave the database as we found it: this test commits deliberately.
-        cleanup = reader.begin()
-        from sqlalchemy import delete
-        from trading_persistence.models import AuditEvent
 
-        reader.execute(delete(AuditEvent).where(AuditEvent.target_ref == "decision-durable"))
-        cleanup.commit()
-        reader.close()
+    assert rows, "a committed decision must outlive the connection that wrote it"
+    assert rows[0][0] == ACTION_PRE_SUBMIT
+
+
+def test_the_chain_still_verifies_after_a_committed_record(engine: Engine) -> None:
+    """And the committed row above left the chain intact."""
+    with engine.connect() as reader:
+        assert verify_audit_chain(reader) == []
 
 
 # == pre and post are two records, never one ===================================
