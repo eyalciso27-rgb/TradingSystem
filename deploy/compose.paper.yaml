@@ -21,14 +21,32 @@ services:
       # lives in a versioned subdirectory, enabling pg_upgrade --link).
       - pg-data-paper:/var/lib/postgresql
 
-  # The scheduler runs in PAPER with its own volume, sharing no universe
-  # history with dev/test. Start it with `--profile apps` (see deploy/README.md);
-  # without it the monthly refresh does not happen automatically.
+  # The scheduler process (apps/scheduler): startup maintenance, then a tick
+  # every TRADING_SCHEDULER_TICK_HOURS for the life of the container. THIS is
+  # what makes the monthly S&P 500 universe refresh automatic.
+  #
+  # It is an ordinary service of the PAPER stack, with no profile and no extra
+  # flag, because the whole point is that the owner never has to remember it.
+  # Normal paper startup starts it.
   scheduler:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.scheduler
     environment:
       TRADING_MODE: PAPER
+      TRADING_UNIVERSE_ROOT: /data/sp500-current
+      TRADING_SCHEDULER_TICK_HOURS: ${TRADING_SCHEDULER_TICK_HOURS:-6}
+      TRADING_LOG_LEVEL: ${TRADING_LOG_LEVEL:-INFO}
+    # Its own volume: the snapshot history survives host and container restarts
+    # and is never shared with dev/test.
     volumes:
       - universe-data-paper:/data/sp500-current
+    # Comes back after a crash, a daemon restart or a host reboot -- an
+    # automatic refresh that stops at the first reboot is not automatic.
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks:
+      - trading
 
   nats:
     volumes:

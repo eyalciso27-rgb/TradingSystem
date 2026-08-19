@@ -5,15 +5,44 @@ ARM64; local development stays portable, including Windows x64).
 
 | File | Stack | Ports | Volumes |
 |---|---|---|---|
-| `compose.yaml` | base + ephemeral test/CI | none published | none (ephemeral) |
+| `compose.yaml` | base + ephemeral test/CI (infrastructure only) | none published | none (ephemeral) |
 | `compose.dev.yaml` | development override | 127.0.0.1 only (5432, 4222, 8222) | `pg-data-dev`, `nats-data-dev`, `universe-data-dev` |
 | `compose.paper.yaml` | PAPER override | none published | `pg-data-paper`, `nats-data-paper`, `universe-data-paper` |
 | `compose.observability.yaml` | metrics/logs stack (ADR-010) | Grafana on 127.0.0.1:3000 only | `prometheus-data`, `alertmanager-data`, `loki-data`, `alloy-data`, `grafana-data` |
 
+## Starting the system
+
+There is exactly ONE normal startup command per environment. Each one starts
+everything that environment needs, including the scheduler — no profile, no
+extra flag, nothing to remember:
+
+```sh
+# PAPER — the canonical deployment (credentials from the PAPER secret store)
+docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml up -d
+```
+
+```sh
+# PAPER with observability (mandatory from Paper Manual onward)
+docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml \
+               -f deploy/compose.observability.yaml up -d
+```
+
+```sh
+# development
+docker compose -f deploy/compose.yaml -f deploy/compose.dev.yaml up -d
+```
+
+The base stack on its own is the ephemeral test/CI stack. It is deliberately
+infrastructure-only: no application services, so a CI stack starts nothing that
+would reach the network by itself. Application services live in the environment
+overrides, which is precisely what makes them start automatically for anyone
+running dev or paper the normal way.
+
 Services: `postgres` (postgres:18, ADR-006) and `nats` (nats:2.10-alpine with
 JetStream, ADR-007) — both official multi-arch images (amd64 + arm64), both
-healthchecked. The remaining application services (api/worker/connectors/
-execution-agent/dashboard) join once their canonical Dockerfiles exist.
+healthchecked — plus `scheduler` in dev and paper. The remaining application
+services (api/worker/connectors/execution-agent/dashboard) join once their
+canonical Dockerfiles exist.
 
 ### `scheduler` — the automatic monthly universe refresh
 
@@ -25,13 +54,12 @@ when the ~30-day interval has genuinely elapsed. **This process is what makes
 the refresh automatic.** The `sp500-universe` CLI remains a diagnostic and
 manual override; it is not how the monthly refresh normally happens.
 
-It sits behind the `apps` Compose profile, so an ephemeral test/CI `up` still
-starts infrastructure only. Paper and Live must start it explicitly:
-
-```sh
-docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml \
-               --profile apps up -d
-```
+**No monthly owner action is required.** The scheduler is an ordinary service
+of the dev and paper stacks, so the canonical paper startup above starts it;
+`restart: unless-stopped` brings it back after a crash, a daemon restart or a
+host reboot; and because overdue is simply due, a process that was down when the
+refresh came due refreshes on its next boot. `deploy/compose.yaml` alone does
+not include it, which keeps the test/CI stack infrastructure-only.
 
 **The free source has not yet been exercised against the real endpoint from
 this repository's CI, which is offline by design.** To verify it on the owner
@@ -65,16 +93,6 @@ else stays on the internal `trading-observability` network. Grafana admin
 credentials are required at runtime (no defaults). Operational logs
 (Loki), metrics (Prometheus) and traces (OpenTelemetry) stay separate from
 the tamper-evident audit trail in PostgreSQL, which they never replace.
-
-```sh
-# development
-docker compose -f deploy/compose.yaml -f deploy/compose.dev.yaml up -d
-# paper (credentials from the PAPER secret store, never shared with dev)
-docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml up -d
-# with observability (mandatory from Paper Manual onward)
-docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml \
-               -f deploy/compose.observability.yaml up -d
-```
 
 Rules baked in: no credentials or defaults in the files (`:?` fails closed);
 PAPER uses its own `PAPER_*` variables, network (`trading-paper`) and volumes,
