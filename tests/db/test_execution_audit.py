@@ -26,8 +26,9 @@ from sqlalchemy.pool import QueuePool
 from trading_contracts.enums import Environment
 from trading_persistence.audit import verify_audit_chain
 from trading_persistence.execution_audit import (
-    ACTION_POST_SUBMIT,
-    ACTION_PRE_SUBMIT,
+    ACTION_EVALUATED,
+    ACTION_OUTCOME,
+    ACTION_SUBMIT_PREPARED,
     DurableExecutionAuditSink,
     ExecutionAuditError,
     canonical_payload,
@@ -116,7 +117,7 @@ def test_a_pre_submit_record_is_visible_from_a_brand_new_connection(
     with engine.connect() as fresh:
         rows = load_decision_records(fresh, decision_id)
 
-    assert [row[0] for row in rows] == [ACTION_PRE_SUBMIT]
+    assert [row[0] for row in rows] == [ACTION_EVALUATED]
     payload_ref = rows[0][2]
     assert payload_ref is not None
     assert objects.exists(payload_ref), "the full record is retrievable"
@@ -168,6 +169,51 @@ def test_the_chain_still_verifies_after_committed_records(engine: Engine) -> Non
 # == pre and post are two records, never one ===================================
 
 
+def test_the_prepared_marker_is_its_own_lifecycle_action(
+    sink: DurableExecutionAuditSink, engine: Engine, decision_id: str
+) -> None:
+    """An evaluation and a point-of-no-return are not the same record.
+
+    Recording every evaluation as "pre-submit" meant a decision refused long
+    before submission replayed, after a restart, as "the broker may hold this
+    order". Only the PREPARED marker carries that meaning.
+    """
+    sink.persist(_record(decision_id=decision_id, stage="RISK_REFUSED"))
+    sink.persist_prepared(_record(decision_id=decision_id))
+    sink.persist_outcome(
+        _record(decision_id=decision_id, submission_outcome="SUBMITTED")
+    )
+
+    with engine.connect() as fresh:
+        actions = [row[0] for row in load_decision_records(fresh, decision_id)]
+
+    assert actions == [ACTION_EVALUATED, ACTION_SUBMIT_PREPARED, ACTION_OUTCOME]
+
+
+def test_the_history_reader_reconstructs_the_stored_payload(
+    engine: Engine, objects: FilesystemObjectStorage, decision_id: str
+) -> None:
+    """A terminal record may say REFUSED as easily as SUBMITTED."""
+    from trading_persistence.execution_audit import DurableExecutionHistoryReader
+
+    sink = DurableExecutionAuditSink(engine, objects, environment=Environment.PAPER)
+    sink.persist_prepared(_record(decision_id=decision_id))
+    sink.persist_outcome(
+        _record(
+            decision_id=decision_id, stage="SUBMISSION_REFUSED",
+            submission_outcome="FAILED",
+        )
+    )
+
+    records = DurableExecutionHistoryReader(engine, objects).records_for(decision_id)
+
+    assert [record.action for record in records] == [
+        ACTION_SUBMIT_PREPARED, ACTION_OUTCOME
+    ]
+    assert records[-1].payload["submission_outcome"] == "FAILED"
+    assert records[-1].payload["stage"] == "SUBMISSION_REFUSED"
+
+
 def test_the_post_submit_record_is_appended_beside_the_pre_submit_one(
     sink: DurableExecutionAuditSink, engine: Engine, decision_id: str
 ) -> None:
@@ -179,7 +225,7 @@ def test_the_post_submit_record_is_appended_beside_the_pre_submit_one(
 
     with engine.connect() as fresh:
         rows = load_decision_records(fresh, decision_id)
-    assert [row[0] for row in rows] == [ACTION_PRE_SUBMIT, ACTION_POST_SUBMIT]
+    assert [row[0] for row in rows] == [ACTION_EVALUATED, ACTION_OUTCOME]
     assert rows[0][1] != rows[1][1], "two distinct chained records"
 
 
