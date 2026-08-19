@@ -86,10 +86,10 @@ PAPER_API_PORT = 4002
 LIVE_API_PORT = 4001
 PAPER_ACCOUNT_PREFIX = "DU"
 
-#: Account-summary key carrying the broker's SESSION (daily) P&L, when one is
-#: served. Absent from the tags this adapter requests today, so the value is
-#: normally missing -- which is reported as missing, never as zero.
-DAILY_PNL_TAG = "DailyPnL"
+#: How long to wait for the ``reqPnL`` subscription's first update before
+#: calling the daily P&L unknown. Short: a trading decision cannot wait, and a
+#: slow answer is not a better answer than an honest "unknown".
+SESSION_PNL_TIMEOUT_SECONDS = 5.0
 DEFAULT_CLIENT_ID = 1
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
@@ -552,6 +552,25 @@ class PaperTransport(Protocol):
 
     def account_summary(self, account_id: str) -> Mapping[str, Decimal]: ...
 
+    def session_pnl(self, account_id: str) -> Decimal | None:
+        """The account's DAILY P&L, or None when the gateway will not say.
+
+        A distinct operation rather than an account-summary tag, because IBKR's
+        ``reqAccountSummary`` genuinely does not carry a daily figure: the daily
+        number comes from the separate ``reqPnL`` subscription, and inventing a
+        ``DailyPnL`` summary key would have described a feed that does not
+        exist.
+
+        ``None`` means unknown -- a missing subscription, a timeout, an error.
+        It is never zero, because the risk engine computes both daily halt
+        limits from this and a zero would silently disable them.
+
+        Cumulative realized/unrealized totals are a different fact and are
+        deliberately not returned here; a cumulative number presented as a daily
+        one is the same fabrication wearing a different hat.
+        """
+        ...
+
     def positions(self, account_id: str) -> tuple[BrokerPosition, ...]: ...
 
     def open_order_snapshot(self, account_id: str) -> tuple[RawOpenOrder, ...]:
@@ -743,13 +762,11 @@ class IbkrPaperAdapter:
                 net_liquidation_value=values["NetLiquidation"],
                 cash=values["TotalCashValue"],
                 buying_power=values["BuyingPower"],
-                # Reported ONLY if the gateway actually served a daily P&L tag.
-                # IBKR's account summary has no canonical session-P&L tag (the
-                # daily figure comes from a separate reqPnL subscription, which
-                # this adapter does not yet hold), so on a live gateway this is
-                # normally None -- and None fails a trading decision closed
-                # rather than pretending the day is flat.
-                session_pnl=values.get(DAILY_PNL_TAG),
+                # From the transport's own daily-P&L operation (reqPnL), never
+                # from an account-summary tag: IBKR's summary carries no daily
+                # figure. Unknown stays None, and None fails a trading decision
+                # closed rather than pretending the day is flat.
+                session_pnl=self._session_pnl(transport, account_id),
                 observed_at=self._now(),
             )
         except KeyError as missing:
@@ -757,6 +774,24 @@ class IbkrPaperAdapter:
                 BrokerErrorCode.UNKNOWN_BROKER_RESPONSE,
                 f"account summary missing tag {missing}; failing closed",
             ) from missing
+
+    @staticmethod
+    def _session_pnl(transport: PaperTransport, account_id: str) -> Decimal | None:
+        """Ask for the daily P&L. Any failure is UNKNOWN, never zero.
+
+        A subscription that is missing, slow or erroring is indistinguishable
+        from a flat day if the failure is swallowed as a number, so it is
+        swallowed as ``None`` instead.
+        """
+        try:
+            value = transport.session_pnl(account_id)
+        except Exception:  # noqa: BLE001 - any failure means UNKNOWN
+            return None
+        if value is None:
+            return None
+        if not value.is_finite():
+            return None
+        return value
 
     def get_positions(self, account_alias: str) -> tuple[BrokerPosition, ...]:
         transport = self._require_connected()
@@ -1174,6 +1209,7 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
     turned a real cancellation into a false timeout.
     """
     import threading
+    import time
 
     try:
         from ibapi.client import EClient  # type: ignore[import-not-found]
@@ -1246,6 +1282,22 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
 
         def accountSummaryEnd(self, req_id: int) -> None:  # noqa: N802
             self.router.publish(request_stream(req_id), "account_end", req_id)
+
+        def pnl(  # noqa: N802
+            self,
+            req_id: int,
+            daily_pnl: float,
+            unrealized_pnl: float,
+            realized_pnl: float,
+        ) -> None:
+            """``reqPnL`` update. ONLY the daily figure is forwarded.
+
+            IBKR sends all three on the same callback, and the unrealized and
+            realized numbers are CUMULATIVE. Forwarding them here would invite
+            exactly the substitution this whole path exists to prevent, so the
+            daily value travels alone.
+            """
+            self.router.publish(request_stream(req_id), "pnl", daily_pnl)
 
         def position(  # noqa: N802
             self, account: str, contract: object, position: object, avg_cost: float
@@ -1409,6 +1461,55 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                 if account == account_id:
                     values[tag] = Decimal(value)
             return values
+
+        def session_pnl(self, account_id: str) -> Decimal | None:
+            """Daily P&L via the canonical ``reqPnL`` subscription.
+
+            This is a subscription, not a request/response: there is no "end"
+            callback, so the first update is taken and the subscription is
+            cancelled immediately. No update inside the timeout means the
+            gateway is not serving one -- typically no P&L permission on the
+            account -- and the honest answer is None.
+
+            A ``nan`` daily value (IBKR's "not available" for a float field) is
+            also None. It is never zero.
+            """
+            req_id = self._next_request_id()
+            try:
+                self._app.reqPnL(req_id, account_id, "")
+            except Exception:  # noqa: BLE001 - unsupported/unavailable => UNKNOWN
+                return None
+            payload: object = None
+            try:
+                deadline = time.monotonic() + SESSION_PNL_TIMEOUT_SECONDS
+                while payload is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    envelope = self._app.router.take(
+                        request_stream(req_id), timeout=remaining
+                    )
+                    if envelope is None:
+                        break
+                    if envelope.kind == "pnl":
+                        payload = envelope.payload
+                    # Any other envelope on this stream (an error, a farm
+                    # notice) simply is not a daily P&L; keep waiting rather
+                    # than mistaking it for one.
+            except Exception:  # noqa: BLE001 - transport failure => UNKNOWN
+                payload = None
+            finally:
+                try:
+                    self._app.cancelPnL(req_id)
+                except Exception:  # noqa: BLE001 - best-effort unsubscribe
+                    pass
+            if payload is None:
+                return None
+            try:
+                value = Decimal(str(payload))
+            except (ArithmeticError, ValueError):
+                return None
+            return value if value.is_finite() else None
 
         def positions(self, account_id: str) -> tuple[BrokerPosition, ...]:
             self._app.reqPositions()
@@ -1636,7 +1737,7 @@ __all__ = [
     "IbkrPaperAdapter",
     "OrderRefTooLongError",
     "OutgoingOrder",
-    "DAILY_PNL_TAG",
+    "SESSION_PNL_TIMEOUT_SECONDS",
     "PaperTransport",
     "RawOpenOrder",
     "RecoveredIdentity",

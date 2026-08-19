@@ -20,7 +20,7 @@ Offline and deterministic: no ibapi, no socket, no network, no real order.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -28,14 +28,23 @@ from uuid import UUID
 import pytest
 from trading_application.decision_engine import DecisionExplanation, EngineDecision
 from trading_application.emergency import HaltRecord
-from trading_application.risk_engine import PositionExposure, RiskEngine, RiskPolicy
+from trading_application.pre_submit_check import (
+    PreSubmitCheckResult,
+    SingleUseAuthorization,
+)
+from trading_application.risk_engine import PositionExposure, RiskEngine, RiskPolicy, RiskResult
 from trading_application.trading_readiness_runtime import (
     MarketDataRules,
     MarketDataState,
     QuoteState,
 )
-from trading_broker_core.port import BrokerCapabilityMode, OrderIntent, OrderSide
-from trading_broker_ibkr.paper_adapter import DAILY_PNL_TAG, IbkrPaperAdapter
+from trading_broker_core.port import (
+    BrokerCapabilities,
+    BrokerCapabilityMode,
+    OrderIntent,
+    OrderSide,
+)
+from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter
 from trading_contracts.decision import DecisionResult
 from trading_contracts.enums import (
     ActionTier,
@@ -47,8 +56,10 @@ from trading_contracts.enums import (
 from trading_execution_agent.agent import ExecutionAgent, ExecutionStatus
 from trading_execution_agent.execution_service import (
     AuthorizationDecision,
+    DecisionRiskRegistry,
     DenyAllExecutionAuthorization,
     ExecutionConfig,
+    ExecutionFingerprint,
     ExecutionIntent,
     ExecutionService,
     ExecutionServiceError,
@@ -63,7 +74,11 @@ from trading_market_data_core.trading_readiness import (
     UniverseType,
 )
 
-from tests.broker.test_ibkr_paper_adapter import ALIASES, FakePaperTransport
+from tests.broker.test_ibkr_paper_adapter import (
+    ALIASES,
+    PAPER_ACCOUNT,
+    FakePaperTransport,
+)
 
 ADAPTER_NOW = datetime(2026, 8, 19, 15, 30, tzinfo=UTC)
 NOW = ADAPTER_NOW + timedelta(seconds=2)
@@ -172,9 +187,10 @@ class _TestOnlyAuthorization:
         self.calls += 1
         if not self._allowed:
             return AuthorizationDecision(allowed=False, reason="test denial")
-        pre_submit, authorization = (
-            _authorization(self._quantity) if self._mint else (None, None)
-        )
+        pre_submit: PreSubmitCheckResult | None = None
+        authorization: SingleUseAuthorization | None = None
+        if self._mint:
+            pre_submit, authorization = _authorization(self._quantity)
         return AuthorizationDecision(
             allowed=True,
             reason="test-only authorization",
@@ -183,14 +199,30 @@ class _TestOnlyAuthorization:
         )
 
 
-def _authorization(quantity: Decimal = Decimal("1")) -> tuple[object, object]:
+def _risk_refs() -> tuple[str, str]:
+    """The refs the REAL risk engine emits for this decision and policy.
+
+    An authorization has to be about the decision it authorizes, so a test seam
+    that minted arbitrary refs would be testing nothing -- the binding check
+    would reject it, correctly.
+    """
+    decision = _decision().result
+    return (
+        f"decision:{decision.decision_id}@{decision.decision_hash}",
+        f"risk-policy:{POLICY.policy_version}",
+    )
+
+
+def _authorization(
+    quantity: Decimal = Decimal("1"),
+) -> tuple[PreSubmitCheckResult, SingleUseAuthorization]:
     """Mint a canonical single-use authorization through its real types."""
     from trading_application.pre_submit_check import (
         PreSubmitAction,
-        PreSubmitCheckResult,
-        SingleUseAuthorization,
         SubmitAuthorization,
     )
+
+    decision_ref, policy_ref = _risk_refs()
 
     submit = SubmitAuthorization(
         candidate_id="candidate-1",
@@ -205,8 +237,8 @@ def _authorization(quantity: Decimal = Decimal("1")) -> tuple[object, object]:
         authorization=submit,
         allocation_ref="allocation-1",
         risk_ref="risk-1",
-        decision_ref="decision-1",
-        policy_ref="policy-1",
+        decision_ref=decision_ref,
+        policy_ref=policy_ref,
         checks=(),
         reason_codes=("TEST_ONLY",),
         input_refs=(),
@@ -214,24 +246,17 @@ def _authorization(quantity: Decimal = Decimal("1")) -> tuple[object, object]:
     return result, SingleUseAuthorization(submit)
 
 
-class PnlAwareTransport(FakePaperTransport):
-    """The real fake transport, plus the daily P&L a gateway may serve.
+def PnlAwareTransport(  # noqa: N802 - a factory named like the type it makes
+    *, daily_pnl: Decimal | None = Decimal("0"), **kw: object
+) -> FakePaperTransport:
+    """The canonical fake transport with a daily P&L configured.
 
-    ``AccountSnapshot.session_pnl`` is explicitly nullable and the base
-    transport reports none, which is the honest default. This subclass supplies
-    one so the daily-halt limits can actually be exercised — and omitting it
-    exercises the case where they cannot.
+    Not a subclass and not a richer shape: ``session_pnl`` is a real
+    ``PaperTransport`` operation that the production SDK transport implements
+    through ``reqPnL``, so the fake answers the same operation. Its default is
+    ``None`` -- the honest common case, where the gateway serves no daily figure.
     """
-
-    def __init__(self, *, daily_pnl: Decimal | None = Decimal("0"), **kw: object) -> None:
-        super().__init__(**kw)  # type: ignore[arg-type]
-        self.daily_pnl = daily_pnl
-
-    def account_summary(self, account_id: str) -> Mapping[str, Decimal]:
-        values = dict(super().account_summary(account_id))
-        if self.daily_pnl is not None:
-            values[DAILY_PNL_TAG] = self.daily_pnl
-        return values
+    return FakePaperTransport(daily_pnl=daily_pnl, **kw)  # type: ignore[arg-type]
 
 
 def _classified_portfolio() -> tuple[PositionExposure, ...]:
@@ -281,6 +306,7 @@ def _service(
     *,
     transport: FakePaperTransport | None = None,
     portfolio: object | None = _classified_portfolio,
+    entry_latch: object | None = None,
     protection_required: bool = False,
     history: object | None = None,
     quotes: _Quotes | None = None,
@@ -325,6 +351,7 @@ def _service(
         universe=(lambda: universe) if universe is not None else None,
         portfolio=portfolio,  # type: ignore[arg-type]
         history=history,  # type: ignore[arg-type]
+        entry_latch=entry_latch,
         universe_status=(lambda: universe_status) if universe_status else None,
         halts=lambda: halts,
         now=lambda: NOW,
@@ -334,7 +361,6 @@ def _service(
 
 def _intent(**kw: object) -> ExecutionIntent:
     fields: dict[str, object] = {
-        "decision_id": "decision-1",
         "strategy_id": "baseline-trend-breakout-v1",
         "decision": _decision(),
         "symbol": "AAPL",
@@ -694,20 +720,42 @@ def test_a_repeated_decision_does_not_submit_twice() -> None:
     assert second.outcome is not None
 
 
-def test_a_post_submit_audit_failure_does_not_retry_the_broker() -> None:
-    """The order may already exist; retrying would risk a duplicate."""
+def test_a_post_submit_audit_failure_becomes_a_critical_reconciliation_state(
+) -> None:
+    """The broker answered and we could not record it.
+
+    One submission, never retried; the receipt preserved; an explicit critical
+    state rather than a log line; and new entries latched shut through the
+    canonical gate. Cancellation stays available.
+    """
+
+    class _Latch:
+        def __init__(self) -> None:
+            self.required: list[str] = []
+            self.cancels_blocked = False
+
+        def require(self, reason: str) -> None:
+            self.required.append(reason)
+
     audit = _Audit()
+    latch = _Latch()
 
     def exploding(record: Mapping[str, object]) -> str:
         raise RuntimeError("audit store died after submission")
 
-    service, transport, _ = _service(audit=audit, authorization=_TestOnlyAuthorization())
+    service, transport, _ = _service(
+        audit=audit, authorization=_TestOnlyAuthorization(), entry_latch=latch
+    )
     audit.persist_outcome = exploding  # type: ignore[method-assign]
 
     evaluation = service.execute(_intent())
 
-    assert evaluation.stage is ExecutionStage.SUBMITTED
+    assert evaluation.stage is ExecutionStage.POST_SUBMIT_AUDIT_FAILED
+    assert evaluation.outcome is not None, "the broker receipt is preserved"
+    assert evaluation.outcome.receipt is not None
     assert len(_submits(transport)) == 1, "no second submission after an audit failure"
+    assert latch.required, "new entries are latched until reconciliation"
+    assert latch.cancels_blocked is False, "cancellation is never gated by this"
 
 
 def test_a_denied_test_authorization_still_never_submits() -> None:
@@ -941,25 +989,148 @@ def test_the_real_adapter_cannot_currently_hold_atomic_protection() -> None:
     )
 
 
-def test_protection_passes_only_when_the_broker_can_establish_it_atomically() -> None:
-    """And when it can, the reason says which mechanism."""
+def test_the_final_guard_never_infers_protection_from_a_capability_flag() -> None:
+    """The defect this replaced a bad test for.
 
-    class _BracketBroker(IbkrPaperAdapter):
-        def capabilities(self) -> object:  # type: ignore[override]
-            base = super().capabilities()
-            return replace(base, bracket=BrokerCapabilityMode.NATIVE)
+    A previous test subclassed the adapter to flip ``bracket`` to NATIVE and
+    asserted protection passed. That proved a flag can make a gate pass, which
+    is the opposite of the invariant: it implemented no bracket order, no
+    parent/child pair, no transmit semantics and nothing resting at the broker.
 
-    adapter = _BracketBroker(
+    Flipping every capability flag now changes nothing, because the final guard
+    reads a protected-entry LIFECYCLE, not capabilities.
+    """
+    from trading_application.readiness_guarded_broker import (
+        GuardConfig,
+        ReadinessGuardedBroker,
+    )
+
+    class _AllFlagsOn(IbkrPaperAdapter):
+        def capabilities(self) -> BrokerCapabilities:
+            return replace(
+                super().capabilities(),
+                bracket=BrokerCapabilityMode.NATIVE,
+                oco=BrokerCapabilityMode.NATIVE,
+            )
+
+    adapter = _AllFlagsOn(
         lambda: PnlAwareTransport(), account_aliases=dict(ALIASES),
         host="127.0.0.1", port=4002, clock=lambda: ADAPTER_NOW,
     )
     adapter.connect()
-    service, _, _ = _service(adapter=adapter, protection_required=True)
+    guard = ReadinessGuardedBroker(
+        adapter,
+        config=GuardConfig(
+            mode=TradingMode.PAPER,
+            requirements=StrategyDataRequirements(strategy_id="s"),
+            rules=MarketDataRules(),
+            account_alias="paper-main",
+            protection_required=True,
+        ),
+        quotes=_Quotes(), risk=_NoRisk(), audit=_Audit(), now=lambda: NOW,
+        # No protected-entry lifecycle: nothing can prove protection.
+    )
 
-    capability = service._protection_state()  # noqa: SLF001
+    state = guard._observe_protection(_order())  # noqa: SLF001
 
-    assert capability.can_protect is True
-    assert "bracket" in capability.detail
+    assert state.protective_order_supported is False, (
+        "capability flags must not be able to make protection pass"
+    )
+    assert "not a resting protective order" in state.detail
+
+
+def test_protection_evidence_without_a_broker_reference_is_not_protection() -> None:
+    """"Established" with nothing to point at is a promise, not protection."""
+    from trading_application.readiness_guarded_broker import (
+        GuardConfig,
+        ProtectionEvidence,
+        ReadinessGuardedBroker,
+    )
+
+    class _EmptyPromise:
+        def protection_for(self, intent: OrderIntent) -> ProtectionEvidence:
+            return ProtectionEvidence(
+                established=True, mechanism="native-bracket",
+                protective_order_refs=(),  # nothing at the broker
+            )
+
+    guard = ReadinessGuardedBroker(
+        _adapter(),
+        config=GuardConfig(
+            mode=TradingMode.PAPER,
+            requirements=StrategyDataRequirements(strategy_id="s"),
+            rules=MarketDataRules(),
+            account_alias="paper-main",
+            protection_required=True,
+        ),
+        quotes=_Quotes(), risk=_NoRisk(), audit=_Audit(),
+        protection=_EmptyPromise(), now=lambda: NOW,
+    )
+
+    state = guard._observe_protection(_order())  # noqa: SLF001
+
+    assert state.protective_order_supported is False
+
+
+def test_the_real_adapter_has_no_protected_entry_lifecycle_so_entries_block() -> None:
+    """Option B, end to end, against the real adapter and the real guard.
+
+    STOP order type may be NATIVE; bracket and OCO are not; there is no atomic
+    protected-entry implementation; the final readiness gate blocks; and the
+    broker's transport sees ZERO submits.
+    """
+    capabilities = _adapter().capabilities()
+    assert capabilities.order_types[OrderType.STOP] is BrokerCapabilityMode.NATIVE
+    assert capabilities.bracket is BrokerCapabilityMode.UNSUPPORTED
+    assert capabilities.oco is BrokerCapabilityMode.UNSUPPORTED
+
+    service, transport, _ = _service(
+        protection_required=True, authorization=_TestOnlyAuthorization()
+    )
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.PROTECTION_UNAVAILABLE
+    assert _submits(transport) == []
+
+
+def test_the_final_guard_blocks_a_protected_entry_even_past_the_service_gate() -> None:
+    """The service's earlier gate is not what makes this safe.
+
+    Bypassing the service and driving the guard directly -- the way a future
+    caller holding the port would -- must still refuse.
+    """
+    from trading_application.readiness_guarded_broker import (
+        GuardConfig,
+        ReadinessBlockedError,
+        ReadinessGuardedBroker,
+    )
+
+    transport = PnlAwareTransport()
+    guard = ReadinessGuardedBroker(
+        _adapter(transport),
+        config=GuardConfig(
+            mode=TradingMode.PAPER,
+            requirements=StrategyDataRequirements(strategy_id="s"),
+            rules=MarketDataRules(),
+            account_alias="paper-main",
+            protection_required=True,
+        ),
+        quotes=_Quotes(), risk=_NoRisk(), audit=_Audit(), now=lambda: NOW,
+    )
+
+    with pytest.raises(ReadinessBlockedError) as error:
+        guard.submit_order(_order())
+
+    blockers = error.value.report.blockers
+    assert any("broker_side_protection" in blocker for blocker in blockers)
+    assert _submits(transport) == []
+
+
+class _NoRisk:
+    """A risk source that answers nothing; these tests are about protection."""
+
+    def risk_result_for(self, intent: OrderIntent) -> RiskResult | None:
+        return None
 
 
 # == the final quantity is bound to the real risk approval ===================
@@ -979,9 +1150,30 @@ def test_an_authorization_larger_than_the_risk_approval_is_blocked() -> None:
     # then mints 10 -- the exact mismatch a faulty future authorization makes.
     evaluation = service.execute(_intent(requested_quantity=Decimal("1")))
 
-    assert evaluation.stage is ExecutionStage.READINESS_BLOCKED
-    assert any("risk_limits" in reason for reason in evaluation.reasons)
+    # Caught at the authorization binding, before the guard is even reached:
+    # an authority may reduce, never raise.
+    assert evaluation.stage is ExecutionStage.AUTHORIZATION_DENIED
+    assert "may reduce, never raise" in " ".join(evaluation.reasons)
     assert _submits(transport) == [], "an oversized order must never reach the broker"
+
+
+def test_the_final_guard_also_refuses_an_oversized_order() -> None:
+    """Defence in depth: if the binding above were bypassed, the guard refuses.
+
+    The risk registry is the last boundary, and it answers only for an order
+    that is still the execution the engine approved.
+    """
+    service, _, _ = _service()
+    evaluation = service.evaluate(_intent())
+    assert evaluation.risk_result is not None
+    assert evaluation.fingerprint is not None
+
+    registry = DecisionRiskRegistry()
+    registry.register(evaluation.fingerprint, evaluation.risk_result)
+    approved = evaluation.risk_result.approved_quantity
+
+    assert registry.risk_result_for(_order(quantity=approved)) is not None
+    assert registry.risk_result_for(_order(quantity=approved * 10)) is None
 
 
 def test_the_risk_registry_refuses_an_order_bigger_than_it_approved() -> None:
@@ -992,13 +1184,46 @@ def test_the_risk_registry_refuses_an_order_bigger_than_it_approved() -> None:
     assert evaluation.risk_result is not None
     approved = evaluation.risk_result.approved_quantity
 
+    fingerprint = ExecutionFingerprint(
+        decision_id=_intent().decision_id, client_order_id="exec-ord-1",
+        strategy_id="baseline-trend-breakout-v1", symbol="AAPL", side="BUY",
+        environment="PAPER", account_alias="paper-main",
+    )
     registry = DecisionRiskRegistry()
-    registry.register("exec-ord-1", "AAPL", evaluation.risk_result)
+    registry.register(fingerprint, evaluation.risk_result)
 
     assert registry.risk_result_for(_order(quantity=approved)) is not None
     assert registry.risk_result_for(_order(quantity=approved + 1)) is None
     assert registry.risk_result_for(_order(symbol="MSFT")) is None
     assert registry.risk_result_for(_order(client_order_id="other")) is None
+    assert registry.risk_result_for(_order(side=OrderSide.SELL)) is None, (
+        "the opposite side is a different execution"
+    )
+    assert registry.risk_result_for(_order(account_alias="another")) is None
+
+
+def test_a_second_decision_cannot_spend_the_first_decisions_risk_approval() -> None:
+    """Sharing a client order id and symbol is not being the same execution."""
+    from trading_execution_agent.execution_service import ExecutionFingerprint
+
+    service, _, _ = _service()
+    evaluation = service.evaluate(_intent())
+    assert evaluation.risk_result is not None
+
+    first = ExecutionFingerprint(
+        decision_id="decision-one", client_order_id="shared-id",
+        strategy_id="s", symbol="AAPL", side="BUY",
+        environment="PAPER", account_alias="paper-main",
+    )
+    registry = DecisionRiskRegistry()
+    registry.register(first, evaluation.risk_result)
+
+    # A DIFFERENT decision re-registering the same id replaces it rather than
+    # inheriting; and an order for a different execution shape gets nothing.
+    assert registry.risk_result_for(_order(client_order_id="shared-id")) is not None
+    assert registry.risk_result_for(
+        _order(client_order_id="shared-id", symbol="MSFT")
+    ) is None
 
 
 def _order(
@@ -1006,11 +1231,13 @@ def _order(
     client_order_id: str = "exec-ord-1",
     symbol: str = "AAPL",
     quantity: Decimal = Decimal("1"),
+    side: OrderSide = OrderSide.BUY,
+    account_alias: str = "paper-main",
 ) -> OrderIntent:
     return OrderIntent(
         client_order_id=client_order_id, authorization_ref="a", correlation_id="c",
-        environment=Environment.PAPER, account_alias="paper-main", symbol=symbol,
-        side=OrderSide.BUY, order_type=OrderType.LIMIT, quantity=quantity,
+        environment=Environment.PAPER, account_alias=account_alias, symbol=symbol,
+        side=side, order_type=OrderType.LIMIT, quantity=quantity,
         limit_price=Decimal("100"), stop_price=Decimal("98"),
     )
 
@@ -1057,14 +1284,32 @@ def test_a_risk_policy_mismatch_between_config_and_engine_is_refused() -> None:
 # == restart-safe idempotency ================================================
 
 
+@dataclass(frozen=True)
+class _Record:
+    """The canonical history record shape, as the reader returns it."""
+
+    action: str
+    payload: Mapping[str, object]
+
+
 class _History:
-    """The durable read side, as the audit chain would answer it."""
+    """The durable read side, as the audit chain would answer it.
 
-    def __init__(self, actions: dict[str, tuple[str, ...]] | None = None) -> None:
-        self.actions = actions or {}
+    Records, not just action names: the caller has to be able to reconstruct
+    what actually happened, and a terminal record may say REFUSED as easily as
+    SUBMITTED.
+    """
 
-    def actions_for(self, decision_id: str) -> tuple[str, ...]:
-        return self.actions.get(decision_id, ())
+    def __init__(self, records: dict[str, list[_Record]] | None = None) -> None:
+        self.records = records or {}
+
+    def records_for(self, decision_id: str) -> tuple[_Record, ...]:
+        return tuple(self.records.get(decision_id, ()))
+
+    def append(self, decision_id: str, action: str, **payload: object) -> None:
+        self.records.setdefault(decision_id, []).append(
+            _Record(action=action, payload=payload)
+        )
 
 
 def test_a_restart_does_not_resubmit_a_decision_that_already_completed() -> None:
@@ -1079,9 +1324,17 @@ def test_a_restart_does_not_resubmit_a_decision_that_already_completed() -> None
     assert first.stage is ExecutionStage.SUBMITTED
     assert len(_submits(transport)) == 1
 
-    # The durable chain recorded both halves; the process now dies.
-    history.actions["decision-1"] = (
-        "EXECUTION_PRE_SUBMIT", "EXECUTION_POST_SUBMIT",
+    # The durable chain recorded the lifecycle; the process now dies.
+    identity = first.fingerprint
+    assert identity is not None
+    history.append(
+        identity.decision_id, "EXECUTION_SUBMIT_PREPARED",
+        execution_fingerprint=identity.to_dict(),
+    )
+    history.append(
+        identity.decision_id, "EXECUTION_OUTCOME",
+        execution_fingerprint=identity.to_dict(),
+        stage="SUBMITTED", submission_outcome="SUBMITTED",
     )
     del first_service
 
@@ -1099,7 +1352,8 @@ def test_a_restart_does_not_resubmit_a_decision_that_already_completed() -> None
 def test_an_unresolved_pre_submit_after_restart_needs_reconciliation() -> None:
     """Committed the intent, never recorded the outcome: UNKNOWN, not a retry."""
     transport = PnlAwareTransport()
-    history = _History({"decision-1": ("EXECUTION_PRE_SUBMIT",)})
+    history = _History()
+    history.append(_intent().decision_id, "EXECUTION_SUBMIT_PREPARED")
 
     service, _, _ = _service(
         transport=transport, authorization=_TestOnlyAuthorization(), history=history
@@ -1173,3 +1427,257 @@ def test_an_audit_that_cannot_persist_blocks_before_anything_is_planned() -> Non
 
     assert evaluation.stage is ExecutionStage.AUDIT_UNAVAILABLE
     assert _submits(transport) == []
+
+
+# == a terminal record is not automatically a submission =====================
+
+
+@pytest.mark.parametrize(
+    ("label", "stage", "outcome", "expected"),
+    [
+        ("prior submission", "SUBMITTED", "SUBMITTED", ExecutionStage.SUBMITTED),
+        (
+            "prior refusal", "SUBMISSION_REFUSED", "REFUSED",
+            ExecutionStage.SUBMISSION_REFUSED,
+        ),
+        (
+            "prior failure", "SUBMISSION_REFUSED", "FAILED",
+            ExecutionStage.SUBMISSION_REFUSED,
+        ),
+        (
+            "prior needs-review", "SUBMISSION_REFUSED", "NEEDS_REVIEW",
+            ExecutionStage.SUBMISSION_REFUSED,
+        ),
+    ],
+)
+def test_a_prior_terminal_outcome_is_reconstructed_not_assumed_submitted(
+    label: str, stage: str, outcome: str, expected: ExecutionStage
+) -> None:
+    """POST_SUBMIT does not mean SUBMITTED.
+
+    A terminal record may say REFUSED, FAILED or NEEDS_REVIEW. Reading every one
+    of them as SUBMITTED would invent an order that never existed — and would
+    tell an operator a refusal had reached the market.
+    """
+    intent = _intent()
+    history = _History()
+    history.append(
+        intent.decision_id, "EXECUTION_OUTCOME",
+        stage=stage, submission_outcome=outcome,
+    )
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), history=history
+    )
+
+    evaluation = service.execute(intent)
+
+    assert evaluation.stage is expected, label
+    assert outcome in " ".join(evaluation.reasons)
+    assert _submits(transport) == [], f"{label}: never resubmitted"
+
+
+# == identity conflicts ======================================================
+
+
+def test_the_same_decision_with_a_different_order_id_is_a_conflict() -> None:
+    intent = _intent()
+    history = _History()
+    other = _fingerprint_dict(intent, client_order_id="a-different-order")
+    history.append(
+        intent.decision_id, "EXECUTION_OUTCOME",
+        execution_fingerprint=other, stage="SUBMITTED",
+        submission_outcome="SUBMITTED",
+    )
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), history=history
+    )
+
+    evaluation = service.execute(intent)
+
+    assert evaluation.stage is ExecutionStage.IDEMPOTENCY_CONFLICT
+    assert "client_order_id" in evaluation.reasons[0]
+    assert _submits(transport) == []
+
+
+def test_the_same_order_id_for_a_different_execution_is_a_conflict() -> None:
+    """A familiar name is not the same execution."""
+    intent = _intent()
+    history = _History()
+    history.append(
+        intent.decision_id, "EXECUTION_SUBMIT_PREPARED",
+        execution_fingerprint=_fingerprint_dict(intent, symbol="MSFT", side="SELL"),
+    )
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), history=history
+    )
+
+    evaluation = service.execute(intent)
+
+    assert evaluation.stage is ExecutionStage.IDEMPOTENCY_CONFLICT
+    assert _submits(transport) == []
+
+
+def test_a_matching_fingerprint_replays_rather_than_conflicting() -> None:
+    intent = _intent()
+    history = _History()
+    history.append(
+        intent.decision_id, "EXECUTION_OUTCOME",
+        execution_fingerprint=_fingerprint_dict(intent),
+        stage="SUBMITTED", submission_outcome="SUBMITTED",
+    )
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), history=history
+    )
+
+    evaluation = service.execute(intent)
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED
+    assert _submits(transport) == []
+
+
+def _fingerprint_dict(intent: ExecutionIntent, **overrides: str) -> dict[str, str]:
+    base = {
+        "decision_id": intent.decision_id,
+        "client_order_id": intent.client_order_id,
+        "strategy_id": intent.strategy_id,
+        "symbol": intent.symbol,
+        "side": intent.side.value,
+        "environment": "PAPER",
+        "account_alias": "paper-main",
+    }
+    base.update(overrides)
+    return base
+
+
+# == an evaluation-only history is not an incident ===========================
+
+
+def test_an_earlier_refusal_replays_as_a_refusal_not_a_reconciliation() -> None:
+    """The defect the lifecycle actions exist to fix.
+
+    A decision refused by a halt or a risk veto never went near the broker, so
+    replaying it must reach the same refusal — not NEEDS_RECONCILIATION, which
+    would turn every routine refusal into an operational incident.
+    """
+    intent = _intent()
+    history = _History()
+    history.append(intent.decision_id, "EXECUTION_EVALUATED", stage="RISK_REFUSED")
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), history=history
+    )
+
+    evaluation = service.execute(intent)
+
+    assert evaluation.stage is not ExecutionStage.NEEDS_RECONCILIATION
+    assert evaluation.stage is ExecutionStage.SUBMITTED, (
+        "an evaluation-only history does not block a fresh attempt"
+    )
+    assert len(_submits(transport)) == 1
+
+
+# == broker recovery resolves an ambiguous durable state =====================
+
+
+def test_an_ambiguous_state_is_resolved_by_the_brokers_own_recovery() -> None:
+    """PREPARED with no outcome, and the broker still holds the order.
+
+    The canonical same-client open-order recovery answers it. Nothing new is
+    submitted, and the state stops being an abstract database condition.
+    """
+    intent = _intent()
+    transport = PnlAwareTransport()
+    history = _History()
+    history.append(intent.decision_id, "EXECUTION_SUBMIT_PREPARED")
+
+    # The broker really does hold a working order with this canonical identity.
+    adapter = _adapter(transport)
+    transport.submit(1001, PAPER_ACCOUNT, _order_intent_for(intent))
+
+    service, _, _ = _service(
+        adapter=adapter, transport=transport,
+        authorization=_TestOnlyAuthorization(), history=history,
+    )
+    before = len(_submits(transport))
+
+    evaluation = service.execute(intent)
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED
+    assert "recovered rather than duplicated" in " ".join(evaluation.reasons)
+    assert len(_submits(transport)) == before, "recovery submits nothing"
+
+
+def test_an_ambiguous_state_the_broker_cannot_resolve_needs_reconciliation() -> None:
+    intent = _intent()
+    history = _History()
+    history.append(intent.decision_id, "EXECUTION_SUBMIT_PREPARED")
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), history=history
+    )
+
+    evaluation = service.execute(intent)
+
+    assert evaluation.stage is ExecutionStage.NEEDS_RECONCILIATION
+    assert "never retry blindly" in " ".join(evaluation.reasons)
+    assert _submits(transport) == []
+
+
+def _order_intent_for(intent: ExecutionIntent) -> OrderIntent:
+    return OrderIntent(
+        client_order_id=intent.client_order_id,
+        authorization_ref="submit-auth:recovered",
+        correlation_id=intent.correlation_id,
+        environment=Environment.PAPER,
+        account_alias="paper-main",
+        symbol=intent.symbol,
+        side=intent.side,
+        order_type=OrderType.LIMIT,
+        quantity=Decimal("1"),
+        limit_price=Decimal("100.00"),
+        stop_price=Decimal("98.00"),
+    )
+
+
+# == the durable submit-prepared marker is the point of no return ============
+
+
+def test_a_failure_to_durably_prepare_means_no_submission() -> None:
+    """The marker is committed BEFORE the submission path is entered."""
+
+    class _PrepareFails(_Audit):
+        def persist_prepared(self, record: Mapping[str, object]) -> str:
+            raise RuntimeError("database unreachable at the point of no return")
+
+    service, transport, _ = _service(
+        audit=_PrepareFails(), authorization=_TestOnlyAuthorization()
+    )
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.AUDIT_UNAVAILABLE
+    assert _submits(transport) == []
+
+
+def test_the_prepared_marker_is_written_before_the_broker_is_called() -> None:
+    order: list[str] = []
+
+    class _Ordered(_Audit):
+        def persist_prepared(self, record: Mapping[str, object]) -> str:
+            order.append("prepared")
+            return "prepared-1"
+
+    audit = _Ordered()
+    service, transport, _ = _service(
+        audit=audit, authorization=_TestOnlyAuthorization()
+    )
+    original = FakePaperTransport.submit
+
+    def tracking(self: FakePaperTransport, *args: object, **kw: object) -> str:
+        order.append("submit")
+        return original(self, *args, **kw)  # type: ignore[arg-type]
+
+    FakePaperTransport.submit = tracking  # type: ignore[method-assign]
+    try:
+        service.execute(_intent())
+    finally:
+        FakePaperTransport.submit = original  # type: ignore[method-assign]
+
+    assert order == ["prepared", "submit"]

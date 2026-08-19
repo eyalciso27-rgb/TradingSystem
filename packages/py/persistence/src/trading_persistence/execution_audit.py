@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
@@ -57,10 +58,34 @@ from trading_persistence.models import AuditEvent
 
 EXECUTION_AUDIT_VERSION = "execution-audit-1.0.0"
 
-#: Chain actions. Distinct verbs so a query can separate "we decided" from
-#: "the broker answered" without parsing payloads.
+#: Chain actions, one per lifecycle stage. The distinction is load-bearing.
+#:
+#: An earlier version recorded EVERY evaluation as PRE_SUBMIT, including
+#: decisions refused long before submission -- a halt, a risk veto, an
+#: authorization denial. On restart, "PRE_SUBMIT with no outcome" was then read
+#: as "the broker may already hold this order", so a decision that was refused
+#: before anything was sent replayed as NEEDS_RECONCILIATION. That is false, and
+#: it turns every routine refusal into an operational incident.
+#:
+#: Only ``ACTION_SUBMIT_PREPARED`` is the point of no return: it is written
+#: after authorization and immediately before the submission path, so a crash
+#: between it and an outcome genuinely means the broker state is unknown.
+ACTION_EVALUATED = "EXECUTION_EVALUATED"
+ACTION_SUBMIT_PREPARED = "EXECUTION_SUBMIT_PREPARED"
+ACTION_OUTCOME = "EXECUTION_OUTCOME"
+
+#: Retained so an existing chain written by the previous naming still reads
+#: back. Never written any more.
 ACTION_PRE_SUBMIT = "EXECUTION_PRE_SUBMIT"
 ACTION_POST_SUBMIT = "EXECUTION_POST_SUBMIT"
+
+#: Which actions mean "the broker may already hold this order".
+AMBIGUOUS_ACTIONS: frozenset[str] = frozenset(
+    {ACTION_SUBMIT_PREPARED, ACTION_PRE_SUBMIT}
+)
+
+#: Which actions carry a terminal broker answer.
+TERMINAL_ACTIONS: frozenset[str] = frozenset({ACTION_OUTCOME, ACTION_POST_SUBMIT})
 
 #: The chain's ``detail`` column is a short operator-readable summary; the full
 #: record lives in the object store. Bounded so one decision cannot dominate the
@@ -163,23 +188,33 @@ class DurableExecutionAuditSink:
         return bool(getattr(stored, "ref", None))
 
     def persist(self, record: Mapping[str, object]) -> str:
-        """Write the payload, then COMMIT the chain row. Returns the chain hash.
+        """Record an evaluation. COMMITTED before it returns.
 
-        The return value is a durability claim: by the time it exists, the
-        record is committed and a brand-new connection can see it.
+        This is the ordinary path and it covers refusals too: a decision that
+        was halted, vetoed or denied is still a decision worth recording. It is
+        deliberately NOT the point of no return -- see ``persist_prepared``.
         """
-        return self._append(record, action=ACTION_PRE_SUBMIT)
+        return self._append(record, action=ACTION_EVALUATED)
+
+    def persist_prepared(self, record: Mapping[str, object]) -> str:
+        """THE point of no return: authorized, and about to reach the broker.
+
+        Committed before the submission path is entered, so a crash after this
+        and before an outcome means exactly one thing: the broker may hold the
+        order, and only reconciliation can say.
+        """
+        return self._append(record, action=ACTION_SUBMIT_PREPARED)
 
     # -- post-submit ----------------------------------------------------------
 
     def persist_outcome(self, record: Mapping[str, object]) -> str:
         """Record what the broker answered. NEVER replaces the pre-submit row.
 
-        Appended as its own chained record: the pre-submit record stated what we
-        decided before acting, and rewriting it afterwards would destroy the one
-        thing it exists to prove.
+        Appended as its own chained record: the earlier records stated what we
+        decided before acting, and rewriting them afterwards would destroy the
+        one thing they exist to prove.
         """
-        return self._append(record, action=ACTION_POST_SUBMIT)
+        return self._append(record, action=ACTION_OUTCOME)
 
     # -- internals ------------------------------------------------------------
 
@@ -251,26 +286,55 @@ def _uuid_or_none(value: object) -> UUID | None:
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionHistoryRecord:
+    """One durable lifecycle record, with the payload that produced it."""
+
+    action: str
+    chain_hash: str
+    payload: Mapping[str, object]
+
+
 class DurableExecutionHistoryReader:
     """The read side of the chain: what happened to a decision, across restarts.
 
     In-process idempotency dies with the process, so a replayed decision after a
-    crash would otherwise submit a second time. The chain already recorded every
-    PRE_SUBMIT and POST_SUBMIT; this reads them back.
+    crash would otherwise submit a second time.
+
+    It returns the stored PAYLOADS, not just action names. An earlier version
+    returned only the actions, and the caller then treated the existence of a
+    terminal record as "SUBMITTED" -- but a terminal record may say REFUSED,
+    FAILED or NEEDS_REVIEW just as easily, and converting all of them into
+    SUBMITTED invents an order that never existed.
 
     It opens and closes its own connection per query for the same reason the
     sink owns its own transactions: a long-lived connection held by a
     long-running service is a lock waiting to happen.
     """
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, objects: ObjectStore) -> None:
         self._engine = engine
+        self._objects = objects
 
-    def actions_for(self, decision_id: str) -> tuple[str, ...]:
+    def records_for(self, decision_id: str) -> tuple[ExecutionHistoryRecord, ...]:
         with self._engine.connect() as connection:
-            return tuple(
-                action for action, _, _ in load_decision_records(connection, decision_id)
+            rows = load_decision_records(connection, decision_id)
+        records: list[ExecutionHistoryRecord] = []
+        for action, chain_hash, payload_ref in rows:
+            payload: Mapping[str, object] = {}
+            if payload_ref:
+                # A payload we cannot read is not a payload we may guess at.
+                # The record still counts; its detail is simply absent.
+                try:
+                    payload = json.loads(self._objects.get(payload_ref))
+                except Exception:  # noqa: BLE001 - unreadable payload, known record
+                    payload = {}
+            records.append(
+                ExecutionHistoryRecord(
+                    action=action, chain_hash=chain_hash, payload=payload
+                )
             )
+        return tuple(records)
 
 
 def load_decision_records(
@@ -290,8 +354,14 @@ def load_decision_records(
 
 
 __all__ = [
+    "ACTION_EVALUATED",
+    "ACTION_OUTCOME",
     "ACTION_POST_SUBMIT",
     "ACTION_PRE_SUBMIT",
+    "ACTION_SUBMIT_PREPARED",
+    "AMBIGUOUS_ACTIONS",
+    "TERMINAL_ACTIONS",
+    "ExecutionHistoryRecord",
     "EXECUTION_AUDIT_VERSION",
     "MAX_DETAIL_CHARS",
     "DurableExecutionAuditSink",

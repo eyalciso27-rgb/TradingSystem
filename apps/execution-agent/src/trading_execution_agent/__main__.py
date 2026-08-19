@@ -32,7 +32,8 @@ import argparse
 import logging
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -135,29 +136,35 @@ class ProbeResources:
     A probe that leaves a gateway session or a database connection behind is a
     probe that cannot be run twice on a schedule, and a leaked transaction holds
     locks for the life of the process.
+
+    Ownership is STAGED, not collected at the end. Construction registers each
+    resource with an ``ExitStack`` the moment it opens, so a failure part-way
+    through unwinds what already opened — the earlier version built everything
+    and only then returned something closeable, which meant a failure in the
+    second step stranded the first.
     """
 
     service: ExecutionService
-    adapter: object
-    session: object
-    engine: object
+    stack: ExitStack
 
     def close(self) -> None:
-        """Release everything, and never let one failure hide the others."""
-        for name, resource, method in (
-            ("market data session", self.session, "disconnect"),
-            ("broker adapter", self.adapter, "disconnect"),
-            ("database engine", self.engine, "dispose"),
-        ):
-            closer = getattr(resource, method, None)
-            if not callable(closer):
-                continue
-            try:
-                closer()
-            except Exception as error:  # noqa: BLE001 - closing is best effort
-                LOGGER.warning(
-                    "could not close the %s: %s", name, type(error).__name__
-                )
+        """Release everything, in reverse order of acquisition."""
+        self.stack.close()
+
+
+def _closing(resource: object, method: str, name: str) -> Callable[[], None]:
+    """A closer that logs and swallows, so one failure never strands the rest."""
+
+    def close() -> None:
+        closer = getattr(resource, method, None)
+        if not callable(closer):
+            return
+        try:
+            closer()
+        except Exception as error:  # noqa: BLE001 - closing is best effort
+            LOGGER.warning("could not close the %s: %s", name, type(error).__name__)
+
+    return close
 
 
 def build_service(
@@ -171,9 +178,6 @@ def build_service(
     from trading_persistence.db import create_sync_engine
     from trading_persistence.object_storage import FilesystemObjectStorage
 
-    from trading_execution_agent.agent import ExecutionAgent
-    from trading_execution_agent.ibkr_quote_source import IbkrQuoteSource
-    from trading_execution_agent.reconciliation_latch import ReconciliationLatch
 
     account_id = os.environ.get("TRADING_PAPER_ACCOUNT_ID", "")
     if not account_id:
@@ -184,29 +188,72 @@ def build_service(
             " that is not a paper account."
         )
 
-    # The canonical builder, over the lazy SDK transport. The adapter refuses
-    # any port but the paper API port, so a mistyped port cannot reach live.
-    adapter = build_paper_adapter(
-        account_aliases={account_alias: account_id}, host=host, port=port
-    )
-    adapter.connect()
+    # Each resource is registered for cleanup THE MOMENT it opens, so a
+    # failure in any later step unwinds everything already acquired.
+    stack = ExitStack()
+    try:
+        # The canonical builder, over the lazy SDK transport. The adapter
+        # refuses any port but the paper API port, so a mistyped port cannot
+        # reach live.
+        adapter = build_paper_adapter(
+            account_aliases={account_alias: account_id}, host=host, port=port
+        )
+        adapter.connect()
+        stack.callback(_closing(adapter, "disconnect", "broker adapter"))
 
-    session = create_session()
-    session.connect(host, port)
+        session = create_session()
+        session.connect(host, port)
+        stack.callback(_closing(session, "disconnect", "market data session"))
 
-    engine = create_sync_engine()
-    objects = FilesystemObjectStorage(
-        Path(os.environ.get("TRADING_OBJECT_STORE", "var/objects"))
-    )
-    service = ExecutionService(
-        broker=adapter,
-        quotes=IbkrQuoteSource(session),
+        engine = create_sync_engine()
+        stack.callback(_closing(engine, "dispose", "database engine"))
+
+        objects = FilesystemObjectStorage(
+            Path(os.environ.get("TRADING_OBJECT_STORE", "var/objects"))
+        )
+        service = _build(
+            adapter, session, engine, objects,
+            account_alias=account_alias, equity_cap=equity_cap,
+        )
+    except BaseException:
+        # Anything at all: unwind what opened, then let it propagate.
+        stack.close()
+        raise
+    return ProbeResources(service=service, stack=stack)
+
+
+def _build(
+    adapter: object,
+    session: object,
+    engine: object,
+    objects: object,
+    *,
+    account_alias: str,
+    equity_cap: Decimal,
+) -> ExecutionService:
+    """Assemble the service from already-owned resources."""
+    from trading_execution_agent.agent import ExecutionAgent
+    from trading_execution_agent.ibkr_quote_source import IbkrQuoteSource
+    from trading_execution_agent.reconciliation_latch import ReconciliationLatch
+
+    # ONE latch: the agent's entry gate and the service's critical-state latch
+    # are the same object, so a failed post-submit audit really does stop the
+    # next entry rather than latching something nobody consults.
+    latch = ReconciliationLatch()
+    return ExecutionService(
+        broker=adapter,  # type: ignore[arg-type]
+        quotes=IbkrQuoteSource(session),  # type: ignore[arg-type]
         # The sink owns its own committed transactions; the probe hands it an
         # ENGINE and never holds a connection of its own.
         audit=DurableExecutionAuditSink(
-            engine, objects, environment=Environment.PAPER
+            engine,  # type: ignore[arg-type]
+            objects,  # type: ignore[arg-type]
+            environment=Environment.PAPER,
         ),
-        history=DurableExecutionHistoryReader(engine),
+        history=DurableExecutionHistoryReader(
+            engine,  # type: ignore[arg-type]
+            objects,  # type: ignore[arg-type]
+        ),
         risk_engine=RiskEngine(PROBE_RISK_POLICY),
         config=ExecutionConfig(
             mode=TradingMode.PAPER,
@@ -220,13 +267,9 @@ def build_service(
             sector="probe",
             cluster="probe",
         ),
-        agent_factory=lambda port_: ExecutionAgent(
-            port_, entry_gate=ReconciliationLatch()
-        ),
+        agent_factory=lambda port_: ExecutionAgent(port_, entry_gate=latch),
+        entry_latch=latch,
         # No authorization argument: the production default DENIES.
-    )
-    return ProbeResources(
-        service=service, adapter=adapter, session=session, engine=engine
     )
 
 
@@ -330,7 +373,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     configure_logging(service="execution-probe", environment="PAPER")
     now = datetime.now(tz=UTC)
-    decision_id = f"probe-{now.strftime('%Y%m%dT%H%M%SZ')}-{args.symbol}"
+    # ONE identity: the decision's own id is the canonical execution identity,
+    # and everything downstream (risk ref, audit target, durable history,
+    # client order id) derives from it rather than inventing a second name.
+    decision = probe_decision(args.symbol, now)
+    decision_id = str(decision.result.decision_id)
 
     try:
         resources = build_service(
@@ -349,9 +396,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         evaluation = resources.service.evaluate(
             ExecutionIntent(
-                decision_id=decision_id,
                 strategy_id=args.strategy,
-                decision=probe_decision(args.symbol, now),
+                decision=decision,
                 symbol=args.symbol,
                 side=OrderSide.BUY,
                 requested_quantity=Decimal(args.quantity),

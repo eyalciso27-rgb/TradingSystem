@@ -11,6 +11,7 @@ Offline: nothing here connects to anything.
 from __future__ import annotations
 
 import ast
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -48,53 +49,161 @@ def test_the_probe_offers_no_live_mode() -> None:
         probe.main(["probe", "--mode", "live"])
 
 
-def test_the_probe_closes_everything_it_opened() -> None:
-    """Including on failure: the cleanup is in a finally."""
+class _Closeable:
+    """Stands in for a gateway session, an adapter or an engine."""
 
-    class _Closeable:
-        def __init__(self) -> None:
-            self.closed = False
+    def __init__(self, *, fails: bool = False) -> None:
+        self.closed = False
+        self._fails = fails
 
-        def disconnect(self) -> None:
-            self.closed = True
+    def connect(self, *args: object, **kw: object) -> None:
+        return None
 
-        def dispose(self) -> None:
-            self.closed = True
-
-    adapter, session, engine = _Closeable(), _Closeable(), _Closeable()
-    resources = probe.ProbeResources(
-        service=None,  # type: ignore[arg-type]
-        adapter=adapter, session=session, engine=engine,
-    )
-
-    resources.close()
-
-    assert adapter.closed and session.closed and engine.closed
-
-
-def test_closing_survives_a_resource_that_fails_to_close() -> None:
-    """One broken close must not strand the others."""
-
-    class _Broken:
-        def disconnect(self) -> None:
+    def disconnect(self) -> None:
+        if self._fails:
             raise RuntimeError("already gone")
+        self.closed = True
 
-    class _Fine:
-        def __init__(self) -> None:
-            self.closed = False
+    def dispose(self) -> None:
+        if self._fails:
+            raise RuntimeError("already gone")
+        self.closed = True
 
-        def dispose(self) -> None:
-            self.closed = True
 
-    engine = _Fine()
-    resources = probe.ProbeResources(
-        service=None,  # type: ignore[arg-type]
-        adapter=_Broken(), session=_Broken(), engine=engine,
+def test_a_failure_after_the_adapter_opens_still_disconnects_it(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Staged ownership: what opened first is released when a later step fails.
+
+    The earlier design built every resource and only then returned something
+    closeable, so a failure in the second step stranded the first. Each resource
+    is now registered for cleanup the moment it opens.
+    """
+    adapter = _Closeable()
+    monkeypatch.setenv("TRADING_PAPER_ACCOUNT_ID", "DU" + "1234567")
+    monkeypatch.setattr(
+        "trading_broker_ibkr.paper_adapter.build_paper_adapter",
+        lambda **kw: adapter,
+    )
+    monkeypatch.setattr(
+        "trading_broker_ibkr.poi_market_data_session.create_session",
+        _raise("the market data session could not be created"),
     )
 
-    resources.close()
+    with pytest.raises(RuntimeError, match="market data session"):
+        probe.build_service(
+            symbol="AAPL", account_alias="paper-poi", host="127.0.0.1",
+            port=4002, equity_cap=Decimal("50000"),
+        )
 
-    assert engine.closed, "the database engine was still disposed"
+    assert adapter.closed, "the adapter opened, so the adapter was closed"
+
+
+def test_a_failure_after_the_session_opens_releases_both(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, session = _Closeable(), _Closeable()
+    monkeypatch.setenv("TRADING_PAPER_ACCOUNT_ID", "DU" + "1234567")
+    monkeypatch.setattr(
+        "trading_broker_ibkr.paper_adapter.build_paper_adapter", lambda **kw: adapter
+    )
+    monkeypatch.setattr(
+        "trading_broker_ibkr.poi_market_data_session.create_session",
+        lambda: session,
+    )
+    monkeypatch.setattr(
+        "trading_persistence.db.create_sync_engine",
+        _raise("the database engine could not be created"),
+    )
+
+    with pytest.raises(RuntimeError, match="database engine"):
+        probe.build_service(
+            symbol="AAPL", account_alias="paper-poi", host="127.0.0.1",
+            port=4002, equity_cap=Decimal("50000"),
+        )
+
+    assert session.closed and adapter.closed, "both were released"
+
+
+def test_a_failure_building_the_service_releases_the_engine_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    adapter, session, engine = _Closeable(), _Closeable(), _Closeable()
+    monkeypatch.setenv("TRADING_PAPER_ACCOUNT_ID", "DU" + "1234567")
+    monkeypatch.setenv("TRADING_OBJECT_STORE", str(tmp_path / "objects"))
+    monkeypatch.setattr(
+        "trading_broker_ibkr.paper_adapter.build_paper_adapter", lambda **kw: adapter
+    )
+    monkeypatch.setattr(
+        "trading_broker_ibkr.poi_market_data_session.create_session", lambda: session
+    )
+    monkeypatch.setattr("trading_persistence.db.create_sync_engine", lambda: engine)
+    monkeypatch.setattr(
+        probe, "_build", _raise("the service could not be assembled")
+    )
+
+    with pytest.raises(RuntimeError, match="service could not be assembled"):
+        probe.build_service(
+            symbol="AAPL", account_alias="paper-poi", host="127.0.0.1",
+            port=4002, equity_cap=Decimal("50000"),
+        )
+
+    assert engine.closed and session.closed and adapter.closed
+
+
+def test_a_successful_construction_releases_everything_exactly_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    adapter, session, engine = _Closeable(), _Closeable(), _Closeable()
+    monkeypatch.setenv("TRADING_PAPER_ACCOUNT_ID", "DU" + "1234567")
+    monkeypatch.setenv("TRADING_OBJECT_STORE", str(tmp_path / "objects"))
+    monkeypatch.setattr(
+        "trading_broker_ibkr.paper_adapter.build_paper_adapter", lambda **kw: adapter
+    )
+    monkeypatch.setattr(
+        "trading_broker_ibkr.poi_market_data_session.create_session", lambda: session
+    )
+    monkeypatch.setattr("trading_persistence.db.create_sync_engine", lambda: engine)
+    monkeypatch.setattr(probe, "_build", lambda *a, **kw: object())
+
+    resources = probe.build_service(
+        symbol="AAPL", account_alias="paper-poi", host="127.0.0.1",
+        port=4002, equity_cap=Decimal("50000"),
+    )
+    resources.close()
+    resources.close()  # idempotent: an ExitStack unwinds once
+
+    assert engine.closed and session.closed and adapter.closed
+
+
+def test_one_resource_failing_to_close_never_strands_the_others(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    adapter, session, engine = _Closeable(), _Closeable(fails=True), _Closeable()
+    monkeypatch.setenv("TRADING_PAPER_ACCOUNT_ID", "DU" + "1234567")
+    monkeypatch.setenv("TRADING_OBJECT_STORE", str(tmp_path / "objects"))
+    monkeypatch.setattr(
+        "trading_broker_ibkr.paper_adapter.build_paper_adapter", lambda **kw: adapter
+    )
+    monkeypatch.setattr(
+        "trading_broker_ibkr.poi_market_data_session.create_session", lambda: session
+    )
+    monkeypatch.setattr("trading_persistence.db.create_sync_engine", lambda: engine)
+    monkeypatch.setattr(probe, "_build", lambda *a, **kw: object())
+
+    probe.build_service(
+        symbol="AAPL", account_alias="paper-poi", host="127.0.0.1",
+        port=4002, equity_cap=Decimal("50000"),
+    ).close()
+
+    assert engine.closed and adapter.closed, "a broken close did not strand these"
+
+
+def _raise(message: str) -> object:
+    def boom(*args: object, **kw: object) -> object:
+        raise RuntimeError(message)
+
+    return boom
 
 
 def test_the_probe_holds_no_database_connection_of_its_own() -> None:

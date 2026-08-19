@@ -60,8 +60,12 @@ class FakePaperTransport:
         healthy: bool = True,
         submit_status: str = "Submitted",
         cancel_status: str = "Cancelled",
+        daily_pnl: Decimal | None = None,
     ) -> None:
         self.calls: list[str] = []
+        #: What reqPnL would answer. None (the default) means the gateway does
+        #: not serve one, which is the common real case.
+        self.daily_pnl = daily_pnl
         self._managed = managed
         self._healthy = healthy
         self._submit_status = submit_status
@@ -106,6 +110,16 @@ class FakePaperTransport:
             exchange="SMART",
             currency="USD",
         )
+
+    def session_pnl(self, account_id: str) -> Decimal | None:
+        """The daily P&L a gateway would serve through reqPnL, or None.
+
+        None is the DEFAULT because it is the honest one: IBKR serves a daily
+        figure only when the account carries P&L permission, and the adapter
+        must treat its absence as unknown rather than as a flat day.
+        """
+        self.calls.append("session_pnl")
+        return self.daily_pnl
 
     def account_summary(self, account_id: str) -> Mapping[str, Decimal]:
         self.calls.append(f"summary:{mask_account_id(account_id)}")

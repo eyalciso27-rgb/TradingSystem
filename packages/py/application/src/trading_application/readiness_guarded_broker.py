@@ -60,7 +60,7 @@ from trading_broker_core.port import (
     OrderPreview,
     ReconciliationResult,
 )
-from trading_contracts.enums import Environment, OrderType
+from trading_contracts.enums import Environment
 from trading_market_data_core.trading_readiness import (
     StrategyDataRequirements,
     TradingMode,
@@ -118,6 +118,41 @@ class QuoteSource(Protocol):
     def current_quote(self, symbol: str) -> QuoteState: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ProtectionEvidence:
+    """Proof that the broker will actually hold protection for this entry.
+
+    Evidence, not capability. A capability flag says the broker *could* accept
+    a protective order if one were sent; it says nothing about one existing. The
+    distinction is the whole safety property, so this carries the broker's own
+    references to the protective orders involved and is refused without them.
+    """
+
+    #: The lifecycle established (or will atomically establish) real
+    #: broker-resident protection for this entry.
+    established: bool
+    #: What actually does it: "native-bracket", "oca-group", "resting-stop"...
+    mechanism: str = ""
+    #: Broker-side references for the protective order(s). REQUIRED when
+    #: ``established`` is True: a mechanism with nothing to point at is a
+    #: promise, not protection.
+    protective_order_refs: tuple[str, ...] = ()
+    detail: str = ""
+
+
+@runtime_checkable
+class ProtectedEntryLifecycle(Protocol):
+    """The authority that can establish broker-resident protection.
+
+    There is deliberately no default implementation. A guard with no lifecycle
+    cannot prove protection and therefore refuses when protection is required —
+    which is the correct answer today, because no adapter in this repository can
+    establish protection atomically with an entry.
+    """
+
+    def protection_for(self, intent: OrderIntent) -> ProtectionEvidence: ...
+
+
 @runtime_checkable
 class RiskSource(Protocol):
     """Supplies the REAL RiskEngine result for this order intent.
@@ -169,6 +204,7 @@ class ReadinessGuardedBroker:
         quotes: QuoteSource,
         risk: RiskSource,
         audit: AuditSink,
+        protection: ProtectedEntryLifecycle | None = None,
         universe_status: Callable[[], UniverseListStatus | None] | None = None,
         gics_sector: Callable[[str], str | None] | None = None,
         pit_membership_available: bool = False,
@@ -179,6 +215,9 @@ class ReadinessGuardedBroker:
         self._quotes = quotes
         self._risk = risk
         self._audit = audit
+        # None means protection cannot be proven -- and therefore cannot pass
+        # when it is required. There is no production implementation yet.
+        self._protection = protection
         self._universe_status = universe_status
         self._gics_sector = gics_sector
         self._pit_membership_available = pit_membership_available
@@ -304,21 +343,56 @@ class ReadinessGuardedBroker:
         return TradabilityState(proven_tradable=True, detail=detail)
 
     def _observe_protection(self, intent: OrderIntent) -> ProtectionState:
-        """Broker capability AND the plan's own protective stop."""
-        supported = False
-        detail = ""
-        try:
-            mode = self._broker.capabilities().order_types.get(OrderType.STOP)
-            supported = mode in (
-                BrokerCapabilityMode.NATIVE, BrokerCapabilityMode.EMULATED
-            )
-            detail = f"STOP capability: {mode}"
-        except Exception as error:  # noqa: BLE001
-            detail = f"capabilities raised {type(error).__name__}"
-        # The intent itself must carry the protective level.
+        """Protection is PROVEN by a lifecycle, never inferred from a flag.
+
+        This used to read "the broker supports STOP orders" plus "the intent
+        carries a stop price" as broker-side protection. Both are true of an
+        entry that goes out completely unprotected: the order is a single LIMIT
+        whose stop price becomes that order's aux price, and a supported order
+        TYPE is a statement about what the broker would accept, not about what
+        it holds.
+
+        So the flag is gone. Evidence comes from a ``ProtectedEntryLifecycle``
+        that can actually establish broker-resident protection, and it must
+        name the protective order(s) it established. No lifecycle, no evidence,
+        no references -> not protected. Since no adapter here can do this today,
+        a protection-required entry is refused at this boundary, which is the
+        intended architecture (ADR-0018, option B).
+        """
+        # The plan must still carry the protective level -- necessary, and
+        # nowhere near sufficient.
         has_stop = intent.stop_price is not None and intent.stop_price > 0
+
+        if self._protection is None:
+            return ProtectionState(
+                protective_order_supported=False,
+                plan_has_protective_stop=has_stop,
+                protection_required=self._config.protection_required,
+                detail=(
+                    "no protected-entry lifecycle is wired, so broker-side"
+                    " protection cannot be established or proven; a supported"
+                    " STOP order type is not a resting protective order"
+                ),
+            )
+        try:
+            evidence = self._protection.protection_for(intent)
+        except Exception as error:  # noqa: BLE001 - unproven is unprotected
+            return ProtectionState(
+                protective_order_supported=False,
+                plan_has_protective_stop=has_stop,
+                protection_required=self._config.protection_required,
+                detail=f"protection lifecycle raised {type(error).__name__}",
+            )
+        # Established WITHOUT a broker reference is a promise, not protection.
+        proven = bool(evidence.established and evidence.protective_order_refs)
+        detail = evidence.detail or (
+            f"protection via {evidence.mechanism}:"
+            f" {list(evidence.protective_order_refs)}"
+            if proven
+            else "the lifecycle established no broker-resident protection"
+        )
         return ProtectionState(
-            protective_order_supported=supported,
+            protective_order_supported=proven,
             plan_has_protective_stop=has_stop,
             protection_required=self._config.protection_required,
             detail=detail,
@@ -479,6 +553,8 @@ __all__ = [
     "GuardConfig",
     "QuoteSource",
     "ReadinessBlockedError",
+    "ProtectedEntryLifecycle",
+    "ProtectionEvidence",
     "ReadinessGuardedBroker",
     "RiskSource",
     "readiness_record_fields",

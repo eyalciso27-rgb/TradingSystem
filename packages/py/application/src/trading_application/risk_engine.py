@@ -163,6 +163,16 @@ class RiskEngine:
     def __init__(self, policy: RiskPolicy) -> None:
         self._policy = policy
 
+    @property
+    def policy(self) -> RiskPolicy:
+        """The policy this engine actually applies.
+
+        Supported, so a caller can verify that the policy its configuration
+        names is the policy the veto is computed from, instead of reaching for
+        a private attribute and hoping.
+        """
+        return self._policy
+
     def evaluate(
         self,
         decision: EngineDecision,

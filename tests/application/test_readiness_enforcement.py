@@ -316,6 +316,7 @@ def _guard(
     universe_status: UniverseListStatus | None = None,
     requirements: StrategyDataRequirements | None = None,
     rules: MarketDataRules | None = None,
+    protection_required: bool = False,
 ) -> tuple[ReadinessGuardedBroker, _Broker, _Audit]:
     real = broker or _Broker()
     sink = audit or _Audit()
@@ -330,6 +331,10 @@ def _guard(
                 max_spread_fraction=Decimal("0.01"), min_price=Decimal("1.00")
             ),
             account_alias="paper-poi",
+            # Protection now requires a protected-entry lifecycle and has its
+            # own tests; these are about the other ten gates and the audit
+            # ordering, which would otherwise all hide behind it.
+            protection_required=protection_required,
         ),
         quotes=quotes or _Quotes(),
         risk=risk or _Risk(),
@@ -508,8 +513,8 @@ def test_the_record_carries_the_opaque_broker_ref_not_a_decoded_id() -> None:
         ("no risk evaluation", {"risk": _Risk(outcome="NONE")}),
         ("zero size", {"risk": _Risk(quantity=Decimal(0))}),
         (
-            "no protection capability",
-            {"broker": _Broker(stop_capability=BrokerCapabilityMode.UNSUPPORTED)},
+            "protection required but no lifecycle can establish it",
+            {"protection_required": True},
         ),
         ("quote feed down", {"quotes": _Quotes(raises=True)}),
         (
@@ -556,9 +561,26 @@ def test_the_what_if_used_to_prove_tradability_places_nothing() -> None:
 
 
 def test_a_plan_without_a_protective_stop_never_reaches_the_broker() -> None:
-    guard, broker, _ = _guard()
+    guard, broker, _ = _guard(protection_required=True)
     with pytest.raises(ReadinessBlockedError):
         guard.submit_order(_intent(order_type=OrderType.MARKET, stop_price=None))
+    assert broker.submitted == []
+
+
+def test_a_stop_price_on_the_entry_is_not_broker_side_protection() -> None:
+    """The intent carries a stop and the broker supports STOP orders.
+
+    Neither fact puts a protective order at the broker, and the guard no longer
+    pretends otherwise.
+    """
+    guard, broker, _ = _guard(protection_required=True)
+
+    with pytest.raises(ReadinessBlockedError) as error:
+        guard.submit_order(_intent(stop_price=Decimal("95.00")))
+
+    assert any(
+        "broker_side_protection" in blocker for blocker in error.value.report.blockers
+    )
     assert broker.submitted == []
 
 

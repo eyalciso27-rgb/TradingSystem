@@ -49,6 +49,9 @@ class ExplodingTransport:
         self._connect_ok = connect_ok
         self.disconnected = False
 
+    def session_pnl(self, account_id: str) -> Decimal | None:
+        raise RuntimeError("arbitrary SDK explosion")
+
     def connect(self, host: str, port: int, client_id: int) -> tuple[str, ...]:
         if not self._connect_ok:
             raise Boom("connect exploded")

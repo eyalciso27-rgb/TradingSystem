@@ -174,6 +174,11 @@ def _guard(
                 max_spread_fraction=Decimal("0.01"), min_price=Decimal("1.00")
             ),
             account_alias="paper-main",
+            # These tests are about identity, tradability, quotes and risk.
+            # Broker-side protection now requires a protected-entry lifecycle
+            # that no adapter here can provide, and it has its own dedicated
+            # tests; leaving it required would mask every other gate behind it.
+            protection_required=False,
         ),
         quotes=quotes or _Quotes(),
         risk=risk or _Risk(),

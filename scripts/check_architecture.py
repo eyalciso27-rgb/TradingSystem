@@ -147,6 +147,18 @@ RISK_RESULT_ALLOWED_PATHS: tuple[str, ...] = (
 # silently disabled a real safety limit: a zero session P&L turns off both daily
 # halts, and labelling existing positions with the candidate's classification
 # corrupts the sector, cluster and source caps at once.
+# Reading broker-side protection out of a capability flag. A supported STOP
+# order TYPE says the broker would accept a protective order; it says nothing
+# about one existing, and an entry carrying a stop price is still one order.
+PROTECTION_INFERENCE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "broker-side protection inferred from a capability rather than proven",
+        re.compile(
+            r"protective_order_supported\s*=\s*(?!False)(?!proven)\S"
+        ),
+    ),
+)
+
 FORBIDDEN_FABRICATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "fabricated session P&L (UNKNOWN must never become zero)",
@@ -286,6 +298,11 @@ def _check_imports(rel_path: str, tree: ast.AST) -> list[Violation]:
 def _check_text(rel_path: str, text: str) -> list[Violation]:
     violations: list[Violation] = []
     for line_number, line_text in enumerate(text.splitlines(), start=1):
+        for rule_name, pattern in PROTECTION_INFERENCE_PATTERNS:
+            if pattern.search(line_text):
+                violations.append(
+                    Violation(rel_path, line_number, "unproven-protection", rule_name)
+                )
         for rule_name, pattern in FORBIDDEN_FABRICATION_PATTERNS:
             if pattern.search(line_text):
                 violations.append(
