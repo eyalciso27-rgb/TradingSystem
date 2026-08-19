@@ -384,6 +384,17 @@ class ReadinessGuardedBroker:
             )
         return str(reference)
 
+    def evaluate_readiness(self, intent: OrderIntent) -> TradingReadinessRuntimeReport:
+        """Observe and report, WITHOUT persisting or submitting anything.
+
+        Exists so an operator probe reads the same observations the gate will
+        use, rather than a parallel re-implementation that could drift from it.
+        It is explicitly NOT the check: ``submit_order`` evaluates again at the
+        boundary, because a report computed a second ago describes a market that
+        has already moved on.
+        """
+        return evaluate_runtime_readiness(self._build_inputs(intent))
+
     def submit_order(self, intent: OrderIntent) -> BrokerOrderReceipt:
         """THE gate. Readiness, then audit, then — only then — the broker."""
         report = evaluate_runtime_readiness(self._build_inputs(intent))

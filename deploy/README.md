@@ -94,6 +94,27 @@ credentials are required at runtime (no defaults). Operational logs
 (Loki), metrics (Prometheus) and traces (OpenTelemetry) stay separate from
 the tamper-evident audit trail in PostgreSQL, which they never replace.
 
+### Execution is NOT automatic
+
+The scheduler starts with the stack because a monthly refresh nobody remembers
+is the whole point of having one. Execution is the opposite case, and it is
+deliberately absent from every compose stack: no service starts the execution
+path, nothing places an order at `up`, and the only production authorization
+implementation denies. Paper Auto and Live remain prohibited.
+
+The one supported way to exercise the real execution runtime is the owner-host
+probe, which resolves a contract, takes a live quote, runs the risk engine, asks
+the broker to validate the order with a what-if that places nothing, computes
+readiness and records the decision — and then stops:
+
+```sh
+uv run --no-sync python -m trading_execution_agent probe --mode paper --symbol AAPL
+```
+
+It has no submission path. It reports the real state of the owner host,
+including answers nobody wants — a missing market-data subscription,
+delayed-only ticks, an unavailable quote size — as themselves.
+
 Rules baked in: no credentials or defaults in the files (`:?` fails closed);
 PAPER uses its own `PAPER_*` variables, network (`trading-paper`) and volumes,
 sharing nothing with dev/test; PostgreSQL is never exposed beyond localhost

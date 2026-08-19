@@ -171,6 +171,17 @@ class ExecutionAgent:
         self._outcomes[request.client_order_id] = outcome
         return outcome
 
+    def outcome_for(self, client_order_id: str) -> ExecutionOutcome | None:
+        """The terminal outcome already recorded for this order, if any.
+
+        Read-only view of the idempotency map. Callers use it to recognise a
+        retry BEFORE re-doing work, which matters because re-planning a decision
+        that already reached the broker means re-previewing an order id the
+        broker has already seen -- and the broker rightly refuses that when the
+        authorization differs.
+        """
+        return self._outcomes.get(client_order_id)
+
     def cancel(self, client_order_id: str, *, correlation_id: str) -> ExecutionOutcome:
         """Cancel a previously submitted order via the port (fail closed)."""
         submitted = self._outcomes.get(client_order_id)

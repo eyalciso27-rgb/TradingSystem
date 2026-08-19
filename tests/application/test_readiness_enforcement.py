@@ -38,7 +38,11 @@ from trading_application.readiness_guarded_broker import (
     ReadinessGuardedBroker,
 )
 from trading_application.risk_engine import RiskResult
-from trading_application.trading_readiness_runtime import MarketDataRules, QuoteState
+from trading_application.trading_readiness_runtime import (
+    MarketDataRules,
+    MarketDataState,
+    QuoteState,
+)
 from trading_broker_core.port import (
     AccountSnapshot,
     BrokerCapabilities,
@@ -74,6 +78,18 @@ from trading_market_data_core.trading_readiness import (
 )
 
 NOW = datetime(2026, 8, 18, 15, 30, tzinfo=UTC)
+
+def _quote(*args: object, **kw: object) -> QuoteState:
+    """A quote that states its feed, because an unstated feed now blocks.
+
+    ``market_data_state`` defaults to UNKNOWN in production for exactly that
+    reason; these tests are about other properties, so they declare a healthy
+    realtime feed rather than silently relying on a default that must not exist.
+    """
+    kw.setdefault("market_data_state", MarketDataState.REALTIME)
+    return QuoteState(*args, **kw)  # type: ignore[arg-type]
+
+
 
 CANONICAL_INSTRUMENT = BrokerInstrument(
     broker_instrument_ref="ibkr-paper:265598",
@@ -206,7 +222,7 @@ class _Broker:
 
 class _Quotes:
     def __init__(self, quote: QuoteState | None = None, raises: bool = False) -> None:
-        self._quote = quote or QuoteState(
+        self._quote = quote or _quote(
             bid=Decimal("100.00"), ask=Decimal("100.05"),
             observed_at=NOW - timedelta(seconds=1), bid_size=500, ask_size=500,
         )
@@ -500,7 +516,7 @@ def test_the_record_carries_the_opaque_broker_ref_not_a_decoded_id() -> None:
             "stale quote",
             {
                 "quotes": _Quotes(
-                    QuoteState(
+                    _quote(
                         Decimal("100"), Decimal("100.05"), NOW - timedelta(minutes=5)
                     )
                 )
@@ -628,7 +644,7 @@ def test_a_configured_liquidity_rule_is_never_silently_ignored() -> None:
     guard, broker, _ = _guard(
         rules=MarketDataRules(min_bid_size=1000),
         quotes=_Quotes(
-            QuoteState(
+            _quote(
                 Decimal("100"), Decimal("100.05"), NOW - timedelta(seconds=1),
                 bid_size=10, ask_size=10,
             )
@@ -643,7 +659,7 @@ def test_an_unknown_bid_size_fails_a_configured_liquidity_rule_closed() -> None:
     guard, broker, _ = _guard(
         rules=MarketDataRules(min_bid_size=100),
         quotes=_Quotes(
-            QuoteState(Decimal("100"), Decimal("100.05"), NOW - timedelta(seconds=1))
+            _quote(Decimal("100"), Decimal("100.05"), NOW - timedelta(seconds=1))
         ),
     )
     with pytest.raises(ReadinessBlockedError):

@@ -118,6 +118,50 @@ FORBIDDEN_TEXT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+# The ONLY places that may call ``submit_order``. An order reaching the broker
+# from anywhere else would be an execution path that skipped the readiness
+# guard, the audit and the single-use authorization -- which is exactly the
+# competing route the canonical execution runtime exists to prevent.
+#
+# ``broker-core`` declares the port, ``broker-ibkr`` implements it, the guard
+# delegates to it after enforcing readiness, and the execution agent is the sole
+# consumer of a SubmitAuthorization. Nothing else, ever.
+SUBMIT_ORDER_ALLOWED_PATHS: tuple[str, ...] = (
+    "packages/py/broker-core",
+    "packages/py/broker-ibkr",
+    "packages/py/application/src/trading_application/readiness_guarded_broker.py",
+    "apps/execution-agent/src/trading_execution_agent/agent.py",
+)
+
+# A RiskResult is the risk engine's verdict. Constructing one anywhere else in
+# production means some other component decided what risk thinks, which is the
+# definition of bypassing the absolute veto.
+RISK_RESULT_ALLOWED_PATHS: tuple[str, ...] = (
+    "packages/py/application/src/trading_application/risk_engine.py",
+)
+
+# Invariants that must remain literally true in the files that carry them.
+# Each is a property a future edit could quietly remove while every test still
+# passes, so the text itself is pinned.
+REQUIRED_INVARIANTS: tuple[tuple[str, str, str], ...] = (
+    (
+        "apps/execution-agent/src/trading_execution_agent/execution_service.py",
+        "authorization or DenyAllExecutionAuthorization()",
+        "execution authorization must DEFAULT to deny",
+    ),
+    (
+        "apps/execution-agent/src/trading_execution_agent/execution_service.py",
+        "self._agent.process(",
+        "the execution service must submit only through the execution agent",
+    ),
+    (
+        "packages/py/application/src/trading_application/readiness_guarded_broker.py",
+        "self._persist_pre_trade(report, intent)",
+        "the guard must persist the pre-trade record before submitting",
+    ),
+)
+
+
 @dataclass(frozen=True)
 class Violation:
     path: str
@@ -229,6 +273,75 @@ def _check_text(rel_path: str, text: str) -> list[Violation]:
     return violations
 
 
+def _attribute_calls(tree: ast.AST, name: str) -> list[int]:
+    """Line numbers of every ``<something>.name(...)`` call in a module."""
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == name
+        ):
+            lines.append(node.lineno)
+    return lines
+
+
+def _constructor_calls(tree: ast.AST, name: str) -> list[int]:
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name:
+            lines.append(node.lineno)
+    return lines
+
+
+def _check_execution_boundary(rel_path: str, tree: ast.AST) -> list[Violation]:
+    """Keep order submission and risk verdicts where they belong."""
+    violations: list[Violation] = []
+    if not any(_under(rel_path, prefix) for prefix in SUBMIT_ORDER_ALLOWED_PATHS):
+        violations.extend(
+            Violation(
+                rel_path,
+                line,
+                "execution-boundary",
+                "submit_order() may only be called by the broker port, its"
+                " adapter, the readiness guard and the execution agent;"
+                f" allowed: {list(SUBMIT_ORDER_ALLOWED_PATHS)}",
+            )
+            for line in _attribute_calls(tree, "submit_order")
+        )
+    if not any(_under(rel_path, prefix) for prefix in RISK_RESULT_ALLOWED_PATHS):
+        violations.extend(
+            Violation(
+                rel_path,
+                line,
+                "risk-authority",
+                "RiskResult is the risk engine's verdict and may only be"
+                " constructed there; building one elsewhere bypasses the veto",
+            )
+            for line in _constructor_calls(tree, "RiskResult")
+        )
+    return violations
+
+
+def _check_invariants(repo_root: Path) -> list[Violation]:
+    """Pin properties a future edit could remove with every test still green.
+
+    Only meaningful against a real checkout: the boundary tests scan synthetic
+    trees, where "this file is missing" says nothing about the repository.
+    """
+    if not (repo_root / "pyproject.toml").is_file():
+        return []
+    violations: list[Violation] = []
+    for rel_path, needle, message in REQUIRED_INVARIANTS:
+        path = repo_root / rel_path
+        if not path.is_file():
+            violations.append(Violation(rel_path, 0, "missing-invariant-file", message))
+            continue
+        if needle not in path.read_text(encoding="utf-8"):
+            violations.append(Violation(rel_path, 0, "invariant", message))
+    return violations
+
+
 def scan_repository(repo_root: Path) -> list[Violation]:
     """Scan a repository tree and return all guardrail violations."""
     violations: list[Violation] = []
@@ -244,6 +357,8 @@ def scan_repository(repo_root: Path) -> list[Violation]:
             continue
         violations.extend(_check_imports(rel_path, tree))
         violations.extend(_check_text(rel_path, text))
+        violations.extend(_check_execution_boundary(rel_path, tree))
+    violations.extend(_check_invariants(repo_root))
     return violations
 
 

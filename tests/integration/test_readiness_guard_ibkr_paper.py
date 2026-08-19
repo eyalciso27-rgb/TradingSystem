@@ -32,7 +32,11 @@ from trading_application.readiness_guarded_broker import (
     ReadinessGuardedBroker,
 )
 from trading_application.risk_engine import RiskResult
-from trading_application.trading_readiness_runtime import MarketDataRules, QuoteState
+from trading_application.trading_readiness_runtime import (
+    MarketDataRules,
+    MarketDataState,
+    QuoteState,
+)
 from trading_broker_core.port import (
     BrokerPort,
     BrokerPortError,
@@ -65,10 +69,22 @@ ADAPTER_NOW = datetime(2026, 8, 18, 15, 30, tzinfo=UTC)
 #: the session-freshness gate sees a genuinely recent observation.
 GUARD_NOW = ADAPTER_NOW + timedelta(seconds=2)
 
+def _quote(*args: object, **kw: object) -> QuoteState:
+    """A quote that states its feed, because an unstated feed now blocks.
+
+    ``market_data_state`` defaults to UNKNOWN in production for exactly that
+    reason; these tests are about other properties, so they declare a healthy
+    realtime feed rather than silently relying on a default that must not exist.
+    """
+    kw.setdefault("market_data_state", MarketDataState.REALTIME)
+    return QuoteState(*args, **kw)  # type: ignore[arg-type]
+
+
+
 
 class _Quotes:
     def __init__(self, quote: QuoteState | None = None) -> None:
-        self._quote = quote or QuoteState(
+        self._quote = quote or _quote(
             bid=Decimal("100.00"), ask=Decimal("100.05"),
             observed_at=GUARD_NOW - timedelta(seconds=1), bid_size=500, ask_size=500,
         )
