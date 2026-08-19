@@ -47,6 +47,7 @@ from trading_contracts.enums import DecisionOutcome, Environment, RiskDecisionOu
 from trading_application.decision_engine import EngineDecision
 from trading_application.emergency import EntryContext, HaltRecord, match_halt
 from trading_application.execution_identity import (
+    allocation_identity,
     decision_identity,
     pre_submit_policy_identity,
     risk_result_identity,
@@ -179,6 +180,27 @@ class PreSubmitRequest:
             raise PreSubmitError("planned entry/stop prices must be positive")
         if self.planned_entry_price == self.planned_stop_price:
             raise PreSubmitError("planned stop must differ from entry")
+        # The allocation must belong to THIS decision and THIS risk evaluation.
+        # Taking its action and quantity on trust would let an allocation sized
+        # against a different decision -- or a different evaluation of the same
+        # decision -- authorize this one.
+        expected_decision = decision_identity(self.decision)
+        if self.allocation.decision_ref != expected_decision:
+            raise PreSubmitError(
+                f"the allocation names decision {self.allocation.decision_ref!r}"
+                f" but this request is for {expected_decision!r}"
+            )
+        if self.risk_result.decision_ref != expected_decision:
+            raise PreSubmitError(
+                f"the risk result names decision {self.risk_result.decision_ref!r}"
+                f" but this request is for {expected_decision!r}"
+            )
+        expected_risk = risk_result_identity(self.risk_result)
+        if self.allocation.risk_ref != expected_risk:
+            raise PreSubmitError(
+                "the allocation was sized against a different risk evaluation"
+                f" ({self.allocation.risk_ref!r} != {expected_risk!r})"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,9 +374,10 @@ class FinalPreSubmitCheck:
                 action=action,
                 authorized_quantity=quantity,
                 authorization=None,
-                allocation_ref=(
-                    f"allocation:{allocation.candidate_id}@{allocation.action.value}"
-                ),
+                # THE exact allocation, content-addressed. The candidate plus
+                # the action could never prove WHICH allocation this was sized
+                # against: many allocations for one candidate share an action.
+                allocation_ref=allocation_identity(allocation),
                 # The EXACT risk result, not merely its outcome: every
                 # approving evaluation in the system shares "risk:APPROVE", so
                 # that could never prove WHICH evaluation was authorized.

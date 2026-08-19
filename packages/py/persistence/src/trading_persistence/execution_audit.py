@@ -411,6 +411,29 @@ class DurableExecutionHistoryReader:
         return tuple(records)
 
 
+#: Every lifecycle record that names an execution must carry these. They are
+#: the fields that say WHICH execution it was and what the caller asked for;
+#: all are known before an order is planned, so all are always available.
+REQUIRED_IDENTITY_FIELDS: tuple[str, ...] = (
+    "decision_id",
+    "client_order_id",
+    "strategy_id",
+    "symbol",
+    "side",
+    "environment",
+    "account_alias",
+    "requested_quantity",
+)
+
+#: A SUBMIT_PREPARED record additionally describes the frozen broker-bound
+#: order. Without these a replay cannot distinguish a repeat from a change.
+REQUIRED_PREPARED_FIELDS: tuple[str, ...] = (
+    "order_type",
+    "quantity",
+    "time_in_force",
+)
+
+
 def _require_readable(
     action: str, chain_hash: str, payload: Mapping[str, object]
 ) -> None:
@@ -423,11 +446,41 @@ def _require_readable(
     """
     if action in AMBIGUOUS_ACTIONS or action in TERMINAL_ACTIONS:
         fingerprint = payload.get("execution_fingerprint")
-        if not isinstance(fingerprint, dict) or not fingerprint:
+        if not isinstance(fingerprint, dict):
             raise ExecutionHistoryUnreadableError(
                 f"{action} record {chain_hash} carries no execution fingerprint;"
                 " the execution it describes cannot be identified"
             )
+        # A NON-EMPTY dict is not a fingerprint. ``{"junk": "x"}`` used to pass
+        # here, then fail to parse into an ExecutionFingerprint, and be silently
+        # skipped by the conflict check -- so a malformed identity behaved
+        # exactly like no identity at all, which is the failure mode this
+        # validation exists to prevent.
+        missing = [
+            field
+            for field in REQUIRED_IDENTITY_FIELDS
+            if not str(fingerprint.get(field, "")).strip()
+        ]
+        if missing:
+            raise ExecutionHistoryUnreadableError(
+                f"{action} record {chain_hash} has an incomplete execution"
+                f" fingerprint (missing {missing}); a malformed identity must"
+                " never be treated as an absent one"
+            )
+        if action in AMBIGUOUS_ACTIONS:
+            # The point of no return must carry the FROZEN order, or a replay
+            # cannot tell a repeat from a changed one.
+            missing_order = [
+                field
+                for field in REQUIRED_PREPARED_FIELDS
+                if not str(fingerprint.get(field, "")).strip()
+            ]
+            if missing_order:
+                raise ExecutionHistoryUnreadableError(
+                    f"{action} record {chain_hash} does not describe the frozen"
+                    f" order (missing {missing_order}); the prepared execution"
+                    " cannot be compared to a replay"
+                )
     if action in TERMINAL_ACTIONS and not payload.get("submission_outcome"):
         raise ExecutionHistoryUnreadableError(
             f"terminal record {chain_hash} carries no submission outcome; it"
@@ -462,6 +515,8 @@ __all__ = [
     "TERMINAL_ACTIONS",
     "ExecutionHistoryRecord",
     "ExecutionHistoryUnreadableError",
+    "REQUIRED_IDENTITY_FIELDS",
+    "REQUIRED_PREPARED_FIELDS",
     "order_index_ref",
     "EXECUTION_AUDIT_VERSION",
     "MAX_DETAIL_CHARS",

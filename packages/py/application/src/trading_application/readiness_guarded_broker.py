@@ -59,6 +59,7 @@ from trading_broker_core.port import (
     OrderIntent,
     OrderPreview,
     ReconciliationResult,
+    RecoveredOrder,
 )
 from trading_contracts.enums import Environment
 from trading_market_data_core.trading_readiness import (
@@ -517,6 +518,12 @@ class ReadinessGuardedBroker:
     ) -> tuple[BrokerOrderReceipt, ...]:
         """Never gated: recovering what already exists reduces uncertainty."""
         return self._broker.recover_cancellable_orders(account_alias)
+
+    def recover_working_orders(
+        self, account_alias: str
+    ) -> tuple[RecoveredOrder, ...]:
+        """Never gated: reading what the broker holds cannot create exposure."""
+        return self._broker.recover_working_orders(account_alias)
 
     def preview_order(self, intent: OrderIntent) -> OrderPreview:
         """What-if only; it places nothing, so it is not gated."""

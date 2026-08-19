@@ -110,8 +110,25 @@ def pre_submit_policy_identity(policy: _Dataclassish) -> str:
     return f"pre-submit-policy:{version}@sha256:{_content(policy)}"
 
 
+def portfolio_policy_identity(policy: _Dataclassish) -> str:
+    """The PORTFOLIO policy, by version AND content.
+
+    A third distinct namespace. Risk, portfolio and pre-submit policies govern
+    different checks, and a version string alone would let two materially
+    different policies share a name -- so an audit could report caps that were
+    never applied.
+    """
+    version = str(getattr(policy, "policy_version", "unknown"))
+    return f"portfolio-policy:{version}@sha256:{_content(policy)}"
+
+
 def allocation_identity(allocation: _Dataclassish) -> str:
-    """The portfolio allocation this authorization was sized against."""
+    """THE exact CandidateAllocation, content-addressed.
+
+    Not ``allocation:{candidate}@{action}``: many allocations for one candidate
+    can share an action, so that could never prove WHICH allocation an
+    authorization was sized against.
+    """
     candidate = str(getattr(allocation, "candidate_id", "unknown"))
     return f"allocation:{candidate}@sha256:{_content(allocation)}"
 
@@ -127,6 +144,7 @@ __all__ = [
     "allocation_identity",
     "authorization_identity",
     "decision_identity",
+    "portfolio_policy_identity",
     "pre_submit_policy_identity",
     "risk_policy_identity",
     "risk_result_identity",

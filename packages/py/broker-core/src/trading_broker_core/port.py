@@ -316,6 +316,36 @@ class CancelOrderRequest:
             raise ValueError("client_order_id is mandatory")
 
 
+@dataclass(frozen=True, slots=True)
+class RecoveredOrder:
+    """A working order the broker says THIS client owns, as the broker sees it.
+
+    Distinct from ``BrokerOrderReceipt`` on purpose. A receipt is our record of
+    something we sent, and after a restart we no longer have it — so recovery
+    must describe what the BROKER still holds, in the broker's own terms.
+
+    Only facts the broker actually reports appear here. There is deliberately no
+    correlation id: the original one was ours and the broker never stored it, so
+    an implementation that produced one would be inventing the very identity the
+    caller is trying to verify.
+    """
+
+    client_order_id: str
+    broker_order_ref: str
+    state: OrderState
+    account_alias: str
+    symbol: str
+    side: OrderSide
+    quantity: Decimal
+    order_type: OrderType
+    limit_price: Decimal | None
+    stop_price: Decimal | None
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_aware(self.observed_at, "observed_at")
+
+
 class BrokerPort(Protocol):
     """The canonical broker boundary (Integration 9.1), synchronous form.
 
@@ -337,6 +367,19 @@ class BrokerPort(Protocol):
     def get_positions(self, account_alias: str) -> tuple[BrokerPosition, ...]: ...
 
     def get_open_orders(self, account_alias: str) -> tuple[BrokerOrderReceipt, ...]: ...
+
+    def recover_working_orders(
+        self, account_alias: str
+    ) -> tuple[RecoveredOrder, ...]:
+        """What the broker still holds for THIS client, in the broker's terms.
+
+        The identity-bearing half of recovery. ``recover_cancellable_orders``
+        answers "what may I cancel"; this answers "what does the broker actually
+        have, and what shape is it", which is what an ambiguous durable state
+        needs in order to decide whether a working order is the execution that
+        was prepared.
+        """
+        ...
 
     def recover_cancellable_orders(
         self, account_alias: str
@@ -386,6 +429,7 @@ __all__ = [
     "ModifyOrderRequest",
     "OrderIntent",
     "OrderPreview",
+    "RecoveredOrder",
     "OrderSide",
     "TimeInForce",
     "ReconciliationResult",

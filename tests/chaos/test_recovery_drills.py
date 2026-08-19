@@ -47,6 +47,10 @@ from trading_application.emergency import (
     HaltRecord,
     InMemoryEmergencyCommandStore,
 )
+from trading_application.execution_identity import (
+    decision_identity,
+    risk_result_identity,
+)
 from trading_application.portfolio_allocator import CandidateAllocation
 from trading_application.pre_submit_check import (
     ApprovalState,
@@ -439,8 +443,8 @@ def _risk() -> RiskResult:
         approved_risk_amount=Decimal("100"),
         max_loss_amount=Decimal("100"),
         risk_budget_equity=Decimal("50000"),
-        decision_ref="decision:d1@sha256:" + "a" * 64,
-        policy_ref="risk-policy:r1",
+        decision_ref=decision_identity(_decision()),
+        policy_ref="risk-policy:r1@sha256:" + "0" * 64,
         engine_version="risk-engine-1.0.0",
         checks=(),
         reason_codes=(),
@@ -482,9 +486,11 @@ def _allocation() -> CandidateAllocation:
         allocated_quantity=Decimal("100"),
         allocated_risk=Decimal("100"),
         allocated_notional=Decimal("1000"),
-        decision_ref="decision:d1@sha256:" + "a" * 64,
-        risk_ref="risk:r1:APPROVE",
-        policy_ref="portfolio-policy:p1",
+        # Lineage the pre-submit check can verify: this allocation really
+        # belongs to this decision and this exact risk evaluation.
+        decision_ref=decision_identity(_decision()),
+        risk_ref=risk_result_identity(_risk()),
+        policy_ref="portfolio-policy:p1@sha256:" + "0" * 64,
         caps_evaluated=(),
         reason_codes=(),
         input_refs=("observation:a-1@src-1",),

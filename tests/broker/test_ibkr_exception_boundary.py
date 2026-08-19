@@ -106,6 +106,7 @@ READ_METHODS: tuple[tuple[str, Callable[[IbkrPaperAdapter], object]], ...] = (
     ("get_open_orders", lambda a: a.get_open_orders("paper-main")),
     ("get_positions", lambda a: a.get_positions("paper-main")),
     ("recover_cancellable_orders", lambda a: a.recover_cancellable_orders("paper-main")),
+    ("recover_working_orders", lambda a: a.recover_working_orders("paper-main")),
     ("reconcile", lambda a: a.reconcile("paper-main")),
 )
 

@@ -57,7 +57,9 @@ from trading_broker_core.port import (
     IntegrationHealth,
     OrderIntent,
     OrderPreview,
+    OrderSide,
     ReconciliationResult,
+    RecoveredOrder,
     TimeInForce,
 )
 from trading_contracts.enums import Environment, OrderState, OrderType
@@ -85,6 +87,24 @@ ALLOWED_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost"})
 PAPER_API_PORT = 4002
 LIVE_API_PORT = 4001
 PAPER_ACCOUNT_PREFIX = "DU"
+
+#: IBKR order fields -> canonical enums, for recovery. Anything absent here is
+#: a shape we cannot express canonically, and an order we will not describe
+#: approximately.
+_RECOVERED_SIDE: Mapping[str, OrderSide] = {
+    "BUY": OrderSide.BUY,
+    "SELL": OrderSide.SELL,
+}
+_RECOVERED_ORDER_TYPE: Mapping[str, OrderType] = {
+    "LMT": OrderType.LIMIT,
+    "STP": OrderType.STOP,
+    "STP LMT": OrderType.STOP_LIMIT,
+    "MKT": OrderType.MARKET,
+    "LIMIT": OrderType.LIMIT,
+    "STOP": OrderType.STOP,
+    "STOP_LIMIT": OrderType.STOP_LIMIT,
+    "MARKET": OrderType.MARKET,
+}
 
 #: How long to wait for the ``reqPnL`` subscription's first update before
 #: calling the daily P&L unknown. Short: a trading decision cannot wait, and a
@@ -842,6 +862,46 @@ class IbkrPaperAdapter:
                 received_at=self._now(),
             )
         return tuple(receipts.values())
+
+    def recover_working_orders(
+        self, account_alias: str
+    ) -> tuple[RecoveredOrder, ...]:
+        """The same eligible set, described as the BROKER reports it.
+
+        Every field comes from the ``reqOpenOrders`` row: symbol, side,
+        quantity, order type and prices are what IBKR says it is holding. The
+        original correlation id is deliberately absent -- it was ours, the
+        broker never stored it, and manufacturing one would fabricate the
+        identity a caller is trying to verify.
+        """
+        transport = self._require_connected()
+        account_id = self._account_id(account_alias)
+        raws = self._guarded(lambda: transport.same_client_open_orders(account_id))
+        eligible = self._eligible_recovered_orders(raws, account_id)
+        recovered: list[RecoveredOrder] = []
+        for client_order_id, raw in eligible.items():
+            side = _RECOVERED_SIDE.get(raw.action.upper())
+            order_type = _RECOVERED_ORDER_TYPE.get(raw.order_type.upper())
+            if side is None or order_type is None:
+                # An order shape we cannot express canonically is not one we may
+                # describe approximately.
+                continue
+            recovered.append(
+                RecoveredOrder(
+                    client_order_id=client_order_id,
+                    broker_order_ref=f"ibkr-paper:{raw.broker_order_id}",
+                    state=IBKR_STATUS_MAP[raw.status],
+                    account_alias=account_alias,
+                    symbol=raw.symbol,
+                    side=side,
+                    quantity=raw.quantity,
+                    order_type=order_type,
+                    limit_price=raw.limit_price,
+                    stop_price=getattr(raw, "aux_price", None),
+                    observed_at=self._now(),
+                )
+            )
+        return tuple(recovered)
 
     def recover_cancellable_orders(
         self, account_alias: str

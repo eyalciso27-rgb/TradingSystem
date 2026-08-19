@@ -9,6 +9,10 @@ from uuid import UUID
 import pytest
 from trading_application.decision_engine import DecisionExplanation, EngineDecision
 from trading_application.emergency import HaltRecord
+from trading_application.execution_identity import (
+    decision_identity,
+    risk_result_identity,
+)
 from trading_application.portfolio_allocator import CandidateAllocation
 from trading_application.pre_submit_check import (
     ApprovalState,
@@ -56,15 +60,25 @@ POLICY = PreSubmitPolicy(
 CHECK = FinalPreSubmitCheck(POLICY)
 
 
-def risk_result(outcome: RiskDecisionOutcome = RiskDecisionOutcome.APPROVE) -> RiskResult:
+def risk_result(
+    outcome: RiskDecisionOutcome = RiskDecisionOutcome.APPROVE,
+    for_decision: EngineDecision | None = None,
+) -> RiskResult:
+    """A risk result whose decision reference really points at its decision.
+
+    The pre-submit check verifies lineage now, so an invented reference is not
+    a valid risk result — the same property the real engine already satisfies.
+    """
     return RiskResult(
         outcome=outcome,
         approved_quantity=Decimal("100"),
         approved_risk_amount=Decimal("100"),  # 100 shares x $1 risk
         max_loss_amount=Decimal("100"),
         risk_budget_equity=Decimal("50000"),
-        decision_ref="decision:d1@sha256:" + "a" * 64,
-        policy_ref="risk-policy:r1",
+        decision_ref=decision_identity(
+            for_decision if for_decision is not None else decision()
+        ),
+        policy_ref="risk-policy:r1@sha256:" + "0" * 64,
         engine_version="risk-engine-1.0.0",
         checks=(),
         reason_codes=(),
@@ -102,7 +116,18 @@ def allocation(
     *,
     action: PortfolioAction = PortfolioAction.ALLOW,
     quantity: str = "100",
+    for_decision: EngineDecision | None = None,
+    for_risk: RiskResult | None = None,
 ) -> CandidateAllocation:
+    """An allocation whose lineage really points at its decision and risk.
+
+    The pre-submit check now VERIFIES that the allocation belongs to this
+    decision and this exact risk evaluation rather than trusting its action and
+    quantity, so a fixture with invented references is no longer a valid
+    allocation — which is the point.
+    """
+    source_decision = for_decision if for_decision is not None else decision()
+    source_risk = for_risk if for_risk is not None else risk_result()
     return CandidateAllocation(
         candidate_id="cand-1",
         action=action,
@@ -110,9 +135,9 @@ def allocation(
         allocated_quantity=Decimal(quantity),
         allocated_risk=Decimal(quantity),
         allocated_notional=Decimal(quantity) * Decimal("10"),
-        decision_ref="decision:d1@sha256:" + "a" * 64,
-        risk_ref="risk:r1:APPROVE",
-        policy_ref="portfolio-policy:p1",
+        decision_ref=decision_identity(source_decision),
+        risk_ref=risk_result_identity(source_risk),
+        policy_ref="portfolio-policy:p1@sha256:" + "0" * 64,
         caps_evaluated=(),
         reason_codes=(),
         input_refs=("observation:a-1@src-1",),
@@ -127,10 +152,16 @@ def request(
     entry: str = "10",
     stop: str = "9",
 ) -> PreSubmitRequest:
+    this_decision = decision(decision_outcome)
+    this_risk = risk_result(risk_outcome, for_decision=this_decision)
     return PreSubmitRequest(
-        allocation=alloc if alloc is not None else allocation(),
-        risk_result=risk_result(risk_outcome),
-        decision=decision(decision_outcome),
+        allocation=(
+            alloc
+            if alloc is not None
+            else allocation(for_decision=this_decision, for_risk=this_risk)
+        ),
+        risk_result=this_risk,
+        decision=this_decision,
         symbol="AAPL",
         strategy_id="strat-1",
         source_id="src-1",

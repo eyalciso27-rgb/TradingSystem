@@ -102,6 +102,8 @@ from trading_broker_core.port import (
     InstrumentQuery,
     OrderIntent,
     OrderSide,
+    RecoveredOrder,
+    TimeInForce,
 )
 from trading_contracts.enums import Environment, OrderType, RiskDecisionOutcome
 from trading_market_data_core.sp500_current_universe import ConstituentSnapshot
@@ -145,7 +147,22 @@ MODE_ENVIRONMENT: Mapping[TradingMode, Environment] = {
 #: guessed from the candidate: an existing position's sector is not the new
 #: candidate's sector, and pretending otherwise corrupts every sector, cluster
 #: and source cap the risk engine computes.
+def _probe_failure(name: str, error: BaseException) -> str:
+    """What a failed read-only observation reports, instead of raising."""
+    return (
+        f"NOT OBSERVED: the {name} check itself failed with"
+        f" {type(error).__name__}: {error}"
+    )
+
+
 UNKNOWN_CLASSIFICATION = "UNKNOWN"
+
+#: The order shape a broker MUST report for a recovered order to be recognised.
+#: A field the broker leaves out is a fact we do not have, and an order we
+#: cannot recognise is reconciled rather than claimed.
+REQUIRED_RECOVERY_FIELDS: tuple[str, ...] = (
+    "symbol", "side", "order_type", "quantity",
+)
 
 
 def policy_identity(policy: RiskPolicy) -> str:
@@ -191,6 +208,9 @@ class ExecutionStage(StrEnum):
     NEEDS_RECONCILIATION = "NEEDS_RECONCILIATION"
     #: The durable record disagrees with this request about what it IS.
     IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
+    #: The observation path itself failed. Not a verdict about the market or
+    #: the account -- a statement that we could not form one.
+    OBSERVATION_FAILED = "OBSERVATION_FAILED"
     #: The broker answered but we could not record it. Operationally critical.
     POST_SUBMIT_AUDIT_FAILED = "POST_SUBMIT_AUDIT_FAILED"
 
@@ -274,6 +294,8 @@ class ExecutionConfig:
     stop_loss_fraction: Decimal = Decimal("0.02")
 
     order_type: OrderType = OrderType.LIMIT
+    #: Part of the request identity: a changed TIF is a changed order.
+    time_in_force: TimeInForce = TimeInForce.DAY
     protection_required: bool = True
     sector: str = "UNKNOWN"
     cluster: str = "UNKNOWN"
@@ -392,6 +414,16 @@ class ExecutionAuthorization(Protocol):
         risk_result: RiskResult,
     ) -> AuthorizationDecision: ...
 
+    def pre_submit_policy_identity(self) -> str:
+        """The EXACT pre-submit policy this authority mints under.
+
+        A namespace prefix proves only that the reference is a pre-submit
+        identity; it says nothing about WHICH policy. A different policy with
+        the same version must not be able to authorize this execution, so the
+        authority states its policy and the service checks equality.
+        """
+        ...
+
 
 class DenyAllExecutionAuthorization:
     """The only production authorization: DENY.
@@ -415,6 +447,10 @@ class DenyAllExecutionAuthorization:
         risk_result: RiskResult,
     ) -> AuthorizationDecision:
         return AuthorizationDecision(allowed=False, reason=self.reason)
+
+    def pre_submit_policy_identity(self) -> str:
+        """Never reached: this authority mints nothing."""
+        return "pre-submit-policy:none@deny-all"
 
 
 # -- risk, scoped to one decision ---------------------------------------------
@@ -515,6 +551,12 @@ class ExecutionFingerprint:
     side: str
     environment: str
     account_alias: str
+    #: What the CALLER asked for, and the order shape the configuration would
+    #: build. Known before planning, so a changed request is detectable on
+    #: replay without a fresh quote.
+    requested_quantity: str = ""
+    configured_order_type: str = ""
+    configured_time_in_force: str = ""
     #: The order that was actually prepared. An id that comes back with a
     #: different quantity, price or order shape is not the same execution --
     #: it is a new one wearing an old name, and treating it as a replay would
@@ -535,6 +577,9 @@ class ExecutionFingerprint:
             "side": self.side,
             "environment": self.environment,
             "account_alias": self.account_alias,
+            "requested_quantity": self.requested_quantity,
+            "configured_order_type": self.configured_order_type,
+            "configured_time_in_force": self.configured_time_in_force,
             "order_type": self.order_type,
             "quantity": self.quantity,
             "limit_price": self.limit_price,
@@ -542,11 +587,14 @@ class ExecutionFingerprint:
             "time_in_force": self.time_in_force,
         }
 
-    #: The fields that say WHICH execution this is. Known before an order is
-    #: planned, so always comparable.
+    #: The fields that say WHICH execution this is, and what the caller ASKED
+    #: for. All are known before planning, so all are always comparable -- which
+    #: matters because a replay has not planned its order yet, and a changed
+    #: request must be detectable without re-reading the market.
     IDENTITY_FIELDS = (
         "decision_id", "client_order_id", "strategy_id", "source_id",
         "symbol", "side", "environment", "account_alias",
+        "requested_quantity", "configured_order_type", "configured_time_in_force",
     )
     #: The frozen order. Known only once one is planned, so compared only when
     #: BOTH sides have it -- a replay has not planned its order yet when the
@@ -588,6 +636,9 @@ class ExecutionFingerprint:
                 side=str(raw["side"]),
                 environment=str(raw["environment"]),
                 account_alias=str(raw["account_alias"]),
+                requested_quantity=str(raw.get("requested_quantity", "")),
+                configured_order_type=str(raw.get("configured_order_type", "")),
+                configured_time_in_force=str(raw.get("configured_time_in_force", "")),
                 order_type=str(raw.get("order_type", "")),
                 quantity=str(raw.get("quantity", "")),
                 limit_price=str(raw.get("limit_price", "")),
@@ -749,13 +800,13 @@ class ExecutionService:
         audit: ExecutionAuditSink,
         risk_engine: RiskEngine,
         config: ExecutionConfig,
-        agent_factory: Callable[[BrokerPort], ExecutionAgent],
+        entry_gate: ReconciliationGate,
+        agent_factory: Callable[[BrokerPort, ReconciliationGate], ExecutionAgent],
         authorization: ExecutionAuthorization | None = None,
         universe: Callable[[], ConstituentSnapshot | None] | None = None,
         portfolio: Callable[[], tuple[PositionExposure, ...]] | None = None,
         protection: ProtectedEntryLifecycle | None = None,
         history: DurableExecutionHistory | None = None,
-        entry_latch: ReconciliationGate | None = None,
         universe_status: Callable[[], UniverseListStatus | None] | None = None,
         halts: Callable[[], Sequence[HaltRecord]] | None = None,
         now: Callable[[], datetime] | None = None,
@@ -807,31 +858,23 @@ class ExecutionService:
             universe_status=universe_status,
             now=now,
         )
-        self._agent = agent_factory(self._guard)
+        # ONE gate. The service and the agent MUST hold the same instance:
+        # latching a gate the agent does not consult would let
+        # POST_SUBMIT_AUDIT_FAILED promise that new entries are blocked while
+        # the next entry sails straight through. The agent is therefore built
+        # FROM this gate rather than being free to install its own.
+        self._entry_gate = entry_gate
+        self._agent = agent_factory(self._guard, entry_gate)
+        #: Set when a submission's outcome could not be recorded. Independent of
+        #: the gate, so a latch that itself fails cannot reopen entries.
+        self._critical_state: str | None = None
         self._universe = universe
         #: Authoritative open-risk view when one exists; otherwise the estimate
         #: below is used and is documented as an estimate.
         self._portfolio = portfolio
         #: Survives a restart, unlike the agent's in-memory outcome map.
         self._history = history
-        #: The canonical entry gate, latched shut when a submission's outcome
-        #: cannot be recorded. Cancellation is never gated by it.
-        self._entry_latch = entry_latch
-        # A service whose authority can say ALLOW may cross the submit boundary,
-        # and POST_SUBMIT_AUDIT_FAILED promises that new entries are latched. A
-        # promise with no latch behind it is worse than no promise, so an
-        # execution-capable service must be given one. Evaluate-only services
-        # (the production DenyAll default) stay easy to construct.
-        if (
-            not isinstance(self._authorization, DenyAllExecutionAuthorization)
-            and entry_latch is None
-        ):
-            raise ExecutionServiceError(
-                "an execution-capable authority is configured but no"
-                " reconciliation latch was supplied; this service promises to"
-                " latch new entries when a post-submit audit fails and cannot"
-                " keep that promise without one"
-            )
+
         self._universe_status = universe_status
         self._halts = halts or (lambda: ())
         self._now = now or (lambda: datetime.now(tz=UTC))
@@ -860,28 +903,73 @@ class ExecutionService:
         """
         evidence = ExecutionEvidence(evaluated_at=self._now())
 
-        evidence.record("halts", *self._halt_evidence(intent))
-        evidence.record("account", *self._account_evidence())
-        evidence.record("session_pnl", *self._session_pnl_evidence())
-        instrument, contract_note = self._contract_evidence(intent)
+        # Every observation gets its OWN boundary. Independent facts must fail
+        # independently: a quote source that raises used to abort the whole run,
+        # so the owner learned nothing about the contract, the universe, the
+        # portfolio or the audit sink -- exactly the facts a broken host needs.
+        evidence.record("halts", *self._isolated("halts", self._halt_evidence, intent))
+        evidence.record("account", *self._isolated("account", self._account_evidence))
         evidence.record(
-            "contract",
-            instrument is not None,
-            contract_note,
+            "session_pnl", *self._isolated("session_pnl", self._session_pnl_evidence)
         )
-        quote = self._quotes.current_quote(intent.symbol)
-        evidence.record("quote", quote.bid is not None and quote.ask is not None,
-                        self._quote_note(quote))
-        evidence.record("universe", *self._universe_evidence(intent))
-        evidence.record("portfolio", *self._portfolio_evidence())
-        evidence.record("protection", *self._protection_evidence(intent, quote))
-        evidence.record("audit", *self._audit_evidence())
+
+        instrument: BrokerInstrument | None = None
+        try:
+            instrument, contract_note = self._contract_evidence(intent)
+        except Exception as error:  # noqa: BLE001 - one failed probe read
+            contract_note = _probe_failure("contract", error)
+        evidence.record("contract", instrument is not None, contract_note)
+
+        quote: QuoteState | None = None
+        try:
+            quote = self._quotes.current_quote(intent.symbol)
+            quote_note = self._quote_note(quote)
+            quote_ok = quote.bid is not None and quote.ask is not None
+        except Exception as error:  # noqa: BLE001 - one failed probe read
+            quote_ok, quote_note = False, _probe_failure("quote", error)
+        evidence.record("quote", quote_ok, quote_note)
+
+        evidence.record("universe", *self._isolated("universe", self._universe_evidence, intent))
+        evidence.record("portfolio", *self._isolated("portfolio", self._portfolio_evidence))
+        evidence.record(
+            "protection",
+            *self._isolated("protection", self._protection_evidence, intent, quote),
+        )
+        evidence.record("audit", *self._isolated("audit", self._audit_evidence))
 
         # The full decision path, which may legitimately stop early. Its own
-        # refusal reason is recorded alongside the independent observations.
-        evaluation = self._observe(intent)
-        evidence.evaluation = evaluation
+        # refusal reason is recorded alongside the independent observations, and
+        # its failure does not discard the observations already gathered.
+        try:
+            evidence.evaluation = self._observe(intent)
+        except Exception as error:  # noqa: BLE001 - the diagnosis survives it
+            evidence.record("evaluation", False, _probe_failure("evaluation", error))
+            evidence.evaluation = self._bare(
+                intent,
+                ExecutionStage.OBSERVATION_FAILED,
+                (_probe_failure("evaluation", error),),
+            )
         return evidence
+
+    def _isolated(
+        self,
+        name: str,
+        observe: Callable[..., tuple[bool, str]],
+        *args: object,
+    ) -> tuple[bool, str]:
+        """One read-only observation, whose failure stays its own.
+
+        A probe exists to report what is broken. An observation that raises IS
+        the finding, so it is recorded as a failed check with its error rather
+        than being allowed to end the run.
+        """
+        try:
+            return observe(*args)
+        except Exception as error:  # noqa: BLE001 - reported, not propagated
+            LOGGER.warning(
+                "probe observation failed", extra={"observation": name}, exc_info=True
+            )
+            return (False, _probe_failure(name, error))
 
     def execute(self, intent: ExecutionIntent) -> ExecutionEvaluation:
         """Observe, then submit ONLY if authorized and ready.
@@ -889,6 +977,26 @@ class ExecutionService:
         Named so it cannot be mistaken for a probe. It still cannot submit
         without an authority that says yes, and the production authority says no.
         """
+        if self._critical_state is not None:
+            # A previous submission's outcome could not be recorded. Until that
+            # is reconciled, no NEW entry may be attempted -- and this refusal
+            # does not depend on the latch having worked.
+            LOGGER.error(
+                "refusing a new entry while an unreconciled critical state"
+                " stands",
+                extra=self._context(intent, stage="CRITICAL_STATE"),
+            )
+            return self._bare(
+                intent,
+                ExecutionStage.POST_SUBMIT_AUDIT_FAILED,
+                (
+                    "a previous submission's outcome could not be durably"
+                    f" recorded ({self._critical_state}); new entries are"
+                    " blocked until an operator reconciles. Cancellation and"
+                    " exposure reduction remain available.",
+                ),
+            )
+
         durable = self._durable_verdict(intent)
         if durable is not None:
             return durable
@@ -1238,6 +1346,9 @@ class ExecutionService:
             side=intent.side.value,
             environment=self._config.environment.value,
             account_alias=self._config.account_alias,
+            requested_quantity=_normal(intent.requested_quantity),
+            configured_order_type=self._config.order_type.value,
+            configured_time_in_force=self._config.time_in_force.value,
             order_type=order.order_type.value if order else "",
             quantity=_normal(order.quantity) if order else "",
             limit_price=_normal(order.limit_price) if order else "",
@@ -1305,7 +1416,7 @@ class ExecutionService:
                 "a submission was prepared and never resolved; reconcile first",
                 extra=self._context(intent, stage="NEEDS_RECONCILIATION"),
             )
-            recovered = self._recover_from_broker(intent)
+            recovered = self._recover_from_broker(intent, records)
             if recovered is not None:
                 return recovered
             return self._bare(
@@ -1408,19 +1519,24 @@ class ExecutionService:
         )
 
     def _recover_from_broker(
-        self, intent: ExecutionIntent
+        self, intent: ExecutionIntent, records: Sequence[ExecutionHistoryLike]
     ) -> ExecutionEvaluation | None:
-        """Ask the broker whether it already holds this order.
+        """Ask the broker whether it already holds the order we prepared.
 
         An ambiguous durable state must not stay an abstract database condition
         when the broker can answer it. This uses the adapter's OWN same-client
-        open-order recovery -- the canonical mechanism -- rather than inventing
-        a second one, and it never submits anything.
+        recovery -- the canonical mechanism, statically typed on the port -- and
+        never submits anything.
+
+        Identity is proven from what the BROKER reports, compared to the frozen
+        order in the durable SUBMIT_PREPARED record. The previous version
+        compared correlation ids, which the broker never stored: the real
+        adapter therefore could not have satisfied it, and only a test double
+        fabricating the original correlation ever did.
         """
+        prepared = self._prepared_fingerprint(records)
         try:
-            recovered = self._broker.recover_cancellable_orders(
-                self._config.account_alias
-            )
+            working = self._broker.recover_working_orders(self._config.account_alias)
         except Exception as error:  # noqa: BLE001 - unknown stays unknown
             LOGGER.warning(
                 "broker recovery failed; the state remains ambiguous",
@@ -1429,27 +1545,35 @@ class ExecutionService:
                 ),
             )
             return None
-        for candidate in recovered:
+        for candidate in working:
             if candidate.client_order_id != intent.client_order_id:
                 continue
-            # A matching order id alone is NOT proof this is the prepared
-            # execution -- that is the same "familiar name" mistake the
-            # fingerprint exists to catch. Correlate as far as the port can
-            # prove, and refuse to claim more than it shows.
-            if candidate.correlation_id != intent.correlation_id:
+            if prepared is None:
+                return self._bare(
+                    intent,
+                    ExecutionStage.NEEDS_RECONCILIATION,
+                    (
+                        "the broker holds a working order with this order id but"
+                        " no prepared-order record describes what we sent;"
+                        " reconcile rather than claim it",
+                    ),
+                )
+            differing = self._broker_order_differences(candidate, prepared)
+            if differing:
                 LOGGER.warning(
-                    "a working order shares this order id but not its"
-                    " correlation; identity is unproven",
-                    extra=self._context(intent, stage="RECOVERY_IDENTITY_MISMATCH"),
+                    "a working order shares this order id but not its shape",
+                    extra=self._context(
+                        intent, stage="RECOVERY_IDENTITY_MISMATCH"
+                    ),
                 )
                 return self._bare(
                     intent,
                     ExecutionStage.NEEDS_RECONCILIATION,
                     (
                         "the broker holds a working order with this order id but"
-                        f" correlation {candidate.correlation_id!r} rather than"
-                        f" {intent.correlation_id!r}; the identity cannot be"
-                        " proven, so this is reconciled, not claimed",
+                        f" a different shape (differs in {list(differing)}); the"
+                        " identity cannot be proven, so this is reconciled, not"
+                        " claimed",
                     ),
                 )
             LOGGER.info(
@@ -1460,8 +1584,8 @@ class ExecutionService:
                 intent,
                 ExecutionStage.SUBMITTED,
                 (
-                    "the broker already holds a working order with this"
-                    " canonical identity; recovered rather than duplicated",
+                    "the broker already holds a working order matching the"
+                    " prepared execution; recovered rather than duplicated",
                 ),
             )
         LOGGER.info(
@@ -1469,6 +1593,59 @@ class ExecutionService:
             extra=self._context(intent, stage="RECOVERY_NO_MATCH"),
         )
         return None
+
+    @staticmethod
+    def _prepared_fingerprint(
+        records: Sequence[ExecutionHistoryLike],
+    ) -> ExecutionFingerprint | None:
+        """The frozen order from the durable point-of-no-return record."""
+        for record in records:
+            if record.action not in AMBIGUOUS_ACTIONS:
+                continue
+            stored = ExecutionFingerprint.from_dict(record.payload)
+            if stored is not None:
+                return stored
+        return None
+
+    @staticmethod
+    def _broker_order_differences(
+        candidate: RecoveredOrder, prepared: ExecutionFingerprint
+    ) -> tuple[str, ...]:
+        """Where the broker's working order differs from what we prepared.
+
+        Only facts the broker actually returned are compared. Time in force is
+        not among them -- the recovery feed does not report it -- and comparing
+        against a value the broker never gave would make recovery impossible
+        rather than safe.
+
+        The core shape must be reported, though: an order whose symbol, side,
+        quantity or type the broker did not state is an order we cannot
+        recognise, and that is reported as a difference rather than passed over.
+        """
+        observed = {
+            "symbol": candidate.symbol,
+            "side": candidate.side.value,
+            "order_type": candidate.order_type.value,
+            "quantity": _normal(candidate.quantity),
+            "limit_price": _normal(candidate.limit_price),
+            "stop_price": _normal(candidate.stop_price),
+            "account_alias": candidate.account_alias,
+        }
+        expected = prepared.to_dict()
+        differing = [
+            field
+            for field in REQUIRED_RECOVERY_FIELDS
+            if not observed[field] or observed[field] != expected.get(field, "")
+        ]
+        differing.extend(
+            field
+            for field, value in observed.items()
+            if field not in REQUIRED_RECOVERY_FIELDS
+            and value
+            and expected.get(field, "")
+            and value != expected[field]
+        )
+        return tuple(differing)
 
     def _bare(
         self, intent: ExecutionIntent, stage: ExecutionStage, reasons: tuple[str, ...]
@@ -1585,7 +1762,11 @@ class ExecutionService:
             authorization=authorization, audit_ref=evaluation.audit_ref,
             outcome=outcome, evaluated_at=self._now(),
             intent_mode=self._config.mode.value,
-            fingerprint=self._fingerprint(intent),
+            # The SAME full prepared-order identity the SUBMIT_PREPARED marker
+            # carried. Recomputing the pre-plan fingerprint here would have
+            # dropped the frozen order from the terminal record, so the durable
+            # lifecycle would not have preserved one identity end to end.
+            fingerprint=prepared_fingerprint,
         )
         LOGGER.info(
             "submit result",
@@ -1617,6 +1798,16 @@ class ExecutionService:
     # -- internals ------------------------------------------------------------
 
     @property
+    def entry_gate(self) -> ReconciliationGate:
+        """The ONE gate this service and its agent share."""
+        return self._entry_gate
+
+    @property
+    def critical_state(self) -> str | None:
+        """Set when a submission's outcome could not be recorded."""
+        return self._critical_state
+
+    @property
     def guarded_broker(self) -> ReadinessGuardedBroker:
         """The guarded port the agent submits through. Exposed for inspection."""
         return self._guard
@@ -1642,6 +1833,7 @@ class ExecutionService:
             quantity=quantity,
             limit_price=entry_price,
             stop_price=stop_price,
+            time_in_force=self._config.time_in_force,
         )
 
     def _stop_price(self, intent: ExecutionIntent, entry: Decimal) -> Decimal | None:
@@ -1868,10 +2060,13 @@ class ExecutionService:
                 "this risk result was produced under a different risk policy"
                 f" ({risk_result.policy_ref!r} != {expected_policy!r})"
             )
-        if not pre_submit.policy_ref.startswith("pre-submit-policy:"):
+        expected_pre_submit = self._authorization.pre_submit_policy_identity()
+        if pre_submit.policy_ref != expected_pre_submit:
             return (
-                f"the authorization's policy reference {pre_submit.policy_ref!r}"
-                " is not a pre-submit policy identity"
+                "the authorization was minted under a different pre-submit"
+                f" policy ({pre_submit.policy_ref!r} !="
+                f" {expected_pre_submit!r}); a policy sharing a version is"
+                " still a different policy"
             )
 
         if pre_submit.authorized_quantity > risk_result.approved_quantity:
@@ -1921,23 +2116,21 @@ class ExecutionService:
         return True
 
     def _require_reconciliation(self, reason: str) -> None:
-        """Latch new entries shut through the canonical gate.
+        """Latch new entries shut through the canonical gate the agent uses.
 
-        Reuses the execution agent's own reconciliation latch rather than
-        inventing a second blocking mechanism; cancellation and exposure
-        reduction are not gated by it, by design. A latch is guaranteed to
-        exist here because construction refuses an execution-capable service
-        without one.
+        The service's own critical state is set FIRST and independently: a
+        latch that throws must not be able to leave entries open, and logging
+        the failure is not the same as blocking. Cancellation and exposure
+        reduction are deliberately not gated by either.
         """
-        if self._entry_latch is None:
-            # Only reachable on an evaluate-only service, which cannot submit
-            # and therefore cannot reach this state.
-            return
+        self._critical_state = reason
         try:
-            self._entry_latch.require(reason)
+            self._entry_gate.require(reason)
         except Exception as error:  # noqa: BLE001
             LOGGER.error(
-                "could not latch new entries (%s) after: %s",
+                "the reconciliation latch itself failed (%s) after: %s;"
+                " new entries remain blocked by the service's own critical"
+                " state",
                 type(error).__name__, reason,
             )
 

@@ -62,6 +62,7 @@ from trading_broker_core.port import (
     OrderPreview,
     OrderSide,
     ReconciliationResult,
+    RecoveredOrder,
 )
 from trading_contracts.enums import (
     Environment,
@@ -212,6 +213,12 @@ class _Broker:
     ) -> tuple[BrokerOrderReceipt, ...]:
         """Same-client recovery. This fake owns everything it can see."""
         return self.get_open_orders(account_alias)
+
+    def recover_working_orders(
+        self, account_alias: str
+    ) -> tuple[RecoveredOrder, ...]:
+        """Broker-observed working orders. This fake owns what it can see."""
+        return ()
 
     def order_events(self) -> Iterator[BrokerOrderEvent]:
         return iter(())

@@ -267,8 +267,9 @@ def _build(
             sector="probe",
             cluster="probe",
         ),
-        agent_factory=lambda port_: ExecutionAgent(port_, entry_gate=latch),
-        entry_latch=latch,
+        # ONE gate: the service latches the same object the agent consults.
+        entry_gate=latch,
+        agent_factory=lambda port_, gate: ExecutionAgent(port_, entry_gate=gate),
         # No authorization argument: the production default DENIES.
     )
 
