@@ -16,16 +16,21 @@ What it does, in order:
 
 Two properties matter more than the loop itself:
 
-* **it does not busy-wait** — the wait is an ``Event.wait(timeout)``, so an idle
-  scheduler consumes no CPU and a stop request wakes it instantly rather than
-  after hours;
+* **it does not busy-wait** — between ticks the loop makes exactly ONE blocking
+  wait for the whole interval. The default wait is ``Event.wait(timeout)``, so
+  an idle scheduler consumes no CPU and a stop request wakes it instantly rather
+  than after hours;
 * **a failing tick does not kill the scheduler** — an exception in one tick is
   logged and the loop continues. A source that is down for a week must not mean
   the refresh never happens again once it returns. Only a stop request ends the
   loop.
 
-The clock, the sleep and the maintenance job are injected, so the whole
-lifecycle is testable without waiting real hours or opening a socket.
+The wait is injectable for the same reason the clock is: "does not spin" is a
+statement about the SHAPE of the loop — one blocking wait per tick, for the full
+interval — not about how many CPU cycles a particular machine happened to burn.
+Timing that on an emulated ARM64 runner measures the emulator. A test can
+substitute a recording wait and check the shape directly, which is both stronger
+and architecture-independent.
 """
 
 from __future__ import annotations
@@ -53,6 +58,9 @@ class SchedulerRunSummary:
 
     startup: MaintenanceOutcome | None
     ticks: int
+    #: How many times the loop blocked. Exactly one per tick: a spinning loop
+    #: would show many waits per tick, or ticks with no wait between them.
+    waits: int
     refreshes: int
     failures: int
     stopped_cleanly: bool
@@ -75,6 +83,7 @@ class SchedulerService:
         tick_interval: timedelta | None = None,
         now: Callable[[], datetime] | None = None,
         max_ticks: int | None = None,
+        wait: Callable[[float], bool] | None = None,
     ) -> None:
         self._maintenance = maintenance
         # `or` would be wrong here: timedelta(0) is falsy, so a zero interval
@@ -91,6 +100,10 @@ class SchedulerService:
         #: the production default — means "until stopped".
         self._max_ticks = max_ticks
         self._stop = threading.Event()
+        #: Blocks for up to ``seconds`` and returns True if a stop was requested
+        #: meanwhile. The default is the stop event's own wait: one syscall, no
+        #: polling, and immediately interruptible.
+        self._wait: Callable[[float], bool] = wait or self._stop.wait
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -111,15 +124,18 @@ class SchedulerService:
         )
         startup = self._run_once("startup", self._maintenance.run_startup)
         ticks = 0
+        waits = 0
         refreshes = 1 if startup is not None and startup.refreshed else 0
         failures = 1 if startup is None else 0
 
         while not self._stop.is_set():
             if self._max_ticks is not None and ticks >= self._max_ticks:
                 break
-            # Event.wait blocks without spinning and returns True the moment a
-            # stop is requested, so shutdown is immediate even mid-interval.
-            if self._stop.wait(self._interval.total_seconds()):
+            # ONE blocking wait for the whole interval — never a poll loop.
+            # It returns True the moment a stop is requested, so shutdown is
+            # immediate even mid-interval.
+            waits += 1
+            if self._wait(self._interval.total_seconds()):
                 break
             outcome = self._run_once("tick", self._maintenance.run_tick)
             ticks += 1
@@ -132,6 +148,7 @@ class SchedulerService:
         return SchedulerRunSummary(
             startup=startup,
             ticks=ticks,
+            waits=waits,
             refreshes=refreshes,
             failures=failures,
             stopped_cleanly=True,

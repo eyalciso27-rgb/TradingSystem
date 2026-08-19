@@ -25,6 +25,7 @@ a test input.
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
@@ -41,7 +42,10 @@ from trading_market_data_core.sp500_current_universe import (
     UniverseStore,
 )
 from trading_market_data_core.trading_readiness import TradingMode
-from trading_market_data_core.universe_maintenance import UniverseMaintenance
+from trading_market_data_core.universe_maintenance import (
+    MaintenanceOutcome,
+    UniverseMaintenance,
+)
 from trading_scheduler.__main__ import (
     ENV_MODE,
     ENV_TICK_HOURS,
@@ -246,22 +250,85 @@ def test_a_stop_request_ends_the_loop_without_waiting_out_the_interval(
 def test_the_idle_loop_does_not_spin(tmp_path: Path) -> None:
     """A busy-wait would burn a core between monthly refreshes.
 
-    Measured as CPU time, not wall time: an interruptible wait consumes
-    essentially none, a spin consumes all of it.
+    Proven by the SHAPE of the loop, not by a stopwatch: exactly one blocking
+    wait per tick, each for the whole interval. A spin shows up as many waits
+    per tick, as waits with a truncated timeout, or as ticks with no wait
+    between them — and all three are checked below.
+
+    This used to measure CPU time, which measured the emulator on ARM64/QEMU
+    rather than the loop, and failed there for reasons unrelated to spinning.
     """
     source, clock = _Source(), _Clock()
-    service = _service(tmp_path, source, clock, interval=timedelta(seconds=30))
+    waits: list[float] = []
 
-    worker = threading.Thread(target=service.run)
-    before = time.process_time()
-    worker.start()
-    time.sleep(0.3)
-    service.request_stop()
-    worker.join(timeout=5)
-    burned = time.process_time() - before
+    def recording_wait(seconds: float) -> bool:
+        waits.append(seconds)
+        return False  # never "stopped"; max_ticks bounds the run
 
-    assert not worker.is_alive()
-    assert burned < 0.2, f"the idle loop burned {burned:.3f}s of CPU"
+    maintenance = UniverseMaintenance(
+        UniverseStore(tmp_path), fetch=source, mode=TradingMode.PAPER
+    )
+    service = SchedulerService(
+        maintenance,
+        tick_interval=timedelta(hours=6),
+        now=clock,
+        max_ticks=5,
+        wait=recording_wait,
+    )
+    summary = service.run()
+
+    assert summary.ticks == 5
+    assert summary.waits == 5, "exactly one blocking wait per tick"
+    assert len(waits) == 5
+    assert waits == [6 * 3600.0] * 5, "each wait covers the WHOLE interval"
+
+
+def test_the_loop_never_ticks_without_blocking_first(tmp_path: Path) -> None:
+    """Interleaving is the other half of 'not a spin'.
+
+    A loop that waits five times up front and then ticks five times in a row
+    would satisfy a bare count. This records the actual order.
+    """
+    events: list[str] = []
+    clock = _Clock()
+
+    class _Recording(UniverseMaintenance):
+        def run_startup(self, *, now: datetime | None = None) -> MaintenanceOutcome:
+            events.append("startup")
+            return super().run_startup(now=now)
+
+        def run_tick(self, *, now: datetime | None = None) -> MaintenanceOutcome:
+            events.append("tick")
+            return super().run_tick(now=now)
+
+    def recording_wait(seconds: float) -> bool:
+        events.append("wait")
+        return False
+
+    service = SchedulerService(
+        _Recording(UniverseStore(tmp_path), fetch=_Source(), mode=TradingMode.PAPER),
+        tick_interval=timedelta(hours=6),
+        now=clock,
+        max_ticks=3,
+        wait=recording_wait,
+    )
+    service.run()
+
+    assert events == ["startup", "wait", "tick", "wait", "tick", "wait", "tick"]
+
+
+def test_the_default_wait_is_the_stop_event_itself(tmp_path: Path) -> None:
+    """The injected wait must not let production quietly become a poll loop.
+
+    Nothing above would notice if the real default were ``time.sleep`` in a
+    polling loop, so this pins the production default to the stop event's own
+    wait: one interruptible block, no polling.
+    """
+    service = _service(tmp_path, _Source(), _Clock())
+    default_wait = service._wait  # noqa: SLF001 - pinning the production default
+
+    assert isinstance(default_wait.__self__, threading.Event)  # type: ignore[attr-defined]
+    assert default_wait.__func__ is threading.Event.wait  # type: ignore[attr-defined]
 
 
 def test_a_stop_requested_before_the_first_tick_is_honoured(tmp_path: Path) -> None:
@@ -331,6 +398,34 @@ def test_main_reports_a_configuration_failure_instead_of_starting(
     assert main([]) == 1
 
 
+def test_main_leaves_a_handler_that_must_be_restored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pin WHY tests/scheduler/conftest.py exists.
+
+    ``main()`` configures the ROOT logger with a handler bound to ``sys.stdout``
+    as it is at that moment — under pytest, this test's capture object. The
+    handler outlives the test but its stream does not, and every later record
+    then raises ``ValueError: I/O operation on closed file``, printing a full
+    traceback per record. That is what broke the ARM64 run.
+
+    If this assertion ever stops holding, the autouse restore fixture is no
+    longer needed and should go with it.
+    """
+    monkeypatch.setenv(ENV_UNIVERSE_ROOT, str(tmp_path))
+    monkeypatch.setenv(ENV_MODE, "NOT_A_MODE")
+    root = logging.getLogger()
+    before = list(root.handlers)
+
+    main([])
+
+    added = [handler for handler in root.handlers if handler not in before]
+    assert added, "main() configures the root logger, so tests must restore it"
+    assert any(
+        handler.get_name() == "trading-structured-json" for handler in added
+    )
+
+
 def test_signal_handlers_request_a_stop(tmp_path: Path) -> None:
     """The handler must ask the loop to stop, not kill the process."""
     service = _service(tmp_path, _Source(), _Clock(), interval=timedelta(hours=6))
@@ -370,21 +465,46 @@ def test_the_real_process_starts_and_exits_cleanly_on_sigterm(tmp_path: Path) ->
         ENV_UNIVERSE_ROOT: str(tmp_path),
         ENV_TICK_HOURS: "1",
         ENV_MODE: "PAPER",
+        # Unbuffered, so the startup line arrives as a readiness signal rather
+        # than sitting in a pipe buffer until exit.
+        "PYTHONUNBUFFERED": "1",
     }
     process = subprocess.Popen(
         [sys.executable, "-m", "trading_scheduler"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
+    lines: list[str] = []
+    started = threading.Event()
+
+    def drain() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            lines.append(line)
+            if "scheduler starting" in line:
+                started.set()
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
     try:
-        time.sleep(2)
+        # Wait for the process to say it is up, rather than sleeping a fixed
+        # amount. Signalling before the handler is installed would kill it with
+        # the default disposition and prove nothing -- and an emulated ARM64
+        # runner is slow enough for that to be a real race.
+        assert started.wait(timeout=120), (
+            f"the scheduler never reported startup; output so far:\n{''.join(lines)}"
+        )
         assert process.poll() is None, "the scheduler must stay running"
         process.terminate()  # SIGTERM
-        output, _ = process.communicate(timeout=30)
+        process.wait(timeout=120)
     finally:
         if process.poll() is None:  # pragma: no cover - only on a hung process
             process.kill()
-            process.communicate(timeout=10)
+            process.wait(timeout=30)
+        reader.join(timeout=30)
+        if process.stdout is not None:
+            process.stdout.close()
 
+    output = "".join(lines)
     assert process.returncode == 0, f"unclean exit; output was:\n{output}"
     assert "scheduler starting" in output
     assert "shutting down gracefully" in output
