@@ -73,6 +73,19 @@ def _record(**kw: object) -> dict[str, object]:
             "side": "BUY",
             "environment": "PAPER",
             "account_alias": "paper-poi",
+            # What the caller ASKED for. Known before planning, so it is part of
+            # the always-comparable request identity rather than the prepared
+            # order shape.
+            "requested_quantity": "1",
+            "configured_order_type": "LIMIT",
+            "configured_time_in_force": "DAY",
+            # The FROZEN order, which a SUBMIT_PREPARED record must describe or
+            # a replay cannot tell a repeat from a changed order.
+            "order_type": "LIMIT",
+            "quantity": "1",
+            "limit_price": "100.02",
+            "stop_price": "98.02",
+            "time_in_force": "DAY",
         },
     }
     record.update(kw)
