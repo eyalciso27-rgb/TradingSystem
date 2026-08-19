@@ -136,6 +136,12 @@ class FakeBroker:
             receipt for receipt in self._orders.values() if receipt.state in open_states
         )
 
+    def recover_cancellable_orders(
+        self, account_alias: str
+    ) -> tuple[BrokerOrderReceipt, ...]:
+        """Same-client recovery. This fake owns everything it can see."""
+        return self.get_open_orders(account_alias)
+
     def preview_order(self, intent: OrderIntent) -> OrderPreview:
         self._require_ready()
         self._validate(intent)

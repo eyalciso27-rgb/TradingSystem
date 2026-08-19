@@ -207,6 +207,12 @@ class _Broker:
     def get_open_orders(self, account_alias: str) -> tuple[BrokerOrderReceipt, ...]:
         return ()
 
+    def recover_cancellable_orders(
+        self, account_alias: str
+    ) -> tuple[BrokerOrderReceipt, ...]:
+        """Same-client recovery. This fake owns everything it can see."""
+        return self.get_open_orders(account_alias)
+
     def order_events(self) -> Iterator[BrokerOrderEvent]:
         return iter(())
 

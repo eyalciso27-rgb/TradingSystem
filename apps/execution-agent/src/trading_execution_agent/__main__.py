@@ -394,7 +394,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_ERROR
 
     try:
-        evaluation = resources.service.evaluate(
+        evidence = resources.service.collect_evidence(
             ExecutionIntent(
                 strategy_id=args.strategy,
                 decision=decision,
@@ -411,6 +411,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Everything opened above is released here, including on failure.
         resources.close()
 
+    evaluation = evidence.evaluation
+    assert evaluation is not None
+    print("=== INDEPENDENT RUNTIME EVIDENCE (read-only) ===")
+    for line in evidence.lines():
+        print(line)
+    print()
     for line in render(evaluation):
         print(line)
 

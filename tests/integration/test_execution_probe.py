@@ -32,8 +32,11 @@ def test_the_probe_has_no_submission_path_at_all() -> None:
     }
 
     assert "submit_order" not in called
-    assert "execute" not in called, "the probe calls evaluate(), never execute()"
-    assert "evaluate" in called
+    assert "execute" not in called, "the probe never calls execute()"
+    # It calls collect_evidence(), which gathers independent read-only
+    # observations and internally runs evaluate() — neither can submit.
+    assert "collect_evidence" in called
+    assert "process" not in called, "the agent's submit path is never entered"
 
 
 def test_the_probe_never_supplies_an_authorization() -> None:

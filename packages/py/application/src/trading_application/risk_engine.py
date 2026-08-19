@@ -36,6 +36,10 @@ from trading_contracts.enums import DecisionOutcome, Environment, RiskDecisionOu
 
 from trading_application.decision_engine import EngineDecision
 from trading_application.emergency import EntryContext, HaltRecord, match_halt
+from trading_application.execution_identity import (
+    decision_identity,
+    risk_policy_identity,
+)
 
 RISK_ENGINE_VERSION = "risk-engine-1.0.0"
 
@@ -453,11 +457,8 @@ class RiskEngine:
             approved_risk_amount=approved_risk,
             max_loss_amount=approved_risk,
             risk_budget_equity=equity,
-            decision_ref=(
-                f"decision:{decision.result.decision_id}"
-                f"@{decision.result.decision_hash}"
-            ),
-            policy_ref=f"risk-policy:{self._policy.policy_version}",
+            decision_ref=decision_identity(decision),
+            policy_ref=risk_policy_identity(self._policy),
             engine_version=RISK_ENGINE_VERSION,
             checks=tuple(checks),
             reason_codes=tuple(dict.fromkeys(reasons)),

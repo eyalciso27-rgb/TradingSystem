@@ -46,6 +46,11 @@ from trading_contracts.enums import DecisionOutcome, Environment, RiskDecisionOu
 
 from trading_application.decision_engine import EngineDecision
 from trading_application.emergency import EntryContext, HaltRecord, match_halt
+from trading_application.execution_identity import (
+    decision_identity,
+    pre_submit_policy_identity,
+    risk_result_identity,
+)
 from trading_application.portfolio_allocator import CandidateAllocation
 from trading_application.risk_engine import RiskResult
 
@@ -350,9 +355,16 @@ class FinalPreSubmitCheck:
                 allocation_ref=(
                     f"allocation:{allocation.candidate_id}@{allocation.action.value}"
                 ),
-                risk_ref=f"risk:{request.risk_result.outcome.value}",
-                decision_ref=request.decision.result.decision_hash,
-                policy_ref=f"pre-submit-policy:{policy.policy_version}",
+                # The EXACT risk result, not merely its outcome: every
+                # approving evaluation in the system shares "risk:APPROVE", so
+                # that could never prove WHICH evaluation was authorized.
+                risk_ref=risk_result_identity(request.risk_result),
+                # The same decision reference the risk engine emits, so a
+                # consumer can actually compare them.
+                decision_ref=decision_identity(request.decision),
+                # The PRE-SUBMIT policy, in its own namespace. Never the risk
+                # policy: they govern different checks.
+                policy_ref=pre_submit_policy_identity(policy),
                 checks=tuple(checks),
                 reason_codes=tuple(dict.fromkeys(reasons)),
                 input_refs=tuple(allocation.input_refs),
@@ -562,6 +574,13 @@ class SingleUseAuthorization:
         self._authorization = authorization
         self._consumed = False
 
+    def peek(self) -> SubmitAuthorization:
+        """Read the wrapped authorization WITHOUT consuming the single use.
+
+        Verification must not spend the one use it is verifying.
+        """
+        return self._authorization
+
     def consume(self) -> SubmitAuthorization:
         if self._consumed:
             raise AuthorizationConsumedError(
@@ -571,8 +590,55 @@ class SingleUseAuthorization:
         return self._authorization
 
 
+def single_use_authorization(result: PreSubmitCheckResult) -> SingleUseAuthorization:
+    """Derive the single-use wrapper FROM the result that minted it.
+
+    ``AuthorizationDecision`` carries a ``PreSubmitCheckResult`` and a
+    ``SingleUseAuthorization``. Accepting those as two independently created
+    objects would let a buggy or malicious authority present a result approving
+    1 alongside an authorization for 10 — the consumer would check the result
+    and the agent would submit the authorization.
+
+    Deriving one from the other removes the gap: there is nothing to
+    substitute, because there is only one object.
+    """
+    if result.authorization is None:
+        raise PreSubmitError(
+            f"pre-submit result for {result.candidate_id!r} minted no"
+            f" authorization ({result.action.value}); there is nothing to consume"
+        )
+    return SingleUseAuthorization(result.authorization)
+
+
+def authorization_matches(
+    result: PreSubmitCheckResult, authorization: SingleUseAuthorization
+) -> str | None:
+    """Is this the authorization THAT result minted? A reason means no.
+
+    For callers that receive the pair rather than deriving it. Compares the
+    identity of the wrapped ``SubmitAuthorization`` against the result's own,
+    without consuming the single use.
+    """
+    if result.authorization is None:
+        return "the pre-submit result minted no authorization"
+    wrapped = authorization.peek()
+    if wrapped is not result.authorization and wrapped != result.authorization:
+        return (
+            "the single-use authorization does not wrap the SubmitAuthorization"
+            f" this pre-submit result minted (candidate {result.candidate_id!r})"
+        )
+    if wrapped.authorized_quantity != result.authorized_quantity:
+        return (
+            f"the authorization permits {wrapped.authorized_quantity} but the"
+            f" result authorized {result.authorized_quantity}"
+        )
+    return None
+
+
 __all__ = [
     "PRE_SUBMIT_VERSION",
+    "authorization_matches",
+    "single_use_authorization",
     "ApprovalState",
     "AuthorizationConsumedError",
     "ChangeAction",

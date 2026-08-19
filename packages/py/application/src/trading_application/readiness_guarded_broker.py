@@ -512,6 +512,12 @@ class ReadinessGuardedBroker:
     def get_open_orders(self, account_alias: str) -> tuple[BrokerOrderReceipt, ...]:
         return self._broker.get_open_orders(account_alias)
 
+    def recover_cancellable_orders(
+        self, account_alias: str
+    ) -> tuple[BrokerOrderReceipt, ...]:
+        """Never gated: recovering what already exists reduces uncertainty."""
+        return self._broker.recover_cancellable_orders(account_alias)
+
     def preview_order(self, intent: OrderIntent) -> OrderPreview:
         """What-if only; it places nothing, so it is not gated."""
         return self._broker.preview_order(intent)

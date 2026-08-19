@@ -416,9 +416,22 @@ def test_lookahead_and_naive_rejected() -> None:
 def test_explanation_contains_full_trace() -> None:
     result = run()
     assert result.allocation_ref.startswith("allocation:cand-1@")
-    assert result.risk_ref.startswith("risk:")
-    assert result.decision_ref.startswith("sha256:")
-    assert result.policy_ref == "pre-submit-policy:pre-submit-policy-test-1"
+    assert result.risk_ref.startswith("risk-result:sha256:")
+    # The SAME canonical decision reference the risk engine emits — carrying
+    # the id and the hash — so a consumer can actually compare the two. A bare
+    # hash could not identify which decision it belonged to.
+    assert result.decision_ref.startswith("decision:")
+    assert "@sha256:" in result.decision_ref
+    # The PRE-SUBMIT policy identity, in its own namespace. It is deliberately
+    # NOT the risk policy identity: they govern different checks, and comparing
+    # them is what made a valid authorization look invalid.
+    assert result.policy_ref.startswith(
+        "pre-submit-policy:pre-submit-policy-test-1@sha256:"
+    )
+    assert not result.policy_ref.startswith("risk-policy:")
+    # And the risk reference identifies the EXACT evaluation, not its outcome.
+    assert result.risk_ref.startswith("risk-result:sha256:")
+    assert result.risk_ref != "risk:APPROVE"
     assert result.input_refs == ("observation:a-1@src-1",)
     names = [check.name for check in result.checks]
     assert "halt_gate" in names and "price_slippage" in names

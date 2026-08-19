@@ -338,6 +338,22 @@ class BrokerPort(Protocol):
 
     def get_open_orders(self, account_alias: str) -> tuple[BrokerOrderReceipt, ...]: ...
 
+    def recover_cancellable_orders(
+        self, account_alias: str
+    ) -> tuple[BrokerOrderReceipt, ...]:
+        """Orders THIS client may act on after a restart (section 9.5).
+
+        Deliberately narrower than ``get_open_orders``: visibility is global,
+        authority is not. An implementation returns only orders it can prove
+        this client owns — same-client feed, matching client id, matching
+        account, genuinely working, canonical order reference.
+
+        Application code needs this to resolve an ambiguous durable state (a
+        submission was prepared and no outcome recorded) without reaching for an
+        adapter-specific method behind the port's back.
+        """
+        ...
+
     def preview_order(self, intent: OrderIntent) -> OrderPreview: ...
 
     def submit_order(self, intent: OrderIntent) -> BrokerOrderReceipt: ...

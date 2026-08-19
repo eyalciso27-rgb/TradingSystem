@@ -237,7 +237,7 @@ class DurableExecutionAuditSink:
             # commit propagates as ExecutionAuditError, which the execution path
             # treats as "not recorded" -- and therefore as "do not submit".
             with self._engine.begin() as connection:
-                return append_audit_record(
+                chain_hash = append_audit_record(
                     connection,
                     actor_ref=self._actor_ref,
                     action=action,
@@ -248,6 +248,23 @@ class DurableExecutionAuditSink:
                     payload_ref=payload_ref,
                     correlation_id=_uuid_or_none(record.get("correlation_id")),
                 )
+                # A second chained record under the ORDER id, in the SAME
+                # transaction, so the lifecycle is findable from either
+                # identity and the two can never disagree about existing.
+                order_ref = order_index_ref(record)
+                if order_ref and order_ref != _target_ref(record):
+                    append_audit_record(
+                        connection,
+                        actor_ref=self._actor_ref,
+                        action=action,
+                        environment=self._environment,
+                        occurred_at=occurred_at,
+                        target_ref=order_ref,
+                        detail=summarize(record),
+                        payload_ref=payload_ref,
+                        correlation_id=_uuid_or_none(record.get("correlation_id")),
+                    )
+                return chain_hash
         except Exception as error:  # noqa: BLE001
             raise ExecutionAuditError(
                 f"decision could not be committed ({type(error).__name__})"
@@ -261,6 +278,18 @@ def _target_ref(record: Mapping[str, object]) -> str | None:
         if value:
             return str(value)
     return None
+
+
+def order_index_ref(record: Mapping[str, object]) -> str | None:
+    """The ORDER id this record belongs to, indexed alongside the decision.
+
+    Written as a second chained record so a lookup by order id finds the same
+    lifecycle. Without it, a client order id reused by a DIFFERENT decision
+    after a restart is invisible: querying under the new decision finds nothing,
+    and the collision only becomes apparent at the broker.
+    """
+    value = record.get("client_order_id")
+    return str(value) if value else None
 
 
 def _aware(value: object) -> datetime | None:
@@ -284,6 +313,15 @@ def _uuid_or_none(value: object) -> UUID | None:
         except ValueError:
             return None
     return None
+
+
+class ExecutionHistoryUnreadableError(Exception):
+    """A durable record exists and its content could not be read.
+
+    Distinct from "no history": the difference between "nothing happened" and
+    "something happened and we cannot see what" is the difference between
+    proceeding safely and submitting a duplicate.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,24 +355,85 @@ class DurableExecutionHistoryReader:
         self._objects = objects
 
     def records_for(self, decision_id: str) -> tuple[ExecutionHistoryRecord, ...]:
+        return self._records(decision_id)
+
+    def records_for_order(self, client_order_id: str) -> tuple[ExecutionHistoryRecord, ...]:
+        """Records filed under an ORDER id, whatever decision produced them.
+
+        Looking up only by decision cannot see a collision: decision A prepares
+        order X, the process restarts, decision B arrives reusing order X, and a
+        query under B finds nothing. The order id is indexed too, so the
+        collision is visible from either side.
+        """
+        return self._records(client_order_id)
+
+    def _records(self, target_ref: str) -> tuple[ExecutionHistoryRecord, ...]:
         with self._engine.connect() as connection:
-            rows = load_decision_records(connection, decision_id)
+            rows = load_decision_records(connection, target_ref)
         records: list[ExecutionHistoryRecord] = []
         for action, chain_hash, payload_ref in rows:
-            payload: Mapping[str, object] = {}
-            if payload_ref:
-                # A payload we cannot read is not a payload we may guess at.
-                # The record still counts; its detail is simply absent.
-                try:
-                    payload = json.loads(self._objects.get(payload_ref))
-                except Exception:  # noqa: BLE001 - unreadable payload, known record
-                    payload = {}
+            if not payload_ref:
+                raise ExecutionHistoryUnreadableError(
+                    f"{action} record {chain_hash} references no payload;"
+                    " the execution it describes cannot be identified"
+                )
+            # An unreadable payload used to become an empty dict, which then
+            # looked like a record whose fingerprint and outcome were simply
+            # absent -- so a terminal record with a missing object would have
+            # been reconstructed as a refusal, and a prepared record would have
+            # lost the identity that makes a replay safe. Missing object,
+            # failed integrity check and undecodable JSON are all the same
+            # answer: we cannot read this, so we must not act on it.
+            try:
+                raw = self._objects.get(payload_ref)
+            except Exception as error:  # noqa: BLE001
+                raise ExecutionHistoryUnreadableError(
+                    f"{action} record {chain_hash} references payload"
+                    f" {payload_ref} which could not be retrieved"
+                    f" ({type(error).__name__})"
+                ) from error
+            try:
+                payload = json.loads(raw)
+            except ValueError as error:
+                raise ExecutionHistoryUnreadableError(
+                    f"{action} record {chain_hash} has an undecodable payload"
+                ) from error
+            if not isinstance(payload, dict):
+                raise ExecutionHistoryUnreadableError(
+                    f"{action} record {chain_hash} payload is not an object"
+                )
+            _require_readable(action, chain_hash, payload)
             records.append(
                 ExecutionHistoryRecord(
                     action=action, chain_hash=chain_hash, payload=payload
                 )
             )
         return tuple(records)
+
+
+def _require_readable(
+    action: str, chain_hash: str, payload: Mapping[str, object]
+) -> None:
+    """A lifecycle record must carry the facts its action promises.
+
+    A prepared record without an identity cannot be compared to a replay, and a
+    terminal record without an outcome cannot be reconstructed -- reading either
+    as "field absent" would turn an integrity failure into a confident wrong
+    answer.
+    """
+    if action in AMBIGUOUS_ACTIONS or action in TERMINAL_ACTIONS:
+        fingerprint = payload.get("execution_fingerprint")
+        if not isinstance(fingerprint, dict) or not fingerprint:
+            raise ExecutionHistoryUnreadableError(
+                f"{action} record {chain_hash} carries no execution fingerprint;"
+                " the execution it describes cannot be identified"
+            )
+    if action in TERMINAL_ACTIONS and not payload.get("submission_outcome"):
+        raise ExecutionHistoryUnreadableError(
+            f"terminal record {chain_hash} carries no submission outcome; it"
+            " must never be reconstructed as a refusal just because the"
+            " outcome string is absent"
+        )
 
 
 def load_decision_records(
@@ -362,6 +461,8 @@ __all__ = [
     "AMBIGUOUS_ACTIONS",
     "TERMINAL_ACTIONS",
     "ExecutionHistoryRecord",
+    "ExecutionHistoryUnreadableError",
+    "order_index_ref",
     "EXECUTION_AUDIT_VERSION",
     "MAX_DETAIL_CHARS",
     "DurableExecutionAuditSink",

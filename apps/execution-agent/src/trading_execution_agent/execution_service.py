@@ -63,13 +63,20 @@ from typing import Protocol, runtime_checkable
 
 from trading_application.decision_engine import EngineDecision
 from trading_application.emergency import EntryCheckpoint, EntryContext, HaltRecord, match_halt
+from trading_application.execution_identity import (
+    decision_identity,
+    risk_policy_identity,
+    risk_result_identity,
+)
 from trading_application.pre_submit_check import (
     PreSubmitAction,
     PreSubmitCheckResult,
     SingleUseAuthorization,
+    authorization_matches,
 )
 from trading_application.readiness_guarded_broker import (
     GuardConfig,
+    ProtectedEntryLifecycle,
     QuoteSource,
     ReadinessBlockedError,
     ReadinessGuardedBroker,
@@ -84,13 +91,11 @@ from trading_application.risk_engine import (
     TradeRiskRequest,
 )
 from trading_application.trading_readiness_runtime import (
-    AuditSink,
     MarketDataRules,
     QuoteState,
     TradingReadinessRuntimeReport,
 )
 from trading_broker_core.port import (
-    BrokerCapabilityMode,
     BrokerInstrument,
     BrokerPort,
     BrokerPortError,
@@ -267,29 +272,13 @@ class ExecutionConfig:
     #: Protective stop distance below (BUY) or above (SELL) the entry. The plan
     #: is refused rather than submitted unprotected when this cannot be applied.
     stop_loss_fraction: Decimal = Decimal("0.02")
-    #: How much of an EXISTING position's notional to treat as open risk when
-    #: nothing better is known. ``BrokerPort`` does not carry each position's
-    #: protective stop, so its true open risk is genuinely unknown here.
-    #:
-    #: Treating the whole notional as at risk sounds safe and is not: it makes
-    #: any account holding a position untradeable, which is the kind of
-    #: unusable conservatism that gets weakened later under pressure. The
-    #: assumption made instead is the one the system itself enforces on every
-    #: new position -- that it is protected by a stop at this distance. Supply
-    #: ``portfolio`` to replace the estimate with real per-position risk.
-    assumed_open_risk_fraction: Decimal | None = None
+
     order_type: OrderType = OrderType.LIMIT
     protection_required: bool = True
     sector: str = "UNKNOWN"
     cluster: str = "UNKNOWN"
     allowed_currencies: tuple[str, ...] = ("USD",)
     allowed_exchanges: tuple[str, ...] = ("SMART",)
-
-    #: Refuse a decision whose existing portfolio cannot be classified. The
-    #: sector, cluster and source caps are meaningless over positions whose
-    #: sector, cluster and source are unknown, and passing them silently is
-    #: worse than refusing. Supply ``portfolio`` to satisfy this honestly.
-    require_classified_portfolio: bool = True
 
     def __post_init__(self) -> None:
         if self.stop_loss_fraction <= 0 or self.stop_loss_fraction >= 1:
@@ -328,6 +317,40 @@ class AuthorizationDecision:
 
 
 @runtime_checkable
+class ExecutionAuditSink(Protocol):
+    """The execution lifecycle audit. Stronger than the readiness AuditSink.
+
+    The readiness guard needs only "can you persist, and persist this". An
+    execution needs three DISTINCT lifecycle records, and the difference between
+    them is load-bearing: an EVALUATED record means a decision was considered,
+    a SUBMIT_PREPARED record means the broker may already hold the order.
+
+    This was previously the generic sink plus ``getattr`` probes with a fallback
+    to ``persist`` -- so a sink that could not record the point of no return
+    would have silently recorded it as an ordinary evaluation, and a restart
+    would then have replayed a possible live order as a routine refusal.
+    Requiring the methods means mypy rejects such a sink instead.
+    """
+
+    def can_persist(self) -> bool: ...
+
+    def persist(self, record: Mapping[str, object]) -> str: ...
+
+    def persist_prepared(self, record: Mapping[str, object]) -> str: ...
+
+    def persist_outcome(self, record: Mapping[str, object]) -> str: ...
+
+
+@runtime_checkable
+class ReconciliationGate(Protocol):
+    """The canonical entry gate, typed. No ``object``, no getattr."""
+
+    def require(self, reason: str) -> None: ...
+
+    def entry_blocked(self) -> tuple[bool, str]: ...
+
+
+@runtime_checkable
 class ExecutionHistoryLike(Protocol):
     """One durable lifecycle record: what happened, and what it said."""
 
@@ -353,13 +376,20 @@ class DurableExecutionHistory(Protocol):
 
     def records_for(self, decision_id: str) -> Sequence[ExecutionHistoryLike]: ...
 
+    def records_for_order(
+        self, client_order_id: str
+    ) -> Sequence[ExecutionHistoryLike]: ...
+
 
 @runtime_checkable
 class ExecutionAuthorization(Protocol):
     """The authority that permits submission. Default production answer: no."""
 
     def authorize(
-        self, intent: ExecutionIntent, report: TradingReadinessRuntimeReport
+        self,
+        intent: ExecutionIntent,
+        report: TradingReadinessRuntimeReport,
+        risk_result: RiskResult,
     ) -> AuthorizationDecision: ...
 
 
@@ -379,7 +409,10 @@ class DenyAllExecutionAuthorization:
     )
 
     def authorize(
-        self, intent: ExecutionIntent, report: TradingReadinessRuntimeReport
+        self,
+        intent: ExecutionIntent,
+        report: TradingReadinessRuntimeReport,
+        risk_result: RiskResult,
     ) -> AuthorizationDecision:
         return AuthorizationDecision(allowed=False, reason=self.reason)
 
@@ -477,21 +510,63 @@ class ExecutionFingerprint:
     decision_id: str
     client_order_id: str
     strategy_id: str
+    source_id: str
     symbol: str
     side: str
     environment: str
     account_alias: str
+    #: The order that was actually prepared. An id that comes back with a
+    #: different quantity, price or order shape is not the same execution --
+    #: it is a new one wearing an old name, and treating it as a replay would
+    #: silently accept a changed order.
+    order_type: str = ""
+    quantity: str = ""
+    limit_price: str = ""
+    stop_price: str = ""
+    time_in_force: str = ""
 
     def to_dict(self) -> dict[str, str]:
         return {
             "decision_id": self.decision_id,
             "client_order_id": self.client_order_id,
             "strategy_id": self.strategy_id,
+            "source_id": self.source_id,
             "symbol": self.symbol,
             "side": self.side,
             "environment": self.environment,
             "account_alias": self.account_alias,
+            "order_type": self.order_type,
+            "quantity": self.quantity,
+            "limit_price": self.limit_price,
+            "stop_price": self.stop_price,
+            "time_in_force": self.time_in_force,
         }
+
+    #: The fields that say WHICH execution this is. Known before an order is
+    #: planned, so always comparable.
+    IDENTITY_FIELDS = (
+        "decision_id", "client_order_id", "strategy_id", "source_id",
+        "symbol", "side", "environment", "account_alias",
+    )
+    #: The frozen order. Known only once one is planned, so compared only when
+    #: BOTH sides have it -- a replay has not planned its order yet when the
+    #: identity check runs.
+    ORDER_FIELDS = (
+        "order_type", "quantity", "limit_price", "stop_price", "time_in_force",
+    )
+
+    def differences(self, other: ExecutionFingerprint) -> tuple[str, ...]:
+        """Fields where these two describe different executions."""
+        mine, theirs = self.to_dict(), other.to_dict()
+        differing = [
+            field for field in self.IDENTITY_FIELDS if mine[field] != theirs[field]
+        ]
+        differing.extend(
+            field
+            for field in self.ORDER_FIELDS
+            if mine[field] and theirs[field] and mine[field] != theirs[field]
+        )
+        return tuple(differing)
 
     def digest(self) -> str:
         """A stable reference for the whole identity, for logs and records."""
@@ -508,13 +583,42 @@ class ExecutionFingerprint:
                 decision_id=str(raw["decision_id"]),
                 client_order_id=str(raw["client_order_id"]),
                 strategy_id=str(raw["strategy_id"]),
+                source_id=str(raw.get("source_id", "")),
                 symbol=str(raw["symbol"]),
                 side=str(raw["side"]),
                 environment=str(raw["environment"]),
                 account_alias=str(raw["account_alias"]),
+                order_type=str(raw.get("order_type", "")),
+                quantity=str(raw.get("quantity", "")),
+                limit_price=str(raw.get("limit_price", "")),
+                stop_price=str(raw.get("stop_price", "")),
+                time_in_force=str(raw.get("time_in_force", "")),
             )
         except KeyError:
             return None
+
+
+@dataclass
+class ExecutionEvidence:
+    """Independent read-only observations from one probe run.
+
+    Deliberately mutable and deliberately not a decision: it is a diagnosis. A
+    check that could not run says so, with the reason, rather than being
+    silently absent or being reported as a failure of the thing it depends on.
+    """
+
+    evaluated_at: datetime
+    observations: list[tuple[str, bool, str]] = field(default_factory=list)
+    evaluation: ExecutionEvaluation | None = None
+
+    def record(self, name: str, satisfied: bool, detail: str) -> None:
+        self.observations.append((name, satisfied, detail))
+
+    def lines(self) -> list[str]:
+        return [
+            f"  [{'OK  ' if satisfied else 'FAIL'}] {name}: {detail}"
+            for name, satisfied, detail in self.observations
+        ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -642,15 +746,16 @@ class ExecutionService:
         *,
         broker: BrokerPort,
         quotes: QuoteSource,
-        audit: AuditSink,
+        audit: ExecutionAuditSink,
         risk_engine: RiskEngine,
         config: ExecutionConfig,
         agent_factory: Callable[[BrokerPort], ExecutionAgent],
         authorization: ExecutionAuthorization | None = None,
         universe: Callable[[], ConstituentSnapshot | None] | None = None,
         portfolio: Callable[[], tuple[PositionExposure, ...]] | None = None,
+        protection: ProtectedEntryLifecycle | None = None,
         history: DurableExecutionHistory | None = None,
-        entry_latch: object | None = None,
+        entry_latch: ReconciliationGate | None = None,
         universe_status: Callable[[], UniverseListStatus | None] | None = None,
         halts: Callable[[], Sequence[HaltRecord]] | None = None,
         now: Callable[[], datetime] | None = None,
@@ -678,6 +783,9 @@ class ExecutionService:
         # DENY unless something explicitly says otherwise, and nothing in
         # production does.
         self._authorization = authorization or DenyAllExecutionAuthorization()
+        #: ONE protection authority, shared with the guard below, so the early
+        #: report and the final gate can never disagree.
+        self._protection = protection
         # ONE guard and ONE agent for the service's lifetime. A fresh agent per
         # decision would reset the idempotency map that makes a retry safe.
         self._risk_registry = DecisionRiskRegistry()
@@ -695,6 +803,7 @@ class ExecutionService:
             quotes=quotes,
             risk=self._risk_registry,
             audit=audit,
+            protection=protection,
             universe_status=universe_status,
             now=now,
         )
@@ -708,6 +817,21 @@ class ExecutionService:
         #: The canonical entry gate, latched shut when a submission's outcome
         #: cannot be recorded. Cancellation is never gated by it.
         self._entry_latch = entry_latch
+        # A service whose authority can say ALLOW may cross the submit boundary,
+        # and POST_SUBMIT_AUDIT_FAILED promises that new entries are latched. A
+        # promise with no latch behind it is worse than no promise, so an
+        # execution-capable service must be given one. Evaluate-only services
+        # (the production DenyAll default) stay easy to construct.
+        if (
+            not isinstance(self._authorization, DenyAllExecutionAuthorization)
+            and entry_latch is None
+        ):
+            raise ExecutionServiceError(
+                "an execution-capable authority is configured but no"
+                " reconciliation latch was supplied; this service promises to"
+                " latch new entries when a post-submit audit fails and cannot"
+                " keep that promise without one"
+            )
         self._universe_status = universe_status
         self._halts = halts or (lambda: ())
         self._now = now or (lambda: datetime.now(tz=UTC))
@@ -721,6 +845,43 @@ class ExecutionService:
         are reads and a what-if preview, which places nothing.
         """
         return self._observe(intent)
+
+    def collect_evidence(self, intent: ExecutionIntent) -> ExecutionEvidence:
+        """Every INDEPENDENT read-only observation, not just the first refusal.
+
+        ``evaluate`` stops at the first blocker, which is right for a decision
+        and wrong for a diagnosis: one owner-host run that stops at "no session
+        P&L" tells us nothing about whether the quote feed works, whether the
+        contract resolves, or whether the broker would validate the order. Those
+        facts do not depend on each other, so they are gathered independently.
+
+        Nothing here weakens a gate. A check whose dependency genuinely failed
+        is reported as NOT EVALUATED, with the reason.
+        """
+        evidence = ExecutionEvidence(evaluated_at=self._now())
+
+        evidence.record("halts", *self._halt_evidence(intent))
+        evidence.record("account", *self._account_evidence())
+        evidence.record("session_pnl", *self._session_pnl_evidence())
+        instrument, contract_note = self._contract_evidence(intent)
+        evidence.record(
+            "contract",
+            instrument is not None,
+            contract_note,
+        )
+        quote = self._quotes.current_quote(intent.symbol)
+        evidence.record("quote", quote.bid is not None and quote.ask is not None,
+                        self._quote_note(quote))
+        evidence.record("universe", *self._universe_evidence(intent))
+        evidence.record("portfolio", *self._portfolio_evidence())
+        evidence.record("protection", *self._protection_evidence(intent, quote))
+        evidence.record("audit", *self._audit_evidence())
+
+        # The full decision path, which may legitimately stop early. Its own
+        # refusal reason is recorded alongside the independent observations.
+        evaluation = self._observe(intent)
+        evidence.evaluation = evaluation
+        return evidence
 
     def execute(self, intent: ExecutionIntent) -> ExecutionEvaluation:
         """Observe, then submit ONLY if authorized and ready.
@@ -759,6 +920,109 @@ class ExecutionService:
         if evaluation.stage is not ExecutionStage.READY_NOT_AUTHORIZED:
             return evaluation
         return self._submit(intent, evaluation)
+
+    # -- independent read-only observations (probe/diagnosis only) ------------
+
+    def _halt_evidence(self, intent: ExecutionIntent) -> tuple[bool, str]:
+        halt = match_halt(
+            self._halts(),
+            EntryContext(
+                environment=self._config.environment,
+                strategy_id=intent.strategy_id,
+                symbol=intent.symbol,
+                source_id=intent.source_id,
+            ),
+        )
+        if halt is None:
+            return True, "no active halt matches this entry"
+        return False, f"halt active ({halt.scope.value})"
+
+    def _account_evidence(self) -> tuple[bool, str]:
+        try:
+            snapshot = self._broker.get_account_snapshot(self._config.account_alias)
+        except Exception as error:  # noqa: BLE001
+            return False, f"account snapshot raised {type(error).__name__}"
+        return True, (
+            f"alias {snapshot.account_alias} environment"
+            f" {snapshot.environment.value} observed"
+            f" {snapshot.observed_at.isoformat()}"
+        )
+
+    def _session_pnl_evidence(self) -> tuple[bool, str]:
+        try:
+            snapshot = self._broker.get_account_snapshot(self._config.account_alias)
+        except Exception as error:  # noqa: BLE001
+            return False, f"NOT EVALUATED: account snapshot raised {type(error).__name__}"
+        if snapshot.session_pnl is None:
+            return False, (
+                "the gateway served no daily P&L (reqPnL). This blocks execution:"
+                " the daily halt limits cannot be evaluated and UNKNOWN is not zero"
+            )
+        return True, f"session P&L {snapshot.session_pnl}"
+
+    def _contract_evidence(
+        self, intent: ExecutionIntent
+    ) -> tuple[BrokerInstrument | None, str]:
+        try:
+            instrument = self._broker.resolve_instrument(
+                InstrumentQuery(symbol=intent.symbol)
+            )
+        except Exception as error:  # noqa: BLE001
+            return None, f"resolve_instrument refused: {error}"
+        return instrument, (
+            f"{instrument.symbol} -> {instrument.broker_instrument_ref}"
+            f" ({instrument.exchange} {instrument.currency})"
+        )
+
+    @staticmethod
+    def _quote_note(quote: QuoteState) -> str:
+        return (
+            f"bid={quote.bid} ask={quote.ask} sizes={quote.bid_size}/{quote.ask_size}"
+            f" feed={quote.market_data_state.value}"
+            f" observed_at={quote.observed_at.isoformat() if quote.observed_at else 'NONE'}"
+            f" {quote.detail}"
+        ).strip()
+
+    def _universe_evidence(self, intent: ExecutionIntent) -> tuple[bool, str]:
+        status = self._universe_status() if self._universe_status else None
+        refusal = self._universe_refusal(intent, status)
+        if refusal is not None:
+            return False, refusal
+        return True, (
+            f"status {status.value}" if status else "not required by this strategy"
+        )
+
+    def _portfolio_evidence(self) -> tuple[bool, str]:
+        unclassified = self._unclassified_positions()
+        if not unclassified:
+            source = "authority" if self._portfolio is not None else "no open positions"
+            return True, f"classified exposure available ({source})"
+        return False, (
+            f"{len(unclassified)} open position(s) with no sector/cluster/source"
+            " classification; the caps cannot be evaluated"
+        )
+
+    def _protection_evidence(
+        self, intent: ExecutionIntent, quote: QuoteState
+    ) -> tuple[bool, str]:
+        midpoint = quote.midpoint
+        if midpoint is None or midpoint <= 0:
+            return False, "NOT EVALUATED: no usable quote to price a protective order"
+        stop = self._stop_price(intent, midpoint)
+        if stop is None:
+            return False, "no valid protective stop could be constructed"
+        order = self._order_intent(intent, intent.requested_quantity, midpoint, stop)
+        capability = self._protection_state(order)
+        return capability.can_protect, capability.detail
+
+    def _audit_evidence(self) -> tuple[bool, str]:
+        try:
+            available = self._audit.can_persist()
+        except Exception as error:  # noqa: BLE001
+            return False, f"audit sink raised {type(error).__name__}"
+        return available, (
+            "audit sink is available" if available else "audit sink cannot persist"
+        )
 
     # -- observation ----------------------------------------------------------
 
@@ -837,7 +1101,7 @@ class ExecutionService:
             )
 
         unclassified = self._unclassified_positions()
-        if unclassified and self._config.require_classified_portfolio:
+        if unclassified:
             return self._refuse(
                 intent, ExecutionStage.PORTFOLIO_UNCLASSIFIED,
                 f"{len(unclassified)} open position(s) have no sector/cluster/source"
@@ -892,7 +1156,11 @@ class ExecutionService:
                 universe_status=universe_status,
             )
 
-        protection = self._protection_state()
+        order_intent = self._order_intent(intent, approved, entry_price, stop_price)
+
+        # Ask the protection authority about the ACTUAL order, not a sketch of
+        # one: whether protection can be established depends on the order.
+        protection = self._protection_state(order_intent)
         if self._config.protection_required and not protection.can_protect:
             # FAIL CLOSED. The entry would rest at the broker with nothing
             # protecting it, and "we will place the stop right after" is not a
@@ -908,7 +1176,6 @@ class ExecutionService:
         # Scope this decision's risk result to this decision before the guard
         # can be asked about it.
         self._risk_registry.register(self._fingerprint(intent), risk_result)
-        order_intent = self._order_intent(intent, approved, entry_price, stop_price)
 
         # Readiness is computed here through the SAME guard the agent will use,
         # so the report an operator reads is produced by the enforcement path
@@ -919,7 +1186,10 @@ class ExecutionService:
             extra=self._context(intent, stage="READINESS", readiness=report.readiness.value),
         )
 
-        authorization = self._authorization.authorize(intent, report)
+        # The authority is handed the risk result it must authorize AGAINST,
+        # so an authorization can be minted about this exact evaluation rather
+        # than about a decision in the abstract.
+        authorization = self._authorization.authorize(intent, report, risk_result)
         LOGGER.info(
             "authorization result",
             extra=self._context(
@@ -948,15 +1218,31 @@ class ExecutionService:
         )
         return self._audit_evaluation(evaluation)
 
-    def _fingerprint(self, intent: ExecutionIntent) -> ExecutionFingerprint:
+    def _fingerprint(
+        self, intent: ExecutionIntent, order: OrderIntent | None = None
+    ) -> ExecutionFingerprint:
+        """The execution identity, including the order once one exists.
+
+        Before an order is planned this identifies the decision; at
+        SUBMIT_PREPARED it also carries the frozen order, which is what makes a
+        changed quantity or price a conflict rather than a replay. Numbers are
+        normalised through ``str`` so equal values compare equal regardless of
+        Decimal exponent.
+        """
         return ExecutionFingerprint(
             decision_id=intent.decision_id,
             client_order_id=intent.client_order_id,
             strategy_id=intent.strategy_id,
+            source_id=intent.source_id,
             symbol=intent.symbol,
             side=intent.side.value,
             environment=self._config.environment.value,
             account_alias=self._config.account_alias,
+            order_type=order.order_type.value if order else "",
+            quantity=_normal(order.quantity) if order else "",
+            limit_price=_normal(order.limit_price) if order else "",
+            stop_price=_normal(order.stop_price) if order else "",
+            time_in_force=order.time_in_force.value if order else "",
         )
 
     def _durable_verdict(self, intent: ExecutionIntent) -> ExecutionEvaluation | None:
@@ -980,6 +1266,12 @@ class ExecutionService:
             return None
         try:
             records = tuple(self._history.records_for(intent.decision_id))
+            # ALSO by order id: a client order id reused by a DIFFERENT decision
+            # after a restart is invisible from the new decision's side, and the
+            # collision would only surface at the broker.
+            records += tuple(
+                self._history.records_for_order(intent.client_order_id)
+            )
         except Exception as error:  # noqa: BLE001 - unknown history blocks
             return self._bare(
                 intent,
@@ -1042,18 +1334,42 @@ class ExecutionService:
         """Does any stored record describe a DIFFERENT execution?"""
         for record in records:
             stored = ExecutionFingerprint.from_dict(record.payload)
-            if stored is None or stored == fingerprint:
+            if stored is None:
                 continue
-            differing = [
-                field
-                for field, value in stored.to_dict().items()
-                if value != fingerprint.to_dict()[field]
-            ]
+            differing = stored.differences(fingerprint)
+            if not differing:
+                continue
             return (
-                "a durable record for this decision describes a different"
-                f" execution (differs in {differing}); refusing rather than"
-                " treating two executions as one"
+                "a durable record describes a different execution under the"
+                f" same identity (differs in {list(differing)}); refusing"
+                " rather than treating two executions as one"
             )
+        return None
+
+    def _prepared_order_conflict(
+        self, intent: ExecutionIntent, prepared: ExecutionFingerprint
+    ) -> str | None:
+        """Was a DIFFERENT order already prepared under this identity?"""
+        if self._history is None:
+            return None
+        try:
+            records = tuple(self._history.records_for(intent.decision_id))
+            records += tuple(self._history.records_for_order(intent.client_order_id))
+        except Exception:  # noqa: BLE001 - handled by the earlier verdict
+            return None
+        for record in records:
+            if record.action not in AMBIGUOUS_ACTIONS:
+                continue
+            stored = ExecutionFingerprint.from_dict(record.payload)
+            if stored is None:
+                continue
+            differing = stored.differences(prepared)
+            if differing:
+                return (
+                    "a different order was already prepared under this identity"
+                    f" (differs in {list(differing)}); refusing to treat a"
+                    " changed order as the same execution"
+                )
         return None
 
     def _reconstruct(
@@ -1101,11 +1417,10 @@ class ExecutionService:
         open-order recovery -- the canonical mechanism -- rather than inventing
         a second one, and it never submits anything.
         """
-        recover = getattr(self._broker, "recover_cancellable_orders", None)
-        if not callable(recover):
-            return None
         try:
-            recovered = recover(self._config.account_alias)
+            recovered = self._broker.recover_cancellable_orders(
+                self._config.account_alias
+            )
         except Exception as error:  # noqa: BLE001 - unknown stays unknown
             LOGGER.warning(
                 "broker recovery failed; the state remains ambiguous",
@@ -1115,8 +1430,28 @@ class ExecutionService:
             )
             return None
         for candidate in recovered:
-            if getattr(candidate, "client_order_id", None) != intent.client_order_id:
+            if candidate.client_order_id != intent.client_order_id:
                 continue
+            # A matching order id alone is NOT proof this is the prepared
+            # execution -- that is the same "familiar name" mistake the
+            # fingerprint exists to catch. Correlate as far as the port can
+            # prove, and refuse to claim more than it shows.
+            if candidate.correlation_id != intent.correlation_id:
+                LOGGER.warning(
+                    "a working order shares this order id but not its"
+                    " correlation; identity is unproven",
+                    extra=self._context(intent, stage="RECOVERY_IDENTITY_MISMATCH"),
+                )
+                return self._bare(
+                    intent,
+                    ExecutionStage.NEEDS_RECONCILIATION,
+                    (
+                        "the broker holds a working order with this order id but"
+                        f" correlation {candidate.correlation_id!r} rather than"
+                        f" {intent.correlation_id!r}; the identity cannot be"
+                        " proven, so this is reconciled, not claimed",
+                    ),
+                )
             LOGGER.info(
                 "the broker still holds this order; recovered without resubmitting",
                 extra=self._context(intent, stage="RECOVERED"),
@@ -1164,6 +1499,17 @@ class ExecutionService:
         assert evaluation.risk_result is not None  # noqa: S101
         assert evaluation.approved_quantity is not None  # noqa: S101
 
+        # The two objects must be ONE authorization, not two substitutable ones:
+        # a result approving 1 presented with an authorization for 10 would
+        # otherwise be checked as 1 and submitted as 10.
+        sealed = authorization_matches(
+            authorization.pre_submit, authorization.authorization
+        )
+        if sealed is not None:
+            return self._replace_stage(
+                evaluation, ExecutionStage.AUTHORIZATION_DENIED, (sealed,)
+            )
+
         binding = self._authorization_binding(
             intent, authorization.pre_submit, evaluation.risk_result
         )
@@ -1172,6 +1518,12 @@ class ExecutionService:
                 evaluation, ExecutionStage.AUTHORIZATION_DENIED, (binding,)
             )
 
+        request_order = self._order_intent(
+            intent,
+            authorization.pre_submit.authorized_quantity,
+            evaluation.entry_price or Decimal(0),
+            evaluation.stop_price,
+        )
         request = ExecutionRequest(
             client_order_id=intent.client_order_id,
             correlation_id=intent.correlation_id,
@@ -1191,7 +1543,19 @@ class ExecutionService:
         # entered, so a crash between here and an outcome means exactly one
         # thing: the broker may hold this order. An ordinary evaluation record
         # must never mean that, which is why this is a distinct action.
-        prepared = self._persist_prepared(evaluation)
+        prepared_fingerprint = self._fingerprint(intent, request_order)
+        # Now that the order exists, compare it against any order this
+        # execution previously prepared. Same id with a different quantity,
+        # price or order shape is a NEW execution wearing an old name.
+        order_conflict = self._prepared_order_conflict(intent, prepared_fingerprint)
+        if order_conflict is not None:
+            return self._replace_stage(
+                evaluation, ExecutionStage.IDEMPOTENCY_CONFLICT, (order_conflict,)
+            )
+
+        prepared = self._persist_prepared(
+            _with(evaluation, fingerprint=prepared_fingerprint)
+        )
         if prepared is not None:
             return prepared
 
@@ -1328,47 +1692,43 @@ class ExecutionService:
             as_of=self._now(),
         )
 
-    def _protection_state(self) -> BrokerProtectionCapability:
-        """Can the broker actually hold protection for a NEW entry?
+    def _protection_state(self, order: OrderIntent) -> BrokerProtectionCapability:
+        """The SAME authority the final guard uses. Never a capability flag.
 
-        A supported STOP *order type* proves nothing: it says the broker would
-        accept a stop order if one were sent, not that one will exist. The entry
-        this service builds is a single LIMIT order that happens to carry a stop
-        price, and the IBKR adapter maps that stop price to the order's aux
-        price -- one order, no resting protection behind it.
+        This used to read ``bracket``/``oco`` capabilities, which recreated the
+        capability-flag inference one layer earlier than the guard and gave the
+        system two different answers to one question. There is now one
+        authority: the ``ProtectedEntryLifecycle``, which must name the
+        protective orders it established.
 
-        Real protection for a brand-new position requires the broker to
-        establish it ATOMICALLY with the entry: a native bracket or OCA. The
-        IBKR paper adapter declares both UNSUPPORTED (deliberately -- it has no
-        bracket wiring, and it refuses to claim NATIVE by promise), so a
-        protected entry is not currently possible through it and this returns
-        False. That is a real blocker, and reporting it is the point.
+        No lifecycle wired means protection cannot be established or proven, so
+        a protection-required entry is refused -- and the early report and the
+        final gate agree, because they are asking the same object.
         """
+        if self._protection is None:
+            return BrokerProtectionCapability(
+                False,
+                "no protected-entry lifecycle is wired, so broker-side"
+                " protection cannot be established or proven; a supported STOP"
+                " order type is not a resting protective order, and submitting"
+                " an unprotected entry is refused",
+            )
         try:
-            capabilities = self._broker.capabilities()
-        except Exception as error:  # noqa: BLE001
+            evidence = self._protection.protection_for(order)
+        except Exception as error:  # noqa: BLE001 - unproven is unprotected
             return BrokerProtectionCapability(
-                False, f"broker capabilities unavailable ({type(error).__name__})"
+                False, f"protection lifecycle raised {type(error).__name__}"
             )
-        atomic = {
-            "bracket": capabilities.bracket,
-            "oco": capabilities.oco,
-        }
-        supported = [
-            name
-            for name, mode in atomic.items()
-            if mode is BrokerCapabilityMode.NATIVE
-        ]
-        if supported:
-            return BrokerProtectionCapability(
-                True, f"broker can establish protection atomically via {supported}"
-            )
+        proven = bool(evidence.established and evidence.protective_order_refs)
         return BrokerProtectionCapability(
-            False,
-            "the broker cannot establish protection atomically with the entry"
-            f" (bracket={capabilities.bracket.value}, oco={capabilities.oco.value});"
-            " a supported STOP order TYPE is not a resting protective order, and"
-            " submitting an unprotected entry is refused",
+            proven,
+            evidence.detail
+            or (
+                f"protection via {evidence.mechanism}:"
+                f" {list(evidence.protective_order_refs)}"
+                if proven
+                else "the lifecycle established no broker-resident protection"
+            ),
         )
 
     def _open_positions(self, intent: ExecutionIntent) -> tuple[PositionExposure, ...]:
@@ -1385,27 +1745,23 @@ class ExecutionService:
         classification is refused by default (see
         ``require_classified_portfolio``) rather than guessed.
 
-        The open-risk AMOUNT remains an explicit estimate (ADR-0018): the port
-        carries no protective stop for an existing position, so it is assumed to
-        be protected at the same distance this system enforces on new entries.
+        The open-risk AMOUNT is no longer estimated either. The port carries no
+        protective stop for an existing position, so its true open risk is
+        genuinely unknown, and converting unknown protection into an assumed
+        stop is the same class of fabrication as an assumed session P&L. An
+        account with positions and no exposure authority therefore refuses new
+        entries; an account with NO positions has a known-zero open risk and
+        trades normally.
+
+        The estimate model is not gone, it is out of the execution path: it
+        belongs to research and simulation, where being wrong costs nothing.
         """
         if self._portfolio is not None:
             return self._portfolio()
-        fraction = self._config.assumed_open_risk_fraction or self._config.stop_loss_fraction
-        return tuple(
-            PositionExposure(
-                symbol=position.symbol,
-                sector=UNKNOWN_CLASSIFICATION,
-                cluster=UNKNOWN_CLASSIFICATION,
-                source_id=UNKNOWN_CLASSIFICATION,
-                strategy_id=UNKNOWN_CLASSIFICATION,
-                open_risk_amount=(
-                    abs(position.quantity * position.average_price) * fraction
-                ),
-                notional=abs(position.quantity * position.average_price),
-            )
-            for position in self._broker.get_positions(self._config.account_alias)
-        )
+        # No authority, so the only honest answer is "nothing known". A real
+        # position reaching here is refused earlier by the classification gate;
+        # an EMPTY portfolio is genuinely zero open risk and is fine.
+        return ()
 
     def _unclassified_positions(self) -> tuple[str, ...]:
         """Symbols whose classification we cannot establish. Empty is good."""
@@ -1475,17 +1831,49 @@ class ExecutionService:
                 f"the pre-submit result is {pre_submit.action.value}, which never"
                 " permits submission"
             )
-        expected = {
-            "decision_ref": (pre_submit.decision_ref, risk_result.decision_ref),
-            "policy_ref": (pre_submit.policy_ref, risk_result.policy_ref),
-        }
-        for name, (authorized, actual) in expected.items():
-            if authorized and actual and authorized != actual:
+
+        # The DECISION: both producers now emit the same canonical reference, so
+        # this compares like with like. It previously compared the pre-submit
+        # check's bare decision hash against the risk engine's id@hash form, and
+        # would have rejected every real authorization.
+        canonical_decision = decision_identity(intent.decision)
+        for name, actual in (
+            ("pre-submit", pre_submit.decision_ref),
+            ("risk result", risk_result.decision_ref),
+        ):
+            if actual != canonical_decision:
                 return (
-                    f"the authorization's {name} ({authorized!r}) does not match"
-                    f" this decision's risk result ({actual!r}); something was"
-                    " authorized, but not this"
+                    f"the {name} names decision {actual!r} but this execution is"
+                    f" for {canonical_decision!r}; something was authorized, but"
+                    " not this"
                 )
+
+        # The RISK RESULT itself, not its outcome. Every approving evaluation
+        # shares an outcome, so an outcome could never prove WHICH evaluation
+        # was authorized.
+        expected_risk = risk_result_identity(risk_result)
+        if pre_submit.risk_ref != expected_risk:
+            return (
+                "the authorization was minted against a different risk"
+                f" evaluation ({pre_submit.risk_ref!r} != {expected_risk!r})"
+            )
+
+        # The RISK POLICY is verified against the risk result, NOT against the
+        # pre-submit result: `pre_submit.policy_ref` names the PRE-SUBMIT
+        # policy, which is a different fact governing different checks, and
+        # comparing the two is what made a valid authorization look invalid.
+        expected_policy = risk_policy_identity(self._config.risk_policy)
+        if risk_result.policy_ref != expected_policy:
+            return (
+                "this risk result was produced under a different risk policy"
+                f" ({risk_result.policy_ref!r} != {expected_policy!r})"
+            )
+        if not pre_submit.policy_ref.startswith("pre-submit-policy:"):
+            return (
+                f"the authorization's policy reference {pre_submit.policy_ref!r}"
+                " is not a pre-submit policy identity"
+            )
+
         if pre_submit.authorized_quantity > risk_result.approved_quantity:
             return (
                 f"the authorization permits {pre_submit.authorized_quantity} but"
@@ -1500,12 +1888,8 @@ class ExecutionService:
         """Durably mark the point of no return. Failure means no submission."""
         record = dict(evaluation.to_dict())
         record["checkpoint"] = "SUBMIT_PREPARED"
-        prepare = getattr(self._audit, "persist_prepared", None)
         try:
-            if callable(prepare):
-                prepare(record)
-            else:
-                self._audit.persist(record)
+            self._audit.persist_prepared(record)
         except Exception as error:  # noqa: BLE001 - unrecorded is unsubmittable
             return self._replace_stage(
                 evaluation,
@@ -1522,12 +1906,8 @@ class ExecutionService:
         """Record the broker's answer. False means it could not be recorded."""
         record = dict(evaluation.to_dict())
         record["checkpoint"] = "POST_SUBMIT"
-        persist_outcome = getattr(self._audit, "persist_outcome", None)
         try:
-            if callable(persist_outcome):
-                persist_outcome(record)
-            else:
-                self._audit.persist(record)
+            self._audit.persist_outcome(record)
         except Exception as error:  # noqa: BLE001
             LOGGER.error(
                 "post-submit audit failed after a broker submission; operator"
@@ -1541,23 +1921,20 @@ class ExecutionService:
         return True
 
     def _require_reconciliation(self, reason: str) -> None:
-        """Latch new entries shut through the canonical gate, if one is wired.
+        """Latch new entries shut through the canonical gate.
 
         Reuses the execution agent's own reconciliation latch rather than
         inventing a second blocking mechanism; cancellation and exposure
-        reduction are not gated by it, by design.
+        reduction are not gated by it, by design. A latch is guaranteed to
+        exist here because construction refuses an execution-capable service
+        without one.
         """
-        latch = self._entry_latch
-        require = getattr(latch, "require", None)
-        if not callable(require):
-            LOGGER.error(
-                "no reconciliation latch is wired; new entries are NOT latched"
-                " and this state requires manual operator attention: %s",
-                reason,
-            )
+        if self._entry_latch is None:
+            # Only reachable on an evaluate-only service, which cannot submit
+            # and therefore cannot reach this state.
             return
         try:
-            require(reason)
+            self._entry_latch.require(reason)
         except Exception as error:  # noqa: BLE001
             LOGGER.error(
                 "could not latch new entries (%s) after: %s",
@@ -1607,6 +1984,13 @@ class ExecutionService:
         }
 
 
+def _normal(value: Decimal | None) -> str:
+    """A canonical number string: 1, 1.0 and 1.00 must not look different."""
+    if value is None:
+        return ""
+    return format(value.normalize(), "f")
+
+
 def _with(evaluation: ExecutionEvaluation, **changes: object) -> ExecutionEvaluation:
     from dataclasses import replace
 
@@ -1627,6 +2011,7 @@ __all__ = [
     "ExecutionAuthorization",
     "ExecutionConfig",
     "ExecutionEvaluation",
+    "ExecutionEvidence",
     "ExecutionIntent",
     "ExecutionService",
     "ExecutionServiceError",
