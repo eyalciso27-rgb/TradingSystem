@@ -30,6 +30,7 @@ from trading_persistence.execution_audit import (
     ACTION_OUTCOME,
     ACTION_SUBMIT_PREPARED,
     DurableExecutionAuditSink,
+    DurableExecutionHistoryReader,
     ExecutionAuditError,
     canonical_payload,
     load_decision_records,
@@ -59,6 +60,20 @@ def _record(**kw: object) -> dict[str, object]:
         "blockers": [],
         "gates": [{"name": "risk_limits", "satisfied": True, "detail": "APPROVE"}],
         "quote": {"bid": "100.00", "ask": "100.05", "market_data_state": "REALTIME"},
+        # Lifecycle records must carry the identity their action promises: a
+        # prepared or terminal record without one cannot be compared to a
+        # replay, and reading it as "field absent" would turn an integrity
+        # failure into a confident wrong answer.
+        "execution_fingerprint": {
+            "decision_id": "decision-abc",
+            "client_order_id": "exec-ord-1",
+            "strategy_id": "baseline-trend-breakout-v1",
+            "source_id": "strategy",
+            "symbol": "AAPL",
+            "side": "BUY",
+            "environment": "PAPER",
+            "account_alias": "paper-poi",
+        },
     }
     record.update(kw)
     return record
@@ -331,3 +346,71 @@ def test_execution_audit_added_no_new_table() -> None:
     source = Path(execution_audit.__file__).read_text(encoding="utf-8")
     assert "__tablename__" not in source
     assert "CREATE TABLE" not in source.upper()
+
+
+def test_a_record_without_its_identity_is_an_integrity_failure(
+    engine: Engine, objects: FilesystemObjectStorage, decision_id: str
+) -> None:
+    """A prepared record with no fingerprint cannot be compared to a replay."""
+    from trading_persistence.execution_audit import ExecutionHistoryUnreadableError
+
+    sink = DurableExecutionAuditSink(engine, objects, environment=Environment.PAPER)
+    bare = dict(_record(decision_id=decision_id))
+    del bare["execution_fingerprint"]
+    sink.persist_prepared(bare)
+
+    with pytest.raises(ExecutionHistoryUnreadableError, match="no execution fingerprint"):
+        DurableExecutionHistoryReader(engine, objects).records_for(decision_id)
+
+
+def test_a_terminal_record_without_an_outcome_is_an_integrity_failure(
+    engine: Engine, objects: FilesystemObjectStorage, decision_id: str
+) -> None:
+    """It must NEVER be reconstructed as a refusal just because it is absent."""
+    from trading_persistence.execution_audit import ExecutionHistoryUnreadableError
+
+    sink = DurableExecutionAuditSink(engine, objects, environment=Environment.PAPER)
+    sink.persist_outcome(_record(decision_id=decision_id))
+
+    with pytest.raises(ExecutionHistoryUnreadableError, match="no submission outcome"):
+        DurableExecutionHistoryReader(engine, objects).records_for(decision_id)
+
+
+def test_a_missing_payload_object_is_an_integrity_failure(
+    engine: Engine, tmp_path: Path, decision_id: str
+) -> None:
+    """A chain row pointing at nothing is not a record with empty fields."""
+    from trading_persistence.execution_audit import ExecutionHistoryUnreadableError
+
+    objects = FilesystemObjectStorage(tmp_path / "written")
+    sink = DurableExecutionAuditSink(engine, objects, environment=Environment.PAPER)
+    sink.persist_prepared(_record(decision_id=decision_id))
+
+    # A reader pointed at an EMPTY store: the chain row survives, the object
+    # does not.
+    empty = FilesystemObjectStorage(tmp_path / "empty")
+    with pytest.raises(ExecutionHistoryUnreadableError, match="could not be retrieved"):
+        DurableExecutionHistoryReader(engine, empty).records_for(decision_id)
+
+
+def test_a_lifecycle_is_findable_by_its_order_id_too(
+    engine: Engine, objects: FilesystemObjectStorage, decision_id: str
+) -> None:
+    """The cross-decision collision is only visible if the order id is indexed."""
+    sink = DurableExecutionAuditSink(engine, objects, environment=Environment.PAPER)
+    order_id = f"order-{decision_id}"
+    stored = _record(decision_id=decision_id)
+    fingerprint = stored["execution_fingerprint"]
+    assert isinstance(fingerprint, dict)
+    sink.persist_prepared(
+        {
+            **stored,
+            "client_order_id": order_id,
+            "execution_fingerprint": {**fingerprint, "client_order_id": order_id},
+        }
+    )
+
+    reader = DurableExecutionHistoryReader(engine, objects)
+
+    assert reader.records_for(decision_id), "findable by decision"
+    assert reader.records_for_order(order_id), "and by order id"
