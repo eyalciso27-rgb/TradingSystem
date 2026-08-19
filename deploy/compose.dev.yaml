@@ -14,6 +14,24 @@ services:
       # lives in a versioned subdirectory, enabling pg_upgrade --link).
       - pg-data-dev:/var/lib/postgresql
 
+  # Same service, same automatic behaviour, its own volume. Defined here rather
+  # than in the base stack so an ephemeral test/CI `up` stays infrastructure-only.
+  scheduler:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.scheduler
+    environment:
+      TRADING_MODE: PAPER
+      TRADING_UNIVERSE_ROOT: /data/sp500-current
+      TRADING_SCHEDULER_TICK_HOURS: ${TRADING_SCHEDULER_TICK_HOURS:-6}
+      TRADING_LOG_LEVEL: ${TRADING_LOG_LEVEL:-INFO}
+    volumes:
+      - universe-data-dev:/data/sp500-current
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks:
+      - trading
+
   nats:
     ports:
       - "127.0.0.1:4222:4222"
@@ -28,3 +46,4 @@ networks:
 volumes:
   pg-data-dev:
   nats-data-dev:
+  universe-data-dev:

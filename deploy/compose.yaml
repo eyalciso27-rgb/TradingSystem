@@ -1,9 +1,14 @@
 # Base / test-CI stack (IMP-0401, ADR-009: Docker Compose on Oracle ARM64).
 #
 # Infrastructure services only (PostgreSQL 18 per ADR-006, NATS JetStream per
-# ADR-007); application services join once their canonical Dockerfiles exist.
-# Used directly for ephemeral test/CI runs (no published ports, no volumes);
-# development and paper are overrides (compose.dev.yaml / compose.paper.yaml).
+# ADR-007). Used directly for ephemeral test/CI runs: no published ports, no
+# volumes, and DELIBERATELY no application services, so a CI stack starts
+# nothing that would reach the network on its own.
+#
+# Application services belong to the environment overrides, not here. The
+# scheduler is defined in compose.dev.yaml and compose.paper.yaml, which is what
+# makes it start automatically for anyone running dev or paper normally --
+# there is no profile or extra flag to remember.
 #
 # No credentials live in this file: every secret value comes from the
 # environment at run time (`:?` fails closed when unset — no defaults). Both

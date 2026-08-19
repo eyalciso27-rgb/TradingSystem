@@ -1,0 +1,29 @@
+# Canonical image for the scheduler application service (apps/scheduler).
+#
+# This is the process that makes the monthly S&P 500 universe refresh
+# automatic: it runs `python -m trading_scheduler`, which performs startup
+# maintenance and then ticks for the life of the container. Nothing here
+# submits orders, and running it does not authorize Paper Auto or Live.
+#
+# Multi-arch by way of the uv base image (amd64 + arm64), matching the Oracle
+# Linux ARM64 deployment target while staying portable for local development.
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+
+WORKDIR /repo
+
+ENV UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    PYTHONUNBUFFERED=1
+
+COPY . .
+
+# Locked resolve, then prove the entry point actually imports in the image.
+# A scheduler that only fails at 03:00 on the first tick is not deployed.
+RUN uv sync --locked \
+    && uv run python -c "import trading_scheduler.__main__ as m; assert callable(m.main)"
+
+# SIGTERM must reach Python so the loop shuts down gracefully rather than being
+# killed mid-refresh; uv execs the interpreter, so the signal is not swallowed.
+STOPSIGNAL SIGTERM
+
+CMD ["uv", "run", "python", "-m", "trading_scheduler"]

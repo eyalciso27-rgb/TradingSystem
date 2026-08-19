@@ -22,14 +22,15 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from test_ibkr_paper_adapter import (  # type: ignore[import-not-found]  # sibling module
+from trading_broker_core.port import BrokerErrorCode, BrokerPortError, CancelOrderRequest
+from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter, utc_now
+
+from tests.broker.test_ibkr_paper_adapter import (
     ALIASES,
     FakePaperTransport,
     deterministic_clock,
     make_intent,
 )
-from trading_broker_core.port import BrokerErrorCode, BrokerPortError, CancelOrderRequest
-from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter, utc_now
 
 #: The frozen default that shipped in production and must never return.
 STALE_DEFAULT = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)

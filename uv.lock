@@ -510,14 +510,18 @@ name = "trading-application"
 version = "0.1.0"
 source = { editable = "packages/py/application" }
 dependencies = [
+    { name = "trading-broker-core" },
     { name = "trading-config" },
+    { name = "trading-contracts" },
     { name = "trading-market-data-core" },
     { name = "trading-observability" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "trading-broker-core", editable = "packages/py/broker-core" },
     { name = "trading-config", editable = "packages/py/config" },
+    { name = "trading-contracts", editable = "packages/py/contracts" },
     { name = "trading-market-data-core", editable = "packages/py/market-data-core" },
     { name = "trading-observability", editable = "packages/py/observability" },
 ]
@@ -653,6 +657,16 @@ requires-dist = [
 name = "trading-scheduler"
 version = "0.1.0"
 source = { editable = "apps/scheduler" }
+dependencies = [
+    { name = "trading-market-data-core" },
+    { name = "trading-observability" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "trading-market-data-core", editable = "packages/py/market-data-core" },
+    { name = "trading-observability", editable = "packages/py/observability" },
+]
 
 [[package]]
 name = "trading-system"
