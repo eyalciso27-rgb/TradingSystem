@@ -22,6 +22,7 @@ from decimal import Decimal
 
 import pytest
 from trading_application.trading_readiness_runtime import MarketDataState
+from trading_broker_core.port import BrokerInstrument
 from trading_broker_ibkr.poi_market_data_client import (
     ContractResolution,
     MarketDataQuote,
@@ -45,6 +46,7 @@ def quote(**kw: object) -> MarketDataQuote:
     """A REAL MarketDataQuote. Nothing here exists that production lacks."""
     fields: dict[str, object] = {
         "symbol": "AAPL",
+        "requested_for": "conid:265598",
         "market_data_type": 1,
         "bid": "100.00",
         "ask": "100.05",
@@ -70,6 +72,9 @@ class _RawClient:
     def __init__(self, result: MarketDataQuote | Exception) -> None:
         self.result = result
         self.requests: list[tuple[str, int]] = []
+        #: Anything landing here is a ticker-shaped request from a caller that
+        #: had already resolved a security.
+        self.ticker_requests: list[tuple[str, int]] = []
         self.opened = False
 
     def open(self, host: str, port: int) -> None:
@@ -85,7 +90,17 @@ class _RawClient:
         raise NotImplementedError
 
     def market_data(self, symbol: str, requested_market_data_type: int = 1) -> MarketDataQuote:
-        self.requests.append((symbol, requested_market_data_type))
+        """Legacy ticker path. The execution quote source must NEVER reach it."""
+        self.ticker_requests.append((symbol, requested_market_data_type))
+        raise AssertionError(
+            "the execution quote path requested market data by ticker; that is"
+            " the identity break this signature exists to prevent"
+        )
+
+    def market_data_for_instrument(
+        self, broker_instrument_ref: str, requested_market_data_type: int = 1
+    ) -> MarketDataQuote:
+        self.requests.append((broker_instrument_ref, requested_market_data_type))
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -104,9 +119,17 @@ def _source(result: MarketDataQuote | Exception) -> tuple[IbkrQuoteSource, _RawC
 # == canonical mapping =========================================================
 
 
+AAPL = BrokerInstrument(
+    broker_instrument_ref="conid:265598",
+    symbol="AAPL",
+    exchange="SMART",
+    currency="USD",
+)
+
+
 def test_a_healthy_realtime_quote_maps_completely() -> None:
     source, _ = _source(quote())
-    state = source.current_quote("AAPL")
+    state = source.current_quote(AAPL)
 
     assert state.bid == Decimal("100.00")
     assert state.ask == Decimal("100.05")
@@ -116,11 +139,18 @@ def test_a_healthy_realtime_quote_maps_completely() -> None:
     assert state.observed_at == datetime(2026, 8, 19, 15, 30, 1, 500000, tzinfo=UTC)
 
 
-def test_the_source_drives_the_real_session() -> None:
+def test_the_source_drives_the_real_session_for_the_exact_security() -> None:
+    """The request names the SECURITY, and the ticker path is never touched."""
     source, client = _source(quote())
-    source.current_quote("AAPL")
+    state = source.current_quote(AAPL)
 
-    assert client.requests == [("AAPL", 1)], "one request, through the existing session"
+    assert client.requests == [("conid:265598", 1)], (
+        "one request, for the resolved security, through the existing session"
+    )
+    assert client.ticker_requests == [], "no ticker-shaped request was made"
+    assert "requested_for=conid:265598" in state.detail, (
+        "the quote states which security it was asked about"
+    )
 
 
 @pytest.mark.parametrize(
@@ -226,7 +256,7 @@ def test_missing_fields_are_reported_in_the_detail() -> None:
 def test_an_unreachable_feed_becomes_an_unavailable_observation() -> None:
     """Readiness must refuse for a stated reason, not by raising."""
     source, _ = _source(RuntimeError("gateway dropped the subscription"))
-    state = source.current_quote("AAPL")
+    state = source.current_quote(AAPL)
 
     assert state.market_data_state is MarketDataState.UNAVAILABLE
     assert state.bid is None

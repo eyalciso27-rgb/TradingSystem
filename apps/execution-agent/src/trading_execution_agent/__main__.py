@@ -37,6 +37,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from trading_application.decision_engine import DecisionExplanation, EngineDecision
@@ -54,6 +55,11 @@ from trading_persistence.execution_audit import (
     DurableExecutionAuditSink,
     DurableExecutionHistoryReader,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from trading_application.readiness_guarded_broker import QuoteSource
+
+    from trading_execution_agent.ibkr_quote_source import MarketDataSessionLike
 
 from trading_execution_agent.execution_service import (
     ExecutionConfig,
@@ -167,6 +173,25 @@ def _closing(resource: object, method: str, name: str) -> Callable[[], None]:
     return close
 
 
+def _quote_source(session: MarketDataSessionLike) -> QuoteSource:
+    """The production quote source, bound to the canonical contract HERE.
+
+    Deliberately a typed builder rather than an inline construction with a
+    ``type: ignore[arg-type]``. That suppression is what let the production
+    quote leg drift: the application contract moved to
+    ``current_quote(BrokerInstrument)`` while ``IbkrQuoteSource`` still took a
+    ticker, and the ignore meant mypy never said so.
+
+    The return annotation is the check. If ``IbkrQuoteSource`` ever stops
+    satisfying ``QuoteSource`` -- a changed parameter type, a renamed method --
+    this function fails to type-check, in the production wiring, before anything
+    runs.
+    """
+    from trading_execution_agent.ibkr_quote_source import IbkrQuoteSource
+
+    return IbkrQuoteSource(session)
+
+
 def build_service(
     *, symbol: str, account_alias: str, host: str, port: int, equity_cap: Decimal
 ) -> ProbeResources:
@@ -224,7 +249,12 @@ def build_service(
 
 def _build(
     adapter: object,
-    session: object,
+    # Typed, not `object`. The quote leg is where production drifted away from
+    # the canonical contract while a `type: ignore` kept mypy quiet, so this
+    # parameter carries its real protocol and `_quote_source` below re-states
+    # the contract as its return type. If IbkrQuoteSource stops satisfying
+    # QuoteSource, the production wiring stops type-checking.
+    session: MarketDataSessionLike,
     engine: object,
     objects: object,
     *,
@@ -232,7 +262,6 @@ def _build(
     equity_cap: Decimal,
 ) -> ExecutionService:
     """Assemble the service from already-owned resources."""
-    from trading_execution_agent.ibkr_quote_source import IbkrQuoteSource
     from trading_execution_agent.reconciliation_latch import ReconciliationLatch
 
     # ONE latch: the agent's entry gate and the service's critical-state latch
@@ -241,7 +270,7 @@ def _build(
     latch = ReconciliationLatch()
     return ExecutionService(
         broker=adapter,  # type: ignore[arg-type]
-        quotes=IbkrQuoteSource(session),  # type: ignore[arg-type]
+        quotes=_quote_source(session),
         # The sink owns its own committed transactions; the probe hands it an
         # ENGINE and never holds a connection of its own.
         audit=DurableExecutionAuditSink(

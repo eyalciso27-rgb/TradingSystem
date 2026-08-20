@@ -770,7 +770,7 @@ def test_lost_fill_callback_surfaces_as_missing_fill_event() -> None:
 
 def test_duplicate_callback_is_detected_not_double_counted() -> None:
     """A redelivered broker event (duplicate callback) is a no-op for order
-    state — the broker's idempotency means no second order and the event
+    state — the adapter's idempotency means no second order and the event
     stream still resolves to one logical order."""
     drill = ExecutionDrill()
     request = drill.request("ord-dupcb")

@@ -85,6 +85,10 @@ class RawMarketDataClient(Protocol):
         self, symbol: str, requested_market_data_type: int = 1
     ) -> MarketDataQuote: ...
 
+    def market_data_for_instrument(
+        self, broker_instrument_ref: str, requested_market_data_type: int = 1
+    ) -> MarketDataQuote: ...
+
     def close(self) -> None: ...
 
 
@@ -132,9 +136,29 @@ class IbkrMarketDataSession:
     def req_market_data(
         self, symbol: str, requested_market_data_type: int = 1
     ) -> MarketDataQuote:
+        """Ticker-shaped, read-only. Kept for the PoI tooling that predates
+        contract resolution; the execution path uses
+        ``req_market_data_for_instrument``.
+        """
         self._require_connected()
         return self._guarded(
             lambda: self._client.market_data(symbol, requested_market_data_type)
+        )
+
+    def req_market_data_for_instrument(
+        self, broker_instrument_ref: str, requested_market_data_type: int = 1
+    ) -> MarketDataQuote:
+        """A quote for THE resolved security, by its opaque reference.
+
+        The execution path's only market-data operation. The reference is
+        decoded inside the raw client; an unusable one raises there, before any
+        request reaches the gateway.
+        """
+        self._require_connected()
+        return self._guarded(
+            lambda: self._client.market_data_for_instrument(
+                broker_instrument_ref, requested_market_data_type
+            )
         )
 
     def disconnect(self) -> None:

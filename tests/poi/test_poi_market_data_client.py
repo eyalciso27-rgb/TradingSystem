@@ -108,8 +108,16 @@ class FakeTransport:
     def set_market_data_type(self, market_data_type: int) -> None:
         self.calls.append(f"set_market_data_type:{market_data_type}")
 
+    def request_market_data_for_con_id(self, req_id: int, con_id: int) -> None:
+        """The EXACT security. The execution path uses only this one."""
+        self.calls.append(f"market_data_con_id:{con_id}")
+        self._replay_market_data()
+
     def request_market_data(self, req_id: int, symbol: str) -> None:
         self.calls.append(f"market_data:{symbol}")
+        self._replay_market_data()
+
+    def _replay_market_data(self) -> None:
         assert self._sink is not None
         if self._market_data_type is not None:
             self._sink.on_market_data_type(self._market_data_type)

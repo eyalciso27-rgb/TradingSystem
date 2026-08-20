@@ -30,7 +30,8 @@ The order of operations closes the audit race:
 A blocked decision is still persisted — a refusal is a decision worth auditing —
 and a persistence failure blocks submission rather than proceeding unrecorded.
 Because the record is written before submission and ``client_order_id`` is the
-broker's idempotency key, an audit retry cannot cause a double submission.
+canonical idempotency key -- which the ADAPTER honours, not the broker --
+an audit retry cannot cause a double submission.
 
 **Readiness is not authorization.** Passing this guard does not authorize Paper
 Auto or Live; those prohibitions are separate and unchanged.

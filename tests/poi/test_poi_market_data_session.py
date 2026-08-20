@@ -30,6 +30,7 @@ LIVE_ACCOUNT = "U" + "7654321"
 def make_quote(**overrides: Any) -> MarketDataQuote:
     values: dict[str, Any] = {
         "symbol": "AAPL",
+        "requested_for": "symbol:AAPL",
         "market_data_type": 1,
         "bid": "191.20",
         "ask": "191.24",
@@ -86,6 +87,15 @@ class FakeClient:
         self, symbol: str, requested_market_data_type: int = 1
     ) -> MarketDataQuote:
         self.calls.append(f"market_data:{symbol}:{requested_market_data_type}")
+        return self._quote
+
+    def market_data_for_instrument(
+        self, broker_instrument_ref: str, requested_market_data_type: int = 1
+    ) -> MarketDataQuote:
+        self.calls.append(
+            f"market_data_for_instrument:{broker_instrument_ref}"
+            f":{requested_market_data_type}"
+        )
         return self._quote
 
     def close(self) -> None:

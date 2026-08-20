@@ -48,6 +48,7 @@ from trading_broker_ibkr.ibkr_error_callback import (
     normalize_error_callback,
     normalize_message,
 )
+from trading_broker_ibkr.instrument_ref import decode_instrument_ref
 from trading_broker_ibkr.poi_readonly_session import (
     PoiSessionError,
     ReadOnlyAccountSummary,
@@ -137,6 +138,17 @@ class MarketDataTransport(Protocol):
 
     def request_market_data(self, req_id: int, symbol: str) -> None: ...
 
+    def request_market_data_for_con_id(self, req_id: int, con_id: int) -> None:
+        """Request market data for ONE broker-identified security.
+
+        The ticker-shaped ``request_market_data`` above stays for the read-only
+        PoI tooling that predates contract resolution. The execution path must
+        not use it: after a security has been resolved, asking for a price by
+        ticker lets IBKR resolve the string a second time, and nothing compares
+        its answer to the security the order was authorized for.
+        """
+        ...
+
     def cancel_market_data(self, req_id: int) -> None: ...
 
 
@@ -162,6 +174,11 @@ class MarketDataQuote:
     """
 
     symbol: str
+    #: EXACTLY what this snapshot was requested for -- ``conid:265598`` on the
+    #: execution path, ``symbol:AAPL`` on the legacy read-only path. Taken from
+    #: the request we made, never inferred from what came back, so a quote can
+    #: always be attributed to the security it was asked about.
+    requested_for: str
     market_data_type: int | None
     bid: str | None
     ask: str | None
@@ -407,8 +424,64 @@ class IbkrMarketDataRawClient:
             )
         return ContractResolution(symbol, True, True, "single contract resolved")
 
+    def market_data_for_instrument(
+        self,
+        broker_instrument_ref: str,
+        requested_market_data_type: int = _REQUESTED_MARKET_DATA_TYPE,
+    ) -> MarketDataQuote:
+        """A quote for THE resolved security, by its opaque reference.
+
+        This is the execution path's only market-data entry point. The
+        reference is decoded here -- inside the package that minted it -- and an
+        unusable, foreign or missing one raises before any request is made.
+        There is deliberately no ticker to fall back to: a caller that has
+        resolved a security and then asks for a price by symbol has thrown away
+        the identity it just established.
+        """
+        con_id = decode_instrument_ref(broker_instrument_ref)
+        if con_id is None:
+            raise PoiSessionError(
+                "market data was requested with no usable broker instrument"
+                " reference; refusing to price a security we cannot name"
+            )
+        return self._market_data(
+            requested_market_data_type,
+            # The request lineage IS the attribution: we know which security
+            # this snapshot was asked for because we asked for it by id. It is
+            # never inferred from a ticker in the response.
+            requested_for=broker_instrument_ref,
+            # Deliberately blank: this request named no symbol, and inventing
+            # one from the reference would fabricate exactly the identity the
+            # opaque reference exists to keep honest.
+            symbol="",
+            request=lambda transport: transport.request_market_data_for_con_id(
+                _MARKET_DATA_REQ_ID, con_id
+            ),
+        )
+
     def market_data(
         self, symbol: str, requested_market_data_type: int = _REQUESTED_MARKET_DATA_TYPE
+    ) -> MarketDataQuote:
+        """Ticker-shaped read-only quote, for the PoI tooling that predates
+        contract resolution. NOT for the execution path -- see
+        ``market_data_for_instrument``.
+        """
+        return self._market_data(
+            requested_market_data_type,
+            requested_for=f"symbol:{symbol}",
+            symbol=symbol,
+            request=lambda transport: transport.request_market_data(
+                _MARKET_DATA_REQ_ID, symbol
+            ),
+        )
+
+    def _market_data(
+        self,
+        requested_market_data_type: int,
+        *,
+        requested_for: str,
+        symbol: str,
+        request: Callable[[MarketDataTransport], None],
     ) -> MarketDataQuote:
         sink, transport = self._require_open()
         sink.mkt_data_ready.clear()
@@ -416,7 +489,7 @@ class IbkrMarketDataRawClient:
         # ACTUAL type served is read from the marketDataType callback below and
         # never assumed from the request.
         transport.set_market_data_type(requested_market_data_type)
-        transport.request_market_data(_MARKET_DATA_REQ_ID, symbol)
+        request(transport)
         self._await(sink.mkt_data_ready, "market data snapshot")
         transport.cancel_market_data(_MARKET_DATA_REQ_ID)  # read-only cleanup only
 
@@ -439,6 +512,7 @@ class IbkrMarketDataRawClient:
         )
         return MarketDataQuote(
             symbol=symbol,
+            requested_for=requested_for,
             market_data_type=sink.market_data_type,
             bid=bid,
             ask=ask,
@@ -494,6 +568,19 @@ def _build_ibapi_transport() -> MarketDataTransport:
     def _stock(symbol: str) -> Any:
         contract = Contract()
         contract.symbol = symbol
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        return contract
+
+    def _by_con_id(con_id: int) -> Any:
+        """The contract for ONE resolved security. No symbol, by design.
+
+        A symbol here would be a second identity for the same request, and the
+        two could disagree; ``conId`` alone is unambiguous to IBKR.
+        """
+        contract = Contract()
+        contract.conId = con_id
         contract.secType = "STK"
         contract.exchange = "SMART"
         contract.currency = "USD"
@@ -611,6 +698,16 @@ def _build_ibapi_transport() -> MarketDataTransport:
             # snapshot=True auto-completes via tickSnapshotEnd;
             # regulatorySnapshot=False avoids any paid snapshot fee.
             self._app.reqMktData(req_id, _stock(symbol), "", True, False, [])
+
+        def request_market_data_for_con_id(self, req_id: int, con_id: int) -> None:
+            """reqMktData for the EXACT resolved security.
+
+            ``conId`` identifies the security; the ticker travels beside it for
+            IBKR's own logging and is not what the request is keyed on.
+            """
+            self._app.reqMktData(
+                req_id, _by_con_id(con_id), "", True, False, []
+            )
 
         def cancel_market_data(self, req_id: int) -> None:
             self._app.cancelMktData(req_id)

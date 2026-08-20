@@ -381,7 +381,7 @@ class ExecutionIntent:
     #: The risk engine may reduce it and can never be asked to raise it.
     requested_quantity: Decimal
     correlation_id: str
-    #: Stable per decision: the broker's idempotency key. A retry of the same
+    #: Stable per decision: OUR idempotency key. A retry of the same
     #: decision reuses it, which is what makes a retry safe.
     client_order_id: str
     source_id: str = "strategy"

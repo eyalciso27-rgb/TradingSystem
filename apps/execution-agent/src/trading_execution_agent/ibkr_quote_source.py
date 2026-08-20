@@ -30,6 +30,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
 from trading_application.trading_readiness_runtime import MarketDataState, QuoteState
+from trading_broker_core.port import BrokerInstrument
 from trading_broker_ibkr.poi_market_data_client import MarketDataQuote
 
 QUOTE_SOURCE_VERSION = "ibkr-quote-source-1.0.0"
@@ -55,10 +56,16 @@ class MarketDataSessionLike(Protocol):
     Typed structurally so this module drives the real session without owning
     its lifecycle: connecting, disconnecting and reconnecting stay where they
     already are.
+
+    Note what is NOT here: the ticker-shaped ``req_market_data``. The execution
+    path may not reach it. A quote requested by symbol after a security has been
+    resolved lets IBKR resolve the string a second time, and nothing compares
+    its answer to the security the order is authorized for -- which is exactly
+    the identity break the rest of this seal exists to close.
     """
 
-    def req_market_data(
-        self, symbol: str, requested_market_data_type: int = ...
+    def req_market_data_for_instrument(
+        self, broker_instrument_ref: str, requested_market_data_type: int = ...
     ) -> MarketDataQuote: ...
 
 
@@ -151,6 +158,11 @@ def to_quote_state(quote: MarketDataQuote) -> QuoteState:
         # the owner host, so they are carried into the readiness detail rather
         # than left in a log nobody reads during a refusal.
         detail_parts.append(f"entitlement={list(quote.entitlement_errors)}")
+    requested_for = str(getattr(quote, "requested_for", "") or "")
+    if requested_for:
+        # Attribution from the REQUEST, not the response: we know which security
+        # this prices because we asked for that security by id.
+        detail_parts.append(f"requested_for={requested_for}")
     return QuoteState(
         bid=parse_price(quote.bid),
         ask=parse_price(quote.ask),
@@ -182,16 +194,35 @@ class IbkrQuoteSource:
         self._requested = requested_market_data_type
         self._now = now or (lambda: datetime.now(tz=UTC))
 
-    def current_quote(self, symbol: str) -> QuoteState:
+    def current_quote(self, instrument: BrokerInstrument) -> QuoteState:
+        """A quote for THE resolved security.
+
+        The opaque reference passes straight through to the IBKR package, the
+        only component permitted to translate it into a contract.
+        ``instrument.symbol`` is deliberately NOT used: falling back to it would
+        quietly reintroduce the ticker-shaped request this signature replaces,
+        and the fallback would be invisible because a ticker usually does
+        resolve to the right thing.
+
+        An unusable, foreign or missing reference raises inside the IBKR client
+        BEFORE any request is made, and arrives here as UNAVAILABLE -- readiness
+        then refuses for a stated reason rather than pricing a security we
+        cannot name.
+        """
         try:
-            raw = self._session.req_market_data(symbol, self._requested)
+            raw = self._session.req_market_data_for_instrument(
+                instrument.broker_instrument_ref, self._requested
+            )
         except Exception as error:  # noqa: BLE001 - any feed failure is UNAVAILABLE
             return QuoteState(
                 bid=None,
                 ask=None,
                 observed_at=None,
                 market_data_state=MarketDataState.UNAVAILABLE,
-                detail=f"market data request raised {type(error).__name__}",
+                detail=(
+                    f"market data request raised {type(error).__name__}"
+                    f" (requested for {instrument.broker_instrument_ref})"
+                ),
             )
         return to_quote_state(raw)
 

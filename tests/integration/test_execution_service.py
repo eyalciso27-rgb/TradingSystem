@@ -62,6 +62,7 @@ from trading_application.pre_submit_check import (
     authorization_matches,
     single_use_authorization,
 )
+from trading_application.readiness_guarded_broker import QuoteSource
 from trading_application.risk_engine import (
     AccountState,
     PositionExposure,
@@ -79,10 +80,11 @@ from trading_broker_core.port import (
     BrokerCapabilities,
     BrokerCapabilityMode,
     BrokerInstrument,
+    InstrumentQuery,
     OrderIntent,
     OrderSide,
 )
-from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter
+from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter, decode_instrument_ref
 from trading_contracts.decision import DecisionResult
 from trading_contracts.enums import (
     ActionTier,
@@ -132,6 +134,7 @@ from tests.broker.test_ibkr_paper_adapter import (
     PAPER_ACCOUNT,
     FakePaperTransport,
 )
+from tests.integration.test_production_quote_binding import RecordingMarketData
 
 ADAPTER_NOW = datetime(2026, 8, 19, 15, 30, tzinfo=UTC)
 NOW = ADAPTER_NOW + timedelta(seconds=2)
@@ -540,6 +543,18 @@ def _classified_portfolio() -> tuple[PositionExposure, ...]:
             open_risk_amount=Decimal("50"), notional=Decimal("4000"),
         ),
     )
+
+
+def _production_quote_source() -> tuple[QuoteSource, RecordingMarketData]:
+    """The REAL production quote chain, with only the SDK stubbed.
+
+    Imported from the dedicated binding test so there is exactly one such
+    harness: a second copy could drift from the first, and the whole point is
+    that the merge gate exercises the production implementation.
+    """
+    from tests.integration.test_production_quote_binding import _production_chain
+
+    return _production_chain()
 
 
 def _adapter(transport: FakePaperTransport | None = None) -> IbkrPaperAdapter:
@@ -3834,7 +3849,7 @@ def test_a_substituted_order_id_is_refused_at_the_agent_boundary() -> None:
         correlation_id=intent.correlation_id,
         pre_submit=pre_submit,
         authorization=single_use_authorization(pre_submit),
-        # Everything else identical; only the broker's idempotency key differs.
+        # Everything else identical; only OUR idempotency key differs.
         plan=replace(pre_submit.authorized_plan, client_order_id="order-B"),
     )
 
@@ -4427,3 +4442,79 @@ def test_the_single_flight_scope_names_the_multi_process_limit() -> None:
 
     assert "single-PROCESS" in doc
     assert "does NOT provide multi-process" in doc
+
+
+# == THE merge gate, with the PRODUCTION quote implementation ================
+
+
+def test_the_merge_gate_one_security_through_the_real_quote_path() -> None:
+    """The identity chain including the REAL production market-data leg.
+
+    The other merge gate uses a fake quote source, which is what let the quote
+    leg drift to a ticker without any test noticing. This one runs the actual
+    ``IbkrQuoteSource`` -> ``IbkrMarketDataSession`` ->
+    ``IbkrMarketDataRawClient`` -> stub-SDK transport chain, so the assertion
+    that the price and the order name the SAME security is made against the
+    production code and not against a test double.
+
+    conid:265598, from resolution to reqMktData to placeOrder.
+    """
+    intent = _intent()
+    authority = _TestOnlyAuthorization()
+    transport = PnlAwareTransport()
+    adapter = _adapter(transport)
+
+    resolved = adapter.resolve_instrument(InstrumentQuery(symbol="AAPL"))
+    assert resolved.broker_instrument_ref == "conid:265598"
+
+    quotes, market_data = _production_quote_source()
+    service, _, _ = _service(
+        transport=transport, adapter=adapter, authorization=authority, quotes=quotes
+    )
+
+    evaluation = service.execute(intent)
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED, evaluation.reasons
+    assert evaluation.authorization is not None
+    pre_submit = evaluation.authorization.pre_submit
+    assert pre_submit is not None and pre_submit.authorized_plan is not None
+    plan = pre_submit.authorized_plan
+
+    # -- resolved == quoted --------------------------------------------------
+    assert evaluation.instrument is not None
+    security = evaluation.instrument.broker_instrument_ref
+    assert security == resolved.broker_instrument_ref
+    assert market_data.contracts, "the production quote path made a request"
+    for contract in market_data.contracts:
+        assert contract.conId == 265598, (
+            "every reqMktData named the resolved security"
+        )
+    assert not any(
+        call.startswith("reqMktData_by_symbol") for call in market_data.calls
+    ), market_data.calls
+
+    # -- quoted == planned == authorized ------------------------------------
+    assert evaluation.plan_context is not None
+    assert evaluation.plan_context.instrument.broker_instrument_ref == security
+    assert plan.broker_instrument_ref == security
+    assert evaluation.quote is not None
+    assert f"requested_for={security}" in evaluation.quote.detail
+
+    # -- authorized == prepared == submitted --------------------------------
+    assert evaluation.fingerprint is not None
+    assert evaluation.fingerprint.broker_instrument_ref == security
+    sent = transport.submitted_intents
+    assert len(sent) == 1
+    assert sent[0].broker_instrument_ref == security
+    assert decode_instrument_ref(sent[0].broker_instrument_ref) == 265598, (
+        "the IBKR package translated its own reference to the real conId"
+    )
+
+    # -- and the entry price really came from that quote --------------------
+    assert plan.limit_price == evaluation.quote.midpoint
+
+    # -- production still refuses -------------------------------------------
+    production, production_transport, _ = _service()
+    refused = production.execute(_intent(client_order_id="prod-quote-1"))
+    assert refused.stage is ExecutionStage.AUTHORIZATION_DENIED
+    assert _submits(production_transport) == []
