@@ -42,18 +42,26 @@ from datetime import datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
 
-from trading_contracts.enums import DecisionOutcome, Environment, RiskDecisionOutcome
+from trading_contracts.enums import (
+    DecisionOutcome,
+    Environment,
+    OrderType,
+    RiskDecisionOutcome,
+)
 
 from trading_application.decision_engine import EngineDecision
 from trading_application.emergency import EntryContext, HaltRecord, match_halt
 from trading_application.execution_identity import (
     allocation_identity,
     decision_identity,
+    plan_identity,
     pre_submit_policy_identity,
+    risk_request_identity,
     risk_result_identity,
 )
+from trading_application.execution_plan import ExecutablePlan
 from trading_application.portfolio_allocator import CandidateAllocation
-from trading_application.risk_engine import RiskResult
+from trading_application.risk_engine import RiskResult, TradeRiskRequest
 
 PRE_SUBMIT_VERSION = "pre-submit-check-1.0.0"
 
@@ -168,12 +176,22 @@ class PreSubmitRequest:
     allocation: CandidateAllocation
     risk_result: RiskResult
     decision: EngineDecision
+    risk_request: TradeRiskRequest
     symbol: str
     strategy_id: str
     source_id: str
     environment: Environment
     planned_entry_price: Decimal
     planned_stop_price: Decimal
+    #: The rest of the broker-bound order. These used to live outside the check
+    #: entirely: the service chose the side, account, order type and time in
+    #: force AFTER the authorization was minted, so the check could approve one
+    #: order while a different one was sent. They are inputs now, and the
+    #: authorized plan is sealed over them.
+    side: str
+    account_alias: str
+    order_type: OrderType
+    time_in_force: str
 
     def __post_init__(self) -> None:
         if self.planned_entry_price <= 0 or self.planned_stop_price <= 0:
@@ -201,6 +219,28 @@ class PreSubmitRequest:
                 "the allocation was sized against a different risk evaluation"
                 f" ({self.allocation.risk_ref!r} != {expected_risk!r})"
             )
+        # The risk result must answer THE question this request describes. A
+        # result is a set of output numbers, and two different questions can
+        # produce identical numbers -- so without this, a risk evaluation of a
+        # different symbol, source or size could authorize this order purely
+        # because the figures happened to coincide.
+        expected_request = risk_request_identity(self.risk_request)
+        if self.risk_result.request_ref != expected_request:
+            raise PreSubmitError(
+                "the risk result answers a different risk request"
+                f" ({self.risk_result.request_ref!r} != {expected_request!r})"
+            )
+        for name, mine, theirs in (
+            ("symbol", self.symbol, self.risk_request.symbol),
+            ("strategy", self.strategy_id, self.risk_request.strategy_id),
+            ("source", self.source_id, self.risk_request.source_id),
+            ("environment", self.environment.value, self.risk_request.environment.value),
+        ):
+            if mine != theirs:
+                raise PreSubmitError(
+                    f"the risk request was evaluated for a different {name}"
+                    f" ({theirs!r} != {mine!r})"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +250,11 @@ class SubmitAuthorization:
     candidate_id: str
     authorized_quantity: Decimal
     authorized_at: datetime
+    #: The EXACT order this authorizes. Not a quantity that some later
+    #: component pairs with an order of its own choosing: an authorization
+    #: whose plan reference does not match the order being sent authorizes a
+    #: different order, which is to say it does not authorize this one.
+    plan_ref: str = ""
     note: str = "execution-agent-only; single-use; not a broker submission"
 
 
@@ -237,6 +282,10 @@ class PreSubmitCheckResult:
     checks: tuple[PreSubmitCheck, ...]
     reason_codes: tuple[str, ...]
     input_refs: tuple[str, ...]
+    #: The sealed order this result authorizes, and its identity. Present only
+    #: when an authorization was minted -- a CANCEL authorizes no plan at all.
+    authorized_plan: ExecutablePlan | None = None
+    plan_ref: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,12 +345,39 @@ class FinalPreSubmitCheck:
             result.action in (PreSubmitAction.ALLOW, PreSubmitAction.RESIZE)
             and result.authorized_quantity > 0
         ):
+            # THE seal, and the only place a sealed plan is ever built. It is
+            # constructed from the request that was just checked, using the
+            # quantity that was just authorized -- so what a later component
+            # sends cannot differ from what was checked without differing from
+            # this hash. A caller cannot supply a plan of its own, because a
+            # caller never constructs one.
+            plan = ExecutablePlan(
+                decision_ref=result.decision_ref,
+                risk_request_ref=request.risk_result.request_ref,
+                risk_ref=result.risk_ref,
+                allocation_ref=result.allocation_ref,
+                strategy_id=request.strategy_id,
+                source_id=request.source_id,
+                environment=request.environment,
+                account_alias=request.account_alias,
+                symbol=request.symbol,
+                side=request.side,
+                quantity=result.authorized_quantity,
+                order_type=request.order_type,
+                time_in_force=request.time_in_force,
+                limit_price=request.planned_entry_price,
+                stop_price=request.planned_stop_price,
+            )
+            sealed = plan_identity(plan)
             return replace(
                 result,
+                authorized_plan=plan,
+                plan_ref=sealed,
                 authorization=SubmitAuthorization(
                     candidate_id=result.candidate_id,
                     authorized_quantity=result.authorized_quantity,
                     authorized_at=as_of,
+                    plan_ref=sealed,
                 ),
             )
         return result

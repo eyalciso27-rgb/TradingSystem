@@ -58,6 +58,7 @@ from trading_contracts.enums import (
     CalibrationStatus,
     DecisionOutcome,
     Environment,
+    OrderType,
     PortfolioAction,
     RiskDecisionOutcome,
     SignalDirection,
@@ -727,19 +728,22 @@ class E2EShadowHarness:
         # -- risk (absolute veto) -----------------------------------------------------
         entry_price = _decimal(payload, "entry_price")
         stop_price = _decimal(payload, "stop_price")
+        # Kept as a named value: the pre-submit gate below must be handed the
+        # SAME request the engine answered, not an equivalent-looking one.
+        risk_request = TradeRiskRequest(
+            symbol=candidate.symbol,
+            sector=_text(payload, "sector") or "UNKNOWN",
+            cluster=_text(payload, "cluster") or "UNKNOWN",
+            source_id=_text(payload, "source_id") or "internal",
+            strategy_id=config.manifest.strategy_id,
+            environment=Environment.RESEARCH,
+            requested_quantity=_decimal(payload, "quantity"),
+            entry_price=entry_price,
+            stop_price=stop_price,
+        )
         risk = self._risk.evaluate(
             decision,
-            TradeRiskRequest(
-                symbol=candidate.symbol,
-                sector=_text(payload, "sector") or "UNKNOWN",
-                cluster=_text(payload, "cluster") or "UNKNOWN",
-                source_id=_text(payload, "source_id") or "internal",
-                strategy_id=config.manifest.strategy_id,
-                environment=Environment.RESEARCH,
-                requested_quantity=_decimal(payload, "quantity"),
-                entry_price=entry_price,
-                stop_price=stop_price,
-            ),
+            risk_request,
             config.account,
             as_of=as_of,
         )
@@ -822,12 +826,22 @@ class E2EShadowHarness:
                 allocation=allocation,
                 risk_result=risk,
                 decision=decision,
+                risk_request=risk_request,
                 symbol=candidate.symbol,
                 strategy_id=config.manifest.strategy_id,
                 source_id=_text(payload, "source_id") or "internal",
                 environment=Environment.RESEARCH,
                 planned_entry_price=entry_price,
                 planned_stop_price=stop_price,
+                # Research/shadow only: this path calls ``evaluate_only`` and
+                # never mints an authorization, so no plan is ever sealed here.
+                # The order shape is still stated rather than defaulted, because
+                # a shadow run that reports a different order than it evaluated
+                # is a shadow run that proves nothing.
+                side="BUY",
+                account_alias="research",
+                order_type=OrderType.LIMIT,
+                time_in_force="DAY",
             ),
             RefreshedMarket(
                 price=Decimal(market_raw) if market_raw.strip() else entry_price,

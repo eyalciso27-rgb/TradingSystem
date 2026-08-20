@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 from trading_application.emergency import HaltRecord
+from trading_application.execution_identity import plan_identity
+from trading_application.execution_plan import ExecutablePlan
 from trading_application.pre_submit_check import (
     PreSubmitAction,
     PreSubmitCheckResult,
@@ -24,7 +26,6 @@ from trading_broker_core.port import (
     BrokerErrorCode,
     BrokerPortError,
     OrderIntent,
-    OrderSide,
 )
 from trading_contracts.enums import Environment, HaltScope, OrderState, OrderType
 from trading_execution_agent.agent import (
@@ -53,16 +54,52 @@ def make_broker(*, healthy: bool = True) -> FakeBroker:
     return broker
 
 
+def plan(
+    *,
+    quantity: str = "100",
+    symbol: str = "AAPL",
+    side: str = "BUY",
+    order_type: OrderType = OrderType.LIMIT,
+    time_in_force: str = "DAY",
+    limit_price: str | None = "10",
+    stop_price: str | None = None,
+    environment: Environment = Environment.PAPER,
+    account_alias: str = "paper-main",
+) -> ExecutablePlan:
+    """The sealed order. The agent reads every order field from this."""
+    return ExecutablePlan(
+        decision_ref="decision:d1@sha256:" + "b" * 64,
+        risk_request_ref="risk-request:AAPL@sha256:" + "c" * 64,
+        risk_ref="risk-result:sha256:" + "d" * 64,
+        allocation_ref="allocation:cand-1@sha256:" + "e" * 64,
+        strategy_id="strat-1",
+        source_id="src-1",
+        environment=environment,
+        account_alias=account_alias,
+        symbol=symbol,
+        side=side,
+        quantity=Decimal(quantity),
+        order_type=order_type,
+        time_in_force=time_in_force,
+        limit_price=Decimal(limit_price) if limit_price is not None else None,
+        stop_price=Decimal(stop_price) if stop_price is not None else None,
+    )
+
+
 def pre_submit_result(
     *,
     action: PreSubmitAction = PreSubmitAction.ALLOW,
     quantity: str = "100",
+    for_plan: ExecutablePlan | None = None,
 ) -> tuple[PreSubmitCheckResult, SingleUseAuthorization | None]:
+    sealed_plan = for_plan if for_plan is not None else plan(quantity=quantity)
+    sealed = plan_identity(sealed_plan)
     authorization = (
         SubmitAuthorization(
             candidate_id="cand-1",
             authorized_quantity=Decimal(quantity),
             authorized_at=AS_OF,
+            plan_ref=sealed,
         )
         if action in (PreSubmitAction.ALLOW, PreSubmitAction.RESIZE)
         else None
@@ -79,6 +116,8 @@ def pre_submit_result(
         checks=(),
         reason_codes=("PRE_SUBMIT_CLEARED",),
         input_refs=("observation:a-1@src-1",),
+        authorized_plan=sealed_plan if authorization else None,
+        plan_ref=sealed if authorization else "",
     )
     token = SingleUseAuthorization(authorization) if authorization else None
     return result, token
@@ -91,8 +130,15 @@ def request(
     quantity: str = "100",
     environment: Environment = Environment.PAPER,
     token: SingleUseAuthorization | None | str = "auto",
+    sends: ExecutablePlan | None = None,
+    account_alias: str = "paper-main",
 ) -> ExecutionRequest:
-    result, auto_token = pre_submit_result(action=action, quantity=quantity)
+    sealed_plan = plan(
+        quantity=quantity, environment=environment, account_alias=account_alias
+    )
+    result, auto_token = pre_submit_result(
+        action=action, quantity=quantity, for_plan=sealed_plan
+    )
     resolved = auto_token if token == "auto" else token
     assert resolved is None or isinstance(resolved, SingleUseAuthorization)
     return ExecutionRequest(
@@ -100,15 +146,9 @@ def request(
         correlation_id=f"corr-{client_order_id}",
         pre_submit=result,
         authorization=resolved,
-        environment=environment,
-        account_alias="paper-main",
-        symbol="AAPL",
-        side=OrderSide.BUY,
-        order_type=OrderType.LIMIT,
-        limit_price=Decimal("10"),
-        stop_price=None,
-        strategy_id="strat-1",
-        source_id="src-1",
+        # ``sends`` exists so a test can try to send an order OTHER than the one
+        # that was sealed. It is the substitution the seal exists to refuse.
+        plan=sends if sends is not None else sealed_plan,
     )
 
 
@@ -336,9 +376,11 @@ def test_unknown_broker_state_needs_review_and_no_blind_retry() -> None:
 def test_other_broker_error_is_terminal_failed() -> None:
     broker = make_broker()
     agent = make_agent(broker)
-    # unknown account alias in the intent -> ACCOUNT_UNKNOWN from the port
-    bad = request("bad-acct")
-    object.__setattr__(bad, "account_alias", "nope")
+    # unknown account alias in the intent -> ACCOUNT_UNKNOWN from the port.
+    # The account is part of the SEALED plan now, so this cannot be done by
+    # mutating the request after the fact: the order has to be sealed for an
+    # account the broker does not know.
+    bad = request("bad-acct", account_alias="nope")
     outcome = agent.process(bad)
     assert outcome.status is ExecutionStatus.FAILED
     assert "SUBMIT_ACCOUNT_UNKNOWN" in outcome.reason_codes

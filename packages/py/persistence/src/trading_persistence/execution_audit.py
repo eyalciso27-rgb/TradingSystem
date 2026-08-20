@@ -44,7 +44,7 @@ only references, identifiers and market observations are ever written here.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -52,6 +52,11 @@ from uuid import UUID
 
 from sqlalchemy import Connection, Engine, select
 from trading_contracts.enums import Environment
+from trading_contracts.execution_fingerprint import (
+    MANDATORY_PREPARED_FIELDS,
+    PREPARED_ORDER_FIELDS,
+    REQUEST_IDENTITY_FIELDS,
+)
 
 from trading_persistence.audit import append_audit_record
 from trading_persistence.models import AuditEvent
@@ -408,30 +413,24 @@ class DurableExecutionHistoryReader:
                     action=action, chain_hash=chain_hash, payload=payload
                 )
             )
+        # The lifecycle must agree with itself before anyone reads it: a
+        # terminal record that resolves a different order than the one prepared
+        # is corruption, and a corrupt lifecycle is unreadable, not resolvable.
+        require_consistent_lifecycle(records)
         return tuple(records)
 
 
-#: Every lifecycle record that names an execution must carry these. They are
-#: the fields that say WHICH execution it was and what the caller asked for;
-#: all are known before an order is planned, so all are always available.
-REQUIRED_IDENTITY_FIELDS: tuple[str, ...] = (
-    "decision_id",
-    "client_order_id",
-    "strategy_id",
-    "symbol",
-    "side",
-    "environment",
-    "account_alias",
-    "requested_quantity",
-)
+#: Every lifecycle record that names an execution must carry these. NOT
+#: restated here: the writer's fingerprint is built from the SAME contract, and
+#: two tuples that happen to agree today are not a contract. A field added to
+#: the writer's identity and forgotten here would mean this reader validated an
+#: identity the writer no longer produces, and nothing would notice.
+REQUIRED_IDENTITY_FIELDS: tuple[str, ...] = REQUEST_IDENTITY_FIELDS
 
-#: A SUBMIT_PREPARED record additionally describes the frozen broker-bound
-#: order. Without these a replay cannot distinguish a repeat from a change.
-REQUIRED_PREPARED_FIELDS: tuple[str, ...] = (
-    "order_type",
-    "quantity",
-    "time_in_force",
-)
+#: A record that describes a prepared submission additionally describes the
+#: frozen broker-bound order. Without these a replay cannot distinguish a
+#: repeat from a change.
+REQUIRED_PREPARED_FIELDS: tuple[str, ...] = MANDATORY_PREPARED_FIELDS
 
 
 def _require_readable(
@@ -467,9 +466,11 @@ def _require_readable(
                 f" fingerprint (missing {missing}); a malformed identity must"
                 " never be treated as an absent one"
             )
-        if action in AMBIGUOUS_ACTIONS:
+        if action in AMBIGUOUS_ACTIONS or _describes_a_submission(payload):
             # The point of no return must carry the FROZEN order, or a replay
-            # cannot tell a repeat from a changed one.
+            # cannot tell a repeat from a changed one -- and so must the
+            # terminal record that resolves it, or the lifecycle ends without
+            # ever stating which order it was that resolved.
             missing_order = [
                 field
                 for field in REQUIRED_PREPARED_FIELDS
@@ -487,6 +488,72 @@ def _require_readable(
             " must never be reconstructed as a refusal just because the"
             " outcome string is absent"
         )
+
+
+#: Outcomes that mean a submission was actually attempted, so the record must
+#: describe the order that was attempted. A record whose outcome says nothing
+#: was ever sent is exempt only when no order was prepared at all.
+_ATTEMPTED_OUTCOMES = frozenset({"SUBMITTED", "REFUSED", "FAILED", "NEEDS_REVIEW", "NOT_SENT"})
+
+
+def _describes_a_submission(payload: Mapping[str, object]) -> bool:
+    """Does this terminal record resolve a prepared submission?"""
+    outcome = str(payload.get("submission_outcome", "")).strip()
+    return outcome in _ATTEMPTED_OUTCOMES
+
+
+def _prepared_order(fingerprint: Mapping[str, object]) -> dict[str, str]:
+    """The frozen-order half of a fingerprint, as plain strings."""
+    return {
+        field: str(fingerprint.get(field, "")).strip()
+        for field in PREPARED_ORDER_FIELDS
+    }
+
+
+def require_consistent_lifecycle(
+    records: Sequence[ExecutionHistoryRecord],
+) -> None:
+    """PREPARED and its terminal resolution must describe the SAME order.
+
+    The writer carries the prepared fingerprint into the outcome record, which
+    is correct -- and not something a reader may depend on. A durable store
+    whose correctness rests on the current writer always behaving is a store
+    that cannot detect the writer misbehaving, and "the outcome says 11 shares
+    where the prepared marker said 10" is exactly the corruption a replay must
+    refuse rather than resolve.
+
+    Raises rather than returning a verdict: an inconsistent lifecycle is
+    unreadable, which means reconciliation and zero submits.
+    """
+    prepared: dict[str, str] | None = None
+    for record in records:
+        if record.action not in AMBIGUOUS_ACTIONS:
+            continue
+        fingerprint = record.payload.get("execution_fingerprint")
+        if isinstance(fingerprint, dict):
+            prepared = _prepared_order(fingerprint)
+            break
+    if prepared is None:
+        return
+    for record in records:
+        if record.action not in TERMINAL_ACTIONS:
+            continue
+        fingerprint = record.payload.get("execution_fingerprint")
+        if not isinstance(fingerprint, dict):
+            continue
+        terminal = _prepared_order(fingerprint)
+        differing = [
+            field
+            for field in PREPARED_ORDER_FIELDS
+            if prepared[field] != terminal[field]
+        ]
+        if differing:
+            raise ExecutionHistoryUnreadableError(
+                f"terminal record {record.chain_hash} resolves a DIFFERENT order"
+                f" than the one that was prepared (differs in {differing});"
+                " a lifecycle that cannot agree with itself about which order"
+                " it was must be reconciled, never replayed"
+            )
 
 
 def load_decision_records(
@@ -516,6 +583,7 @@ __all__ = [
     "ExecutionHistoryRecord",
     "ExecutionHistoryUnreadableError",
     "REQUIRED_IDENTITY_FIELDS",
+    "require_consistent_lifecycle",
     "REQUIRED_PREPARED_FIELDS",
     "order_index_ref",
     "EXECUTION_AUDIT_VERSION",

@@ -61,6 +61,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from trading_application.execution_identity import plan_identity
+from trading_application.execution_plan import ExecutablePlan
 from trading_application.owner_run_journal import (
     OwnerRunJournal,
     OwnerRunJournalError,
@@ -648,10 +650,33 @@ def _authorized_request(
     the reason codes below say so.
     """
     candidate_id = f"{CLIENT_ORDER_PREFIX}:{client_order_id}"
+    # The SEALED order. The agent reads every order field from this plan and
+    # refuses to send anything whose identity does not match the pre-submit
+    # result and the single-use token, so the owner-confirmed envelope and the
+    # order that reaches the gateway cannot drift apart.
+    plan = ExecutablePlan(
+        decision_ref="owner-run:owner-confirmed",
+        risk_request_ref="owner-run:poi-envelope-request",
+        risk_ref="owner-run:poi-envelope",
+        allocation_ref="owner-run:manual-minimal-size",
+        strategy_id="poi-ibkr-001-manual",
+        source_id="owner-manual",
+        environment=Environment.PAPER,
+        account_alias=envelope.account_alias,
+        symbol=envelope.symbol,
+        side=side.value,
+        quantity=quantity,
+        order_type=order_type,
+        time_in_force=time_in_force.value,
+        limit_price=limit_price,
+        stop_price=stop_price,
+    )
+    sealed = plan_identity(plan)
     authorization = SubmitAuthorization(
         candidate_id=candidate_id,
         authorized_quantity=quantity,
         authorized_at=now,
+        plan_ref=sealed,
     )
     pre_submit = PreSubmitCheckResult(
         candidate_id=candidate_id,
@@ -684,22 +709,15 @@ def _authorized_request(
         ),
         reason_codes=("OWNER_CONFIRMED_POI_RUN", "NOT_AN_AUTOMATED_DECISION"),
         input_refs=(f"envelope:{envelope.scenario}",),
+        authorized_plan=plan,
+        plan_ref=sealed,
     )
     return ExecutionRequest(
         client_order_id=client_order_id,
         correlation_id=correlation_id,
         pre_submit=pre_submit,
         authorization=SingleUseAuthorization(authorization),
-        environment=Environment.PAPER,
-        account_alias=envelope.account_alias,
-        symbol=envelope.symbol,
-        side=side,
-        order_type=order_type,
-        limit_price=limit_price,
-        stop_price=stop_price,
-        strategy_id="poi-ibkr-001-manual",
-        source_id="owner-manual",
-        time_in_force=time_in_force,
+        plan=plan,
     )
 
 

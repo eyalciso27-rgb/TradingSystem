@@ -38,7 +38,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from trading_application.decision_engine import EngineDecision
-    from trading_application.risk_engine import RiskPolicy, RiskResult
+    from trading_application.execution_plan import ExecutablePlan
+    from trading_application.risk_engine import RiskPolicy, RiskResult, TradeRiskRequest
 
 IDENTITY_VERSION = "execution-identity-1.0.0"
 
@@ -89,6 +90,23 @@ def risk_policy_identity(policy: RiskPolicy) -> str:
     return f"risk-policy:{policy.policy_version}@sha256:{_content(policy)}"
 
 
+def risk_request_identity(request: TradeRiskRequest) -> str:
+    """THE exact risk question that was asked.
+
+    A risk RESULT is a set of output numbers, and two materially different
+    questions can produce identical outputs: same quantity, same prices, same
+    approved risk, but AAPL instead of MSFT, or a different sector, source or
+    cluster where no cap happened to bind. Hashing only the result therefore
+    gave both evaluations the SAME identity, so an authorization derived from
+    one could be presented for the other and every reference would line up.
+
+    This hashes the request itself -- symbol, sector, cluster, source,
+    strategy, environment, requested quantity, entry and stop -- so the
+    identity says which question was asked, not merely what came back.
+    """
+    return f"risk-request:{request.symbol}@sha256:{_content(request)}"
+
+
 def risk_result_identity(result: RiskResult) -> str:
     """THE exact risk evaluation, not merely its outcome.
 
@@ -96,6 +114,10 @@ def risk_result_identity(result: RiskResult) -> str:
     an authorization carrying it could be presented against a different
     decision's risk result and look correct. This is content-addressed, so it
     identifies one evaluation and no other.
+
+    The result carries ``request_ref``, so this hash covers the QUESTION as
+    well as the answer: two evaluations whose output numbers coincide but whose
+    requests differ can no longer share an identity.
     """
     return f"risk-result:sha256:{_content(result)}"
 
@@ -133,6 +155,21 @@ def allocation_identity(allocation: _Dataclassish) -> str:
     return f"allocation:{candidate}@sha256:{_content(allocation)}"
 
 
+def plan_identity(plan: ExecutablePlan) -> str:
+    """THE exact order, and the exact evaluation that permitted it.
+
+    This is the seal. Everything that could change the order -- symbol, side,
+    quantity, order type, time in force, entry and stop prices, environment and
+    account -- is inside the hash, together with the decision, risk request,
+    risk result and allocation refs that authorized it.
+
+    So there is no order fact a later component can vary on its own: an agent
+    that builds a different order builds a different identity, and the
+    comparison is equality, never a prefix.
+    """
+    return f"plan:{plan.symbol}@sha256:{_content(plan)}"
+
+
 def authorization_identity(authorization: _Dataclassish) -> str:
     """One minted SubmitAuthorization, by its own content."""
     candidate = str(getattr(authorization, "candidate_id", "unknown"))
@@ -145,7 +182,9 @@ __all__ = [
     "authorization_identity",
     "decision_identity",
     "portfolio_policy_identity",
+    "plan_identity",
     "pre_submit_policy_identity",
     "risk_policy_identity",
+    "risk_request_identity",
     "risk_result_identity",
 ]

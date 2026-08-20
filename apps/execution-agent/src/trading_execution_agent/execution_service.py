@@ -53,6 +53,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
@@ -64,10 +65,15 @@ from typing import Protocol, runtime_checkable
 from trading_application.decision_engine import EngineDecision
 from trading_application.emergency import EntryCheckpoint, EntryContext, HaltRecord, match_halt
 from trading_application.execution_identity import (
+    allocation_identity,
     decision_identity,
+    plan_identity,
     risk_policy_identity,
+    risk_request_identity,
     risk_result_identity,
 )
+from trading_application.execution_plan import ExecutablePlan
+from trading_application.portfolio_allocator import CandidateAllocation
 from trading_application.pre_submit_check import (
     PreSubmitAction,
     PreSubmitCheckResult,
@@ -106,6 +112,10 @@ from trading_broker_core.port import (
     TimeInForce,
 )
 from trading_contracts.enums import Environment, OrderType, RiskDecisionOutcome
+from trading_contracts.execution_fingerprint import (
+    PREPARED_ORDER_FIELDS,
+    REQUEST_IDENTITY_FIELDS,
+)
 from trading_market_data_core.sp500_current_universe import ConstituentSnapshot
 from trading_market_data_core.trading_readiness import (
     StrategyDataRequirements,
@@ -147,15 +157,85 @@ MODE_ENVIRONMENT: Mapping[TradingMode, Environment] = {
 #: guessed from the candidate: an existing position's sector is not the new
 #: candidate's sector, and pretending otherwise corrupts every sector, cluster
 #: and source cap the risk engine computes.
+#: Exceptions from these module roots are ours: we wrote their messages, so
+#: they say what went wrong in our own vocabulary rather than repeating a DSN,
+#: a filesystem path, a hostname or an account number back to the operator.
+_OUR_MODULES = ("trading_",)
+
+#: Even our own messages are bounded. A message is a diagnostic, not a dump.
+_MAX_DETAIL = 200
+
+#: Patterns that must never reach owner-visible output, wherever they came
+#: from. Account numbers are the important one -- an IB account id in a probe
+#: transcript is an account id in whatever the operator pastes it into.
+_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\b[DU]U?\d{5,}\b"), "[account]"),
+    (re.compile(r"\b[a-zA-Z]+://[^\s]+"), "[uri]"),
+    (re.compile(r"[A-Za-z]:\\[^\s]+"), "[path]"),
+    (re.compile(r"(?<![\w.])/(?:[\w.-]+/){2,}[\w.-]*"), "[path]"),
+    (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"), "[host]"),
+)
+
+
+def _safe_detail(error: BaseException) -> str:
+    """A diagnostic that is safe to print, or nothing.
+
+    Exception text from a broker SDK, a database driver or the filesystem is
+    written by someone else and routinely contains a DSN, a path, a hostname or
+    an account number. The probe's output is read by an operator and pasted
+    into issues and chats, so that text is not printed at all.
+
+    What IS printed: the exception type always; a canonical error code when the
+    exception carries one, because a code is a fixed vocabulary; and, for our
+    own exceptions only, a bounded and redacted message.
+    """
+    parts: list[str] = []
+    code = getattr(error, "code", None)
+    code_value = getattr(code, "value", code)
+    if isinstance(code_value, str) and code_value.strip():
+        parts.append(f"code={code_value}")
+    module = type(error).__module__
+    if module.startswith(_OUR_MODULES):
+        detail = str(error)
+        for pattern, replacement in _REDACTIONS:
+            detail = pattern.sub(replacement, detail)
+        detail = " ".join(detail.split())[:_MAX_DETAIL]
+        if detail:
+            parts.append(detail)
+    return "; ".join(parts)
+
+
 def _probe_failure(name: str, error: BaseException) -> str:
     """What a failed read-only observation reports, instead of raising."""
+    detail = _safe_detail(error)
+    suffix = f" ({detail})" if detail else ""
     return (
         f"NOT OBSERVED: the {name} check itself failed with"
-        f" {type(error).__name__}: {error}"
+        f" {type(error).__name__}{suffix}"
     )
 
 
 UNKNOWN_CLASSIFICATION = "UNKNOWN"
+
+#: The terminal outcome of a prepared attempt the FINAL boundary refused before
+#: the broker call. Distinct from a refusal by the broker: this one is proof
+#: that nothing was sent, and a replay must reconstruct it as such rather than
+#: as an unresolved submission the broker might be holding.
+NOT_SENT_OUTCOME = "NOT_SENT"
+
+
+def _plan_differences(mine: ExecutablePlan, theirs: ExecutablePlan) -> list[str]:
+    """Which order facts differ, so a refusal says what was substituted.
+
+    Diagnostic only. The refusal itself is decided by comparing ONE identity;
+    this never decides anything, because a field-by-field decision could omit
+    a field and a hash cannot.
+    """
+    return [
+        field.name
+        for field in dataclass_fields(mine)
+        if getattr(mine, field.name) != getattr(theirs, field.name)
+    ]
 
 #: The order shape a broker MUST report for a recovered order to be recognised.
 #: A field the broker leaves out is a fact we do not have, and an order we
@@ -336,6 +416,12 @@ class AuthorizationDecision:
     #: found by the broker rather than the compiler.
     pre_submit: PreSubmitCheckResult | None = None
     authorization: SingleUseAuthorization | None = None
+    #: The allocation the pre-submit result was sized against. Required on
+    #: ALLOW: without it the service can check the authorized quantity against
+    #: the RISK ceiling only, so a faulty authority could authorize a size the
+    #: PORTFOLIO never allocated -- 50 shares under a risk approval of 100 and
+    #: a portfolio allocation of 10 would have passed every reference check.
+    allocation: CandidateAllocation | None = None
 
 
 @runtime_checkable
@@ -403,6 +489,63 @@ class DurableExecutionHistory(Protocol):
     ) -> Sequence[ExecutionHistoryLike]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class PlanContext:
+    """The runtime order this execution intends to send, minus the size.
+
+    Handed to the authority so it checks THE order rather than an order of its
+    own construction. The authority previously received only the intent, the
+    readiness report and the risk result -- so it chose its own entry price,
+    stop, side, order type, account and time in force, and the service then
+    built a different order from its live quote and sent that. Both looked
+    correct because nothing compared them.
+
+    The size is deliberately absent: it is what the authority decides.
+    """
+
+    decision_ref: str
+    #: The risk QUESTION itself, not a reference to it. The final pre-submit
+    #: check re-verifies that the risk result answers this exact request, and
+    #: it cannot do that from a hash alone.
+    risk_request: TradeRiskRequest
+    risk_ref: str
+    symbol: str
+    side: str
+    strategy_id: str
+    source_id: str
+    environment: Environment
+    account_alias: str
+    order_type: OrderType
+    time_in_force: str
+    entry_price: Decimal
+    stop_price: Decimal | None
+
+    def sealed_with(self, allocation_ref: str, quantity: Decimal) -> ExecutablePlan:
+        """The executable plan these runtime facts make, at this size.
+
+        The service and the authority both build the plan through this method,
+        so a difference between them can only be a difference in the FACTS --
+        which is exactly what the seal comparison is for.
+        """
+        return ExecutablePlan(
+            decision_ref=self.decision_ref,
+            risk_request_ref=risk_request_identity(self.risk_request),
+            risk_ref=self.risk_ref,
+            allocation_ref=allocation_ref,
+            strategy_id=self.strategy_id,
+            source_id=self.source_id,
+            environment=self.environment,
+            account_alias=self.account_alias,
+            symbol=self.symbol,
+            side=self.side,
+            quantity=quantity,
+            order_type=self.order_type,
+            time_in_force=self.time_in_force,
+            limit_price=self.entry_price,
+            stop_price=self.stop_price,
+        )
+
+
 @runtime_checkable
 class ExecutionAuthorization(Protocol):
     """The authority that permits submission. Default production answer: no."""
@@ -412,6 +555,7 @@ class ExecutionAuthorization(Protocol):
         intent: ExecutionIntent,
         report: TradingReadinessRuntimeReport,
         risk_result: RiskResult,
+        plan: PlanContext,
     ) -> AuthorizationDecision: ...
 
     def pre_submit_policy_identity(self) -> str:
@@ -445,6 +589,7 @@ class DenyAllExecutionAuthorization:
         intent: ExecutionIntent,
         report: TradingReadinessRuntimeReport,
         risk_result: RiskResult,
+        plan: PlanContext,
     ) -> AuthorizationDecision:
         return AuthorizationDecision(allowed=False, reason=self.reason)
 
@@ -591,17 +736,15 @@ class ExecutionFingerprint:
     #: for. All are known before planning, so all are always comparable -- which
     #: matters because a replay has not planned its order yet, and a changed
     #: request must be detectable without re-reading the market.
-    IDENTITY_FIELDS = (
-        "decision_id", "client_order_id", "strategy_id", "source_id",
-        "symbol", "side", "environment", "account_alias",
-        "requested_quantity", "configured_order_type", "configured_time_in_force",
-    )
+    #: Not restated here. The durable reader validates records against the
+    #: SAME contract, and two tuples that happen to match today are not a
+    #: contract -- a field added here and forgotten there would mean the reader
+    #: validates an identity the writer no longer writes.
+    IDENTITY_FIELDS = REQUEST_IDENTITY_FIELDS
     #: The frozen order. Known only once one is planned, so compared only when
     #: BOTH sides have it -- a replay has not planned its order yet when the
     #: identity check runs.
-    ORDER_FIELDS = (
-        "order_type", "quantity", "limit_price", "stop_price", "time_in_force",
-    )
+    ORDER_FIELDS = PREPARED_ORDER_FIELDS
 
     def differences(self, other: ExecutionFingerprint) -> tuple[str, ...]:
         """Fields where these two describe different executions."""
@@ -696,6 +839,8 @@ class ExecutionEvaluation:
     universe_status: UniverseListStatus | None = None
     readiness: TradingReadinessRuntimeReport | None = None
     authorization: AuthorizationDecision | None = None
+    #: The runtime order facts handed to the authority, if it was reached.
+    plan_context: PlanContext | None = None
     audit_ref: str | None = None
     outcome: ExecutionOutcome | None = None
     #: The immutable identity of this attempt, carried into every record so a
@@ -801,7 +946,6 @@ class ExecutionService:
         risk_engine: RiskEngine,
         config: ExecutionConfig,
         entry_gate: ReconciliationGate,
-        agent_factory: Callable[[BrokerPort, ReconciliationGate], ExecutionAgent],
         authorization: ExecutionAuthorization | None = None,
         universe: Callable[[], ConstituentSnapshot | None] | None = None,
         portfolio: Callable[[], tuple[PositionExposure, ...]] | None = None,
@@ -830,7 +974,6 @@ class ExecutionService:
                 f" {engine_policy.policy_version!r} ->"
                 f" {policy_identity(engine_policy)})"
             )
-        self._agent_factory = agent_factory
         # DENY unless something explicitly says otherwise, and nothing in
         # production does.
         self._authorization = authorization or DenyAllExecutionAuthorization()
@@ -858,13 +1001,20 @@ class ExecutionService:
             universe_status=universe_status,
             now=now,
         )
-        # ONE gate. The service and the agent MUST hold the same instance:
-        # latching a gate the agent does not consult would let
-        # POST_SUBMIT_AUDIT_FAILED promise that new entries are blocked while
-        # the next entry sails straight through. The agent is therefore built
-        # FROM this gate rather than being free to install its own.
+        # ONE gate, and no way to install a second one. The service and the
+        # agent MUST hold the same instance: latching a gate the agent does not
+        # consult would let POST_SUBMIT_AUDIT_FAILED promise that new entries
+        # are blocked while the next entry sails straight through.
+        #
+        # This used to take an ``agent_factory``, which made the guarantee a
+        # convention: the wiring passed the gate through, but nothing stopped a
+        # caller writing ``lambda port, gate: ExecutionAgent(port,
+        # entry_gate=ALWAYS_PERMIT)``, and no type could catch it. The service
+        # constructs its own agent instead, so the only gate that exists is
+        # this one. A clock is a clock, and is injected; a safety dependency is
+        # not something a caller may replace.
         self._entry_gate = entry_gate
-        self._agent = agent_factory(self._guard, entry_gate)
+        self._agent = ExecutionAgent(self._guard, entry_gate=entry_gate, clock=now)
         #: Set when a submission's outcome could not be recorded. Independent of
         #: the gate, so a latch that itself fails cannot reopen entries.
         self._critical_state: str | None = None
@@ -1220,14 +1370,19 @@ class ExecutionService:
             )
 
         try:
-            risk_result = self._evaluate_risk(intent, entry_price, stop_price)
+            risk_request, risk_result = self._evaluate_risk(
+                intent, entry_price, stop_price
+            )
         except IncompleteAccountStateError as error:
             return self._refuse(
                 intent, ExecutionStage.ACCOUNT_STATE_INCOMPLETE, str(error),
                 instrument=instrument, quote=quote, entry_price=entry_price,
                 stop_price=stop_price, universe_status=universe_status,
             )
-        except (RiskEngineError, BrokerPortError) as error:
+        except (RiskEngineError, BrokerPortError, ExecutionServiceError) as error:
+            # ExecutionServiceError covers the integrity check below: an engine
+            # that answers a different question than the one asked has not
+            # evaluated this execution, and that refuses rather than escaping.
             return self._refuse(
                 intent, ExecutionStage.RISK_REFUSED,
                 f"risk evaluation could not be completed: {error}",
@@ -1297,7 +1452,45 @@ class ExecutionService:
         # The authority is handed the risk result it must authorize AGAINST,
         # so an authorization can be minted about this exact evaluation rather
         # than about a decision in the abstract.
-        authorization = self._authorization.authorize(intent, report, risk_result)
+        plan_context = PlanContext(
+            decision_ref=decision_identity(intent.decision),
+            risk_request=risk_request,
+            risk_ref=risk_result_identity(risk_result),
+            symbol=intent.symbol,
+            side=intent.side.value,
+            strategy_id=intent.strategy_id,
+            source_id=intent.source_id,
+            environment=self._config.environment,
+            account_alias=self._config.account_alias,
+            order_type=self._config.order_type,
+            time_in_force=self._config.time_in_force.value,
+            entry_price=entry_price,
+            stop_price=stop_price,
+        )
+        try:
+            authorization = self._authorization.authorize(
+                intent, report, risk_result, plan_context
+            )
+        except Exception as error:  # noqa: BLE001 - an authority that fails denies
+            # An authority that raises has not authorized anything. The canonical
+            # producers refuse a mismatched lineage by raising -- a risk result
+            # for another symbol or environment, say -- and that refusal must
+            # arrive here as a denial, not as an unhandled exception escaping the
+            # service with the decision half-evaluated.
+            LOGGER.error(
+                "the authorization authority raised; treating as DENIED",
+                extra=self._context(
+                    intent, stage="AUTHORIZATION", error=type(error).__name__
+                ),
+            )
+            authorization = AuthorizationDecision(
+                allowed=False,
+                reason=(
+                    "the authorization authority raised"
+                    f" {type(error).__name__}; an authority that cannot answer"
+                    " has not authorized anything"
+                ),
+            )
         LOGGER.info(
             "authorization result",
             extra=self._context(
@@ -1323,6 +1516,10 @@ class ExecutionService:
             authorization=authorization, evaluated_at=self._now(),
             intent_mode=self._config.mode.value,
             fingerprint=self._fingerprint(intent),
+            # The EXACT facts the authority was handed. Carried rather than
+            # rebuilt, so the seal check compares against what was actually
+            # asked for and not against a second derivation of it.
+            plan_context=plan_context,
         )
         return self._audit_evaluation(evaluation)
 
@@ -1695,26 +1892,41 @@ class ExecutionService:
                 evaluation, ExecutionStage.AUTHORIZATION_DENIED, (binding,)
             )
 
-        request_order = self._order_intent(
-            intent,
-            authorization.pre_submit.authorized_quantity,
-            evaluation.entry_price or Decimal(0),
-            evaluation.stop_price,
+        # THE seal. The service builds the plan it intends to execute from
+        # its OWN runtime facts and requires it to be, bit for bit, the plan the
+        # pre-submit check approved. Anything the service would have varied on
+        # its own -- a different entry from a moved quote, a different stop,
+        # side, order type, time in force, symbol, account or environment --
+        # changes this identity and refuses here, before anything is prepared.
+        context = evaluation.plan_context
+        if context is None:
+            return self._replace_stage(
+                evaluation,
+                ExecutionStage.AUTHORIZATION_DENIED,
+                (
+                    "no plan context was recorded for this evaluation, so the"
+                    " authorized order cannot be compared to the order this"
+                    " execution would send",
+                ),
+            )
+        sealed = self._plan_seal_failure(
+            intent, evaluation, context, authorization
         )
+        if sealed is not None:
+            return self._replace_stage(
+                evaluation, ExecutionStage.AUTHORIZATION_DENIED, (sealed,)
+            )
+        assert authorization.pre_submit.authorized_plan is not None  # noqa: S101
+        plan = authorization.pre_submit.authorized_plan
+        request_order = self._order_intent_for_plan(intent, plan)
         request = ExecutionRequest(
             client_order_id=intent.client_order_id,
             correlation_id=intent.correlation_id,
             pre_submit=authorization.pre_submit,
             authorization=authorization.authorization,
-            environment=self._config.environment,
-            account_alias=self._config.account_alias,
-            symbol=intent.symbol,
-            side=intent.side,
-            order_type=self._config.order_type,
-            limit_price=evaluation.entry_price,
-            stop_price=evaluation.stop_price,
-            strategy_id=intent.strategy_id,
-            source_id=intent.source_id,
+            # The SEALED plan itself, not a copy of its fields. There is
+            # nothing left for the agent to source from anywhere else.
+            plan=plan,
         )
         # THE point of no return. Committed before the submission path is
         # entered, so a crash between here and an outcome means exactly one
@@ -1743,10 +1955,16 @@ class ExecutionService:
             # The guard's just-in-time check refused at the boundary, after this
             # service had already seen a satisfied report. That is the check
             # doing its job: the market moved.
-            return self._audit_evaluation(
-                self._replace_stage(
-                    evaluation, ExecutionStage.READINESS_BLOCKED, error.report.blockers
-                )
+            #
+            # It also PROVES the order was never sent -- the guard raised before
+            # the broker call. So the durable lifecycle must be resolved, not
+            # left as a prepared attempt with no outcome: after a restart, a
+            # bare SUBMIT_PREPARED means "the broker may hold this order", and
+            # reporting an order we know was never sent as an ambiguous incident
+            # is a false one.
+            return self._resolve_not_sent(
+                _with(evaluation, fingerprint=prepared_fingerprint),
+                error.report.blockers,
             )
 
         submitted = outcome.status.value == "SUBMITTED"
@@ -1762,6 +1980,7 @@ class ExecutionService:
             authorization=authorization, audit_ref=evaluation.audit_ref,
             outcome=outcome, evaluated_at=self._now(),
             intent_mode=self._config.mode.value,
+            plan_context=context,
             # The SAME full prepared-order identity the SUBMIT_PREPARED marker
             # carried. Recomputing the pre-plan fingerprint here would have
             # dropped the frozen order from the terminal record, so the durable
@@ -1812,6 +2031,91 @@ class ExecutionService:
         """The guarded port the agent submits through. Exposed for inspection."""
         return self._guard
 
+    def _plan_seal_failure(
+        self,
+        intent: ExecutionIntent,
+        evaluation: ExecutionEvaluation,
+        context: PlanContext,
+        authorization: AuthorizationDecision,
+    ) -> str | None:
+        """Is the authorized plan the plan this service is about to run?"""
+        pre_submit = authorization.pre_submit
+        assert pre_submit is not None  # noqa: S101 - checked by the caller
+        plan = pre_submit.authorized_plan
+        if plan is None or not pre_submit.plan_ref:
+            return (
+                "the authorization sealed no executable plan; a quantity"
+                " without an order is not an authorization to send one"
+            )
+        if plan_identity(plan) != pre_submit.plan_ref:
+            return (
+                "the sealed plan does not match its own identity"
+                f" ({pre_submit.plan_ref!r}); the authorization was altered"
+                " after it was minted"
+            )
+        token = authorization.authorization
+        if token is None or token.peek().plan_ref != pre_submit.plan_ref:
+            return (
+                "the single-use token authorizes a different plan than the"
+                " pre-submit result checked"
+            )
+
+        allocation = authorization.allocation
+        if allocation is None:
+            return (
+                "the authorization carried no portfolio allocation, so the"
+                " authorized size cannot be checked against the size the"
+                " portfolio actually allocated"
+            )
+        expected_allocation = allocation_identity(allocation)
+        if pre_submit.allocation_ref != expected_allocation:
+            return (
+                "the authorization was sized against a different allocation"
+                f" ({pre_submit.allocation_ref!r} != {expected_allocation!r})"
+            )
+        canonical_decision = decision_identity(intent.decision)
+        if allocation.decision_ref != canonical_decision:
+            return (
+                f"the allocation belongs to decision {allocation.decision_ref!r},"
+                f" not to {canonical_decision!r}"
+            )
+        assert evaluation.risk_result is not None  # noqa: S101
+        expected_risk = risk_result_identity(evaluation.risk_result)
+        if allocation.risk_ref != expected_risk:
+            return (
+                "the allocation was sized against a different risk evaluation"
+                f" ({allocation.risk_ref!r} != {expected_risk!r})"
+            )
+        if pre_submit.authorized_quantity > allocation.allocated_quantity:
+            return (
+                f"the authorization permits {pre_submit.authorized_quantity} but"
+                f" the portfolio allocated {allocation.allocated_quantity}; a"
+                " risk ceiling is not a portfolio allocation, and an authority"
+                " may reduce, never raise"
+            )
+
+        # The comparison that closes the substitution: OUR plan, built from the
+        # runtime facts this service would actually use, against THEIR seal.
+        mine = context.sealed_with(
+            expected_allocation, pre_submit.authorized_quantity
+        )
+        if plan_identity(mine) != pre_submit.plan_ref:
+            differing = _plan_differences(mine, plan)
+            return (
+                "the authorized plan is not the plan this execution would send"
+                f" (differs in {differing}); an authorization for one order is"
+                " not an authorization for another"
+            )
+        return None
+
+    def _order_intent_for_plan(
+        self, intent: ExecutionIntent, plan: ExecutablePlan
+    ) -> OrderIntent:
+        """The prepared order, read from the sealed plan and nowhere else."""
+        return self._order_intent(
+            intent, plan.quantity, plan.limit_price or Decimal(0), plan.stop_price
+        )
+
     def _order_intent(
         self,
         intent: ExecutionIntent,
@@ -1847,7 +2151,7 @@ class ExecutionService:
 
     def _evaluate_risk(
         self, intent: ExecutionIntent, entry_price: Decimal, stop_price: Decimal | None
-    ) -> RiskResult:
+    ) -> tuple[TradeRiskRequest, RiskResult]:
         """Invoke the REAL engine with REAL account state for THIS decision."""
         snapshot = self._broker.get_account_snapshot(self._config.account_alias)
         if snapshot.session_pnl is None:
@@ -1876,13 +2180,24 @@ class ExecutionService:
             entry_price=entry_price,
             stop_price=stop_price,
         )
-        return self._risk_engine.evaluate(
+        result = self._risk_engine.evaluate(
             intent.decision,
             request,
             account,
             active_halts=self._halts(),
             as_of=self._now(),
         )
+        # The engine must answer THE question this execution asked. A risk
+        # result is a set of output numbers; two materially different requests
+        # can produce identical ones, so without this an evaluation of another
+        # symbol, source or size could pass for this one on matching figures.
+        expected = risk_request_identity(request)
+        if result.request_ref != expected:
+            raise ExecutionServiceError(
+                "the risk engine returned a result for a different risk request"
+                f" ({result.request_ref!r} != {expected!r})"
+            )
+        return request, result
 
     def _protection_state(self, order: OrderIntent) -> BrokerProtectionCapability:
         """The SAME authority the final guard uses. Never a capability flag.
@@ -2096,6 +2411,55 @@ class ExecutionService:
                 ),
             )
         return None
+
+    def _resolve_not_sent(
+        self, evaluation: ExecutionEvaluation, blockers: Sequence[str]
+    ) -> ExecutionEvaluation:
+        """Durably close a prepared attempt the final guard proved never went.
+
+        Appended BESIDE the SUBMIT_PREPARED marker, never over it, and carrying
+        the same full prepared fingerprint -- so a replay reconstructs "refused
+        at the boundary, nothing sent" rather than "possibly live, reconcile".
+
+        If this record cannot be committed we fail closed: after a restart the
+        durable store could not prove the not-sent fact, and a fact only this
+        process knows is not a durable fact.
+        """
+        resolved = self._replace_stage(
+            evaluation,
+            ExecutionStage.READINESS_BLOCKED,
+            (
+                "the final readiness boundary refused BEFORE the broker call;"
+                " this order was never sent",
+                *blockers,
+            ),
+        )
+        record = dict(resolved.to_dict())
+        record["checkpoint"] = "POST_SUBMIT"
+        # Terminal, and explicitly not a submission: no receipt, no broker
+        # reference, and an outcome string a replay can reconstruct.
+        record["submission_outcome"] = NOT_SENT_OUTCOME
+        record["submission_reasons"] = list(resolved.reasons)
+        record["broker_order_ref"] = None
+        try:
+            self._audit.persist_outcome(record)
+        except Exception as error:  # noqa: BLE001 - unproven is unresolved
+            self._require_reconciliation(
+                "a prepared submission was refused at the final boundary and the"
+                " not-sent resolution could not be durably recorded"
+            )
+            return self._replace_stage(
+                resolved,
+                ExecutionStage.POST_SUBMIT_AUDIT_FAILED,
+                (
+                    "the final boundary refused before the broker call, and that"
+                    f" resolution could NOT be durably recorded ({type(error).__name__});"
+                    " a restart cannot prove this order was never sent, so it is"
+                    " treated as unresolved and new entries are latched",
+                    *resolved.reasons,
+                ),
+            )
+        return resolved
 
     def _persist_outcome(self, evaluation: ExecutionEvaluation) -> bool:
         """Record the broker's answer. False means it could not be recorded."""

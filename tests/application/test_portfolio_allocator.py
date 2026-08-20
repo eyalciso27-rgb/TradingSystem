@@ -50,6 +50,7 @@ def risk_result(
         max_loss_amount=Decimal(quantity) * per_share_risk,
         risk_budget_equity=EQUITY,
         decision_ref="decision:d1@sha256:" + "a" * 64,
+        request_ref="risk-request:AAPL@sha256:" + "a" * 64,
         policy_ref="risk-policy:risk-policy-test-1",
         engine_version="risk-engine-1.0.0",
         checks=(),

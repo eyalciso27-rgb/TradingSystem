@@ -43,6 +43,8 @@ from decimal import Decimal
 from enum import StrEnum
 
 from trading_application.emergency import EntryCheckpoint, EntryContext, HaltRecord, match_halt
+from trading_application.execution_identity import plan_identity
+from trading_application.execution_plan import ExecutablePlan
 from trading_application.pre_submit_check import (
     AuthorizationConsumedError,
     PreSubmitAction,
@@ -79,35 +81,77 @@ class ExecutionStatus(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ExecutionRequest:
-    """One queue item: pre-submit output + authorization + frozen order args.
+    """One queue item: the SEALED plan, its pre-submit result and its token.
 
-    The agent never invents or edits any of these — they are the sealed
-    output of the decision → risk → allocation → final pre-submit pipeline.
+    The order shape used to live here as separate fields — symbol, side, order
+    type, prices, time in force — beside a pre-submit result that had proved a
+    decision, a risk result, an allocation and a quantity but nothing about the
+    order itself. So a queue item could pair a genuine authorization with a
+    different order, and every reference would still line up.
+
+    There is now exactly one order in this request: ``plan``. Everything the
+    agent sends is read from it, and the plan carries the identity the
+    pre-submit check sealed, so an order that differs anywhere is an order that
+    was never authorized.
     """
 
     client_order_id: str
     correlation_id: str
     pre_submit: PreSubmitCheckResult
     authorization: SingleUseAuthorization | None
-    environment: Environment
-    account_alias: str
-    symbol: str
-    side: OrderSide
-    order_type: OrderType
-    limit_price: Decimal | None
-    stop_price: Decimal | None
-    strategy_id: str
-    source_id: str
-    #: Time-in-force for the order. Defaults to DAY; a protective exit that must
-    #: outlive the session (so it cannot expire while the position is open)
-    #: is submitted GTC by its caller — never left to a session-bound default.
-    time_in_force: TimeInForce = TimeInForce.DAY
+    #: THE order. Not "some order parameters that accompany an authorization".
+    plan: ExecutablePlan
 
     def __post_init__(self) -> None:
         if not self.client_order_id.strip():
             raise ValueError("client_order_id is mandatory")
         if not self.correlation_id.strip():
             raise ValueError("correlation_id is mandatory")
+
+    # -- the order shape, read from the sealed plan and nowhere else ---------
+    # Properties rather than fields on purpose: a field could be set to
+    # something the plan does not say, and that is precisely the substitution
+    # this class exists to make impossible.
+
+    @property
+    def environment(self) -> Environment:
+        return self.plan.environment
+
+    @property
+    def account_alias(self) -> str:
+        return self.plan.account_alias
+
+    @property
+    def symbol(self) -> str:
+        return self.plan.symbol
+
+    @property
+    def side(self) -> OrderSide:
+        return OrderSide(self.plan.side)
+
+    @property
+    def order_type(self) -> OrderType:
+        return self.plan.order_type
+
+    @property
+    def limit_price(self) -> Decimal | None:
+        return self.plan.limit_price
+
+    @property
+    def stop_price(self) -> Decimal | None:
+        return self.plan.stop_price
+
+    @property
+    def strategy_id(self) -> str:
+        return self.plan.strategy_id
+
+    @property
+    def source_id(self) -> str:
+        return self.plan.source_id
+
+    @property
+    def time_in_force(self) -> TimeInForce:
+        return TimeInForce(self.plan.time_in_force)
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +339,14 @@ class ExecutionAgent:
         if not health.healthy:
             return refuse(ExecutionStatus.FAILED, "BROKER_UNHEALTHY", "NOT_SENT")
 
+        # THE seal, verified by the component that actually sends the order and
+        # BEFORE the single use is spent. The service checks this too; the agent
+        # checks it again because the agent is the one thing that can submit,
+        # and a boundary that trusts its caller is not a boundary.
+        broken = self._seal_failure(request)
+        if broken is not None:
+            return refuse(ExecutionStatus.REFUSED, broken, "NOT_SENT")
+
         # FINAL-BOUNDARY reconciliation latch — checked immediately before the
         # single-use authorization is consumed. Even with pre_submit ALLOW, a
         # valid authorization and a healthy broker, a new entry is REFUSED while
@@ -317,6 +369,10 @@ class ExecutionAgent:
             # Single-use stays single-use: never a second submit.
             return refuse(ExecutionStatus.REFUSED, "AUTHORIZATION_ALREADY_CONSUMED")
 
+        # Every order field comes from the SEALED plan, whose identity was
+        # just verified against both the pre-submit result and the token. There
+        # is no field here the agent could source from somewhere else.
+        plan = request.plan
         intent = OrderIntent(
             client_order_id=request.client_order_id,
             authorization_ref=(
@@ -324,15 +380,15 @@ class ExecutionAgent:
                 f"@{authorization.authorized_at.isoformat()}"
             ),
             correlation_id=request.correlation_id,
-            environment=request.environment,
-            account_alias=request.account_alias,
-            symbol=request.symbol,
-            side=request.side,
-            order_type=request.order_type,
-            quantity=authorization.authorized_quantity,  # exactly as authorized
-            limit_price=request.limit_price,
-            stop_price=request.stop_price,
-            time_in_force=request.time_in_force,
+            environment=plan.environment,
+            account_alias=plan.account_alias,
+            symbol=plan.symbol,
+            side=OrderSide(plan.side),
+            order_type=plan.order_type,
+            quantity=plan.quantity,
+            limit_price=plan.limit_price,
+            stop_price=plan.stop_price,
+            time_in_force=TimeInForce(plan.time_in_force),
         )
         try:
             receipt = self._broker.submit_order(intent)
@@ -346,6 +402,29 @@ class ExecutionAgent:
                 )
             return refuse(ExecutionStatus.FAILED, f"SUBMIT_{error.code.value}", "NO_AUTO_RETRY")
         return self._outcome(request, ExecutionStatus.SUBMITTED, ("SUBMITTED",), receipt=receipt)
+
+    def _seal_failure(self, request: ExecutionRequest) -> str | None:
+        """Is the plan about to be sent the plan that was authorized?
+
+        Equality over one content-addressed identity, never a prefix and never
+        a field-by-field comparison that could omit a field. Both the result
+        that was checked and the token that permits the send must name it, so
+        neither a re-checked result carrying a stale token nor a fresh token
+        carrying a substituted order can pass.
+        """
+        sealed = plan_identity(request.plan)
+        pre_submit = request.pre_submit
+        if not pre_submit.plan_ref:
+            return "PRE_SUBMIT_SEALED_NO_PLAN"
+        if pre_submit.plan_ref != sealed:
+            return "PLAN_NOT_THE_ONE_CHECKED"
+        assert request.authorization is not None  # noqa: S101 - checked above
+        token = request.authorization.peek()
+        if token.plan_ref != sealed:
+            return "PLAN_NOT_THE_ONE_AUTHORIZED"
+        if token.authorized_quantity != request.plan.quantity:
+            return "AUTHORIZED_QUANTITY_IS_NOT_THE_PLAN_QUANTITY"
+        return None
 
     def _outcome(
         self,

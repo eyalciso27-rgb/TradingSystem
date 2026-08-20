@@ -39,6 +39,7 @@ from trading_application.emergency import EntryContext, HaltRecord, match_halt
 from trading_application.execution_identity import (
     decision_identity,
     risk_policy_identity,
+    risk_request_identity,
 )
 
 RISK_ENGINE_VERSION = "risk-engine-1.0.0"
@@ -154,6 +155,11 @@ class RiskResult:
     max_loss_amount: Decimal
     risk_budget_equity: Decimal
     decision_ref: str
+    #: THE exact question this answers. Without it a result is only its output
+    #: numbers, and two different requests whose numbers coincide would carry
+    #: the same identity -- so an authorization derived from one could be
+    #: presented for the other.
+    request_ref: str
     policy_ref: str
     engine_version: str
     checks: tuple[RiskCheck, ...]
@@ -330,7 +336,7 @@ class RiskEngine:
         if vetoed:
             return self._result(
                 RiskDecisionOutcome.VETO, Decimal(0), Decimal(0), equity,
-                decision, checks, reasons,
+                decision, request, checks, reasons,
             )
 
         # -- 7. quantity budgets: reduce-only, rounded DOWN (section 3.1) -------
@@ -428,7 +434,7 @@ class RiskEngine:
             reasons.append("NO_ROOM_WITHIN_ENVELOPE")
             return self._result(
                 RiskDecisionOutcome.VETO, Decimal(0), Decimal(0), equity,
-                decision, checks, reasons,
+                decision, request, checks, reasons,
             )
 
         approved_risk = quantity * per_share_risk
@@ -439,7 +445,9 @@ class RiskEngine:
         )
         if outcome is RiskDecisionOutcome.APPROVE:
             reasons.append("WITHIN_SAFETY_ENVELOPE")
-        return self._result(outcome, quantity, approved_risk, equity, decision, checks, reasons)
+        return self._result(
+            outcome, quantity, approved_risk, equity, decision, request, checks, reasons
+        )
 
     def _result(
         self,
@@ -448,6 +456,7 @@ class RiskEngine:
         approved_risk: Decimal,
         equity: Decimal,
         decision: EngineDecision,
+        request: TradeRiskRequest,
         checks: list[RiskCheck],
         reasons: list[str],
     ) -> RiskResult:
@@ -458,6 +467,7 @@ class RiskEngine:
             max_loss_amount=approved_risk,
             risk_budget_equity=equity,
             decision_ref=decision_identity(decision),
+            request_ref=risk_request_identity(request),
             policy_ref=risk_policy_identity(self._policy),
             engine_version=RISK_ENGINE_VERSION,
             checks=tuple(checks),

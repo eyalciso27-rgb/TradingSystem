@@ -232,7 +232,6 @@ def _build(
     equity_cap: Decimal,
 ) -> ExecutionService:
     """Assemble the service from already-owned resources."""
-    from trading_execution_agent.agent import ExecutionAgent
     from trading_execution_agent.ibkr_quote_source import IbkrQuoteSource
     from trading_execution_agent.reconciliation_latch import ReconciliationLatch
 
@@ -267,9 +266,10 @@ def _build(
             sector="probe",
             cluster="probe",
         ),
-        # ONE gate: the service latches the same object the agent consults.
+        # ONE gate: the service builds its own agent from this object, so
+        # there is no wiring in which the latched gate and the gate the agent
+        # consults could be different.
         entry_gate=latch,
-        agent_factory=lambda port_, gate: ExecutionAgent(port_, entry_gate=gate),
         # No authorization argument: the production default DENIES.
     )
 

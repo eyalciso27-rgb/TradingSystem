@@ -121,6 +121,7 @@ class _Risk:
             max_loss_amount=Decimal("500"),
             risk_budget_equity=Decimal("100000"),
             decision_ref="decision-1",
+            request_ref="risk-request:AAPL@sha256:" + "1" * 64,
             policy_ref="policy-1",
             engine_version="test",
             checks=(),

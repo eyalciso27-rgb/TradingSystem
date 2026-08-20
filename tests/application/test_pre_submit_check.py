@@ -11,6 +11,7 @@ from trading_application.decision_engine import DecisionExplanation, EngineDecis
 from trading_application.emergency import HaltRecord
 from trading_application.execution_identity import (
     decision_identity,
+    risk_request_identity,
     risk_result_identity,
 )
 from trading_application.portfolio_allocator import CandidateAllocation
@@ -30,13 +31,14 @@ from trading_application.pre_submit_check import (
     SingleUseAuthorization,
     StaleAction,
 )
-from trading_application.risk_engine import RiskResult
+from trading_application.risk_engine import RiskResult, TradeRiskRequest
 from trading_contracts.decision import DecisionResult
 from trading_contracts.enums import (
     ActionTier,
     DecisionOutcome,
     Environment,
     HaltScope,
+    OrderType,
     PortfolioAction,
     RiskDecisionOutcome,
 )
@@ -60,9 +62,41 @@ POLICY = PreSubmitPolicy(
 CHECK = FinalPreSubmitCheck(POLICY)
 
 
+def risk_request(
+    *,
+    symbol: str = "AAPL",
+    sector: str = "tech",
+    cluster: str = "megacap",
+    source_id: str = "src-1",
+    strategy_id: str = "strat-1",
+    environment: Environment = Environment.PAPER,
+    quantity: str = "100",
+    entry: str = "10",
+    stop: str = "9",
+) -> TradeRiskRequest:
+    """THE question the risk engine was asked.
+
+    A result now names the request it answers, so a fixture has to state one:
+    two evaluations whose output numbers coincide are no longer allowed to
+    share an identity.
+    """
+    return TradeRiskRequest(
+        symbol=symbol,
+        sector=sector,
+        cluster=cluster,
+        source_id=source_id,
+        strategy_id=strategy_id,
+        environment=environment,
+        requested_quantity=Decimal(quantity),
+        entry_price=Decimal(entry),
+        stop_price=Decimal(stop),
+    )
+
+
 def risk_result(
     outcome: RiskDecisionOutcome = RiskDecisionOutcome.APPROVE,
     for_decision: EngineDecision | None = None,
+    for_request: TradeRiskRequest | None = None,
 ) -> RiskResult:
     """A risk result whose decision reference really points at its decision.
 
@@ -77,6 +111,9 @@ def risk_result(
         risk_budget_equity=Decimal("50000"),
         decision_ref=decision_identity(
             for_decision if for_decision is not None else decision()
+        ),
+        request_ref=risk_request_identity(
+            for_request if for_request is not None else risk_request()
         ),
         policy_ref="risk-policy:r1@sha256:" + "0" * 64,
         engine_version="risk-engine-1.0.0",
@@ -153,7 +190,10 @@ def request(
     stop: str = "9",
 ) -> PreSubmitRequest:
     this_decision = decision(decision_outcome)
-    this_risk = risk_result(risk_outcome, for_decision=this_decision)
+    this_question = risk_request(entry=entry, stop=stop)
+    this_risk = risk_result(
+        risk_outcome, for_decision=this_decision, for_request=this_question
+    )
     return PreSubmitRequest(
         allocation=(
             alloc
@@ -162,12 +202,17 @@ def request(
         ),
         risk_result=this_risk,
         decision=this_decision,
+        risk_request=this_question,
         symbol="AAPL",
         strategy_id="strat-1",
         source_id="src-1",
         environment=Environment.PAPER,
         planned_entry_price=Decimal(entry),
         planned_stop_price=Decimal(stop),
+        side="BUY",
+        account_alias="paper-main",
+        order_type=OrderType.LIMIT,
+        time_in_force="DAY",
     )
 
 
@@ -338,12 +383,17 @@ def test_expired_decision_cancels() -> None:
             allocation=allocation(),
             risk_result=risk_result(),
             decision=old_decision,
+            risk_request=risk_request(),
             symbol="AAPL",
             strategy_id="strat-1",
             source_id="src-1",
             environment=Environment.PAPER,
             planned_entry_price=Decimal("10"),
             planned_stop_price=Decimal("9"),
+            side="BUY",
+            account_alias="paper-main",
+            order_type=OrderType.LIMIT,
+            time_in_force="DAY",
         )
     )
     assert result.action is PreSubmitAction.CANCEL

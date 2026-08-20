@@ -19,7 +19,7 @@ Offline and deterministic: no ibapi, no socket, no network, no real order.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -31,7 +31,9 @@ from trading_application.emergency import HaltRecord
 from trading_application.execution_identity import (
     allocation_identity,
     decision_identity,
+    plan_identity,
     pre_submit_policy_identity,
+    risk_request_identity,
     risk_result_identity,
 )
 from trading_application.portfolio_allocator import (
@@ -39,6 +41,7 @@ from trading_application.portfolio_allocator import (
     CandidateAllocation,
     PortfolioAllocationPolicy,
     PortfolioAllocator,
+    PortfolioPosition,
     PortfolioState,
 )
 from trading_application.pre_submit_check import (
@@ -57,7 +60,14 @@ from trading_application.pre_submit_check import (
     authorization_matches,
     single_use_authorization,
 )
-from trading_application.risk_engine import PositionExposure, RiskEngine, RiskPolicy, RiskResult
+from trading_application.risk_engine import (
+    AccountState,
+    PositionExposure,
+    RiskEngine,
+    RiskPolicy,
+    RiskResult,
+    TradeRiskRequest,
+)
 from trading_application.trading_readiness_runtime import (
     MarketDataRules,
     MarketDataState,
@@ -89,11 +99,13 @@ from trading_execution_agent.execution_service import (
     DecisionRiskRegistry,
     DenyAllExecutionAuthorization,
     ExecutionConfig,
+    ExecutionEvaluation,
     ExecutionFingerprint,
     ExecutionIntent,
     ExecutionService,
     ExecutionServiceError,
     ExecutionStage,
+    PlanContext,
 )
 from trading_execution_agent.reconciliation_latch import ALWAYS_PERMIT
 from trading_market_data_core.sp500_current_universe import Constituent, ConstituentSnapshot
@@ -102,6 +114,14 @@ from trading_market_data_core.trading_readiness import (
     TradingMode,
     UniverseListStatus,
     UniverseType,
+)
+from trading_persistence.execution_audit import (
+    REQUIRED_IDENTITY_FIELDS,
+    REQUIRED_PREPARED_FIELDS,
+    ExecutionHistoryRecord,
+    ExecutionHistoryUnreadableError,
+    _require_readable,
+    require_consistent_lifecycle,
 )
 
 from tests.broker.test_ibkr_paper_adapter import (
@@ -218,27 +238,64 @@ class _TestOnlyAuthorization:
         allowed: bool = True,
         mint: bool = True,
         oversize: Decimal | None = None,
+        checks_instead: Callable[[PlanContext], PlanContext] | None = None,
+        portfolio: PortfolioState | None = None,
     ) -> None:
         self._allowed = allowed
         self._mint = mint
         #: Simulates a faulty authority presenting more than risk approved.
         self._oversize = oversize
+        #: Simulates an authority that checks an order OTHER than the one the
+        #: service will send -- the substitution the seal exists to refuse.
+        self._context_override = checks_instead
+        #: A portfolio state that constrains the allocator, so the portfolio
+        #: cap can be made materially tighter than the risk ceiling.
+        self._portfolio_state = portfolio
         self.calls = 0
+        self.last_context: PlanContext | None = None
 
     def pre_submit_policy_identity(self) -> str:
         """The EXACT policy this authority mints under, as the service checks."""
         return pre_submit_policy_identity(PRE_SUBMIT_POLICY)
 
     def authorize(
-        self, intent: object, report: object, risk_result: RiskResult
+        self,
+        intent: object,
+        report: object,
+        risk_result: RiskResult,
+        plan: PlanContext,
     ) -> AuthorizationDecision:
         self.calls += 1
+        self.last_context = plan
         if not self._allowed:
             return AuthorizationDecision(allowed=False, reason="test denial")
         pre_submit: PreSubmitCheckResult | None = None
         authorization: SingleUseAuthorization | None = None
+        allocation: CandidateAllocation | None = None
         if self._mint:
-            pre_submit = _real_authorization(risk_result)
+            # THE runtime facts, not a fixture price. The authority is handed
+            # the order the service intends to send and checks THAT order --
+            # which is the whole point: an authorization minted against an
+            # entry of 100.02 while the service plans from a live quote is an
+            # authorization for a different order.
+            # A faulty authority checks a DIFFERENT order than the one it was
+            # handed. Derived from the real context so only the substituted
+            # fact differs -- the lineage stays genuine, which is what makes
+            # the refusal a statement about the ORDER.
+            context = (
+                self._context_override(plan)
+                if self._context_override is not None
+                else plan
+            )
+            allocation = _real_allocation(
+                risk_result,
+                entry=context.entry_price,
+                stop=context.stop_price or context.entry_price - Decimal("2"),
+                portfolio=self._portfolio_state,
+            )
+            pre_submit = _real_authorization(
+                risk_result, allocation=allocation, context=context
+            )
             if self._oversize is not None:
                 pre_submit = _oversized(pre_submit, self._oversize)
             authorization = single_use_authorization(pre_submit)
@@ -247,6 +304,7 @@ class _TestOnlyAuthorization:
             reason="test-only authorization",
             pre_submit=pre_submit,
             authorization=authorization,
+            allocation=allocation,
         )
 
 
@@ -269,6 +327,7 @@ def _real_allocation(
     *,
     entry: Decimal = Decimal("100.02"),
     stop: Decimal = Decimal("98.02"),
+    portfolio: PortfolioState | None = None,
 ) -> CandidateAllocation:
     """The allocation the REAL PortfolioAllocator produces for this risk result.
 
@@ -293,7 +352,8 @@ def _real_allocation(
                 priority_score=Decimal("1"),
             )
         ],
-        PortfolioState(
+        portfolio
+        or PortfolioState(
             risk_budget_equity=Decimal("50000"),
             open_positions=(),
             observed_at=NOW,
@@ -334,12 +394,65 @@ PRE_SUBMIT_POLICY = PreSubmitPolicy(
 )
 
 
+def _pre_submit_request(
+    allocation: CandidateAllocation,
+    risk_result: RiskResult,
+    context: PlanContext,
+) -> PreSubmitRequest:
+    """A pre-submit request built from the REAL runtime order facts."""
+    return PreSubmitRequest(
+        allocation=allocation,
+        risk_result=risk_result,
+        decision=_decision(),
+        risk_request=context.risk_request,
+        symbol=context.symbol,
+        strategy_id=context.strategy_id,
+        source_id=context.source_id,
+        environment=context.environment,
+        planned_entry_price=context.entry_price,
+        planned_stop_price=context.stop_price or context.entry_price,
+        side=context.side,
+        account_alias=context.account_alias,
+        order_type=context.order_type,
+        time_in_force=context.time_in_force,
+    )
+
+
+def _authorization_for(
+    evaluation: ExecutionEvaluation, **kw: object
+) -> PreSubmitCheckResult:
+    """The authorization for THE order this evaluation would send.
+
+    Every caller goes through the evaluation's own plan context, so no test can
+    mint an authorization against a price, side or account the service is not
+    actually using -- which is exactly what the previous fixture did, with an
+    entry of 100.02 against a service that plans from a midpoint of 100.025.
+    """
+    assert evaluation.risk_result is not None
+    assert evaluation.plan_context is not None
+    return _real_authorization(
+        evaluation.risk_result, context=evaluation.plan_context, **kw  # type: ignore[arg-type]
+    )
+
+
+def _allocation_for(evaluation: ExecutionEvaluation) -> CandidateAllocation:
+    """The allocation for THE order this evaluation would send."""
+    assert evaluation.risk_result is not None
+    assert evaluation.plan_context is not None
+    context = evaluation.plan_context
+    return _real_allocation(
+        evaluation.risk_result,
+        entry=context.entry_price,
+        stop=context.stop_price or context.entry_price,
+    )
+
+
 def _real_authorization(
     risk_result: RiskResult,
     *,
+    context: PlanContext,
     decision: EngineDecision | None = None,
-    entry: Decimal = Decimal("100.02"),
-    stop: Decimal = Decimal("98.02"),
+    allocation: CandidateAllocation | None = None,
 ) -> PreSubmitCheckResult:
     """Mint an authorization through the REAL FinalPreSubmitCheck.
 
@@ -350,21 +463,36 @@ def _real_authorization(
     rejected.
     """
     engine_decision = decision or _decision()
+    # The REAL runtime facts when the service supplies them. A fixture price
+    # here was the actual defect: the check approved an order at 100.02 while
+    # the service planned from its live quote, and the order still went out.
+    facts = context
+    entry = facts.entry_price
+    stop = facts.stop_price if facts.stop_price is not None else entry
     # The REAL allocator produces the allocation. Hand-building one meant the
     # merge gate skipped a producer entirely -- and the real allocator was
     # emitting a risk reference the consumer could not verify.
-    allocation = _real_allocation(risk_result, entry=entry, stop=stop)
+    allocation = (
+        allocation
+        if allocation is not None
+        else _real_allocation(risk_result, entry=entry, stop=stop)
+    )
     return FinalPreSubmitCheck(PRE_SUBMIT_POLICY).check(
         PreSubmitRequest(
             allocation=allocation,
             risk_result=risk_result,
             decision=engine_decision,
-            symbol="AAPL",
-            strategy_id="baseline-trend-breakout-v1",
-            source_id="strategy",
-            environment=Environment.PAPER,
+            risk_request=facts.risk_request,
+            symbol=facts.symbol,
+            strategy_id=facts.strategy_id,
+            source_id=facts.source_id,
+            environment=facts.environment,
             planned_entry_price=entry,
             planned_stop_price=stop,
+            side=facts.side,
+            account_alias=facts.account_alias,
+            order_type=facts.order_type,
+            time_in_force=facts.time_in_force,
         ),
         RefreshedMarket(price=entry, observed_at=NOW),
         RefreshedAccount(risk_budget_equity=Decimal("50000"), observed_at=NOW),
@@ -438,8 +566,11 @@ def _service(
     protection: object | None = None,
     protection_required: bool = False,
     history: object | None = None,
-    quotes: _Quotes | None = None,
-    audit: _Audit | None = None,
+    # Deliberately `object`: the service takes protocols, and a test fake that
+    # implements the protocol is a valid quote source or audit sink whether or
+    # not it inherits from this file's default fixture.
+    quotes: object | None = None,
+    audit: object | None = None,
     authorization: object | None = None,
     requirements: StrategyDataRequirements | None = None,
     rules: MarketDataRules | None = None,
@@ -455,8 +586,8 @@ def _service(
     gate = entry_latch or _PermissiveLatch()
     service = ExecutionService(
         broker=broker,
-        quotes=quotes or _Quotes(),
-        audit=sink,
+        quotes=quotes or _Quotes(),  # type: ignore[arg-type]
+        audit=sink,  # type: ignore[arg-type]
         risk_engine=RiskEngine(POLICY),
         config=ExecutionConfig(
             mode=TradingMode.PAPER,
@@ -477,13 +608,11 @@ def _service(
             # correctly impossible through it -- proven by its own test below.
             protection_required=protection_required,
         ),
-        # The agent is built FROM the service's gate, so the two can never be
-        # different objects. Passing ALWAYS_PERMIT here used to be possible and
-        # silently defeated the whole post-submit latch.
+        # The service builds its own agent from this gate. There is no
+        # parameter through which a different one could be installed -- an
+        # agent_factory used to exist, and `lambda port, gate: ExecutionAgent(
+        # port, entry_gate=ALWAYS_PERMIT)` silently defeated the whole latch.
         entry_gate=gate,  # type: ignore[arg-type]
-        agent_factory=lambda port, agent_gate: ExecutionAgent(
-            port, entry_gate=agent_gate
-        ),
         authorization=authorization,  # type: ignore[arg-type]
         universe=(lambda: universe) if universe is not None else None,
         portfolio=portfolio,  # type: ignore[arg-type]
@@ -493,7 +622,7 @@ def _service(
         halts=lambda: halts,
         now=lambda: NOW,
     )
-    return service, fake, sink
+    return service, fake, sink  # type: ignore[return-value]
 
 
 class _PermissiveLatch:
@@ -554,10 +683,12 @@ def test_the_production_authorization_is_deny() -> None:
     evaluated = service.evaluate(_intent())
     assert evaluated.risk_result is not None
 
+    assert evaluated.plan_context is not None
     decision = DenyAllExecutionAuthorization().authorize(
         _intent(),
         evaluated.readiness,  # type: ignore[arg-type]
         evaluated.risk_result,
+        evaluated.plan_context,
     )
     assert decision.allowed is False
     assert decision.authorization is None
@@ -1017,25 +1148,22 @@ def _raise_after_submit(record: Mapping[str, object]) -> str:
 
 
 def _execution_request(intent: ExecutionIntent) -> ExecutionRequest:
-    """A request shaped like the service builds, for driving the agent directly."""
+    """A request shaped like the service builds, for driving the agent directly.
+
+    The order comes from the SEALED plan the real pre-submit check minted, so
+    this helper cannot smuggle in an order the check never approved.
+    """
     service, _, _ = _service()
     evaluated = service.evaluate(intent)
     assert evaluated.risk_result is not None
-    pre_submit = _real_authorization(evaluated.risk_result)
+    pre_submit = _authorization_for(evaluated)
+    assert pre_submit.authorized_plan is not None
     return ExecutionRequest(
         client_order_id=intent.client_order_id,
         correlation_id=intent.correlation_id,
         pre_submit=pre_submit,
         authorization=single_use_authorization(pre_submit),
-        environment=Environment.PAPER,
-        account_alias="paper-main",
-        symbol=intent.symbol,
-        side=intent.side,
-        order_type=OrderType.LIMIT,
-        limit_price=Decimal("100.02"),
-        stop_price=Decimal("98.02"),
-        strategy_id=intent.strategy_id,
-        source_id=intent.source_id,
+        plan=pre_submit.authorized_plan,
     )
 
 
@@ -1075,7 +1203,7 @@ def test_the_guard_re_checks_at_the_boundary_not_just_at_planning() -> None:
 
     quotes = _MovingQuotes()
     service, transport, _ = _service(
-        quotes=quotes,  # type: ignore[arg-type]
+        quotes=quotes,
         authorization=_TestOnlyAuthorization(),
     )
     evaluation = service.execute(_intent())
@@ -1632,7 +1760,6 @@ def test_a_risk_policy_mismatch_between_config_and_engine_is_refused() -> None:
                 simulation_equity_cap=Decimal("50000"),
             ),
             entry_gate=_PermissiveLatch(),
-            agent_factory=lambda port, gate: ExecutionAgent(port, entry_gate=gate),
         )
 
 
@@ -1774,7 +1901,7 @@ def test_a_failed_audit_commit_means_zero_broker_submissions() -> None:
             raise ExecutionAuditError("decision could not be committed (OperationalError)")
 
     service, transport, _ = _service(
-        audit=_CommitFails(),  # type: ignore[arg-type]
+        audit=_CommitFails(),
         authorization=_TestOnlyAuthorization(),
     )
     evaluation = service.execute(_intent())
@@ -2159,7 +2286,7 @@ def test_the_canonical_chain_binds_without_any_hand_built_result() -> None:
     evaluated = service.evaluate(_intent())
     assert evaluated.risk_result is not None
 
-    pre_submit = _real_authorization(evaluated.risk_result)
+    pre_submit = _authorization_for(evaluated)
 
     assert pre_submit.action is PreSubmitAction.ALLOW
     assert pre_submit.authorization is not None
@@ -2195,19 +2322,22 @@ def test_each_individual_mismatch_fails_closed_and_submits_nothing(
 
         other = _decision(decision_id=UUID("00000000-0000-0000-0000-0000000000d9"))
         with pytest.raises(PreSubmitError, match="but this request is for"):
-            _real_authorization(risk_result, decision=other)
+            _authorization_for(evaluated, decision=other)
         assert _submits(transport) == []
         return
     if mutation == "risk_result":
         # Authorized against a different risk evaluation of the same decision.
         other_result = replace(risk_result, approved_quantity=Decimal("7"))
-        pre_submit = _real_authorization(other_result)
+        assert evaluated.plan_context is not None
+        pre_submit = _real_authorization(
+            other_result, context=evaluated.plan_context
+        )
     elif mutation == "risk_policy":
         # The risk result was produced under a different policy.
         risk_result = replace(risk_result, policy_ref="risk-policy:something-else")
-        pre_submit = _real_authorization(evaluated.risk_result)
+        pre_submit = _authorization_for(evaluated)
     else:
-        pre_submit = _oversized(_real_authorization(risk_result), Decimal("10"))
+        pre_submit = _oversized(_authorization_for(evaluated), Decimal("10"))
 
     reason = service._authorization_binding(  # noqa: SLF001
         _intent(), pre_submit, risk_result
@@ -2226,7 +2356,7 @@ def test_a_pre_submit_policy_ref_is_never_compared_to_the_risk_policy() -> None:
     evaluated = service.evaluate(_intent())
     assert evaluated.risk_result is not None
 
-    pre_submit = _real_authorization(evaluated.risk_result)
+    pre_submit = _authorization_for(evaluated)
 
     assert pre_submit.policy_ref != evaluated.risk_result.policy_ref
     assert pre_submit.policy_ref.startswith("pre-submit-policy:")
@@ -2259,7 +2389,7 @@ def test_the_single_use_authorization_is_derived_from_its_own_result() -> None:
     service, _, _ = _service()
     evaluated = service.evaluate(_intent())
     assert evaluated.risk_result is not None
-    pre_submit = _real_authorization(evaluated.risk_result)
+    pre_submit = _authorization_for(evaluated)
 
     wrapper = single_use_authorization(pre_submit)
 
@@ -2273,7 +2403,7 @@ def test_a_mismatched_authorization_pair_is_refused() -> None:
     evaluated = service.evaluate(_intent())
     assert evaluated.risk_result is not None
 
-    one = _real_authorization(evaluated.risk_result)
+    one = _authorization_for(evaluated)
     ten = _oversized(one, Decimal("10"))
     assert ten.authorization is not None
 
@@ -2289,7 +2419,7 @@ def test_a_result_that_minted_nothing_cannot_produce_a_wrapper() -> None:
     service, _, _ = _service()
     evaluated = service.evaluate(_intent())
     assert evaluated.risk_result is not None
-    allowed = _real_authorization(evaluated.risk_result)
+    allowed = _authorization_for(evaluated)
     unminted = replace(allowed, authorization=None)
 
     with pytest.raises(PreSubmitError, match="minted no"):
@@ -2302,9 +2432,13 @@ def test_the_service_refuses_an_authorization_that_does_not_match_its_result(
 
     class _MismatchedAuthority:
         def authorize(
-            self, intent: object, report: object, risk_result: RiskResult
+            self,
+            intent: object,
+            report: object,
+            risk_result: RiskResult,
+            plan: PlanContext,
         ) -> AuthorizationDecision:
-            one = _real_authorization(risk_result)
+            one = _real_authorization(risk_result, context=plan)
             ten = _oversized(one, Decimal("10"))
             assert ten.authorization is not None
             return AuthorizationDecision(
@@ -2312,6 +2446,11 @@ def test_the_service_refuses_an_authorization_that_does_not_match_its_result(
                 reason="a result approving 1 with an authorization for 10",
                 pre_submit=one,
                 authorization=SingleUseAuthorization(ten.authorization),
+                allocation=_real_allocation(
+                    risk_result,
+                    entry=plan.entry_price,
+                    stop=plan.stop_price or plan.entry_price,
+                ),
             )
 
     service, transport, _ = _service(authorization=_MismatchedAuthority())
@@ -2556,14 +2695,14 @@ def test_the_full_real_producer_chain_reaches_the_broker_exactly_once() -> None:
     assert evaluated.risk_result is not None
 
     # Produced by the REAL PortfolioAllocator.
-    allocation = _real_allocation(evaluated.risk_result)
+    allocation = _allocation_for(evaluated)
     assert allocation.decision_ref == decision_identity(_decision())
     assert allocation.risk_ref == risk_result_identity(evaluated.risk_result)
     assert allocation.policy_ref.startswith("portfolio-policy:")
     assert "@sha256:" in allocation.policy_ref
 
     # Produced by the REAL FinalPreSubmitCheck, from that allocation.
-    pre_submit = _real_authorization(evaluated.risk_result)
+    pre_submit = _authorization_for(evaluated)
     assert pre_submit.allocation_ref == allocation_identity(allocation)
 
     evaluation = service.execute(_intent())
@@ -2586,22 +2725,19 @@ def test_an_allocation_from_another_decision_cannot_authorize_this_one() -> None
     foreign_risk = replace(
         evaluated.risk_result, decision_ref=decision_identity(other_decision)
     )
-    foreign_allocation = _real_allocation(foreign_risk)
+    assert evaluated.plan_context is not None
+    foreign_allocation = _real_allocation(
+        foreign_risk,
+        entry=evaluated.plan_context.entry_price,
+        stop=evaluated.plan_context.stop_price or evaluated.plan_context.entry_price,
+    )
 
+    context = evaluated.plan_context
+    assert context is not None
     with pytest.raises(PreSubmitError, match="allocation names decision"):
         FinalPreSubmitCheck(PRE_SUBMIT_POLICY).check(
-            PreSubmitRequest(
-                allocation=foreign_allocation,
-                risk_result=evaluated.risk_result,
-                decision=_decision(),
-                symbol="AAPL",
-                strategy_id="baseline-trend-breakout-v1",
-                source_id="strategy",
-                environment=Environment.PAPER,
-                planned_entry_price=Decimal("100.02"),
-                planned_stop_price=Decimal("98.02"),
-            ),
-            RefreshedMarket(price=Decimal("100.02"), observed_at=NOW),
+            _pre_submit_request(foreign_allocation, evaluated.risk_result, context),
+            RefreshedMarket(price=context.entry_price, observed_at=NOW),
             RefreshedAccount(risk_budget_equity=Decimal("50000"), observed_at=NOW),
             ApprovalState(approved=True, approved_at=NOW),
             ExecutionContext(),
@@ -2622,22 +2758,19 @@ def test_an_allocation_sized_against_another_evaluation_is_refused() -> None:
     other_evaluation = replace(
         evaluated.risk_result, approved_quantity=Decimal("7")
     )
-    allocation = _real_allocation(other_evaluation)
+    assert evaluated.plan_context is not None
+    allocation = _real_allocation(
+        other_evaluation,
+        entry=evaluated.plan_context.entry_price,
+        stop=evaluated.plan_context.stop_price or evaluated.plan_context.entry_price,
+    )
 
+    context = evaluated.plan_context
+    assert context is not None
     with pytest.raises(PreSubmitError, match="different risk evaluation"):
         FinalPreSubmitCheck(PRE_SUBMIT_POLICY).check(
-            PreSubmitRequest(
-                allocation=allocation,
-                risk_result=evaluated.risk_result,
-                decision=_decision(),
-                symbol="AAPL",
-                strategy_id="baseline-trend-breakout-v1",
-                source_id="strategy",
-                environment=Environment.PAPER,
-                planned_entry_price=Decimal("100.02"),
-                planned_stop_price=Decimal("98.02"),
-            ),
-            RefreshedMarket(price=Decimal("100.02"), observed_at=NOW),
+            _pre_submit_request(allocation, evaluated.risk_result, context),
+            RefreshedMarket(price=context.entry_price, observed_at=NOW),
             RefreshedAccount(risk_budget_equity=Decimal("50000"), observed_at=NOW),
             ApprovalState(approved=True, approved_at=NOW),
             ExecutionContext(),
@@ -2653,7 +2786,7 @@ def test_the_allocation_reference_identifies_the_exact_allocation() -> None:
     evaluated = service.evaluate(_intent())
     assert evaluated.risk_result is not None
 
-    allocation = _real_allocation(evaluated.risk_result)
+    allocation = _allocation_for(evaluated)
     different = replace(allocation, allocated_quantity=Decimal("99"))
 
     assert allocation_identity(allocation).startswith("allocation:cand-1@sha256:")
@@ -2675,7 +2808,7 @@ def test_a_failing_observation_does_not_abort_the_whole_probe() -> None:
         def current_quote(self, symbol: str) -> QuoteState:
             raise RuntimeError("the market data farm is unreachable")
 
-    service, _, _ = _service(quotes=_BrokenQuotes())  # type: ignore[arg-type]
+    service, _, _ = _service(quotes=_BrokenQuotes())
 
     evidence = service.collect_evidence(_intent())
 
@@ -2683,7 +2816,10 @@ def test_a_failing_observation_does_not_abort_the_whole_probe() -> None:
     quote_ok, quote_detail = checks["quote"]
     assert not quote_ok
     assert "NOT OBSERVED" in quote_detail
-    assert "the market data farm is unreachable" in quote_detail
+    assert "RuntimeError" in quote_detail
+    assert "the market data farm is unreachable" not in quote_detail, (
+        "a foreign exception's text is not printed to the owner"
+    )
     # ...and every other independent observation still ran.
     for other in ("halts", "account", "session_pnl", "contract", "universe",
                   "portfolio", "audit"):
@@ -2707,7 +2843,7 @@ def test_each_observation_fails_on_its_own() -> None:
         checks = {name: (ok, detail) for name, ok, detail in evidence.observations}
         assert len(checks) >= 8, f"{broken} took other observations with it"
         failed = [d for _ok, d in checks.values() if "NOT OBSERVED" in d]
-        assert any(broken in d for d in failed), broken
+        assert failed, broken
 
 
 def test_a_failing_evaluation_still_returns_the_observations() -> None:
@@ -2724,3 +2860,852 @@ def test_a_failing_evaluation_still_returns_the_observations() -> None:
     assert evidence.evaluation is not None
     assert evidence.evaluation.stage is ExecutionStage.OBSERVATION_FAILED
     assert len(evidence.observations) >= 9
+
+
+# == the seal: what was checked IS what is sent ==============================
+#
+# The defect these close: FinalPreSubmitCheck proved a decision, a risk result,
+# an allocation, a policy and a quantity -- and then the service built its own
+# order from its own runtime fields and the agent built the broker's OrderIntent
+# from separate, independently substitutable request fields. The merge gate even
+# contained a live instance: the authorization was minted against an entry of
+# 100.02 while the service planned from a midpoint of 100.025, and the order
+# still went out.
+
+
+def _mutating(**fields: object) -> Callable[[PlanContext], PlanContext]:
+    """An authority that checks an order OTHER than the one it was handed."""
+
+    def transform(context: PlanContext) -> PlanContext:
+        return replace(context, **fields)  # type: ignore[arg-type]
+
+    return transform
+
+
+def test_the_authority_is_handed_the_order_the_service_will_actually_send(
+) -> None:
+    """The runtime facts, not a fixture price.
+
+    The service plans its entry from the live quote midpoint (100.00/100.05 ->
+    100.025), which is NOT the 100.02 the old fixture minted against.
+    """
+    authority = _TestOnlyAuthorization()
+    service, transport, _ = _service(authorization=authority)
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED, evaluation.reasons
+    context = authority.last_context
+    assert context is not None
+    assert context.entry_price == Decimal("100.025"), (
+        "the authority checks the price the service actually planned"
+    )
+    assert context.stop_price == Decimal("98.025")
+    assert len(_submits(transport)) == 1
+    sent = transport.submitted_intents[0]
+    assert sent.limit_price == context.entry_price
+    assert sent.stop_price == context.stop_price
+
+
+@pytest.mark.parametrize(
+    ("name", "mutation"),
+    [
+        ("entry price", {"entry_price": Decimal("100.02")}),
+        ("stop price", {"stop_price": Decimal("98.02")}),
+        ("side", {"side": "SELL"}),
+        ("order type", {"order_type": OrderType.MARKET}),
+        ("time in force", {"time_in_force": "GTC"}),
+        ("symbol", {"symbol": "MSFT"}),
+        ("account", {"account_alias": "paper-other"}),
+        ("environment", {"environment": Environment.LIVE}),
+    ],
+)
+def test_an_authorization_for_a_different_order_never_reaches_the_broker(
+    name: str, mutation: dict[str, object]
+) -> None:
+    """B through G: one substituted order fact at a time, all fail closed.
+
+    The lineage stays genuine in every case -- same decision, same risk
+    evaluation, same allocation, same policy -- so the ONLY thing wrong is the
+    order. Every reference check the previous design performed would pass.
+    """
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(checks_instead=_mutating(**mutation))
+    )
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.AUTHORIZATION_DENIED, name
+    reasons = " ".join(evaluation.reasons)
+    # Symbol and environment are ALSO part of the risk question, so the
+    # canonical pre-submit check refuses them even earlier -- by refusing to
+    # mint at all. Either way the refusal is total.
+    assert (
+        "not the plan this execution would send" in reasons
+        or "authority raised" in reasons
+    ), f"{name}: {evaluation.reasons}"
+    assert _submits(transport) == [], f"{name} reached the broker"
+
+
+def test_a_faulty_authority_cannot_raise_the_portfolio_allocation() -> None:
+    """A: risk approves more than the portfolio allocates.
+
+    Risk sizes from the risk envelope; the PORTFOLIO then allocates less. An
+    authority presenting a genuine-derived result for a size between the two
+    passes every risk check -- a risk ceiling is not a portfolio allocation, and
+    the previous binding checked only the ceiling.
+    """
+    intent = _intent(requested_quantity=Decimal("100"))
+    # A portfolio already carrying open risk, so the allocator's caps bind
+    # strictly below what risk alone would allow.
+    constrained = PortfolioState(
+        risk_budget_equity=Decimal("50000"),
+        open_positions=(
+            PortfolioPosition(
+                symbol="MSFT", sector="software", theme="enterprise",
+                cluster="megacap-software", source_id="other-source",
+                strategy_id="other-strategy",
+                open_risk_amount=Decimal("450"), notional=Decimal("35000"),
+            ),
+        ),
+        observed_at=NOW,
+    )
+    honest, _, _ = _service(
+        authorization=_TestOnlyAuthorization(portfolio=constrained)
+    )
+    evaluated = honest.evaluate(intent)
+    assert evaluated.risk_result is not None
+    assert evaluated.plan_context is not None
+    allocated = _real_allocation(
+        evaluated.risk_result,
+        entry=evaluated.plan_context.entry_price,
+        stop=evaluated.plan_context.stop_price or evaluated.plan_context.entry_price,
+        portfolio=constrained,
+    )
+    risk_ceiling = evaluated.risk_result.approved_quantity
+    assert allocated.allocated_quantity < risk_ceiling, (
+        "the portfolio must allocate strictly less than risk approved, or this"
+        " test proves nothing"
+    )
+    between = allocated.allocated_quantity + Decimal(1)
+    assert between <= risk_ceiling, "the presented size is within the RISK limit"
+
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(
+            portfolio=constrained, oversize=between
+        )
+    )
+
+    evaluation = service.execute(intent)
+
+    assert evaluation.stage is ExecutionStage.AUTHORIZATION_DENIED
+    assert _submits(transport) == []
+
+
+def test_an_authorization_without_its_allocation_is_refused() -> None:
+    """The allocation is not optional: without it the cap cannot be checked."""
+
+    class _NoAllocation:
+        def pre_submit_policy_identity(self) -> str:
+            return pre_submit_policy_identity(PRE_SUBMIT_POLICY)
+
+        def authorize(
+            self,
+            intent: object,
+            report: object,
+            risk_result: RiskResult,
+            plan: PlanContext,
+        ) -> AuthorizationDecision:
+            pre_submit = _real_authorization(risk_result, context=plan)
+            return AuthorizationDecision(
+                allowed=True,
+                reason="genuine authorization, no allocation handed over",
+                pre_submit=pre_submit,
+                authorization=single_use_authorization(pre_submit),
+            )
+
+    service, transport, _ = _service(authorization=_NoAllocation())
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.AUTHORIZATION_DENIED
+    assert "no portfolio allocation" in " ".join(evaluation.reasons)
+    assert _submits(transport) == []
+
+
+def test_the_agent_refuses_a_plan_that_is_not_the_one_authorized() -> None:
+    """The agent checks the seal itself, before spending the single use.
+
+    Even handed a genuine result and a genuine token, an order that is not the
+    sealed one is refused by the component that would send it.
+    """
+    intent = _intent()
+    service, transport, _ = _service(authorization=_TestOnlyAuthorization())
+    evaluated = service.evaluate(intent)
+    assert evaluated.risk_result is not None
+    pre_submit = _authorization_for(evaluated)
+    assert pre_submit.authorized_plan is not None
+
+    substituted = ExecutionRequest(
+        client_order_id=intent.client_order_id,
+        correlation_id=intent.correlation_id,
+        pre_submit=pre_submit,
+        authorization=single_use_authorization(pre_submit),
+        # A different order, presented with a genuine authorization.
+        plan=replace(pre_submit.authorized_plan, quantity=Decimal("99")),
+    )
+
+    outcome = service._agent.process(substituted)  # noqa: SLF001
+
+    assert outcome.status is ExecutionStatus.REFUSED
+    assert "PLAN_NOT_THE_ONE_CHECKED" in outcome.reason_codes
+    assert _submits(transport) == []
+
+
+def test_the_agent_builds_its_order_only_from_the_sealed_plan() -> None:
+    """Structural: no order field on the request is independently settable."""
+    from dataclasses import fields as dataclass_fields
+
+    settable = {field.name for field in dataclass_fields(ExecutionRequest)}
+
+    for order_fact in (
+        "symbol", "side", "order_type", "limit_price", "stop_price",
+        "time_in_force", "environment", "account_alias",
+    ):
+        assert order_fact not in settable, (
+            f"{order_fact} is a settable field on ExecutionRequest, so an order"
+            " fact can differ from the sealed plan"
+        )
+        assert hasattr(ExecutionRequest, order_fact), (
+            f"{order_fact} must still be readable -- from the plan"
+        )
+
+
+def test_the_sealed_plan_is_the_order_the_broker_receives() -> None:
+    """The whole chain, compared field for field at the transport."""
+    authority = _TestOnlyAuthorization()
+    service, transport, _ = _service(authorization=authority)
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED, evaluation.reasons
+    assert evaluation.authorization is not None
+    pre_submit = evaluation.authorization.pre_submit
+    assert pre_submit is not None and pre_submit.authorized_plan is not None
+    plan = pre_submit.authorized_plan
+    assert len(_submits(transport)) == 1
+    order = transport.submitted_intents[0]
+
+    assert order.symbol == plan.symbol
+    assert order.side.value == plan.side
+    assert order.quantity == plan.quantity
+    assert order.order_type == plan.order_type
+    assert order.limit_price == plan.limit_price
+    assert order.stop_price == plan.stop_price
+    assert order.time_in_force.value == plan.time_in_force
+    assert order.account_alias == plan.account_alias
+    assert order.environment == plan.environment
+
+
+# == the risk identity names the QUESTION, not just the answer ===============
+
+
+def _question(**overrides: object) -> TradeRiskRequest:
+    """A risk request, with one fact varied at a time."""
+    base = {
+        "symbol": "AAPL",
+        "sector": "tech",
+        "cluster": "megacap",
+        "source_id": "strategy",
+        "strategy_id": "baseline-trend-breakout-v1",
+        "environment": Environment.PAPER,
+        "requested_quantity": Decimal("10"),
+        "entry_price": Decimal("100"),
+        "stop_price": Decimal("98"),
+    }
+    base.update(overrides)
+    return TradeRiskRequest(**base)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("name", "overrides"),
+    [
+        ("symbol", {"symbol": "MSFT"}),
+        ("sector", {"sector": "energy"}),
+        ("cluster", {"cluster": "smallcap"}),
+        ("source", {"source_id": "another-source"}),
+        ("strategy", {"strategy_id": "another-strategy"}),
+        ("environment", {"environment": Environment.LIVE}),
+        ("quantity", {"requested_quantity": Decimal("11")}),
+        ("entry", {"entry_price": Decimal("101")}),
+        ("stop", {"stop_price": Decimal("97")}),
+    ],
+)
+def test_two_different_risk_questions_never_share_an_identity(
+    name: str, overrides: dict[str, object]
+) -> None:
+    """The defect: a RiskResult is output numbers, and outputs can coincide.
+
+    Same decision, same account, same policy, same approved quantity and risk
+    figures -- but a different symbol, sector, source or cluster where no cap
+    happened to bind. The results were byte-identical, so ``risk_result_identity``
+    gave them the SAME reference and an authorization derived from one was
+    indistinguishable from an authorization for the other.
+    """
+    mine, theirs = _question(), _question(**overrides)
+
+    assert risk_request_identity(mine) != risk_request_identity(theirs), name
+
+
+def test_equal_looking_risk_outputs_still_get_different_identities() -> None:
+    """Proof at the RESULT level, which is what an authorization carries.
+
+    Two evaluations engineered to produce identical output numbers. Under the
+    old contract their identities were equal; they must now differ, because the
+    result carries the question it answered.
+    """
+    engine = RiskEngine(POLICY)
+    decision = _decision()
+    account = AccountState(
+        broker_net_liquidation_value=Decimal("50000"),
+        simulation_equity_cap=Decimal("50000"),
+        session_pnl=Decimal("0"),
+        open_positions=(),
+        observed_at=NOW,
+    )
+    apple = engine.evaluate(decision, _question(), account, as_of=NOW)
+    micro = engine.evaluate(
+        decision, _question(symbol="MSFT", sector="software"), account, as_of=NOW
+    )
+
+    # Identical answers...
+    assert apple.outcome is micro.outcome
+    assert apple.approved_quantity == micro.approved_quantity
+    assert apple.approved_risk_amount == micro.approved_risk_amount
+    assert apple.risk_budget_equity == micro.risk_budget_equity
+    assert apple.decision_ref == micro.decision_ref
+    assert apple.policy_ref == micro.policy_ref
+    # ...to different questions.
+    assert apple.request_ref != micro.request_ref
+    assert risk_result_identity(apple) != risk_result_identity(micro), (
+        "an authorization for the MSFT evaluation must not be usable for AAPL"
+    )
+
+
+def test_a_risk_result_for_another_question_cannot_cross_the_chain() -> None:
+    """Risk -> Allocator -> PreSubmit -> Service, with a foreign evaluation."""
+    from trading_application.pre_submit_check import PreSubmitError
+
+    service, transport, _ = _service()
+    evaluated = service.evaluate(_intent())
+    assert evaluated.risk_result is not None
+    context = evaluated.plan_context
+    assert context is not None
+
+    # A genuine risk result -- of a different question. Its decision, policy and
+    # numbers all line up; only the question differs.
+    engine = RiskEngine(POLICY)
+    account = AccountState(
+        broker_net_liquidation_value=Decimal("50000"),
+        simulation_equity_cap=Decimal("50000"),
+        session_pnl=Decimal("0"),
+        open_positions=(),
+        observed_at=NOW,
+    )
+    foreign = engine.evaluate(
+        _decision(), _question(symbol="MSFT", sector="software"), account, as_of=NOW
+    )
+    foreign_allocation = _real_allocation(
+        foreign,
+        entry=context.entry_price,
+        stop=context.stop_price or context.entry_price,
+    )
+
+    with pytest.raises(PreSubmitError, match="different risk request"):
+        FinalPreSubmitCheck(PRE_SUBMIT_POLICY).check(
+            _pre_submit_request(foreign_allocation, foreign, context),
+            RefreshedMarket(price=context.entry_price, observed_at=NOW),
+            RefreshedAccount(risk_budget_equity=Decimal("50000"), observed_at=NOW),
+            ApprovalState(approved=True, approved_at=NOW),
+            ExecutionContext(),
+            as_of=NOW,
+        )
+
+    assert _submits(transport) == []
+
+
+def test_the_service_verifies_the_engine_answered_its_own_question() -> None:
+    """A result that names a different request is a service-level failure."""
+    service, transport, _ = _service()
+
+    class _WrongQuestion:
+        policy = POLICY
+
+        def evaluate(self, decision: object, request: object, account: object,
+                     **kw: object) -> RiskResult:
+            real = RiskEngine(POLICY)
+            return replace(
+                real.evaluate(decision, request, account, **kw),  # type: ignore[arg-type]
+                request_ref="risk-request:SOMETHING-ELSE@sha256:" + "0" * 64,
+            )
+
+    service._risk_engine = _WrongQuestion()  # type: ignore[assignment] # noqa: SLF001
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is not ExecutionStage.SUBMITTED
+    assert _submits(transport) == []
+
+
+# == the one gate is structural, not conventional ============================
+
+
+def test_there_is_no_constructor_path_to_a_second_entry_gate() -> None:
+    """The agent_factory is gone, and nothing replaced it.
+
+    The wiring was correct before, but the CONTRACT allowed
+    ``lambda port, gate: ExecutionAgent(port, entry_gate=ALWAYS_PERMIT)`` --
+    a supplied gate the service never checked was used. No type could catch
+    that, so the parameter had to go.
+    """
+    import inspect
+
+    parameters = inspect.signature(ExecutionService.__init__).parameters
+    assert "agent_factory" not in parameters
+    for name, parameter in parameters.items():
+        annotation = str(parameter.annotation)
+        assert "ExecutionAgent" not in annotation, (
+            f"{name} can supply an agent, so it can supply a different gate"
+        )
+    # A clock is a clock; a safety dependency is not injectable.
+    assert "entry_gate" in parameters
+
+
+def test_every_service_shares_its_gate_with_its_agent() -> None:
+    """Whatever gate goes in, that is the gate the agent consults."""
+    gate = _PermissiveLatch()
+    service, _, _ = _service(entry_latch=gate)
+
+    assert service.entry_gate is gate
+    assert service._agent._entry_gate is gate  # noqa: SLF001
+
+
+# == a late boundary refusal is RESOLVED, not left ambiguous =================
+
+
+class _LateBoundaryQuotes:
+    """Healthy while the service plans, stale by the time the guard re-asks."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def current_quote(self, symbol: str) -> QuoteState:
+        self.calls += 1
+        observed = (
+            NOW - timedelta(seconds=1)
+            if self.calls <= 2
+            else NOW - timedelta(hours=1)
+        )
+        return QuoteState(
+            Decimal("100.00"), Decimal("100.05"), observed,
+            bid_size=500, ask_size=500,
+            market_data_state=MarketDataState.REALTIME,
+        )
+
+
+class _LinkedStore:
+    """One durable store, written by the sink and read on replay.
+
+    The restart tests used to hand-append the records they then asserted on,
+    which tests the reader against whatever the test believes the writer does.
+    This is the writer's OWN output, replayed.
+    """
+
+    def __init__(self) -> None:
+        self.history = _History()
+
+    # -- the sink side ----------------------------------------------------
+    def can_persist(self) -> bool:
+        return True
+
+    def persist(self, record: Mapping[str, object]) -> str:
+        return self._append("EXECUTION_EVALUATED", record)
+
+    def persist_prepared(self, record: Mapping[str, object]) -> str:
+        return self._append("EXECUTION_SUBMIT_PREPARED", record)
+
+    def persist_outcome(self, record: Mapping[str, object]) -> str:
+        return self._append("EXECUTION_OUTCOME", record)
+
+    def _append(self, action: str, record: Mapping[str, object]) -> str:
+        payload = dict(record)
+        decision_id = str(payload.get("decision_id", ""))
+        stored = _Record(action=action, payload=payload)
+        self.history.records.setdefault(decision_id, []).append(stored)
+        fingerprint = payload.get("execution_fingerprint")
+        if isinstance(fingerprint, dict):
+            order_id = str(fingerprint.get("client_order_id", ""))
+            if order_id:
+                self.history.orders.setdefault(order_id, []).append(stored)
+        return f"{action}-{len(self.history.records.get(decision_id, ()))}"
+
+    # -- the reader side --------------------------------------------------
+    def records_for(self, decision_id: str) -> tuple[_Record, ...]:
+        return self.history.records_for(decision_id)
+
+    def records_for_order(self, client_order_id: str) -> tuple[_Record, ...]:
+        return self.history.records_for_order(client_order_id)
+
+
+def test_a_late_readiness_refusal_is_durably_resolved_as_not_sent() -> None:
+    """The guard refused BEFORE the broker call, so nothing was sent.
+
+    Leaving the SUBMIT_PREPARED marker unresolved would mean a restart reads
+    "the broker may hold this order" about an order the guard proved was never
+    sent -- an incident invented out of a working safety check.
+    """
+    store = _LinkedStore()
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(),
+        audit=store, history=store,
+        quotes=_LateBoundaryQuotes(),
+    )
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.READINESS_BLOCKED, evaluation.reasons
+    assert _submits(transport) == [], "the guard refused before the broker call"
+    records = store.records_for(_intent().decision_id)
+    actions = [record.action for record in records]
+    assert "EXECUTION_SUBMIT_PREPARED" in actions, "the marker is NOT rewritten"
+    assert "EXECUTION_OUTCOME" in actions, "and it IS resolved, beside it"
+    resolved = next(r for r in records if r.action == "EXECUTION_OUTCOME")
+    assert resolved.payload["submission_outcome"] == "NOT_SENT"
+    assert resolved.payload["broker_order_ref"] is None
+    prepared = next(r for r in records if r.action == "EXECUTION_SUBMIT_PREPARED")
+    assert (
+        resolved.payload["execution_fingerprint"]
+        == prepared.payload["execution_fingerprint"]
+    ), "the SAME full prepared fingerprint is preserved"
+
+
+def test_a_restart_after_a_late_refusal_reconstructs_not_sent() -> None:
+    """The whole point: a NEW service, a fresh replay, no false incident."""
+    intent = _intent()
+    store = _LinkedStore()
+    first, first_transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), audit=store, history=store,
+        quotes=_LateBoundaryQuotes(),
+    )
+    assert first.execute(intent).stage is ExecutionStage.READINESS_BLOCKED
+    assert _submits(first_transport) == []
+    del first
+
+    # The process dies. A brand new service replays the same execution.
+    second, second_transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), audit=store, history=store
+    )
+
+    replayed = second.execute(intent)
+
+    assert replayed.stage is ExecutionStage.READINESS_BLOCKED, replayed.reasons
+    assert _submits(second_transport) == [], "still nothing sent"
+
+
+def test_an_unrecordable_not_sent_resolution_fails_closed() -> None:
+    """If the store cannot prove it, a restart cannot either."""
+    store = _LinkedStore()
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), audit=store, history=store,
+        quotes=_LateBoundaryQuotes(),
+    )
+    store.persist_outcome = _raise_after_submit  # type: ignore[method-assign]
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.POST_SUBMIT_AUDIT_FAILED
+    assert _submits(transport) == [], "nothing was ever sent"
+    assert service.critical_state is not None
+    assert service.entry_gate.entry_blocked()[0], "new entries are latched"
+
+
+# == PREPARED and OUTCOME must agree about which order it was ================
+#
+# The writer carries the prepared fingerprint into the outcome record, which is
+# correct -- and not something the reader may DEPEND on. A store whose
+# correctness rests on the current writer always behaving cannot detect the
+# writer misbehaving.
+
+
+def _prepared_payload(**order: str) -> dict[str, object]:
+    shape = {
+        "decision_id": "decision-1",
+        "client_order_id": "ord-1",
+        "strategy_id": "strat-1",
+        "source_id": "src-1",
+        "symbol": "AAPL",
+        "side": "BUY",
+        "environment": "PAPER",
+        "account_alias": "paper-main",
+        "requested_quantity": "10",
+        "configured_order_type": "LIMIT",
+        "configured_time_in_force": "DAY",
+        "order_type": "LIMIT",
+        "quantity": "10",
+        "limit_price": "100.02",
+        "stop_price": "98.02",
+        "time_in_force": "DAY",
+    }
+    shape.update(order)
+    return {"execution_fingerprint": shape}
+
+
+def _history_record(action: str, payload: dict[str, object]) -> ExecutionHistoryRecord:
+    return ExecutionHistoryRecord(
+        action=action, chain_hash="sha256:" + "0" * 64, payload=payload
+    )
+
+
+def _lifecycle(**outcome_order: str) -> tuple[ExecutionHistoryRecord, ...]:
+    prepared = _history_record("EXECUTION_SUBMIT_PREPARED", _prepared_payload())
+    terminal_payload = _prepared_payload(**outcome_order)
+    terminal_payload["submission_outcome"] = "SUBMITTED"
+    return (prepared, _history_record("EXECUTION_OUTCOME", terminal_payload))
+
+
+def test_a_matching_prepared_outcome_pair_reads_normally() -> None:
+    """The control: an honest lifecycle is readable."""
+    require_consistent_lifecycle(_lifecycle())
+
+
+@pytest.mark.parametrize(
+    ("name", "mutation"),
+    [
+        ("quantity", {"quantity": "11"}),
+        ("order type", {"order_type": "MARKET"}),
+        ("time in force", {"time_in_force": "GTC"}),
+        ("limit price", {"limit_price": "101.00"}),
+        ("stop price", {"stop_price": "97.00"}),
+    ],
+)
+def test_an_outcome_resolving_a_different_order_is_unreadable(
+    name: str, mutation: dict[str, str]
+) -> None:
+    """PREPARED says one order, OUTCOME says another. Reconcile, never replay."""
+    with pytest.raises(ExecutionHistoryUnreadableError, match="DIFFERENT order"):
+        require_consistent_lifecycle(_lifecycle(**mutation))
+
+
+@pytest.mark.parametrize(
+    ("name", "missing"),
+    [
+        ("prepared quantity", "quantity"),
+        ("order type", "order_type"),
+        ("time in force", "time_in_force"),
+    ],
+)
+def test_a_terminal_record_missing_the_prepared_order_is_unreadable(
+    name: str, missing: str
+) -> None:
+    """A record that resolves a submission must say WHICH order it resolved."""
+    payload = _prepared_payload(**{missing: ""})
+    payload["submission_outcome"] = "SUBMITTED"
+
+    with pytest.raises(ExecutionHistoryUnreadableError, match="frozen order"):
+        _require_readable("EXECUTION_OUTCOME", "sha256:x", payload)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["source_id", "configured_order_type", "configured_time_in_force"],
+)
+def test_a_record_missing_a_request_identity_field_is_unreadable(
+    missing: str,
+) -> None:
+    """The request identity is the writer's contract, enforced by the reader."""
+    payload = _prepared_payload(**{missing: ""})
+    payload["submission_outcome"] = "SUBMITTED"
+
+    with pytest.raises(ExecutionHistoryUnreadableError, match="incomplete"):
+        _require_readable("EXECUTION_OUTCOME", "sha256:x", payload)
+
+
+def test_the_reader_and_the_writer_share_one_field_contract() -> None:
+    """Structural: neither side restates the field list.
+
+    Two tuples that happen to match today are not a contract. A field added to
+    the writer's identity and forgotten in the reader would mean the reader
+    validated an identity the writer no longer produced.
+    """
+    from trading_contracts.execution_fingerprint import (
+        MANDATORY_PREPARED_FIELDS,
+        PREPARED_ORDER_FIELDS,
+        REQUEST_IDENTITY_FIELDS,
+    )
+
+    assert ExecutionFingerprint.IDENTITY_FIELDS is REQUEST_IDENTITY_FIELDS
+    assert ExecutionFingerprint.ORDER_FIELDS is PREPARED_ORDER_FIELDS
+    assert REQUIRED_IDENTITY_FIELDS is REQUEST_IDENTITY_FIELDS
+    assert REQUIRED_PREPARED_FIELDS is MANDATORY_PREPARED_FIELDS
+    # And the writer really does emit every field the reader demands.
+    written = set(
+        ExecutionFingerprint(
+            decision_id="d", client_order_id="o", strategy_id="s", source_id="src",
+            symbol="AAPL", side="BUY", environment="PAPER", account_alias="a",
+        ).to_dict()
+    )
+    assert set(REQUEST_IDENTITY_FIELDS) <= written
+    assert set(PREPARED_ORDER_FIELDS) <= written
+
+
+def test_an_inconsistent_lifecycle_blocks_the_service_with_zero_submits() -> None:
+    """End to end: unreadable history means reconcile, not submit."""
+
+    class _Inconsistent:
+        def records_for(self, decision_id: str) -> tuple[object, ...]:
+            raise ExecutionHistoryUnreadableError(
+                "terminal record resolves a DIFFERENT order than the one prepared"
+            )
+
+        def records_for_order(self, client_order_id: str) -> tuple[object, ...]:
+            return ()
+
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), history=_Inconsistent()
+    )
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.NEEDS_RECONCILIATION
+    assert _submits(transport) == []
+
+
+# == THE merge gate: one uninterrupted identity chain =======================
+
+
+def test_the_merge_gate_one_identity_from_decision_to_broker_order() -> None:
+    """Every link, real, and the same runtime facts throughout.
+
+    REAL EngineDecision -> REAL TradeRiskRequest -> REAL RiskEngine ->
+    request-bound RiskResult -> REAL PortfolioAllocator -> exact
+    CandidateAllocation -> REAL FinalPreSubmitCheck -> sealed ExecutablePlan ->
+    REAL SingleUseAuthorization -> ExecutionService -> ExecutionAgent ->
+    ReadinessGuardedBroker -> the real IbkrPaperAdapter over a deterministic
+    transport.
+
+    Nothing here is hand-built: not a risk ref, not an allocation, not an
+    allocation bound, not a plan ref, not a PreSubmitCheckResult, not a token.
+    The gate is that the plan FinalPreSubmit approved is bit-for-bit the
+    OrderIntent the transport received.
+    """
+    intent = _intent()
+    authority = _TestOnlyAuthorization()
+    transport = PnlAwareTransport()
+    service, _, _ = _service(
+        transport=transport, adapter=_adapter(transport), authorization=authority
+    )
+
+    evaluation = service.execute(intent)
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED, evaluation.reasons
+    assert evaluation.authorization is not None
+    pre_submit = evaluation.authorization.pre_submit
+    allocation = evaluation.authorization.allocation
+    risk_result = evaluation.risk_result
+    context = evaluation.plan_context
+    assert pre_submit is not None and allocation is not None
+    assert risk_result is not None and context is not None
+    plan = pre_submit.authorized_plan
+    assert plan is not None
+
+    # -- every link names the link before it, by canonical identity --------
+    assert risk_result.decision_ref == decision_identity(intent.decision)
+    assert risk_result.request_ref == risk_request_identity(context.risk_request)
+    assert allocation.decision_ref == risk_result.decision_ref
+    assert allocation.risk_ref == risk_result_identity(risk_result)
+    assert pre_submit.allocation_ref == allocation_identity(allocation)
+    assert pre_submit.risk_ref == allocation.risk_ref
+    assert pre_submit.decision_ref == risk_result.decision_ref
+    assert pre_submit.policy_ref == pre_submit_policy_identity(PRE_SUBMIT_POLICY)
+
+    # -- the plan seals all of it, plus the order --------------------------
+    assert plan.decision_ref == risk_result.decision_ref
+    assert plan.risk_request_ref == risk_result.request_ref
+    assert plan.risk_ref == pre_submit.risk_ref
+    assert plan.allocation_ref == pre_submit.allocation_ref
+    assert pre_submit.plan_ref == plan_identity(plan)
+    assert pre_submit.authorization is not None
+    assert pre_submit.authorization.plan_ref == pre_submit.plan_ref
+
+    # -- the authorized size respects BOTH ceilings ------------------------
+    assert pre_submit.authorized_quantity <= risk_result.approved_quantity
+    assert pre_submit.authorized_quantity <= allocation.allocated_quantity
+
+    # -- and the broker received exactly that plan, once -------------------
+    assert len(_submits(transport)) == 1
+    order = transport.submitted_intents[0]
+    assert order.symbol == plan.symbol
+    assert order.side.value == plan.side
+    assert order.quantity == plan.quantity
+    assert order.order_type == plan.order_type
+    assert order.limit_price == plan.limit_price
+    assert order.stop_price == plan.stop_price
+    assert order.time_in_force.value == plan.time_in_force
+    assert order.account_alias == plan.account_alias
+    assert order.environment == plan.environment
+    # The same runtime quote drove the whole chain.
+    assert plan.limit_price == context.entry_price == Decimal("100.025")
+
+    # -- and production still refuses ---------------------------------------
+    production, production_transport, _ = _service()
+    refused = production.execute(_intent(client_order_id="prod-1"))
+    assert refused.stage is ExecutionStage.AUTHORIZATION_DENIED
+    assert _submits(production_transport) == []
+
+
+# == the probe reports what broke, not who we are ============================
+
+
+def test_the_probe_never_prints_foreign_exception_text() -> None:
+    """Broker/database/filesystem messages carry DSNs, paths and account ids.
+
+    Probe output is read by an operator and pasted into issues and chats, so a
+    third party's exception text is not printed at all -- the type is, and a
+    canonical code when there is one.
+    """
+
+    class _LeakyQuotes:
+        def current_quote(self, symbol: str) -> QuoteState:
+            raise ConnectionError(
+                "could not connect to postgres://tws:hunter2@10.0.0.4:5432/ib"
+                " for account DU1234567 (C:\\Users\\owner\\ibkr\\session.log)"
+            )
+
+    service, _, _ = _service(quotes=_LeakyQuotes())
+
+    evidence = service.collect_evidence(_intent())
+
+    detail = next(d for name, _ok, d in evidence.observations if name == "quote")
+    assert "ConnectionError" in detail
+    for secret in ("hunter2", "postgres://", "DU1234567", "10.0.0.4", "C:\\Users"):
+        assert secret not in detail, f"{secret!r} leaked into owner output"
+
+
+def test_a_known_application_error_still_reports_its_safe_code() -> None:
+    """Being safe must not mean being useless."""
+    from trading_broker_core.port import BrokerErrorCode, BrokerPortError
+
+    class _CodedQuotes:
+        def current_quote(self, symbol: str) -> QuoteState:
+            raise BrokerPortError(
+                BrokerErrorCode.BROKER_UNHEALTHY,
+                "no market data for account DU1234567",
+            )
+
+    service, _, _ = _service(quotes=_CodedQuotes())
+
+    evidence = service.collect_evidence(_intent())
+
+    detail = next(d for name, _ok, d in evidence.observations if name == "quote")
+    assert "BROKER_UNHEALTHY" in detail, "the safe reason code IS reported"
+    assert "DU1234567" not in detail, "the account id is not"

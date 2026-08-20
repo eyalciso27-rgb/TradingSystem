@@ -49,8 +49,11 @@ from trading_application.emergency import (
 )
 from trading_application.execution_identity import (
     decision_identity,
+    plan_identity,
+    risk_request_identity,
     risk_result_identity,
 )
+from trading_application.execution_plan import ExecutablePlan
 from trading_application.portfolio_allocator import CandidateAllocation
 from trading_application.pre_submit_check import (
     ApprovalState,
@@ -67,7 +70,7 @@ from trading_application.pre_submit_check import (
     StaleAction,
     SubmitAuthorization,
 )
-from trading_application.risk_engine import RiskResult
+from trading_application.risk_engine import RiskResult, TradeRiskRequest
 from trading_broker_core.fake import DEFAULT_CAPABILITIES, FakeBroker
 from trading_broker_core.port import (
     AccountSnapshot,
@@ -153,11 +156,33 @@ class ExecutionDrill:
         self.reconciliation = ReconciliationEngine(RECON_POLICY)
 
     def request(self, client_order_id: str, *, owner_approved: bool = True) -> ExecutionRequest:
+        # The order is the SEALED plan: the agent reads every order field from
+        # it, and refuses anything whose identity does not match the result and
+        # the token.
+        plan = ExecutablePlan(
+            decision_ref="decision:d1@sha256:" + "c" * 64,
+            risk_request_ref="risk-request:AAPL@sha256:" + "c" * 64,
+            risk_ref="risk-result:sha256:" + "c" * 64,
+            allocation_ref=f"allocation:cand-{client_order_id}@sha256:" + "c" * 64,
+            strategy_id="strat-1",
+            source_id="src-1",
+            environment=Environment.PAPER,
+            account_alias="paper-main",
+            symbol="AAPL",
+            side=OrderSide.BUY.value,
+            quantity=Decimal("1"),
+            order_type=OrderType.LIMIT,
+            time_in_force="DAY",
+            limit_price=Decimal("10"),
+            stop_price=None,
+        )
+        sealed = plan_identity(plan)
         authorization = (
             SubmitAuthorization(
                 candidate_id=f"cand-{client_order_id}",
                 authorized_quantity=Decimal("1"),
                 authorized_at=AS_OF,
+                plan_ref=sealed,
             )
             if owner_approved
             else None
@@ -174,21 +199,15 @@ class ExecutionDrill:
             checks=(),
             reason_codes=("PRE_SUBMIT_CLEARED",),
             input_refs=("observation:a-1@src-1",),
+            authorized_plan=plan if authorization else None,
+            plan_ref=sealed if authorization else "",
         )
         return ExecutionRequest(
             client_order_id=client_order_id,
             correlation_id=f"corr-{client_order_id}",
             pre_submit=pre_submit,
             authorization=SingleUseAuthorization(authorization) if authorization else None,
-            environment=Environment.PAPER,
-            account_alias="paper-main",
-            symbol="AAPL",
-            side=OrderSide.BUY,
-            order_type=OrderType.LIMIT,
-            limit_price=Decimal("10"),
-            stop_price=None,
-            strategy_id="strat-1",
-            source_id="src-1",
+            plan=plan,
         )
 
     def processed_event_ids(self) -> frozenset[str]:
@@ -444,11 +463,27 @@ def _risk() -> RiskResult:
         max_loss_amount=Decimal("100"),
         risk_budget_equity=Decimal("50000"),
         decision_ref=decision_identity(_decision()),
+        request_ref=risk_request_identity(_risk_request()),
         policy_ref="risk-policy:r1@sha256:" + "0" * 64,
         engine_version="risk-engine-1.0.0",
         checks=(),
         reason_codes=(),
         input_refs=("observation:a-1@src-1",),
+    )
+
+
+def _risk_request() -> TradeRiskRequest:
+    """THE question this risk result answers, so its identity says which."""
+    return TradeRiskRequest(
+        symbol="AAPL",
+        sector="tech",
+        cluster="megacap",
+        source_id="src-1",
+        strategy_id="strat-1",
+        environment=Environment.PAPER,
+        requested_quantity=Decimal("100"),
+        entry_price=Decimal("10"),
+        stop_price=Decimal("9"),
     )
 
 
@@ -502,12 +537,17 @@ def _request() -> PreSubmitRequest:
         allocation=_allocation(),
         risk_result=_risk(),
         decision=_decision(),
+        risk_request=_risk_request(),
         symbol="AAPL",
         strategy_id="strat-1",
         source_id="src-1",
         environment=Environment.PAPER,
         planned_entry_price=Decimal("10"),
         planned_stop_price=Decimal("9"),
+        side=OrderSide.BUY.value,
+        account_alias="paper-main",
+        order_type=OrderType.LIMIT,
+        time_in_force="DAY",
     )
 
 

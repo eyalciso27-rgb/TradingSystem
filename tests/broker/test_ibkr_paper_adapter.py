@@ -63,6 +63,10 @@ class FakePaperTransport:
         daily_pnl: Decimal | None = None,
     ) -> None:
         self.calls: list[str] = []
+        #: Every OrderIntent this transport was actually handed. The call
+        #: log records that a submit happened; this records WHAT was sent,
+        #: which is what a seal test has to compare against.
+        self.submitted_intents: list[OrderIntent] = []
         #: What reqPnL would answer. None (the default) means the gateway does
         #: not serve one, which is the common real case.
         self.daily_pnl = daily_pnl
@@ -141,6 +145,7 @@ class FakePaperTransport:
 
     def submit(self, broker_order_id: int, account_id: str, intent: OrderIntent) -> str:
         self.calls.append(f"submit:{broker_order_id}:{intent.client_order_id}")
+        self.submitted_intents.append(intent)
         # Faithfully round-trip the orderRef codec so the snapshot can recover
         # the client_order_id after a "restart" (a fresh adapter instance).
         self._live[broker_order_id] = RawOpenOrder(
