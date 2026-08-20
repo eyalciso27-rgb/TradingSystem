@@ -144,6 +144,7 @@ class LifecycleDrill:
         # The SEALED order. Every order field the agent sends is read from it,
         # and its identity has to match both the result and the token.
         plan = ExecutablePlan(
+            client_order_id=client_order_id,
             decision_ref="decision:d1@sha256:" + "c" * 64,
             risk_request_ref="risk-request:AAPL@sha256:" + "c" * 64,
             risk_ref="risk-result:sha256:" + "c" * 64,
@@ -187,7 +188,6 @@ class LifecycleDrill:
             plan_ref=sealed if authorization else "",
         )
         return ExecutionRequest(
-            client_order_id=client_order_id,
             correlation_id=f"corr-{client_order_id}",
             pre_submit=pre_submit,
             authorization=SingleUseAuthorization(authorization) if authorization else None,

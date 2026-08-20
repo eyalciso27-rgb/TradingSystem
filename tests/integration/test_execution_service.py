@@ -30,12 +30,14 @@ from trading_application.decision_engine import DecisionExplanation, EngineDecis
 from trading_application.emergency import HaltRecord
 from trading_application.execution_identity import (
     allocation_identity,
+    authorization_identity,
     decision_identity,
     plan_identity,
     pre_submit_policy_identity,
     risk_request_identity,
     risk_result_identity,
 )
+from trading_application.execution_plan import ExecutablePlan
 from trading_application.portfolio_allocator import (
     AllocationCandidate,
     CandidateAllocation,
@@ -415,6 +417,7 @@ def _pre_submit_request(
         account_alias=context.account_alias,
         order_type=context.order_type,
         time_in_force=context.time_in_force,
+        client_order_id=context.client_order_id,
     )
 
 
@@ -493,6 +496,7 @@ def _real_authorization(
             account_alias=facts.account_alias,
             order_type=facts.order_type,
             time_in_force=facts.time_in_force,
+            client_order_id=facts.client_order_id,
         ),
         RefreshedMarket(price=entry, observed_at=NOW),
         RefreshedAccount(risk_budget_equity=Decimal("50000"), observed_at=NOW),
@@ -565,6 +569,9 @@ def _service(
     entry_latch: object | None = None,
     protection: object | None = None,
     protection_required: bool = False,
+    # Never None. Durable history is mandatory for an execution-capable
+    # service, so a test that omits it gets a real in-memory one rather than a
+    # service with no restart-safe idempotency.
     history: object | None = None,
     # Deliberately `object`: the service takes protocols, and a test fake that
     # implements the protocol is a valid quote source or audit sink whether or
@@ -616,7 +623,7 @@ def _service(
         authorization=authorization,  # type: ignore[arg-type]
         universe=(lambda: universe) if universe is not None else None,
         portfolio=portfolio,  # type: ignore[arg-type]
-        history=history,  # type: ignore[arg-type]
+        history=history if history is not None else _History(),  # type: ignore[arg-type]
         protection=protection,  # type: ignore[arg-type]
         universe_status=(lambda: universe_status) if universe_status else None,
         halts=lambda: halts,
@@ -1159,7 +1166,6 @@ def _execution_request(intent: ExecutionIntent) -> ExecutionRequest:
     pre_submit = _authorization_for(evaluated)
     assert pre_submit.authorized_plan is not None
     return ExecutionRequest(
-        client_order_id=intent.client_order_id,
         correlation_id=intent.correlation_id,
         pre_submit=pre_submit,
         authorization=single_use_authorization(pre_submit),
@@ -1760,6 +1766,7 @@ def test_a_risk_policy_mismatch_between_config_and_engine_is_refused() -> None:
                 simulation_equity_cap=Decimal("50000"),
             ),
             entry_gate=_PermissiveLatch(),
+            history=_History(),
         )
 
 
@@ -3047,7 +3054,6 @@ def test_the_agent_refuses_a_plan_that_is_not_the_one_authorized() -> None:
     assert pre_submit.authorized_plan is not None
 
     substituted = ExecutionRequest(
-        client_order_id=intent.client_order_id,
         correlation_id=intent.correlation_id,
         pre_submit=pre_submit,
         authorization=single_use_authorization(pre_submit),
@@ -3628,7 +3634,8 @@ def test_the_merge_gate_one_identity_from_decision_to_broker_order() -> None:
     assert pre_submit.decision_ref == risk_result.decision_ref
     assert pre_submit.policy_ref == pre_submit_policy_identity(PRE_SUBMIT_POLICY)
 
-    # -- the plan seals all of it, plus the order --------------------------
+    # -- the plan seals all of it, plus the order INCLUDING its broker key --
+    assert plan.client_order_id == intent.client_order_id
     assert plan.decision_ref == risk_result.decision_ref
     assert plan.risk_request_ref == risk_result.request_ref
     assert plan.risk_ref == pre_submit.risk_ref
@@ -3644,6 +3651,10 @@ def test_the_merge_gate_one_identity_from_decision_to_broker_order() -> None:
     # -- and the broker received exactly that plan, once -------------------
     assert len(_submits(transport)) == 1
     order = transport.submitted_intents[0]
+    assert order.client_order_id == plan.client_order_id
+    assert order.authorization_ref == authorization_identity(
+        pre_submit.authorization
+    ), "the canonical authorization identity, naming the exact plan"
     assert order.symbol == plan.symbol
     assert order.side.value == plan.side
     assert order.quantity == plan.quantity
@@ -3655,6 +3666,17 @@ def test_the_merge_gate_one_identity_from_decision_to_broker_order() -> None:
     assert order.environment == plan.environment
     # The same runtime quote drove the whole chain.
     assert plan.limit_price == context.entry_price == Decimal("100.025")
+
+    # -- one authorization can never become two broker orderRefs -----------
+    replayed = service.execute(intent)
+    assert replayed.stage is ExecutionStage.SUBMITTED
+    assert "already durably recorded" in " ".join(replayed.reasons) or (
+        "idempotent retry" in " ".join(replayed.reasons)
+    )
+    assert len(_submits(transport)) == 1
+    assert {order.client_order_id for order in transport.submitted_intents} == {
+        plan.client_order_id
+    }
 
     # -- and production still refuses ---------------------------------------
     production, production_transport, _ = _service()
@@ -3709,3 +3731,345 @@ def test_a_known_application_error_still_reports_its_safe_code() -> None:
     detail = next(d for name, _ok, d in evidence.observations if name == "quote")
     assert "BROKER_UNHEALTHY" in detail, "the safe reason code IS reported"
     assert "DU1234567" not in detail, "the account id is not"
+
+
+# == the broker idempotency key is INSIDE the seal ==========================
+#
+# The hole this closes: ExecutablePlan fixed the symbol, side, size, type,
+# prices, TIF and account -- and `client_order_id` sat outside it as an
+# independently settable field on ExecutionRequest. That is the broker's
+# deduplication key and IBKR's orderRef, so one authorized plan could be sent
+# under two different order ids and become two distinct broker orders.
+
+
+def test_one_authorization_cannot_become_two_broker_orders() -> None:
+    """THE regression. On the previous head this produced two submits.
+
+    One genuine pre-submit result, one genuine sealed plan, and two attempts to
+    send it under different order ids. The second must be unrepresentable or
+    refused, and the broker must never see two orders.
+    """
+    intent = _intent()
+    service, transport, _ = _service(authorization=_TestOnlyAuthorization())
+    evaluated = service.evaluate(intent)
+    assert evaluated.risk_result is not None
+    pre_submit = _authorization_for(evaluated)
+    assert pre_submit.authorized_plan is not None
+    plan = pre_submit.authorized_plan
+
+    first = ExecutionRequest(
+        correlation_id=intent.correlation_id,
+        pre_submit=pre_submit,
+        authorization=single_use_authorization(pre_submit),
+        plan=plan,
+    )
+    # A SECOND independent single-use wrapper around the same genuine result --
+    # the public API permits it, so the defence cannot rely on it not happening.
+    second = ExecutionRequest(
+        correlation_id=intent.correlation_id,
+        pre_submit=pre_submit,
+        authorization=single_use_authorization(pre_submit),
+        plan=plan,
+    )
+
+    assert first.client_order_id == second.client_order_id == plan.client_order_id, (
+        "there is no way to give the same sealed plan a different order id"
+    )
+
+    service._agent.process(first)  # noqa: SLF001
+    service._agent.process(second)  # noqa: SLF001
+
+    submitted = transport.submitted_intents
+    assert len(submitted) <= 1, "one authorization, at most one broker order"
+    assert len({order.client_order_id for order in submitted}) <= 1, (
+        "one authorization can never produce two distinct broker orderRefs"
+    )
+
+
+def test_a_substituted_order_id_is_refused_at_the_agent_boundary() -> None:
+    """The order id is sealed, so changing it alone breaks the seal."""
+    intent = _intent()
+    service, transport, _ = _service(authorization=_TestOnlyAuthorization())
+    evaluated = service.evaluate(intent)
+    assert evaluated.risk_result is not None
+    pre_submit = _authorization_for(evaluated)
+    assert pre_submit.authorized_plan is not None
+
+    substituted = ExecutionRequest(
+        correlation_id=intent.correlation_id,
+        pre_submit=pre_submit,
+        authorization=single_use_authorization(pre_submit),
+        # Everything else identical; only the broker's idempotency key differs.
+        plan=replace(pre_submit.authorized_plan, client_order_id="order-B"),
+    )
+
+    outcome = service._agent.process(substituted)  # noqa: SLF001
+
+    assert outcome.status is ExecutionStatus.REFUSED
+    assert "PLAN_NOT_THE_ONE_CHECKED" in outcome.reason_codes
+    assert "NOT_SENT" in outcome.reason_codes
+    assert _submits(transport) == []
+
+
+def test_the_order_id_is_part_of_the_plan_identity() -> None:
+    """Two plans differing only by order id are two different plans."""
+    service, _, _ = _service(authorization=_TestOnlyAuthorization())
+    evaluated = service.evaluate(_intent())
+    assert evaluated.risk_result is not None
+    pre_submit = _authorization_for(evaluated)
+    assert pre_submit.authorized_plan is not None
+    plan = pre_submit.authorized_plan
+
+    assert plan_identity(plan) != plan_identity(
+        replace(plan, client_order_id="order-B")
+    )
+    assert pre_submit.authorization is not None
+    assert pre_submit.authorization.plan_ref == plan_identity(plan), (
+        "the token authorizes the order id too"
+    )
+
+
+def test_the_agent_takes_the_order_id_from_the_sealed_plan() -> None:
+    """Not from the request, because the request no longer has one."""
+    authority = _TestOnlyAuthorization()
+    service, transport, _ = _service(authorization=authority)
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED, evaluation.reasons
+    assert evaluation.authorization is not None
+    pre_submit = evaluation.authorization.pre_submit
+    assert pre_submit is not None and pre_submit.authorized_plan is not None
+    assert transport.submitted_intents[0].client_order_id == (
+        pre_submit.authorized_plan.client_order_id
+    )
+
+
+def test_no_broker_bound_order_field_is_independently_settable() -> None:
+    """Structural, and now including the broker idempotency key.
+
+    The previous version of this test omitted `client_order_id`, which is
+    exactly how the remaining substitution stayed hidden: every field it named
+    was sealed, and the one it did not name was not.
+    """
+    from dataclasses import fields as dataclass_fields
+
+    settable = {field.name for field in dataclass_fields(ExecutionRequest)}
+    sealed = {field.name for field in dataclass_fields(ExecutablePlan)}
+
+    for order_fact in (
+        "client_order_id", "symbol", "side", "quantity", "order_type",
+        "limit_price", "stop_price", "time_in_force", "environment",
+        "account_alias",
+    ):
+        assert order_fact not in settable, (
+            f"{order_fact} is a settable field on ExecutionRequest, so an order"
+            " fact can differ from the sealed plan"
+        )
+        assert order_fact in sealed, f"{order_fact} is not inside the seal"
+        assert hasattr(ExecutionRequest, order_fact), (
+            f"{order_fact} must still be readable -- from the plan"
+        )
+
+    # Only the correlation id and the sealed objects remain settable. A
+    # correlation id is a tracing label; it is not a broker-bound order fact.
+    assert settable == {"correlation_id", "pre_submit", "authorization", "plan"}
+
+
+def test_the_broker_receipt_carries_the_canonical_authorization_identity() -> None:
+    """One authorization identity format, content-addressed, naming the plan."""
+    authority = _TestOnlyAuthorization()
+    service, transport, _ = _service(authorization=authority)
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED, evaluation.reasons
+    assert evaluation.authorization is not None
+    pre_submit = evaluation.authorization.pre_submit
+    assert pre_submit is not None and pre_submit.authorization is not None
+    expected = authorization_identity(pre_submit.authorization)
+
+    assert transport.submitted_intents[0].authorization_ref == expected
+    assert evaluation.outcome is not None and evaluation.outcome.receipt is not None
+    assert evaluation.outcome.receipt.authorization_ref == expected
+    assert "@sha256:" in expected, "content-addressed, not a timestamp"
+    # ...and it really does identify the plan: a different plan_ref is a
+    # different authorization identity.
+    assert expected != authorization_identity(
+        replace(pre_submit.authorization, plan_ref="plan:OTHER@sha256:" + "0" * 64)
+    )
+
+
+def test_the_agent_refuses_a_token_minted_by_another_result() -> None:
+    """The final boundary verifies the exact authorization PAIR."""
+    intent = _intent()
+    service, transport, _ = _service(authorization=_TestOnlyAuthorization())
+    evaluated = service.evaluate(intent)
+    assert evaluated.risk_result is not None
+    mine = _authorization_for(evaluated)
+    # A genuine token from a genuinely different authorization. Two byte-equal
+    # authorizations ARE the same authorization -- same plan, same size, same
+    # instant -- so the comparison that matters is by value, and this is a
+    # materially different one.
+    theirs = _oversized(_authorization_for(evaluated), Decimal("9"))
+    assert mine.authorized_plan is not None
+    assert theirs.authorization is not None
+
+    crossed = ExecutionRequest(
+        correlation_id=intent.correlation_id,
+        pre_submit=mine,
+        authorization=SingleUseAuthorization(theirs.authorization),
+        plan=mine.authorized_plan,
+    )
+
+    outcome = service._agent.process(crossed)  # noqa: SLF001
+
+    assert outcome.status is ExecutionStatus.REFUSED
+    assert "AUTHORIZATION_IS_NOT_THE_ONE_MINTED" in outcome.reason_codes
+    assert "NOT_SENT" in outcome.reason_codes
+    assert _submits(transport) == []
+
+
+# == durable history is not optional for an execution-capable service ========
+
+
+def test_an_execution_service_cannot_be_built_without_durable_history() -> None:
+    """Structural: there is no submission-capable object without a history.
+
+    `history` used to default to None and `_durable_verdict` simply returned
+    None when it was absent -- so supplying an authority was enough to make a
+    service submission-capable with no restart-safe idempotency at all.
+    """
+    import inspect
+
+    parameter = inspect.signature(ExecutionService.__init__).parameters["history"]
+    assert parameter.default is inspect.Parameter.empty, (
+        "history has a default again, so a service can be built without one"
+    )
+
+    with pytest.raises(ExecutionServiceError, match="durable execution history"):
+        ExecutionService(
+            broker=_adapter(),
+            quotes=_Quotes(),
+            audit=_Audit(),
+            risk_engine=RiskEngine(POLICY),
+            config=ExecutionConfig(
+                mode=TradingMode.PAPER,
+                environment=Environment.PAPER,
+                account_alias="paper-main",
+                requirements=StrategyDataRequirements(strategy_id="s"),
+                rules=MarketDataRules(),
+                risk_policy=POLICY,
+                simulation_equity_cap=Decimal("50000"),
+            ),
+            entry_gate=_PermissiveLatch(),
+            history=None,  # type: ignore[arg-type]
+            authorization=_TestOnlyAuthorization(),
+        )
+
+
+# == single-flight: two concurrent calls cannot both submit ==================
+
+
+def test_a_re_entrant_duplicate_cannot_submit_a_second_order() -> None:
+    """The exact interleaving, deterministically.
+
+    The second attempt runs from INSIDE the first, at the moment the first has
+    read an empty history and not yet written anything -- which is precisely the
+    window where the durable check cannot help, because there is nothing durable
+    to see yet.
+    """
+    intent = _intent()
+    service, transport, _ = _service(authorization=_TestOnlyAuthorization())
+    duplicates: list[ExecutionStage] = []
+
+    original = service._quotes.current_quote  # noqa: SLF001
+    entered = False
+
+    def racing(symbol: str) -> QuoteState:
+        nonlocal entered
+        if not entered:
+            entered = True
+            # Re-enter with the SAME identity, before the first attempt has
+            # prepared or submitted anything.
+            duplicates.append(service.execute(intent).stage)
+        return original(symbol)
+
+    service._quotes.current_quote = racing  # type: ignore[method-assign] # noqa: SLF001
+
+    first = service.execute(intent)
+
+    assert duplicates == [ExecutionStage.ALREADY_IN_FLIGHT]
+    assert first.stage is ExecutionStage.SUBMITTED, first.reasons
+    assert len(_submits(transport)) == 1, "exactly one order reached the broker"
+
+
+def test_two_threads_racing_the_same_execution_submit_at_most_once() -> None:
+    """Real threads, released together by a barrier."""
+    import threading
+
+    intent = _intent()
+    service, transport, _ = _service(authorization=_TestOnlyAuthorization())
+    start = threading.Barrier(2)
+    stages: list[ExecutionStage] = []
+    guard = threading.Lock()
+
+    def run() -> None:
+        start.wait(timeout=5)
+        evaluation = service.execute(intent)
+        with guard:
+            stages.append(evaluation.stage)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(stages) == 2
+    assert len(_submits(transport)) <= 1, "at most one broker order"
+    assert ExecutionStage.SUBMITTED in stages or ExecutionStage.ALREADY_IN_FLIGHT in stages
+
+
+def test_competing_order_ids_for_one_decision_produce_one_winner() -> None:
+    """Same decision, two different client order ids. Never two orders."""
+    store = _LinkedStore()
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), audit=store, history=store
+    )
+
+    first = service.execute(_intent(client_order_id="race-A"))
+    second = service.execute(_intent(client_order_id="race-B"))
+
+    assert first.stage is ExecutionStage.SUBMITTED, first.reasons
+    assert second.stage is not ExecutionStage.SUBMITTED, second.reasons
+    assert len(_submits(transport)) == 1, "one decision, one order"
+
+
+def test_the_single_flight_claim_is_released_after_a_refusal() -> None:
+    """A refused attempt must not wedge the identity permanently."""
+    service, transport, _ = _service(authorization=_TestOnlyAuthorization(allowed=False))
+
+    first = service.execute(_intent())
+    second = service.execute(_intent())
+
+    assert first.stage is ExecutionStage.AUTHORIZATION_DENIED
+    assert second.stage is ExecutionStage.AUTHORIZATION_DENIED, (
+        "the claim was released, so this is a fresh refusal rather than the"
+        " identity being wedged as permanently in flight"
+    )
+    assert _submits(transport) == []
+
+
+def test_the_single_flight_scope_is_documented_as_single_process() -> None:
+    """We do not claim multi-process ownership we do not have.
+
+    A durable claim with a uniqueness constraint would be needed for that, and
+    the canonical execution path does not have one yet. Saying so is the point.
+    """
+    from trading_execution_agent import execution_service as module
+
+    doc = module._SingleFlight.__doc__ or ""  # noqa: SLF001
+
+    assert "single-PROCESS" in doc
+    assert "does NOT provide multi-process" in doc

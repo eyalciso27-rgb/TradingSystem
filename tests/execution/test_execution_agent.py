@@ -56,6 +56,7 @@ def make_broker(*, healthy: bool = True) -> FakeBroker:
 
 def plan(
     *,
+    client_order_id: str = "ord-1",
     quantity: str = "100",
     symbol: str = "AAPL",
     side: str = "BUY",
@@ -68,6 +69,7 @@ def plan(
 ) -> ExecutablePlan:
     """The sealed order. The agent reads every order field from this."""
     return ExecutablePlan(
+        client_order_id=client_order_id,
         decision_ref="decision:d1@sha256:" + "b" * 64,
         risk_request_ref="risk-request:AAPL@sha256:" + "c" * 64,
         risk_ref="risk-result:sha256:" + "d" * 64,
@@ -134,7 +136,10 @@ def request(
     account_alias: str = "paper-main",
 ) -> ExecutionRequest:
     sealed_plan = plan(
-        quantity=quantity, environment=environment, account_alias=account_alias
+        client_order_id=client_order_id,
+        quantity=quantity,
+        environment=environment,
+        account_alias=account_alias,
     )
     result, auto_token = pre_submit_result(
         action=action, quantity=quantity, for_plan=sealed_plan
@@ -142,7 +147,6 @@ def request(
     resolved = auto_token if token == "auto" else token
     assert resolved is None or isinstance(resolved, SingleUseAuthorization)
     return ExecutionRequest(
-        client_order_id=client_order_id,
         correlation_id=f"corr-{client_order_id}",
         pre_submit=result,
         authorization=resolved,
@@ -280,12 +284,38 @@ def test_missing_authorization_refused_nothing_sent() -> None:
 def test_consumed_authorization_never_submits_twice() -> None:
     broker = make_broker()
     agent = make_agent(broker)
-    _, token = pre_submit_result()
-    assert token is not None
-    token.consume()  # consumed elsewhere first
-    outcome = agent.process(request("ord-3", token=token))
+    # This request's OWN token, spent elsewhere first. It has to be its own:
+    # a token minted by a different pre-submit result is refused earlier now,
+    # by the authorization-pair check, which would hide the single-use property
+    # this test exists to prove.
+    queued = request("ord-3")
+    assert queued.authorization is not None
+    queued.authorization.consume()
+
+    outcome = agent.process(queued)
+
     assert outcome.status is ExecutionStatus.REFUSED
     assert "AUTHORIZATION_ALREADY_CONSUMED" in outcome.reason_codes
+    assert broker.get_open_orders("paper-main") == ()
+
+
+def test_a_token_minted_by_another_result_never_submits() -> None:
+    """Defence in depth at the component that actually submits.
+
+    The service checks the pair too. The agent is the boundary that sends, and
+    a boundary that trusts its caller is not a boundary: a token which merely
+    agrees about the plan is not the token this result minted.
+    """
+    broker = make_broker()
+    agent = make_agent(broker)
+    _, foreign = pre_submit_result()
+    assert foreign is not None
+
+    outcome = agent.process(request("ord-foreign", token=foreign))
+
+    assert outcome.status is ExecutionStatus.REFUSED
+    assert "AUTHORIZATION_IS_NOT_THE_ONE_MINTED" in outcome.reason_codes
+    assert "NOT_SENT" in outcome.reason_codes
     assert broker.get_open_orders("paper-main") == ()
 
 

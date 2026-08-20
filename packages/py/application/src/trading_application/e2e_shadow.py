@@ -842,6 +842,10 @@ class E2EShadowHarness:
                 account_alias="research",
                 order_type=OrderType.LIMIT,
                 time_in_force="DAY",
+                # Shadow-only and never sent, but stated rather than blank: a
+                # shadow run that evaluates an order without an identity is
+                # evaluating something no broker could have received.
+                client_order_id=f"shadow-{cid}",
             ),
             RefreshedMarket(
                 price=Decimal(market_raw) if market_raw.strip() else entry_price,

@@ -54,6 +54,15 @@ class ExecutablePlan:
     risk_ref: str
     allocation_ref: str
 
+    # -- the broker's own idempotency key ------------------------------------
+    #: THE order id the broker will see, and IBKR's ``orderRef``. It lived
+    #: outside the seal until the fourth review round: the plan fixed the
+    #: symbol, side, size, type, prices and account, and a later component was
+    #: still free to attach a different order id to the very same authorized
+    #: plan. That is the broker's deduplication key, so an unsealed one means
+    #: one authorization could become two distinct broker orders.
+    client_order_id: str
+
     # -- who is trading, and where -------------------------------------------
     strategy_id: str
     source_id: str
@@ -72,6 +81,8 @@ class ExecutablePlan:
     def __post_init__(self) -> None:
         if self.quantity <= 0:
             raise ValueError("an executable plan must have a positive quantity")
+        if not self.client_order_id.strip():
+            raise ValueError("client_order_id is mandatory on an executable plan")
         for name in ("decision_ref", "risk_request_ref", "risk_ref", "allocation_ref"):
             if not str(getattr(self, name)).strip():
                 # A plan whose lineage is blank proves nothing about what

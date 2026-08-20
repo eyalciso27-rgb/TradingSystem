@@ -171,7 +171,16 @@ def plan_identity(plan: ExecutablePlan) -> str:
 
 
 def authorization_identity(authorization: _Dataclassish) -> str:
-    """One minted SubmitAuthorization, by its own content."""
+    """One minted SubmitAuthorization, by its own content.
+
+    Content-addressed over every field, which includes ``plan_ref`` -- so this
+    reference identifies the exact authorization AND says which plan it
+    authorized. The agent used to build ``submit-auth:{candidate}@{timestamp}``
+    by hand for the broker receipt and the audit lineage: that proved neither,
+    and every authorization minted for one candidate within the same second
+    shared it. There is deliberately ONE authorization identity format, and
+    this is it.
+    """
     candidate = str(getattr(authorization, "candidate_id", "unknown"))
     return f"submit-auth:{candidate}@sha256:{_content(authorization)}"
 

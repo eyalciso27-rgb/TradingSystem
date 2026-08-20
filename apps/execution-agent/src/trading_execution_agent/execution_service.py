@@ -60,6 +60,7 @@ from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
 from enum import StrEnum
+from threading import Lock
 from typing import Protocol, runtime_checkable
 
 from trading_application.decision_engine import EngineDecision
@@ -217,6 +218,48 @@ def _probe_failure(name: str, error: BaseException) -> str:
 
 UNKNOWN_CLASSIFICATION = "UNKNOWN"
 
+
+class _SingleFlight:
+    """One in-flight execution per identity, within THIS process.
+
+    The durable history answers "did this already happen". It cannot answer "is
+    this happening right now in another thread", because the first attempt has
+    not written anything yet at the moment the second one reads. Two concurrent
+    calls could therefore both find an empty history, both prepare, and both
+    submit.
+
+    So a claim is taken before the durable check and released after the outcome
+    is recorded. Both the decision id and the client order id are claimed: two
+    different order ids racing for one decision must serialise (the loser then
+    meets the durable conflict check and is refused), and one order id racing
+    across two decisions must serialise for the same reason.
+
+    **Scope, stated honestly: this is a single-PROCESS guarantee.** The
+    execution agent runs as one process today, and this makes that process safe.
+    It does NOT provide multi-process or multi-host atomic ownership -- that
+    needs a durable claim with a uniqueness constraint, which this system does
+    not yet have for the canonical execution path. A second execution-agent
+    process would not be protected by this, and nothing here should be read as
+    claiming otherwise.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._claimed: set[str] = set()
+
+    def claim(self, *keys: str) -> tuple[str, ...] | None:
+        """Take ALL of these keys, or none of them. None means refused."""
+        wanted = tuple(key for key in keys if key)
+        with self._lock:
+            if any(key in self._claimed for key in wanted):
+                return None
+            self._claimed.update(wanted)
+        return wanted
+
+    def release(self, keys: tuple[str, ...]) -> None:
+        with self._lock:
+            self._claimed.difference_update(keys)
+
 #: The terminal outcome of a prepared attempt the FINAL boundary refused before
 #: the broker call. Distinct from a refusal by the broker: this one is proof
 #: that nothing was sent, and a replay must reconstruct it as such rather than
@@ -291,6 +334,9 @@ class ExecutionStage(StrEnum):
     #: The observation path itself failed. Not a verdict about the market or
     #: the account -- a statement that we could not form one.
     OBSERVATION_FAILED = "OBSERVATION_FAILED"
+    #: This execution identity is already being executed right now. Refused
+    #: rather than queued: a duplicate is not a thing to retry into.
+    ALREADY_IN_FLIGHT = "ALREADY_IN_FLIGHT"
     #: The broker answered but we could not record it. Operationally critical.
     POST_SUBMIT_AUDIT_FAILED = "POST_SUBMIT_AUDIT_FAILED"
 
@@ -509,6 +555,8 @@ class PlanContext:
     #: it cannot do that from a hash alone.
     risk_request: TradeRiskRequest
     risk_ref: str
+    #: The broker-bound order id. Part of the order, so part of the seal.
+    client_order_id: str
     symbol: str
     side: str
     strategy_id: str
@@ -528,6 +576,7 @@ class PlanContext:
         which is exactly what the seal comparison is for.
         """
         return ExecutablePlan(
+            client_order_id=self.client_order_id,
             decision_ref=self.decision_ref,
             risk_request_ref=risk_request_identity(self.risk_request),
             risk_ref=self.risk_ref,
@@ -949,8 +998,8 @@ class ExecutionService:
         authorization: ExecutionAuthorization | None = None,
         universe: Callable[[], ConstituentSnapshot | None] | None = None,
         portfolio: Callable[[], tuple[PositionExposure, ...]] | None = None,
+        history: DurableExecutionHistory,
         protection: ProtectedEntryLifecycle | None = None,
-        history: DurableExecutionHistory | None = None,
         universe_status: Callable[[], UniverseListStatus | None] | None = None,
         halts: Callable[[], Sequence[HaltRecord]] | None = None,
         now: Callable[[], datetime] | None = None,
@@ -1022,10 +1071,22 @@ class ExecutionService:
         #: Authoritative open-risk view when one exists; otherwise the estimate
         #: below is used and is documented as an estimate.
         self._portfolio = portfolio
-        #: Survives a restart, unlike the agent's in-memory outcome map.
-        self._history = history
+        # Survives a restart, unlike the agent's in-memory outcome map, and
+        # therefore MANDATORY. It used to default to None, and `_durable_verdict`
+        # returned None when it was absent -- so an execution-capable service
+        # could be constructed with no restart-safe idempotency at all, merely by
+        # supplying an authority. A submission path whose duplicate protection
+        # dies with the process is not a submission path we are willing to build.
+        if history is None:
+            raise ExecutionServiceError(
+                "an execution service requires a durable execution history;"
+                " without it a restart cannot tell a replay from a new order"
+            )
+        self._history: DurableExecutionHistory = history
 
         self._universe_status = universe_status
+        #: Concurrency safety for THIS process. See _SingleFlight.
+        self._in_flight = _SingleFlight()
         self._halts = halts or (lambda: ())
         self._now = now or (lambda: datetime.now(tz=UTC))
 
@@ -1147,6 +1208,33 @@ class ExecutionService:
                 ),
             )
 
+        # Claimed BEFORE the durable read, because the durable read is exactly
+        # where a race is decided: two callers both see an empty history, both
+        # prepare, both submit. Released only after the outcome is recorded.
+        claim = self._in_flight.claim(
+            f"decision:{intent.decision_id}", f"order:{intent.client_order_id}"
+        )
+        if claim is None:
+            LOGGER.warning(
+                "refusing a duplicate execution that is already in flight",
+                extra=self._context(intent, stage="ALREADY_IN_FLIGHT"),
+            )
+            return self._bare(
+                intent,
+                ExecutionStage.ALREADY_IN_FLIGHT,
+                (
+                    "this execution identity is already being executed; a"
+                    " duplicate is refused rather than queued, so one"
+                    " authorization can never become two broker orders",
+                ),
+            )
+        try:
+            return self._execute_claimed(intent)
+        finally:
+            self._in_flight.release(claim)
+
+    def _execute_claimed(self, intent: ExecutionIntent) -> ExecutionEvaluation:
+        """The execution path proper, with the single-flight claim held."""
         durable = self._durable_verdict(intent)
         if durable is not None:
             return durable
@@ -1453,6 +1541,7 @@ class ExecutionService:
         # so an authorization can be minted about this exact evaluation rather
         # than about a decision in the abstract.
         plan_context = PlanContext(
+            client_order_id=intent.client_order_id,
             decision_ref=decision_identity(intent.decision),
             risk_request=risk_request,
             risk_ref=risk_result_identity(risk_result),
@@ -1570,8 +1659,6 @@ class ExecutionService:
           same name is being used for a different execution. Refuse.
         * nothing recorded -> no prior submit occurred.
         """
-        if self._history is None:
-            return None
         try:
             records = tuple(self._history.records_for(intent.decision_id))
             # ALSO by order id: a client order id reused by a DIFFERENT decision
@@ -1658,8 +1745,6 @@ class ExecutionService:
         self, intent: ExecutionIntent, prepared: ExecutionFingerprint
     ) -> str | None:
         """Was a DIFFERENT order already prepared under this identity?"""
-        if self._history is None:
-            return None
         try:
             records = tuple(self._history.records_for(intent.decision_id))
             records += tuple(self._history.records_for_order(intent.client_order_id))
@@ -1920,7 +2005,6 @@ class ExecutionService:
         plan = authorization.pre_submit.authorized_plan
         request_order = self._order_intent_for_plan(intent, plan)
         request = ExecutionRequest(
-            client_order_id=intent.client_order_id,
             correlation_id=intent.correlation_id,
             pre_submit=authorization.pre_submit,
             authorization=authorization.authorization,

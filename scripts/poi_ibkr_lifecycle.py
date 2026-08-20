@@ -655,6 +655,7 @@ def _authorized_request(
     # result and the single-use token, so the owner-confirmed envelope and the
     # order that reaches the gateway cannot drift apart.
     plan = ExecutablePlan(
+        client_order_id=client_order_id,
         decision_ref="owner-run:owner-confirmed",
         risk_request_ref="owner-run:poi-envelope-request",
         risk_ref="owner-run:poi-envelope",
@@ -713,7 +714,6 @@ def _authorized_request(
         plan_ref=sealed,
     )
     return ExecutionRequest(
-        client_order_id=client_order_id,
         correlation_id=correlation_id,
         pre_submit=pre_submit,
         authorization=SingleUseAuthorization(authorization),

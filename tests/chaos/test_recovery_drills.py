@@ -160,6 +160,7 @@ class ExecutionDrill:
         # it, and refuses anything whose identity does not match the result and
         # the token.
         plan = ExecutablePlan(
+            client_order_id=client_order_id,
             decision_ref="decision:d1@sha256:" + "c" * 64,
             risk_request_ref="risk-request:AAPL@sha256:" + "c" * 64,
             risk_ref="risk-result:sha256:" + "c" * 64,
@@ -203,7 +204,6 @@ class ExecutionDrill:
             plan_ref=sealed if authorization else "",
         )
         return ExecutionRequest(
-            client_order_id=client_order_id,
             correlation_id=f"corr-{client_order_id}",
             pre_submit=pre_submit,
             authorization=SingleUseAuthorization(authorization) if authorization else None,
@@ -548,6 +548,7 @@ def _request() -> PreSubmitRequest:
         account_alias="paper-main",
         order_type=OrderType.LIMIT,
         time_in_force="DAY",
+        client_order_id="ord-1",
     )
 
 

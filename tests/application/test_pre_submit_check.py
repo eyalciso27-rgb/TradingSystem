@@ -213,6 +213,7 @@ def request(
         account_alias="paper-main",
         order_type=OrderType.LIMIT,
         time_in_force="DAY",
+        client_order_id="ord-1",
     )
 
 
@@ -394,6 +395,7 @@ def test_expired_decision_cancels() -> None:
             account_alias="paper-main",
             order_type=OrderType.LIMIT,
             time_in_force="DAY",
+            client_order_id="ord-1",
         )
     )
     assert result.action is PreSubmitAction.CANCEL

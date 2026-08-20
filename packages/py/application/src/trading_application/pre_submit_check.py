@@ -192,8 +192,13 @@ class PreSubmitRequest:
     account_alias: str
     order_type: OrderType
     time_in_force: str
+    #: The broker-bound order id. Part of the order, therefore part of what is
+    #: checked and part of what is sealed.
+    client_order_id: str
 
     def __post_init__(self) -> None:
+        if not self.client_order_id.strip():
+            raise PreSubmitError("client_order_id is mandatory")
         if self.planned_entry_price <= 0 or self.planned_stop_price <= 0:
             raise PreSubmitError("planned entry/stop prices must be positive")
         if self.planned_entry_price == self.planned_stop_price:
@@ -352,6 +357,7 @@ class FinalPreSubmitCheck:
             # this hash. A caller cannot supply a plan of its own, because a
             # caller never constructs one.
             plan = ExecutablePlan(
+                client_order_id=request.client_order_id,
                 decision_ref=result.decision_ref,
                 risk_request_ref=request.risk_result.request_ref,
                 risk_ref=result.risk_ref,

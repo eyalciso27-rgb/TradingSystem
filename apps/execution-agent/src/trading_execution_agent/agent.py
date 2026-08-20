@@ -43,13 +43,17 @@ from decimal import Decimal
 from enum import StrEnum
 
 from trading_application.emergency import EntryCheckpoint, EntryContext, HaltRecord, match_halt
-from trading_application.execution_identity import plan_identity
+from trading_application.execution_identity import (
+    authorization_identity,
+    plan_identity,
+)
 from trading_application.execution_plan import ExecutablePlan
 from trading_application.pre_submit_check import (
     AuthorizationConsumedError,
     PreSubmitAction,
     PreSubmitCheckResult,
     SingleUseAuthorization,
+    authorization_matches,
 )
 from trading_broker_core.port import (
     BrokerErrorCode,
@@ -95,7 +99,6 @@ class ExecutionRequest:
     was never authorized.
     """
 
-    client_order_id: str
     correlation_id: str
     pre_submit: PreSubmitCheckResult
     authorization: SingleUseAuthorization | None
@@ -103,8 +106,6 @@ class ExecutionRequest:
     plan: ExecutablePlan
 
     def __post_init__(self) -> None:
-        if not self.client_order_id.strip():
-            raise ValueError("client_order_id is mandatory")
         if not self.correlation_id.strip():
             raise ValueError("correlation_id is mandatory")
 
@@ -112,6 +113,16 @@ class ExecutionRequest:
     # Properties rather than fields on purpose: a field could be set to
     # something the plan does not say, and that is precisely the substitution
     # this class exists to make impossible.
+
+    @property
+    def client_order_id(self) -> str:
+        """The broker's idempotency key, from the sealed plan.
+
+        A settable field here meant one authorized plan could be sent twice
+        under two different order ids -- two distinct broker orders from one
+        authorization, which is the failure the whole seal exists to prevent.
+        """
+        return self.plan.client_order_id
 
     @property
     def environment(self) -> Environment:
@@ -132,6 +143,10 @@ class ExecutionRequest:
     @property
     def order_type(self) -> OrderType:
         return self.plan.order_type
+
+    @property
+    def quantity(self) -> Decimal:
+        return self.plan.quantity
 
     @property
     def limit_price(self) -> Decimal | None:
@@ -374,11 +389,14 @@ class ExecutionAgent:
         # is no field here the agent could source from somewhere else.
         plan = request.plan
         intent = OrderIntent(
-            client_order_id=request.client_order_id,
-            authorization_ref=(
-                f"submit-auth:{authorization.candidate_id}"
-                f"@{authorization.authorized_at.isoformat()}"
-            ),
+            client_order_id=plan.client_order_id,
+            # The CANONICAL authorization identity, content-addressed over the
+            # authorization itself -- including its plan_ref. The old
+            # "submit-auth:{candidate}@{timestamp}" string proved neither which
+            # authorization this was nor which plan it authorized, and every
+            # authorization minted in the same second for one candidate shared
+            # it.
+            authorization_ref=authorization_identity(authorization),
             correlation_id=request.correlation_id,
             environment=plan.environment,
             account_alias=plan.account_alias,
@@ -419,6 +437,13 @@ class ExecutionAgent:
         if pre_submit.plan_ref != sealed:
             return "PLAN_NOT_THE_ONE_CHECKED"
         assert request.authorization is not None  # noqa: S101 - checked above
+        # The token must be the one THIS result minted, not merely a token that
+        # agrees about the plan. Two wrappers can name the same plan; only one
+        # of them was minted by this check, and the service verifying that is
+        # not the same as the component that submits verifying it.
+        mismatch = authorization_matches(pre_submit, request.authorization)
+        if mismatch is not None:
+            return "AUTHORIZATION_IS_NOT_THE_ONE_MINTED"
         token = request.authorization.peek()
         if token.plan_ref != sealed:
             return "PLAN_NOT_THE_ONE_AUTHORIZED"
