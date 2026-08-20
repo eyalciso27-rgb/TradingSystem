@@ -127,20 +127,36 @@ class InstrumentQuery:
 
 @dataclass(frozen=True, slots=True)
 class BrokerInstrument:
-    """Broker-resolved instrument; ``broker_instrument_ref`` is opaque."""
+    """Broker-resolved instrument; ``broker_instrument_ref`` is opaque.
+
+    Opaque means opaque: only the adapter that minted a reference may interpret
+    it. Application code compares references for equality and never parses
+    them, because the moment it does, the broker's identity scheme becomes part
+    of the domain.
+    """
 
     broker_instrument_ref: str
     symbol: str
     exchange: str
     currency: str
 
+    def __post_init__(self) -> None:
+        if not self.broker_instrument_ref.strip():
+            raise ValueError(
+                "a resolved instrument must carry a broker reference; an"
+                " unresolved security is not a security"
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class OrderIntent:
     """A NOT-YET-SUBMITTED domain order intent handed to the port.
 
-    ``client_order_id`` is the idempotency key: submitting the same id
-    twice must return the original receipt and create nothing new.
+    ``client_order_id`` is OUR idempotency key, and this port's contract is
+    that submitting the same id twice returns the original receipt and creates
+    nothing new. That guarantee is the ADAPTER's to keep -- it is not something
+    the broker provides. IBKR in particular does not deduplicate on the
+    ``orderRef`` the id travels in; two orders carrying one are two orders.
     ``authorization_ref`` references the one-time SubmitAuthorization from
     the final pre-submit check (40.4); an empty ref fails closed. The
     intent itself never carries a submitted status — the port returns
@@ -153,6 +169,16 @@ class OrderIntent:
     environment: Environment
     account_alias: str
     symbol: str
+    #: THE security, as the broker itself identified it. Opaque to everyone
+    #: outside the adapter that produced it.
+    #:
+    #: A ticker is not a security. "BRK.B" and "BRK B", a US listing and its
+    #: foreign line, two share classes under one root -- these differ as
+    #: securities while agreeing as strings, and an order routed on the string
+    #: is an order routed on a guess. This carries the resolution the broker
+    #: actually performed, so the security that was quoted, risked, authorized
+    #: and re-checked is provably the security that is sent.
+    broker_instrument_ref: str
     side: OrderSide
     order_type: OrderType
     quantity: Decimal
@@ -167,6 +193,14 @@ class OrderIntent:
     def __post_init__(self) -> None:
         if not self.client_order_id.strip():
             raise ValueError("client_order_id is mandatory")
+        if not self.broker_instrument_ref.strip():
+            # Fail closed rather than letting the adapter fall back to a
+            # ticker-shaped contract, which is exactly the substitution this
+            # field exists to prevent.
+            raise ValueError(
+                "broker_instrument_ref is mandatory: an order must name the"
+                " security the broker resolved, not a ticker"
+            )
         if not self.correlation_id.strip():
             raise ValueError("correlation_id is mandatory")
         if not isinstance(self.time_in_force, TimeInForce):
@@ -335,6 +369,10 @@ class RecoveredOrder:
     state: OrderState
     account_alias: str
     symbol: str
+    #: The broker's own security identity for this working order, when the
+    #: broker reports one. Empty means the broker did not say -- which is a
+    #: fact we do not have, never a fact we may assume.
+    broker_instrument_ref: str
     side: OrderSide
     quantity: Decimal
     order_type: OrderType

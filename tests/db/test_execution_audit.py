@@ -82,6 +82,10 @@ def _record(**kw: object) -> dict[str, object]:
             # The FROZEN order, which a SUBMIT_PREPARED record must describe or
             # a replay cannot tell a repeat from a changed order.
             "order_type": "LIMIT",
+            # WHICH SECURITY. A record that names only a ticker has not said
+            # which instrument was prepared, and a replay could then mistake a
+            # different security for the same order.
+            "broker_instrument_ref": "conid:265598",
             "quantity": "1",
             "limit_price": "100.02",
             "stop_price": "98.02",

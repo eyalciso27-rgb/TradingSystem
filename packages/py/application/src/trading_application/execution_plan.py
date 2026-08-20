@@ -54,13 +54,21 @@ class ExecutablePlan:
     risk_ref: str
     allocation_ref: str
 
-    # -- the broker's own idempotency key ------------------------------------
-    #: THE order id the broker will see, and IBKR's ``orderRef``. It lived
-    #: outside the seal until the fourth review round: the plan fixed the
-    #: symbol, side, size, type, prices and account, and a later component was
-    #: still free to attach a different order id to the very same authorized
-    #: plan. That is the broker's deduplication key, so an unsealed one means
-    #: one authorization could become two distinct broker orders.
+    # -- OUR idempotency key -------------------------------------------------
+    #: The canonical id for this execution, carried to IBKR in ``orderRef``.
+    #:
+    #: Precisely: this is **our** idempotency key, not the broker's. IBKR does
+    #: not deduplicate on ``orderRef`` -- two orders sharing one are two orders,
+    #: and it will happily hold both. What ``orderRef`` buys us is correlation
+    #: and recovery: after a restart we can tell which working order is ours.
+    #: The actual duplicate protection is ours to provide, from the durable
+    #: execution history plus the in-process claim.
+    #:
+    #: Which is exactly why it belongs inside the seal. It lived outside until
+    #: the fifth review round: the plan fixed the symbol, side, size, type,
+    #: prices and account, and a later component was still free to attach a
+    #: different id to the same authorized plan -- and because the broker will
+    #: not catch that for us, it would simply have become a second live order.
     client_order_id: str
 
     # -- who is trading, and where -------------------------------------------
@@ -71,6 +79,15 @@ class ExecutablePlan:
 
     # -- the order itself ------------------------------------------------------
     symbol: str
+    #: THE security the broker resolved, opaque to this layer. A ticker is not
+    #: a security: two share classes, two listings or two currency lines can
+    #: agree as strings and differ as instruments, so an order authorized on a
+    #: ticker alone is authorized on a guess. Never parsed here.
+    broker_instrument_ref: str
+    #: What the broker said about that security. Carried so the audit record
+    #: says which listing was traded rather than only which id.
+    broker_exchange: str
+    broker_currency: str
     side: str
     quantity: Decimal
     order_type: OrderType
@@ -83,6 +100,11 @@ class ExecutablePlan:
             raise ValueError("an executable plan must have a positive quantity")
         if not self.client_order_id.strip():
             raise ValueError("client_order_id is mandatory on an executable plan")
+        if not self.broker_instrument_ref.strip():
+            raise ValueError(
+                "broker_instrument_ref is mandatory on an executable plan: a"
+                " plan that names only a ticker has not identified a security"
+            )
         for name in ("decision_ref", "risk_request_ref", "risk_ref", "allocation_ref"):
             if not str(getattr(self, name)).strip():
                 # A plan whose lineage is blank proves nothing about what

@@ -236,6 +236,9 @@ def make_intent(client_order_id: str = "ord-1", **overrides: Any) -> OrderIntent
         "environment": Environment.PAPER,
         "account_alias": "paper-main",
         "symbol": "AAPL",
+        # The SECURITY the broker resolved. An order that names only a ticker
+        # is refused by the port now, which is the point.
+        "broker_instrument_ref": "conid:265598",
         "side": OrderSide.BUY,
         "order_type": OrderType.LIMIT,
         "quantity": Decimal("100"),

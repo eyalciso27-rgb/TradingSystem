@@ -195,10 +195,20 @@ class PreSubmitRequest:
     #: The broker-bound order id. Part of the order, therefore part of what is
     #: checked and part of what is sealed.
     client_order_id: str
+    #: The resolved security, opaque. Also part of the order: the check that
+    #: approves an entry must approve WHICH security is entered.
+    broker_instrument_ref: str
+    broker_exchange: str
+    broker_currency: str
 
     def __post_init__(self) -> None:
         if not self.client_order_id.strip():
             raise PreSubmitError("client_order_id is mandatory")
+        if not self.broker_instrument_ref.strip():
+            raise PreSubmitError(
+                "broker_instrument_ref is mandatory: a final pre-submit check"
+                " that cannot name the security is not a check"
+            )
         if self.planned_entry_price <= 0 or self.planned_stop_price <= 0:
             raise PreSubmitError("planned entry/stop prices must be positive")
         if self.planned_entry_price == self.planned_stop_price:
@@ -358,6 +368,9 @@ class FinalPreSubmitCheck:
             # caller never constructs one.
             plan = ExecutablePlan(
                 client_order_id=request.client_order_id,
+                broker_instrument_ref=request.broker_instrument_ref,
+                broker_exchange=request.broker_exchange,
+                broker_currency=request.broker_currency,
                 decision_ref=result.decision_ref,
                 risk_request_ref=request.risk_result.request_ref,
                 risk_ref=result.risk_ref,

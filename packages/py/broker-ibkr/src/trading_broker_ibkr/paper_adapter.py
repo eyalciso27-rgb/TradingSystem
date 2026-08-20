@@ -34,7 +34,7 @@ the separately-approved POI-IBKR-001 experiment, not part of this task.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -463,6 +463,46 @@ def encode_order_ref(client_order_id: str) -> str:
     return ref
 
 
+#: The scheme for an IBKR security reference. Only this package may read it.
+INSTRUMENT_REF_PREFIX = "conid:"
+
+
+def encode_instrument_ref(con_id: object) -> str:
+    """Mint the opaque reference for an IBKR-resolved security.
+
+    Fails closed on anything that is not a real, positive contract id. The
+    resolver used to write ``f"conid:{getattr(resolved, 'conId', 0)}"``, which
+    produced ``"conid:0"`` whenever IBKR reported no usable id -- a truthy
+    string that is not a security identity, and which every downstream check
+    would then have compared happily against itself.
+    """
+    try:
+        numeric = int(str(con_id).strip())
+    except (TypeError, ValueError):
+        return ""
+    if numeric <= 0:
+        return ""
+    return f"{INSTRUMENT_REF_PREFIX}{numeric}"
+
+
+def decode_instrument_ref(instrument_ref: str) -> int | None:
+    """Recover the IBKR contract id from an opaque reference.
+
+    Deliberately here and nowhere else: the reference is opaque OUTSIDE this
+    package, so this package is the only place that may translate it back into
+    a contract. ``None`` means the reference is not one of ours or is unusable,
+    and the caller must fail closed rather than guess a contract from a ticker.
+    """
+    if not instrument_ref or not instrument_ref.startswith(INSTRUMENT_REF_PREFIX):
+        return None
+    body = instrument_ref[len(INSTRUMENT_REF_PREFIX) :].strip()
+    try:
+        numeric = int(body)
+    except ValueError:
+        return None
+    return numeric if numeric > 0 else None
+
+
 @dataclass(frozen=True, slots=True)
 class RecoveredIdentity:
     """The identity recovered from an order's orderRef.
@@ -517,6 +557,8 @@ class RawOpenOrder:
     order_ref: str
     status: str
     symbol: str
+    #: The broker's own security identity, when the callback reported one.
+    broker_instrument_ref: str = ""
     client_id: int = FOREIGN_CLIENT_ID
     perm_id: int = 0
     account: str = ""
@@ -893,6 +935,7 @@ class IbkrPaperAdapter:
                     state=IBKR_STATUS_MAP[raw.status],
                     account_alias=account_alias,
                     symbol=raw.symbol,
+                    broker_instrument_ref=raw.broker_instrument_ref,
                     side=side,
                     quantity=raw.quantity,
                     order_type=order_type,
@@ -1228,6 +1271,52 @@ class IbkrPaperAdapter:
             ) from error
 
 
+def _resolve_one_contract(
+    details: Sequence[object], query: InstrumentQuery, requested: object
+) -> BrokerInstrument | None:
+    """The ONE security this query names, or nothing.
+
+    Two failures used to pass silently. ``details[0]`` took whichever contract
+    IBKR happened to list first, so an ambiguous query -- several listings,
+    several currencies, several share classes under one root -- resolved to an
+    arbitrary one of them. And a contract with no usable ``conId`` still
+    produced ``"conid:0"``, a reference that identifies nothing.
+
+    An ambiguous or unusable answer is now no answer, which the caller turns
+    into INSTRUMENT_NOT_FOUND and zero submits. A security we cannot name is a
+    security we will not trade.
+    """
+    candidates: list[tuple[int, object]] = []
+    for detail in details:
+        resolved = getattr(detail, "contract", None)
+        if resolved is None:
+            continue
+        con_id = _coerce_int(getattr(resolved, "conId", None), 0)
+        if con_id <= 0:
+            # IBKR answered without a usable identity. Not a security.
+            continue
+        candidates.append((con_id, resolved))
+    if not candidates:
+        return None
+    distinct = {con_id for con_id, _ in candidates}
+    if len(distinct) > 1:
+        # Genuinely ambiguous: the query names more than one security. Choosing
+        # one would be choosing at random.
+        return None
+    con_id, resolved = candidates[0]
+    reference = encode_instrument_ref(con_id)
+    if not reference:
+        return None
+    return BrokerInstrument(
+        broker_instrument_ref=reference,
+        symbol=str(getattr(resolved, "symbol", query.symbol)),
+        exchange=str(getattr(resolved, "exchange", getattr(requested, "exchange", ""))),
+        currency=str(
+            getattr(resolved, "currency", getattr(requested, "currency", ""))
+        ),
+    )
+
+
 def _coerce_int(value: object, default: int) -> int:
     """Read an integer broker field, falling back to a fail-closed default."""
     try:
@@ -1490,18 +1579,7 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                 want="contract",
                 what="contract details",
             )
-            if not details:
-                return None
-            first = details[0]
-            resolved = getattr(first, "contract", None)
-            if resolved is None:
-                return None
-            return BrokerInstrument(
-                broker_instrument_ref=f"conid:{getattr(resolved, 'conId', 0)}",
-                symbol=str(getattr(resolved, "symbol", query.symbol)),
-                exchange=str(getattr(resolved, "exchange", contract.exchange)),
-                currency=str(getattr(resolved, "currency", contract.currency)),
-            )
+            return _resolve_one_contract(details, query, contract)
 
         def account_summary(self, account_id: str) -> Mapping[str, Decimal]:
             req_id = self._next_request_id()
@@ -1600,9 +1678,25 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             return order_id
 
         def submit(self, broker_order_id: int, account_id: str, intent: OrderIntent) -> str:
+            # THE resolved security, by its broker id -- not a fresh
+            # STK/SMART/USD contract rebuilt from the ticker. Rebuilding it
+            # meant the security that was resolved, quoted, risked and
+            # authorized was not provably the security that was sent: IBKR
+            # re-resolved the string itself, at submission time, with no one
+            # comparing the two answers.
+            con_id = decode_instrument_ref(intent.broker_instrument_ref)
+            if con_id is None:
+                raise BrokerPortError(
+                    BrokerErrorCode.VALIDATION_FAILED,
+                    "the order carries no usable broker instrument reference;"
+                    " refusing to submit a contract rebuilt from a ticker",
+                )
             contract = Contract()
+            contract.conId = con_id
             contract.symbol = intent.symbol
             contract.secType = "STK"
+            # SMART routes the ORDER; conId identifies the SECURITY, and with a
+            # conId present IBKR does not have to guess which listing this is.
             contract.exchange = "SMART"
             contract.currency = "USD"
             # Translate + validate every outbound field BEFORE placeOrder. A
@@ -1647,6 +1741,14 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                     continue
                 snapshot[order_id] = RawOpenOrder(
                     broker_order_id=order_id,
+                    # The openOrder callback carries the Contract, so when IBKR
+                    # reports a usable conId the recovered order can name the
+                    # security it actually is. Empty when it does not -- absent
+                    # is absent, and a working order whose security cannot be
+                    # proven is reconciled rather than claimed.
+                    broker_instrument_ref=encode_instrument_ref(
+                        getattr(contract, "conId", None)
+                    ),
                     order_ref=str(getattr(order, "orderRef", "") or ""),
                     status=str(getattr(order_state, "status", "") or ""),
                     symbol=str(getattr(contract, "symbol", "") or ""),
@@ -1807,6 +1909,8 @@ __all__ = [
     "classify_cancel_status",
     "classify_ibkr_order_error",
     "decode_order_ref",
+    "decode_instrument_ref",
+    "encode_instrument_ref",
     "encode_order_ref",
     "format_ibkr_error",
     "ibkr_order_type",

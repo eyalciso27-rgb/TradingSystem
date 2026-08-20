@@ -38,6 +38,7 @@ from trading_application.trading_readiness_runtime import (
     QuoteState,
 )
 from trading_broker_core.port import (
+    BrokerInstrument,
     BrokerPort,
     BrokerPortError,
     InstrumentQuery,
@@ -89,7 +90,7 @@ class _Quotes:
             observed_at=GUARD_NOW - timedelta(seconds=1), bid_size=500, ask_size=500,
         )
 
-    def current_quote(self, symbol: str) -> QuoteState:
+    def current_quote(self, instrument: BrokerInstrument) -> QuoteState:
         return self._quote
 
 
@@ -197,6 +198,9 @@ def _intent(symbol: str = "AAPL", **overrides: object) -> OrderIntent:
         "environment": Environment.PAPER,
         "account_alias": "paper-main",
         "symbol": symbol,
+        # The SECURITY the fake transport resolves for this symbol. The guard
+        # compares its own just-in-time resolution against this.
+        "broker_instrument_ref": "conid:265598",
         "side": OrderSide.BUY,
         "order_type": OrderType.LIMIT,
         "quantity": Decimal(10),
@@ -350,3 +354,49 @@ def test_the_adapter_still_refuses_the_live_port() -> None:
     )
     with pytest.raises(BrokerPortError):
         adapter.connect()
+
+
+# == the final boundary proves the SAME security ============================
+
+
+def test_the_boundary_refuses_an_order_for_a_different_security() -> None:
+    """Same ticker, different instrument. This is the share-class case.
+
+    The symbol resolves perfectly, so every symbol-shaped check passes. The
+    security is not the one the authorization named, and that is the whole
+    point: a ticker is not a security identity, and the boundary that submits
+    must prove the security it resolves NOW is the one the order was
+    authorized for.
+    """
+    transport = FakePaperTransport()
+    adapter = _adapter(transport)
+    guard, _ = _guard(adapter)
+
+    with pytest.raises(ReadinessBlockedError) as blocked:
+        guard.submit_order(_intent(broker_instrument_ref="conid:999999"))
+
+    blockers = list(blocked.value.report.blockers)
+    assert any("contract_identity_valid" in reason for reason in blockers), blockers
+    gate = next(
+        g for g in blocked.value.report.gates if g.name == "contract_identity_valid"
+    )
+    assert not gate.satisfied
+    assert "authorized" in gate.detail, gate.detail
+    assert not [call for call in transport.calls if call.startswith("submit:")], (
+        "nothing reached the broker"
+    )
+
+
+def test_the_boundary_admits_the_security_it_authorized() -> None:
+    """The control: the SAME instrument passes the identity check."""
+    transport = FakePaperTransport()
+    adapter = _adapter(transport)
+    resolved = adapter.resolve_instrument(InstrumentQuery(symbol="AAPL"))
+    guard, _ = _guard(adapter)
+
+    receipt = guard.submit_order(
+        _intent(broker_instrument_ref=resolved.broker_instrument_ref)
+    )
+
+    assert receipt.client_order_id == "guard-ord-1"
+    assert [call for call in transport.calls if call.startswith("submit:")]

@@ -241,7 +241,7 @@ class _Quotes:
         )
         self._raises = raises
 
-    def current_quote(self, symbol: str) -> QuoteState:
+    def current_quote(self, instrument: BrokerInstrument) -> QuoteState:
         if self._raises:
             raise RuntimeError("quote feed down")
         return self._quote
@@ -311,6 +311,10 @@ def _intent(**kw: object) -> OrderIntent:
         "environment": Environment.PAPER,
         "account_alias": "paper-poi",
         "symbol": "AAPL",
+        # The SECURITY. The guard now proves the instrument it resolves at the
+        # boundary is the instrument the order names, so this has to match what
+        # the fake resolver returns.
+        "broker_instrument_ref": CANONICAL_INSTRUMENT.broker_instrument_ref,
         "side": OrderSide.BUY,
         "order_type": OrderType.LIMIT,
         "quantity": Decimal(10),

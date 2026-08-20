@@ -170,6 +170,9 @@ class ExecutionDrill:
             environment=Environment.PAPER,
             account_alias="paper-main",
             symbol="AAPL",
+            broker_instrument_ref="conid:265598",
+            broker_exchange="SMART",
+            broker_currency="USD",
             side=OrderSide.BUY.value,
             quantity=Decimal("1"),
             order_type=OrderType.LIMIT,
@@ -549,6 +552,9 @@ def _request() -> PreSubmitRequest:
         order_type=OrderType.LIMIT,
         time_in_force="DAY",
         client_order_id="ord-1",
+        broker_instrument_ref="conid:265598",
+        broker_exchange="SMART",
+        broker_currency="USD",
     )
 
 

@@ -78,6 +78,7 @@ from trading_application.trading_readiness_runtime import (
 from trading_broker_core.port import (
     BrokerCapabilities,
     BrokerCapabilityMode,
+    BrokerInstrument,
     OrderIntent,
     OrderSide,
 )
@@ -199,7 +200,7 @@ class _Quotes:
             market_data_state=MarketDataState.REALTIME,
         )
 
-    def current_quote(self, symbol: str) -> QuoteState:
+    def current_quote(self, instrument: BrokerInstrument) -> QuoteState:
         return self.quote
 
 
@@ -418,6 +419,9 @@ def _pre_submit_request(
         order_type=context.order_type,
         time_in_force=context.time_in_force,
         client_order_id=context.client_order_id,
+        broker_instrument_ref=context.instrument.broker_instrument_ref,
+        broker_exchange=context.instrument.exchange,
+        broker_currency=context.instrument.currency,
     )
 
 
@@ -497,6 +501,9 @@ def _real_authorization(
             order_type=facts.order_type,
             time_in_force=facts.time_in_force,
             client_order_id=facts.client_order_id,
+            broker_instrument_ref=facts.instrument.broker_instrument_ref,
+            broker_exchange=facts.instrument.exchange,
+            broker_currency=facts.instrument.currency,
         ),
         RefreshedMarket(price=entry, observed_at=NOW),
         RefreshedAccount(risk_budget_equity=Decimal("50000"), observed_at=NOW),
@@ -1196,7 +1203,7 @@ def test_the_guard_re_checks_at_the_boundary_not_just_at_planning() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        def current_quote(self, symbol: str) -> QuoteState:
+        def current_quote(self, instrument: BrokerInstrument) -> QuoteState:
             self.calls += 1
             observed = (
                 NOW - timedelta(seconds=1) if self.calls <= 1 else NOW - timedelta(hours=1)
@@ -1234,6 +1241,7 @@ def test_the_risk_result_is_scoped_to_this_decision() -> None:
         return OrderIntent(
             client_order_id=client_order_id, authorization_ref="a", correlation_id="c",
             environment=Environment.PAPER, account_alias="paper-main", symbol=symbol,
+            broker_instrument_ref="conid:265598",
             side=OrderSide.BUY, order_type=OrderType.LIMIT, quantity=Decimal(1),
             limit_price=Decimal("100"), stop_price=Decimal("98"),
         )
@@ -1721,10 +1729,12 @@ def _order(
     quantity: Decimal = Decimal("1"),
     side: OrderSide = OrderSide.BUY,
     account_alias: str = "paper-main",
+    broker_instrument_ref: str = "conid:265598",
 ) -> OrderIntent:
     return OrderIntent(
         client_order_id=client_order_id, authorization_ref="a", correlation_id="c",
         environment=Environment.PAPER, account_alias=account_alias, symbol=symbol,
+        broker_instrument_ref=broker_instrument_ref,
         side=side, order_type=OrderType.LIMIT, quantity=quantity,
         limit_price=Decimal("100"), stop_price=Decimal("98"),
     )
@@ -2208,6 +2218,7 @@ def _order_intent_for(intent: ExecutionIntent) -> OrderIntent:
         environment=Environment.PAPER,
         account_alias="paper-main",
         symbol=intent.symbol,
+        broker_instrument_ref="conid:265598",
         side=intent.side,
         order_type=OrderType.LIMIT,
         quantity=Decimal("1"),
@@ -2812,7 +2823,7 @@ def test_a_failing_observation_does_not_abort_the_whole_probe() -> None:
     """
 
     class _BrokenQuotes:
-        def current_quote(self, symbol: str) -> QuoteState:
+        def current_quote(self, instrument: BrokerInstrument) -> QuoteState:
             raise RuntimeError("the market data farm is unreachable")
 
     service, _, _ = _service(quotes=_BrokenQuotes())
@@ -3305,7 +3316,7 @@ class _LateBoundaryQuotes:
     def __init__(self) -> None:
         self.calls = 0
 
-    def current_quote(self, symbol: str) -> QuoteState:
+    def current_quote(self, instrument: BrokerInstrument) -> QuoteState:
         self.calls += 1
         observed = (
             NOW - timedelta(seconds=1)
@@ -3634,8 +3645,13 @@ def test_the_merge_gate_one_identity_from_decision_to_broker_order() -> None:
     assert pre_submit.decision_ref == risk_result.decision_ref
     assert pre_submit.policy_ref == pre_submit_policy_identity(PRE_SUBMIT_POLICY)
 
-    # -- the plan seals all of it, plus the order INCLUDING its broker key --
+    # -- the plan seals all of it, the order, its id AND its security -------
     assert plan.client_order_id == intent.client_order_id
+    assert evaluation.instrument is not None
+    resolved_security = evaluation.instrument.broker_instrument_ref
+    assert resolved_security, "the broker resolved a security"
+    assert plan.broker_instrument_ref == resolved_security
+    assert context.instrument.broker_instrument_ref == resolved_security
     assert plan.decision_ref == risk_result.decision_ref
     assert plan.risk_request_ref == risk_result.request_ref
     assert plan.risk_ref == pre_submit.risk_ref
@@ -3652,6 +3668,9 @@ def test_the_merge_gate_one_identity_from_decision_to_broker_order() -> None:
     assert len(_submits(transport)) == 1
     order = transport.submitted_intents[0]
     assert order.client_order_id == plan.client_order_id
+    assert order.broker_instrument_ref == resolved_security, (
+        "the OrderIntent names the resolved security, not a ticker"
+    )
     assert order.authorization_ref == authorization_identity(
         pre_submit.authorization
     ), "the canonical authorization identity, naming the exact plan"
@@ -3666,6 +3685,17 @@ def test_the_merge_gate_one_identity_from_decision_to_broker_order() -> None:
     assert order.environment == plan.environment
     # The same runtime quote drove the whole chain.
     assert plan.limit_price == context.entry_price == Decimal("100.025")
+
+    # -- and the real adapter sent it as the resolved contract --------------
+    from trading_broker_ibkr.paper_adapter import decode_instrument_ref
+
+    assert decode_instrument_ref(order.broker_instrument_ref) == 265598, (
+        "the IBKR package translates its own opaque reference to a real conId"
+    )
+    # The durable record names the security too, so a restart cannot mistake a
+    # different security for a replay.
+    assert evaluation.fingerprint is not None
+    assert evaluation.fingerprint.broker_instrument_ref == resolved_security
 
     # -- one authorization can never become two broker orderRefs -----------
     replayed = service.execute(intent)
@@ -3697,7 +3727,7 @@ def test_the_probe_never_prints_foreign_exception_text() -> None:
     """
 
     class _LeakyQuotes:
-        def current_quote(self, symbol: str) -> QuoteState:
+        def current_quote(self, instrument: BrokerInstrument) -> QuoteState:
             raise ConnectionError(
                 "could not connect to postgres://tws:hunter2@10.0.0.4:5432/ib"
                 " for account DU1234567 (C:\\Users\\owner\\ibkr\\session.log)"
@@ -3718,7 +3748,7 @@ def test_a_known_application_error_still_reports_its_safe_code() -> None:
     from trading_broker_core.port import BrokerErrorCode, BrokerPortError
 
     class _CodedQuotes:
-        def current_quote(self, symbol: str) -> QuoteState:
+        def current_quote(self, instrument: BrokerInstrument) -> QuoteState:
             raise BrokerPortError(
                 BrokerErrorCode.BROKER_UNHEALTHY,
                 "no market data for account DU1234567",
@@ -3733,13 +3763,18 @@ def test_a_known_application_error_still_reports_its_safe_code() -> None:
     assert "DU1234567" not in detail, "the account id is not"
 
 
-# == the broker idempotency key is INSIDE the seal ==========================
+# == OUR idempotency key is INSIDE the seal =================================
 #
 # The hole this closes: ExecutablePlan fixed the symbol, side, size, type,
 # prices, TIF and account -- and `client_order_id` sat outside it as an
-# independently settable field on ExecutionRequest. That is the broker's
-# deduplication key and IBKR's orderRef, so one authorized plan could be sent
-# under two different order ids and become two distinct broker orders.
+# independently settable field on ExecutionRequest.
+#
+# Note the wording, because it matters: this is OUR idempotency key, not the
+# broker's. IBKR does not deduplicate on the orderRef it travels in, so two
+# orders carrying the same one are two live orders. Nothing at the broker
+# would have caught a substituted id -- the protection is entirely ours, from
+# the durable history and the agent's outcome map, and that is why the id has
+# to be sealed rather than merely conventional.
 
 
 def test_one_authorization_cannot_become_two_broker_orders() -> None:
@@ -3846,7 +3881,7 @@ def test_the_agent_takes_the_order_id_from_the_sealed_plan() -> None:
 
 
 def test_no_broker_bound_order_field_is_independently_settable() -> None:
-    """Structural, and now including the broker idempotency key.
+    """Structural, and now including our idempotency key and the security.
 
     The previous version of this test omitted `client_order_id`, which is
     exactly how the remaining substitution stayed hidden: every field it named
@@ -3986,14 +4021,14 @@ def test_a_re_entrant_duplicate_cannot_submit_a_second_order() -> None:
     original = service._quotes.current_quote  # noqa: SLF001
     entered = False
 
-    def racing(symbol: str) -> QuoteState:
+    def racing(instrument: BrokerInstrument) -> QuoteState:
         nonlocal entered
         if not entered:
             entered = True
             # Re-enter with the SAME identity, before the first attempt has
             # prepared or submitted anything.
             duplicates.append(service.execute(intent).stage)
-        return original(symbol)
+        return original(instrument)
 
     service._quotes.current_quote = racing  # type: ignore[method-assign] # noqa: SLF001
 
@@ -4067,6 +4102,325 @@ def test_the_single_flight_scope_is_documented_as_single_process() -> None:
     A durable claim with a uniqueness constraint would be needed for that, and
     the canonical execution path does not have one yet. Saying so is the point.
     """
+    from trading_execution_agent import execution_service as module
+
+    doc = module._SingleFlight.__doc__ or ""  # noqa: SLF001
+
+    assert "single-PROCESS" in doc
+    assert "does NOT provide multi-process" in doc
+
+
+# == the SECURITY is sealed, not the ticker =================================
+#
+# A ticker is not a security. Two share classes under one root, a US listing
+# and its foreign line, a symbol re-used after a corporate action -- these agree
+# as strings and differ as instruments. Before this, the system could resolve
+# security X, price a ticker-shaped contract, authorize a ticker-shaped plan and
+# submit a third ticker-shaped contract, with nothing proving all four were the
+# same security.
+
+
+def test_the_plan_seals_the_resolved_security() -> None:
+    """The authorization names the instrument, not just the symbol."""
+    authority = _TestOnlyAuthorization()
+    service, transport, _ = _service(authorization=authority)
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED, evaluation.reasons
+    assert evaluation.instrument is not None
+    assert evaluation.authorization is not None
+    pre_submit = evaluation.authorization.pre_submit
+    assert pre_submit is not None and pre_submit.authorized_plan is not None
+    plan = pre_submit.authorized_plan
+
+    resolved = evaluation.instrument.broker_instrument_ref
+    assert resolved, "the broker resolved a security"
+    assert plan.broker_instrument_ref == resolved
+    assert plan.broker_exchange == evaluation.instrument.exchange
+    assert plan.broker_currency == evaluation.instrument.currency
+    # ...and it is inside the hash, so a different security is a different plan.
+    assert plan_identity(plan) != plan_identity(
+        replace(plan, broker_instrument_ref="conid:999999")
+    )
+
+
+def test_the_quote_is_asked_for_the_resolved_security() -> None:
+    """Not for a ticker the feed might resolve to something else."""
+    asked: list[BrokerInstrument] = []
+
+    class _RecordingQuotes:
+        def current_quote(self, instrument: BrokerInstrument) -> QuoteState:
+            asked.append(instrument)
+            return QuoteState(
+                Decimal("100.00"), Decimal("100.05"), NOW - timedelta(seconds=1),
+                bid_size=500, ask_size=500,
+                market_data_state=MarketDataState.REALTIME,
+            )
+
+    service, _, _ = _service(
+        quotes=_RecordingQuotes(), authorization=_TestOnlyAuthorization()
+    )
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED, evaluation.reasons
+    assert asked, "the quote source was consulted"
+    assert evaluation.instrument is not None
+    for instrument in asked:
+        assert instrument.broker_instrument_ref == (
+            evaluation.instrument.broker_instrument_ref
+        ), "every quote was for the resolved security"
+
+
+def test_a_substituted_security_never_reaches_the_broker() -> None:
+    """Same ticker, different instrument. The seal refuses it."""
+    intent = _intent()
+    service, transport, _ = _service(authorization=_TestOnlyAuthorization())
+    evaluated = service.evaluate(intent)
+    assert evaluated.risk_result is not None
+    pre_submit = _authorization_for(evaluated)
+    assert pre_submit.authorized_plan is not None
+
+    substituted = ExecutionRequest(
+        correlation_id=intent.correlation_id,
+        pre_submit=pre_submit,
+        authorization=single_use_authorization(pre_submit),
+        # Same AAPL, a different security.
+        plan=replace(pre_submit.authorized_plan, broker_instrument_ref="conid:999999"),
+    )
+
+    outcome = service._agent.process(substituted)  # noqa: SLF001
+
+    assert outcome.status is ExecutionStatus.REFUSED
+    assert "PLAN_NOT_THE_ONE_CHECKED" in outcome.reason_codes
+    assert _submits(transport) == []
+
+
+def test_the_durable_fingerprint_records_which_security_was_prepared() -> None:
+    """Same decision, same order id, same ticker, DIFFERENT security."""
+    store = _LinkedStore()
+    service, transport, _ = _service(
+        authorization=_TestOnlyAuthorization(), audit=store, history=store
+    )
+
+    first = service.execute(_intent())
+    assert first.stage is ExecutionStage.SUBMITTED, first.reasons
+    assert first.fingerprint is not None
+    assert first.fingerprint.broker_instrument_ref, "the security is recorded"
+
+    prepared = next(
+        record for record in store.records_for(_intent().decision_id)
+        if record.action == "EXECUTION_SUBMIT_PREPARED"
+    )
+    fingerprint = prepared.payload["execution_fingerprint"]
+    assert isinstance(fingerprint, dict)
+    assert fingerprint["broker_instrument_ref"] == (
+        first.fingerprint.broker_instrument_ref
+    )
+
+    # A replay of the same identity against a DIFFERENT security is a conflict,
+    # not a replay. Ticker equality is not security equality.
+    stored = ExecutionFingerprint.from_dict(prepared.payload)
+    assert stored is not None
+    other = replace(stored, broker_instrument_ref="conid:999999")
+    assert "broker_instrument_ref" in stored.differences(other)
+    assert len(_submits(transport)) == 1
+
+
+# == the resolver itself fails closed =======================================
+
+
+def test_a_contract_without_a_usable_id_is_unresolved() -> None:
+    """conid:0 is truthy and is not a security."""
+    from trading_broker_ibkr.paper_adapter import encode_instrument_ref
+
+    for unusable in (0, -1, None, "", "abc"):
+        assert encode_instrument_ref(unusable) == "", unusable
+    assert encode_instrument_ref(265598) == "conid:265598"
+
+
+def test_an_opaque_reference_is_only_decoded_by_its_own_package() -> None:
+    from trading_broker_ibkr.paper_adapter import decode_instrument_ref
+
+    assert decode_instrument_ref("conid:265598") == 265598
+    for unusable in ("", "conid:0", "conid:-3", "conid:", "conid:abc", "sec:265598"):
+        assert decode_instrument_ref(unusable) is None, unusable
+
+
+def test_an_ambiguous_contract_is_not_resolved_to_an_arbitrary_one() -> None:
+    """Several materially different contracts is no answer, not the first one."""
+    from trading_broker_core.port import InstrumentQuery
+    from trading_broker_ibkr.paper_adapter import _resolve_one_contract
+
+    class _Contract:
+        def __init__(self, con_id: int, currency: str) -> None:
+            self.conId = con_id
+            self.symbol = "BRK"
+            self.exchange = "SMART"
+            self.currency = currency
+
+    class _Detail:
+        def __init__(self, contract: object) -> None:
+            self.contract = contract
+
+    query = InstrumentQuery(symbol="BRK")
+    requested = _Contract(0, "USD")
+
+    ambiguous = [_Detail(_Contract(1, "USD")), _Detail(_Contract(2, "GBP"))]
+    assert _resolve_one_contract(ambiguous, query, requested) is None
+
+    unusable = [_Detail(_Contract(0, "USD"))]
+    assert _resolve_one_contract(unusable, query, requested) is None
+
+    exact = [_Detail(_Contract(265598, "USD"))]
+    resolved = _resolve_one_contract(exact, query, requested)
+    assert resolved is not None
+    assert resolved.broker_instrument_ref == "conid:265598"
+    # The same answer twice: the reference is stable.
+    again = _resolve_one_contract(exact, query, requested)
+    assert again is not None
+    assert again.broker_instrument_ref == resolved.broker_instrument_ref
+
+
+def test_a_resolved_instrument_must_carry_a_reference() -> None:
+    """The type itself refuses an unidentified security."""
+    with pytest.raises(ValueError, match="broker reference"):
+        BrokerInstrument(
+            broker_instrument_ref="", symbol="AAPL", exchange="SMART", currency="USD"
+        )
+
+
+def test_an_order_must_name_a_security() -> None:
+    """OrderIntent refuses a ticker-only order at the port boundary."""
+    with pytest.raises(ValueError, match="broker_instrument_ref is mandatory"):
+        _order(client_order_id="ord-no-security", broker_instrument_ref="")
+
+
+# == two services in ONE process cannot both submit =========================
+
+
+def test_two_service_instances_share_one_single_flight_registry() -> None:
+    """The claim was per-INSTANCE, so two services could not see each other.
+
+    Each ExecutionService constructed its own _SingleFlight, which meant two of
+    them in one process held different locks and different claimed sets -- and
+    the code described the guarantee as process-wide. The registry is now one
+    per process, with no constructor parameter that could install a second.
+    """
+    import inspect
+
+    from trading_execution_agent import execution_service as module
+
+    first, _, _ = _service(authorization=_TestOnlyAuthorization())
+    second, _, _ = _service(authorization=_TestOnlyAuthorization())
+
+    assert first._in_flight is second._in_flight  # noqa: SLF001
+    assert first._in_flight is module._PROCESS_SINGLE_FLIGHT  # noqa: SLF001
+    parameters = inspect.signature(ExecutionService.__init__).parameters
+    for name, parameter in parameters.items():
+        assert "SingleFlight" not in str(parameter.annotation), (
+            f"{name} can supply a second registry"
+        )
+
+
+def test_two_services_racing_one_identity_submit_at_most_once() -> None:
+    """Deterministic: the second service runs from INSIDE the first's window.
+
+    Both share the durable history and the broker seam, and the second starts
+    at the moment the first has read an empty history and written nothing --
+    the exact interleaving a per-instance claim could not see.
+    """
+    intent = _intent()
+    transport = PnlAwareTransport()
+    store = _LinkedStore()
+    first, _, _ = _service(
+        transport=transport, adapter=_adapter(transport),
+        authorization=_TestOnlyAuthorization(), audit=store, history=store,
+    )
+    second, _, _ = _service(
+        transport=transport, adapter=_adapter(transport),
+        authorization=_TestOnlyAuthorization(), audit=store, history=store,
+    )
+    stages: list[ExecutionStage] = []
+
+    original = first._quotes.current_quote  # noqa: SLF001
+    entered = False
+
+    def racing(instrument: BrokerInstrument) -> QuoteState:
+        nonlocal entered
+        if not entered:
+            entered = True
+            # A DIFFERENT service object, same process, same identity.
+            stages.append(second.execute(intent).stage)
+        return original(instrument)
+
+    first._quotes.current_quote = racing  # type: ignore[method-assign] # noqa: SLF001
+
+    winner = first.execute(intent)
+
+    assert stages == [ExecutionStage.ALREADY_IN_FLIGHT], stages
+    assert winner.stage is ExecutionStage.SUBMITTED, winner.reasons
+    assert len(_submits(transport)) == 1, "two services, at most one order"
+
+
+def test_two_services_with_competing_order_ids_produce_one_winner() -> None:
+    """Same decision, different order ids, two service objects. One order."""
+    transport = PnlAwareTransport()
+    store = _LinkedStore()
+    first, _, _ = _service(
+        transport=transport, adapter=_adapter(transport),
+        authorization=_TestOnlyAuthorization(), audit=store, history=store,
+    )
+    second, _, _ = _service(
+        transport=transport, adapter=_adapter(transport),
+        authorization=_TestOnlyAuthorization(), audit=store, history=store,
+    )
+
+    a = first.execute(_intent(client_order_id="two-svc-A"))
+    b = second.execute(_intent(client_order_id="two-svc-B"))
+
+    assert a.stage is ExecutionStage.SUBMITTED, a.reasons
+    assert b.stage is not ExecutionStage.SUBMITTED, b.reasons
+    assert len(_submits(transport)) == 1, "one decision, one order"
+
+
+def test_threads_across_two_service_instances_submit_at_most_once() -> None:
+    """Real threads, two service objects, one barrier."""
+    import threading
+
+    intent = _intent(client_order_id="two-svc-threads")
+    transport = PnlAwareTransport()
+    store = _LinkedStore()
+    services = [
+        _service(
+            transport=transport, adapter=_adapter(transport),
+            authorization=_TestOnlyAuthorization(), audit=store, history=store,
+        )[0]
+        for _ in range(2)
+    ]
+    start = threading.Barrier(2)
+    stages: list[ExecutionStage] = []
+    guard = threading.Lock()
+
+    def run(service: ExecutionService) -> None:
+        start.wait(timeout=5)
+        evaluation = service.execute(intent)
+        with guard:
+            stages.append(evaluation.stage)
+
+    threads = [threading.Thread(target=run, args=(svc,)) for svc in services]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(stages) == 2
+    assert len(_submits(transport)) <= 1, "at most one broker order"
+
+
+def test_the_single_flight_scope_names_the_multi_process_limit() -> None:
+    """We still do not claim ownership we do not have."""
     from trading_execution_agent import execution_service as module
 
     doc = module._SingleFlight.__doc__ or ""  # noqa: SLF001

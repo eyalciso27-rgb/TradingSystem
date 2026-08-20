@@ -214,6 +214,9 @@ def request(
         order_type=OrderType.LIMIT,
         time_in_force="DAY",
         client_order_id="ord-1",
+        broker_instrument_ref="conid:265598",
+        broker_exchange="SMART",
+        broker_currency="USD",
     )
 
 
@@ -396,6 +399,9 @@ def test_expired_decision_cancels() -> None:
             order_type=OrderType.LIMIT,
             time_in_force="DAY",
             client_order_id="ord-1",
+            broker_instrument_ref="conid:265598",
+            broker_exchange="SMART",
+            broker_currency="USD",
         )
     )
     assert result.action is PreSubmitAction.CANCEL

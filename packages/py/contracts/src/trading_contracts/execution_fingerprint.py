@@ -46,6 +46,11 @@ PREPARED_ORDER_FIELDS: tuple[str, ...] = (
     "limit_price",
     "stop_price",
     "time_in_force",
+    # WHICH SECURITY. Known only once the contract resolves, so it belongs
+    # here rather than with the request identity -- but a replay that agrees on
+    # the ticker and disagrees on the security is not a replay, it is a
+    # different order wearing the same name.
+    "broker_instrument_ref",
 )
 
 #: The subset of the frozen order that a prepared or terminal record MUST
@@ -56,6 +61,7 @@ MANDATORY_PREPARED_FIELDS: tuple[str, ...] = (
     "order_type",
     "quantity",
     "time_in_force",
+    "broker_instrument_ref",
 )
 
 __all__ = [

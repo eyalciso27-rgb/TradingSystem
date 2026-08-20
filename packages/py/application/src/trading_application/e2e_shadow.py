@@ -846,6 +846,12 @@ class E2EShadowHarness:
                 # shadow run that evaluates an order without an identity is
                 # evaluating something no broker could have received.
                 client_order_id=f"shadow-{cid}",
+                # Research/shadow only: no broker resolved anything here, and
+                # this path mints no authorization. The reference is explicitly
+                # marked as non-broker so it can never be mistaken for one.
+                broker_instrument_ref=f"research:{candidate.symbol}",
+                broker_exchange="RESEARCH",
+                broker_currency="USD",
             ),
             RefreshedMarket(
                 price=Decimal(market_raw) if market_raw.strip() else entry_price,

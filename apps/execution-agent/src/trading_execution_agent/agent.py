@@ -116,11 +116,14 @@ class ExecutionRequest:
 
     @property
     def client_order_id(self) -> str:
-        """The broker's idempotency key, from the sealed plan.
+        """OUR idempotency key, from the sealed plan.
 
-        A settable field here meant one authorized plan could be sent twice
-        under two different order ids -- two distinct broker orders from one
-        authorization, which is the failure the whole seal exists to prevent.
+        Ours, not the broker's: IBKR does not deduplicate on ``orderRef``, so
+        two orders carrying the same one are two orders. Duplicate protection
+        comes from the durable execution history and the agent's own outcome
+        map -- which is precisely why a settable field here was dangerous. One
+        authorized plan sent under two ids would have become two live orders,
+        with nothing at the broker to stop it.
         """
         return self.plan.client_order_id
 
@@ -135,6 +138,11 @@ class ExecutionRequest:
     @property
     def symbol(self) -> str:
         return self.plan.symbol
+
+    @property
+    def broker_instrument_ref(self) -> str:
+        """The sealed security. A ticker is not a security identity."""
+        return self.plan.broker_instrument_ref
 
     @property
     def side(self) -> OrderSide:
@@ -401,6 +409,9 @@ class ExecutionAgent:
             environment=plan.environment,
             account_alias=plan.account_alias,
             symbol=plan.symbol,
+            # THE security, from the seal. The symbol travels beside it for
+            # logs and receipts; the reference is what identifies the order.
+            broker_instrument_ref=plan.broker_instrument_ref,
             side=OrderSide(plan.side),
             order_type=plan.order_type,
             quantity=plan.quantity,

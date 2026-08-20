@@ -77,6 +77,7 @@ from trading_application.pre_submit_check import (
 )
 from trading_broker_core.port import (
     BrokerCapabilityMode,
+    BrokerInstrument,
     BrokerOrderEvent,
     BrokerOrderReceipt,
     BrokerPort,
@@ -630,6 +631,7 @@ class LifecycleReport:
 def _authorized_request(
     envelope: LifecycleEnvelope,
     *,
+    instrument: BrokerInstrument,
     client_order_id: str,
     order_type: OrderType,
     side: OrderSide,
@@ -665,6 +667,12 @@ def _authorized_request(
         environment=Environment.PAPER,
         account_alias=envelope.account_alias,
         symbol=envelope.symbol,
+        # The security the owner-confirmed envelope resolved through the
+        # broker. The harness resolves it before building the plan, so the
+        # order names a security rather than a ticker.
+        broker_instrument_ref=instrument.broker_instrument_ref,
+        broker_exchange=instrument.exchange,
+        broker_currency=instrument.currency,
         side=side.value,
         quantity=quantity,
         order_type=order_type,
@@ -1253,6 +1261,9 @@ def _run_cancel_path(
 ) -> None:
     """Submit a non-marketable resting LIMIT, acknowledge, then cancel."""
     _record_intended_parameters(report, envelope)
+    # Resolve the SECURITY before building any order. A ticker is not a
+    # security, and the adapter refuses to submit an order that names one.
+    instrument = broker.resolve_instrument(InstrumentQuery(symbol=envelope.symbol))
     # LifecycleEnvelope already refused to construct without a reference
     # price and a limit far enough below it; this records the proof. Note the
     # claim: NON-MARKETABLE at the observed quote. A limit below the market
@@ -1283,6 +1294,7 @@ def _run_cancel_path(
     correlation_id = f"{CLIENT_ORDER_PREFIX}-cancel-{int(now.timestamp())}"
     request = _authorized_request(
         envelope,
+        instrument=instrument,
         client_order_id=envelope.client_order_id,
         order_type=OrderType.LIMIT,
         side=envelope.side,
@@ -1421,9 +1433,11 @@ def _run_fill_path(
 ) -> None:
     """Submit a marketable LIMIT, then protect the resulting position."""
     _record_intended_parameters(report, envelope)
+    instrument = broker.resolve_instrument(InstrumentQuery(symbol=envelope.symbol))
     correlation_id = f"{CLIENT_ORDER_PREFIX}-fill-{int(now.timestamp())}"
     request = _authorized_request(
         envelope,
+        instrument=instrument,
         client_order_id=envelope.client_order_id,
         order_type=OrderType.LIMIT,
         side=envelope.side,
@@ -1586,6 +1600,7 @@ def _run_fill_path(
         protective_id = f"{envelope.client_order_id}-{spec.spec_ref}"
         protective = _authorized_request(
             envelope,
+            instrument=instrument,
             client_order_id=protective_id,
             order_type=spec.order_type,
             side=spec.side,
@@ -2334,9 +2349,15 @@ def run_lifecycle(
         elif not execute:
             # What-if only. preview_order never places anything, and the
             # intent below is discarded — no authorization is ever minted.
+            what_if_instrument = broker.resolve_instrument(
+                InstrumentQuery(symbol=envelope.symbol)
+            )
             preview = broker.preview_order(
                 OrderIntent(
                     client_order_id=envelope.client_order_id,
+                    broker_instrument_ref=(
+                        what_if_instrument.broker_instrument_ref
+                    ),
                     authorization_ref="dry-run:what-if-only",
                     correlation_id=f"{CLIENT_ORDER_PREFIX}-dry-run",
                     environment=Environment.PAPER,

@@ -260,6 +260,12 @@ class _SingleFlight:
         with self._lock:
             self._claimed.difference_update(keys)
 
+
+#: THE registry, one per process. Every ExecutionService uses this one, so two
+#: services in the same process genuinely serialise against each other instead
+#: of each holding a private lock that the other cannot see.
+_PROCESS_SINGLE_FLIGHT = _SingleFlight()
+
 #: The terminal outcome of a prepared attempt the FINAL boundary refused before
 #: the broker call. Distinct from a refusal by the broker: this one is proof
 #: that nothing was sent, and a replay must reconstruct it as such rather than
@@ -557,6 +563,10 @@ class PlanContext:
     risk_ref: str
     #: The broker-bound order id. Part of the order, so part of the seal.
     client_order_id: str
+    #: The security the broker resolved for this execution. The whole object,
+    #: so the authority checks WHICH security it is authorizing and not merely
+    #: a ticker the feed might resolve differently.
+    instrument: BrokerInstrument
     symbol: str
     side: str
     strategy_id: str
@@ -577,6 +587,9 @@ class PlanContext:
         """
         return ExecutablePlan(
             client_order_id=self.client_order_id,
+            broker_instrument_ref=self.instrument.broker_instrument_ref,
+            broker_exchange=self.instrument.exchange,
+            broker_currency=self.instrument.currency,
             decision_ref=self.decision_ref,
             risk_request_ref=risk_request_identity(self.risk_request),
             risk_ref=self.risk_ref,
@@ -760,6 +773,11 @@ class ExecutionFingerprint:
     limit_price: str = ""
     stop_price: str = ""
     time_in_force: str = ""
+    #: The SECURITY that was prepared. Known only once the contract resolves,
+    #: so it belongs with the frozen order rather than with the request
+    #: identity -- but it is compared exactly as strictly, because a replay
+    #: that agrees on ticker and disagrees on security is not a replay.
+    broker_instrument_ref: str = ""
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -779,6 +797,7 @@ class ExecutionFingerprint:
             "limit_price": self.limit_price,
             "stop_price": self.stop_price,
             "time_in_force": self.time_in_force,
+            "broker_instrument_ref": self.broker_instrument_ref,
         }
 
     #: The fields that say WHICH execution this is, and what the caller ASKED
@@ -836,6 +855,7 @@ class ExecutionFingerprint:
                 limit_price=str(raw.get("limit_price", "")),
                 stop_price=str(raw.get("stop_price", "")),
                 time_in_force=str(raw.get("time_in_force", "")),
+                broker_instrument_ref=str(raw.get("broker_instrument_ref", "")),
             )
         except KeyError:
             return None
@@ -1085,8 +1105,14 @@ class ExecutionService:
         self._history: DurableExecutionHistory = history
 
         self._universe_status = universe_status
-        #: Concurrency safety for THIS process. See _SingleFlight.
-        self._in_flight = _SingleFlight()
+        #: Concurrency safety for THIS process. Deliberately the module-level
+        #: registry rather than a fresh instance: two ExecutionService objects
+        #: in one process used to hold different locks and different claimed
+        #: sets, so they could not see each other race -- which made the code's
+        #: "single-process" claim stronger than the implementation. There is now
+        #: one registry per process, and no constructor parameter through which
+        #: a second one could be installed.
+        self._in_flight = _PROCESS_SINGLE_FLIGHT
         self._halts = halts or (lambda: ())
         self._now = now or (lambda: datetime.now(tz=UTC))
 
@@ -1133,7 +1159,12 @@ class ExecutionService:
 
         quote: QuoteState | None = None
         try:
-            quote = self._quotes.current_quote(intent.symbol)
+            if instrument is None:
+                raise ExecutionServiceError(
+                    "no resolved security to quote; a price for an unidentified"
+                    " instrument is not evidence about this execution"
+                )
+            quote = self._quotes.current_quote(instrument)
             quote_note = self._quote_note(quote)
             quote_ok = quote.bid is not None and quote.ask is not None
         except Exception as error:  # noqa: BLE001 - one failed probe read
@@ -1144,7 +1175,9 @@ class ExecutionService:
         evidence.record("portfolio", *self._isolated("portfolio", self._portfolio_evidence))
         evidence.record(
             "protection",
-            *self._isolated("protection", self._protection_evidence, intent, quote),
+            *self._isolated(
+                "protection", self._protection_evidence, intent, quote, instrument
+            ),
         )
         evidence.record("audit", *self._isolated("audit", self._audit_evidence))
 
@@ -1349,15 +1382,26 @@ class ExecutionService:
         )
 
     def _protection_evidence(
-        self, intent: ExecutionIntent, quote: QuoteState
+        self,
+        intent: ExecutionIntent,
+        quote: QuoteState | None,
+        instrument: BrokerInstrument | None,
     ) -> tuple[bool, str]:
+        if quote is None or instrument is None:
+            return False, (
+                "NOT EVALUATED: protection cannot be priced without a resolved"
+                " security and a quote for it"
+            )
         midpoint = quote.midpoint
         if midpoint is None or midpoint <= 0:
             return False, "NOT EVALUATED: no usable quote to price a protective order"
         stop = self._stop_price(intent, midpoint)
         if stop is None:
             return False, "no valid protective stop could be constructed"
-        order = self._order_intent(intent, intent.requested_quantity, midpoint, stop)
+        order = self._order_intent(
+            intent, intent.requested_quantity, midpoint, stop,
+            instrument.broker_instrument_ref,
+        )
         capability = self._protection_state(order)
         return capability.can_protect, capability.detail
 
@@ -1422,7 +1466,9 @@ class ExecutionService:
             extra=self._context(intent, stage="CONTRACT", ref=instrument.broker_instrument_ref),
         )
 
-        quote = self._quotes.current_quote(intent.symbol)
+        # The security, not the ticker: the contract is resolved above, and
+        # the price this decision is built from must belong to THAT security.
+        quote = self._quotes.current_quote(instrument)
         entry_price = quote.midpoint
         LOGGER.info(
             "quote observed",
@@ -1507,7 +1553,10 @@ class ExecutionService:
                 universe_status=universe_status,
             )
 
-        order_intent = self._order_intent(intent, approved, entry_price, stop_price)
+        order_intent = self._order_intent(
+            intent, approved, entry_price, stop_price,
+            instrument.broker_instrument_ref,
+        )
 
         # Ask the protection authority about the ACTUAL order, not a sketch of
         # one: whether protection can be established depends on the order.
@@ -1542,6 +1591,7 @@ class ExecutionService:
         # than about a decision in the abstract.
         plan_context = PlanContext(
             client_order_id=intent.client_order_id,
+            instrument=instrument,
             decision_ref=decision_identity(intent.decision),
             risk_request=risk_request,
             risk_ref=risk_result_identity(risk_result),
@@ -1640,6 +1690,7 @@ class ExecutionService:
             limit_price=_normal(order.limit_price) if order else "",
             stop_price=_normal(order.stop_price) if order else "",
             time_in_force=order.time_in_force.value if order else "",
+            broker_instrument_ref=order.broker_instrument_ref if order else "",
         )
 
     def _durable_verdict(self, intent: ExecutionIntent) -> ExecutionEvaluation | None:
@@ -1906,6 +1957,9 @@ class ExecutionService:
         """
         observed = {
             "symbol": candidate.symbol,
+            # The broker's own security identity, when it reported one. If it
+            # did not, this is empty and is skipped below -- absent is absent.
+            "broker_instrument_ref": candidate.broker_instrument_ref,
             "side": candidate.side.value,
             "order_type": candidate.order_type.value,
             "quantity": _normal(candidate.quantity),
@@ -2197,7 +2251,11 @@ class ExecutionService:
     ) -> OrderIntent:
         """The prepared order, read from the sealed plan and nowhere else."""
         return self._order_intent(
-            intent, plan.quantity, plan.limit_price or Decimal(0), plan.stop_price
+            intent,
+            plan.quantity,
+            plan.limit_price or Decimal(0),
+            plan.stop_price,
+            plan.broker_instrument_ref,
         )
 
     def _order_intent(
@@ -2206,6 +2264,7 @@ class ExecutionService:
         quantity: Decimal,
         entry_price: Decimal,
         stop_price: Decimal | None,
+        broker_instrument_ref: str,
     ) -> OrderIntent:
         return OrderIntent(
             client_order_id=intent.client_order_id,
@@ -2216,6 +2275,7 @@ class ExecutionService:
             environment=self._config.environment,
             account_alias=self._config.account_alias,
             symbol=intent.symbol,
+            broker_instrument_ref=broker_instrument_ref,
             side=intent.side,
             order_type=self._config.order_type,
             quantity=quantity,
