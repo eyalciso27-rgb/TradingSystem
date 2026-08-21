@@ -3,10 +3,19 @@
 Provides ``create_session()`` for ``scripts/poi_ibkr_market_data_readonly.py``:
 a session object exposing exactly the harness allowlist — ``connect``,
 ``req_current_time``, ``req_account_summary``, ``resolve_contract``,
-``req_market_data``, ``disconnect`` — and nothing else. There is deliberately
-no order-placing, cancellation, modification or global-cancel surface here at
-all; this is a market-data pre-check, NOT the IMP-1002 adapter and NOT
-POI-IBKR-001 execution.
+``req_market_data``, ``disconnect`` — plus ONE addition for the canonical
+execution path, ``req_market_data_for_instrument``, which quotes a security by
+the broker's own resolved reference rather than by ticker. Nothing else. There
+is deliberately no order-placing, cancellation, modification or global-cancel
+surface here at all; this is a market-data pre-check, NOT the IMP-1002 adapter
+and NOT POI-IBKR-001 execution.
+
+The two market-data operations are not interchangeable. ``req_market_data``
+takes a ticker and predates contract resolution; it is kept for the read-only
+PoI tooling that still uses it. The execution path may only use
+``req_market_data_for_instrument``, because asking for a price by ticker after a
+security has been resolved lets IBKR resolve the string a second time, with
+nobody comparing the two answers.
 
 The shared safety gates are REUSED from the merged POI-IBKR-READONLY session
 (``_validate_endpoint``, ``mask_account_id``, ``PoiSessionError``,
