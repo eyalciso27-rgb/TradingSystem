@@ -37,6 +37,7 @@ Design (ADR-0014; PoI plan v2), mirroring the merged read-only client:
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -54,6 +55,8 @@ from trading_broker_ibkr.poi_readonly_session import (
     ReadOnlyAccountSummary,
     _validate_endpoint,
 )
+
+_LOGGER = logging.getLogger("trading_broker_ibkr.market_data")
 
 MARKET_DATA_CLIENT_VERSION = "poi-ibkr-market-data-client-1.0.0"
 
@@ -813,7 +816,7 @@ def _build_ibapi_transport() -> MarketDataTransport:
             EClient.__init__(self, self)
             self._sink: MarketDataSink | None = None
 
-        def bind(self, sink: MarketDataSink) -> None:
+        def bind(self, sink: MarketDataSink | None) -> None:
             self._sink = sink
 
         def nextValidId(self, order_id: int) -> None:  # noqa: N802
@@ -899,12 +902,41 @@ def _build_ibapi_transport() -> MarketDataTransport:
             self._thread.start()
 
         def stop(self) -> None:
+            """Deterministic teardown, including from a PARTIAL connection.
+
+            The first real owner-host run aborted startup between connecting and
+            finishing, and the SDK reader thread then tore down through
+            ``serverVersion() == None`` and printed a traceback from a
+            background thread. A probe that aborts cleanly must not leave that
+            behind: every step here tolerates a half-established connection and
+            none of them may raise past this method.
+            """
             try:
-                if self._app.isConnected():
+                connected = bool(self._app.isConnected())
+            except Exception:  # noqa: BLE001 - a partial connect cannot answer
+                connected = False
+            if connected:
+                try:
                     self._app.disconnect()
-            finally:
-                if self._thread is not None:
-                    self._thread.join(timeout=5)
+                except Exception as error:  # noqa: BLE001 - teardown is best effort
+                    _LOGGER.debug(
+                        "market-data disconnect raised %s", type(error).__name__
+                    )
+            else:
+                # Never connected, or connected far enough to have a socket and
+                # no server version. Release the reader loop either way.
+                try:
+                    self._app.done = True
+                except Exception:  # noqa: BLE001 - attribute may not exist yet
+                    pass
+            if self._thread is not None:
+                self._thread.join(timeout=5)
+                if self._thread.is_alive():
+                    _LOGGER.warning(
+                        "the market-data SDK thread did not stop within 5s"
+                    )
+                self._thread = None
+            self._app.bind(None)
 
         def request_current_time(self) -> None:
             self._app.reqCurrentTime()

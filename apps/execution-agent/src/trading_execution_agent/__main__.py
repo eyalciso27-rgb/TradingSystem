@@ -68,10 +68,25 @@ from trading_execution_agent.execution_service import (
     ExecutionService,
     ExecutionStage,
 )
+from trading_execution_agent.safe_logging import install_owner_output_protection
 
 #: Owner-host defaults. The account ALIAS is configuration; the account NUMBER
 #: never appears here and never leaves the adapter.
 ENV_ACCOUNT_ALIAS = "TRADING_PAPER_ACCOUNT_ALIAS"
+#: The canonical secret store root, as the rest of the owner-host runtime uses
+#: it. No default: a secret store location is deployment configuration, and
+#: guessing one is how a probe ends up reading the wrong environment's secrets.
+ENV_SECRETS_ROOT = "SECRETS_ROOT"
+#: The reference inside the PAPER store. Not a path -- FileSecretStore resolves
+#: it under $SECRETS_ROOT/PAPER/ and refuses anything that escapes that root.
+PAPER_ACCOUNT_SECRET = "ibkr/paper-account-id"
+#: Explicit override, retained for unusual cases and NOT the documented path:
+#: exporting a raw broker account id puts it in shell history and in `ps`.
+#: Takes precedence over the secret store when set.
+ENV_ACCOUNT_ID_OVERRIDE = "TRADING_PAPER_ACCOUNT_ID"
+ENV_DATABASE_URL = "DATABASE_URL"
+ENV_OBJECT_STORE = "TRADING_OBJECT_STORE"
+DEFAULT_OBJECT_STORE = "var/objects"
 ENV_GATEWAY_HOST = "TRADING_IBKR_HOST"
 ENV_GATEWAY_PORT = "TRADING_IBKR_PORT"
 ENV_EQUITY_CAP = "TRADING_SIMULATION_EQUITY_CAP"
@@ -192,26 +207,148 @@ def _quote_source(session: MarketDataSessionLike) -> QuoteSource:
     return IbkrQuoteSource(session)
 
 
+class ProbePreflightError(Exception):
+    """Local configuration is not usable. Raised BEFORE anything connects."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeConfig:
+    """Every local fact the probe needs, validated before any socket opens."""
+
+    account_alias: str
+    #: The broker account, resolved from the canonical PAPER secret store.
+    #: Held as a plain string only because the adapter needs it; it is never
+    #: logged, never printed and never written anywhere.
+    account_id: str
+    database_url_present: bool
+    object_store: object
+    host: str
+    port: int
+    equity_cap: Decimal
+
+
+def _resolve_account_id(account_alias: str) -> str:
+    """The paper account for this alias, from the canonical secret store.
+
+    Reuses ``FileSecretStore`` -- the same PAPER/LIVE-separated loader the rest
+    of the owner-host runtime already uses (``scripts/poi_ibkr_lifecycle.py``,
+    ``scripts/poi_tg_user.py``, ``scripts/ib_gateway_watchdog.py``) with the
+    same ``SECRETS_ROOT`` convention. There is deliberately no second account
+    secret location and no path hard-coded here: the owner host configures
+    ``SECRETS_ROOT`` and the store resolves
+    ``$SECRETS_ROOT/PAPER/ibkr/paper-account-id``.
+
+    ``TRADING_PAPER_ACCOUNT_ID`` is still honoured as an explicit override for
+    unusual cases, and takes precedence when set -- but it is NOT the documented
+    path, because requiring the owner to export a raw broker account id makes it
+    visible in the shell history and in ``ps``.
+    """
+    from pathlib import Path
+
+    from trading_config.secrets import FileSecretStore, SecretError
+
+    override = os.environ.get(ENV_ACCOUNT_ID_OVERRIDE, "").strip()
+    if override:
+        return override
+
+    secrets_root = os.environ.get(ENV_SECRETS_ROOT, "").strip()
+    if not secrets_root:
+        raise ProbePreflightError(
+            f"{ENV_SECRETS_ROOT} is not set, so the paper account for alias"
+            f" {account_alias!r} cannot be resolved. The owner host keeps it in"
+            f" the canonical secret store at"
+            f" $" + f"{ENV_SECRETS_ROOT}/PAPER/{PAPER_ACCOUNT_SECRET}."
+            f" (An explicit {ENV_ACCOUNT_ID_OVERRIDE} also works, but exporting"
+            " a raw account id puts it in your shell history.)"
+        )
+    try:
+        store = FileSecretStore(Path(secrets_root), Environment.PAPER)
+        account_id = store.get(PAPER_ACCOUNT_SECRET).reveal().strip()
+    except SecretError as error:
+        # Names the reference, never the value.
+        raise ProbePreflightError(
+            f"the paper account for alias {account_alias!r} could not be"
+            f" resolved from the secret store: {error}"
+        ) from error
+    if not account_id:
+        raise ProbePreflightError(
+            f"the canonical paper account secret {PAPER_ACCOUNT_SECRET!r} is"
+            " empty; refusing to connect without knowing which account this is"
+        )
+    return account_id
+
+
+def preflight(
+    *, account_alias: str, host: str, port: int, equity_cap: Decimal
+) -> ProbeConfig:
+    """Validate ALL local configuration before opening ANY network resource.
+
+    The first real owner-host run opened two IBKR sessions and only then
+    discovered ``DATABASE_URL`` was unset -- which aborted startup mid-flight
+    and left the SDK thread tearing down into a ``serverVersion() == None``
+    exception. Nothing about that failure needed a socket to detect.
+
+    So every purely local fact is checked here, first: the account secret, the
+    database configuration, the object store path, and the paper-only endpoint.
+    Failing here costs one clear message and zero connections.
+    """
+    from pathlib import Path
+
+    from trading_broker_ibkr.poi_readonly_session import _validate_endpoint
+
+    # 1. Paper-only endpoint. Purely local, and the most important refusal.
+    try:
+        _validate_endpoint(host, port)
+    except Exception as error:  # noqa: BLE001 - normalised into one message
+        raise ProbePreflightError(f"refused endpoint: {error}") from error
+
+    # 2. The account, from the canonical secret store.
+    account_id = _resolve_account_id(account_alias)
+
+    # 3. The database. Checked for PRESENCE only -- the value is a DSN with a
+    #    password in it and never appears in a message.
+    if not os.environ.get(ENV_DATABASE_URL, "").strip():
+        raise ProbePreflightError(
+            f"{ENV_DATABASE_URL} is not set, so the durable execution audit"
+            " cannot be reached. The paper stack publishes no database port by"
+            " design; use scripts/run_execution_probe_paper.sh, which supplies"
+            " it from the paper environment without printing it."
+        )
+
+    # 4. The object store path must be constructible.
+    raw_store = os.environ.get(ENV_OBJECT_STORE, DEFAULT_OBJECT_STORE)
+    try:
+        object_store = Path(raw_store)
+    except (TypeError, ValueError) as error:
+        raise ProbePreflightError(
+            f"{ENV_OBJECT_STORE} is not a usable path ({type(error).__name__})"
+        ) from error
+
+    return ProbeConfig(
+        account_alias=account_alias,
+        account_id=account_id,
+        database_url_present=True,
+        object_store=object_store,
+        host=host,
+        port=port,
+        equity_cap=equity_cap,
+    )
+
+
 def build_service(
     *, symbol: str, account_alias: str, host: str, port: int, equity_cap: Decimal
 ) -> ProbeResources:
     """Wire the REAL components. Imported lazily so --help never opens a socket."""
-    from pathlib import Path
-
     from trading_broker_ibkr.paper_adapter import build_paper_adapter
     from trading_broker_ibkr.poi_market_data_session import create_session
     from trading_persistence.db import create_sync_engine
     from trading_persistence.object_storage import FilesystemObjectStorage
 
-
-    account_id = os.environ.get("TRADING_PAPER_ACCOUNT_ID", "")
-    if not account_id:
-        raise SystemExit(
-            "TRADING_PAPER_ACCOUNT_ID must be set to the paper account this alias"
-            " maps to. It is read from the environment, never written to disk,"
-            " and never printed: the adapter masks it and refuses any account"
-            " that is not a paper account."
-        )
+    # EVERYTHING local first. No socket is opened until this returns.
+    config = preflight(
+        account_alias=account_alias, host=host, port=port, equity_cap=equity_cap
+    )
+    account_id = config.account_id
 
     # Each resource is registered for cleanup THE MOMENT it opens, so a
     # failure in any later step unwinds everything already acquired.
@@ -233,9 +370,7 @@ def build_service(
         engine = create_sync_engine()
         stack.callback(_closing(engine, "dispose", "database engine"))
 
-        objects = FilesystemObjectStorage(
-            Path(os.environ.get("TRADING_OBJECT_STORE", "var/objects"))
-        )
+        objects = FilesystemObjectStorage(config.object_store)  # type: ignore[arg-type]
         service = _build(
             adapter, session, engine, objects,
             account_alias=account_alias, equity_cap=equity_cap,
@@ -394,6 +529,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--account-alias",
         default=os.environ.get(ENV_ACCOUNT_ALIAS, DEFAULT_ACCOUNT_ALIAS),
     )
+    probe.add_argument(
+        "--debug-broker-logging",
+        action="store_true",
+        help=(
+            "leave the IBKR SDK's protocol loggers at their own level for"
+            " troubleshooting. Account identifiers are still redacted."
+        ),
+    )
     probe.add_argument("--host", default=os.environ.get(ENV_GATEWAY_HOST, DEFAULT_HOST))
     probe.add_argument(
         "--port", type=int,
@@ -402,6 +545,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     configure_logging(service="execution-probe", environment="PAPER")
+    # BEFORE anything can log. The broker SDK echoes its own protocol payloads
+    # at INFO -- including the managed-account list, DU number and all -- so the
+    # promise that the account id is never printed has to be enforced against
+    # third-party loggers, not just against our own render().
+    install_owner_output_protection(debug=args.debug_broker_logging)
     now = datetime.now(tz=UTC)
     # ONE identity: the decision's own id is the canonical execution identity,
     # and everything downstream (risk ref, audit target, durable history,

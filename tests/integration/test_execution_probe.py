@@ -84,6 +84,9 @@ def test_a_failure_after_the_adapter_opens_still_disconnects_it(
     """
     adapter = _Closeable()
     monkeypatch.setenv("TRADING_PAPER_ACCOUNT_ID", "DU" + "1234567")
+    # Preflight now validates ALL local configuration before any socket
+    # opens, so these tests must supply what a real run supplies.
+    monkeypatch.setenv("DATABASE_URL", "postgresql://probe@localhost/test")
     monkeypatch.setattr(
         "trading_broker_ibkr.paper_adapter.build_paper_adapter",
         lambda **kw: adapter,
@@ -107,6 +110,9 @@ def test_a_failure_after_the_session_opens_releases_both(
 ) -> None:
     adapter, session = _Closeable(), _Closeable()
     monkeypatch.setenv("TRADING_PAPER_ACCOUNT_ID", "DU" + "1234567")
+    # Preflight now validates ALL local configuration before any socket
+    # opens, so these tests must supply what a real run supplies.
+    monkeypatch.setenv("DATABASE_URL", "postgresql://probe@localhost/test")
     monkeypatch.setattr(
         "trading_broker_ibkr.paper_adapter.build_paper_adapter", lambda **kw: adapter
     )
@@ -133,6 +139,9 @@ def test_a_failure_building_the_service_releases_the_engine_too(
 ) -> None:
     adapter, session, engine = _Closeable(), _Closeable(), _Closeable()
     monkeypatch.setenv("TRADING_PAPER_ACCOUNT_ID", "DU" + "1234567")
+    # Preflight now validates ALL local configuration before any socket
+    # opens, so these tests must supply what a real run supplies.
+    monkeypatch.setenv("DATABASE_URL", "postgresql://probe@localhost/test")
     monkeypatch.setenv("TRADING_OBJECT_STORE", str(tmp_path / "objects"))
     monkeypatch.setattr(
         "trading_broker_ibkr.paper_adapter.build_paper_adapter", lambda **kw: adapter
@@ -159,6 +168,9 @@ def test_a_successful_construction_releases_everything_exactly_once(
 ) -> None:
     adapter, session, engine = _Closeable(), _Closeable(), _Closeable()
     monkeypatch.setenv("TRADING_PAPER_ACCOUNT_ID", "DU" + "1234567")
+    # Preflight now validates ALL local configuration before any socket
+    # opens, so these tests must supply what a real run supplies.
+    monkeypatch.setenv("DATABASE_URL", "postgresql://probe@localhost/test")
     monkeypatch.setenv("TRADING_OBJECT_STORE", str(tmp_path / "objects"))
     monkeypatch.setattr(
         "trading_broker_ibkr.paper_adapter.build_paper_adapter", lambda **kw: adapter
@@ -184,6 +196,9 @@ def test_one_resource_failing_to_close_never_strands_the_others(
 ) -> None:
     adapter, session, engine = _Closeable(), _Closeable(fails=True), _Closeable()
     monkeypatch.setenv("TRADING_PAPER_ACCOUNT_ID", "DU" + "1234567")
+    # Preflight now validates ALL local configuration before any socket
+    # opens, so these tests must supply what a real run supplies.
+    monkeypatch.setenv("DATABASE_URL", "postgresql://probe@localhost/test")
     monkeypatch.setenv("TRADING_OBJECT_STORE", str(tmp_path / "objects"))
     monkeypatch.setattr(
         "trading_broker_ibkr.paper_adapter.build_paper_adapter", lambda **kw: adapter

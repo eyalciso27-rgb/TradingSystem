@@ -105,7 +105,41 @@ implementation denies. Paper Auto and Live remain prohibited.
 The one supported way to exercise the real execution runtime is the owner-host
 probe, which resolves a contract, takes a live quote, runs the risk engine, asks
 the broker to validate the order with a what-if that places nothing, computes
-readiness and records the decision — and then stops:
+readiness and records the decision — and then stops.
+
+**Run it with the wrapper.** It is the canonical invocation:
+
+```sh
+bash scripts/run_execution_probe_paper.sh AAPL
+```
+
+You do not export a broker account id. The paper account is resolved internally
+from the canonical secret store the rest of the owner-host runtime already uses,
+at `$SECRETS_ROOT/PAPER/ibkr/paper-account-id`, and it is never printed — the
+probe reports the configured alias (`paper-poi`), and account identifiers are
+redacted out of *all* logging, including the IBKR SDK's own.
+
+The wrapper exists because the probe needs two things that do not otherwise
+meet. The IB Gateway is reachable only at `127.0.0.1:4002` — both the adapter
+and the market-data session refuse anything else — so the probe runs on the
+host; and the paper stack publishes no database port at all. The wrapper opens a
+**loopback-only** publish of the paper database for the duration of the run
+(`127.0.0.1:${PAPER_PROBE_DB_PORT:-55432}`, never `0.0.0.0`) via
+`deploy/compose.paper-probe.yaml`, and closes it again on exit. That override is
+never part of normal paper startup.
+
+What it needs from you, all of which the paper stack already needs:
+
+| variable | why |
+|---|---|
+| `SECRETS_ROOT` | locates the canonical PAPER secret store |
+| `PAPER_POSTGRES_USER` / `PAPER_POSTGRES_PASSWORD` | the paper database, as for the stack itself |
+
+Every purely local precondition is validated **before any connection is
+opened**, so a missing one costs a single clear message and zero IBKR sessions.
+
+Running the module directly still works and is what the wrapper calls, but it
+then requires `DATABASE_URL` to already point at a reachable paper database:
 
 ```sh
 uv run --no-sync python -m trading_execution_agent probe --mode paper --symbol AAPL
