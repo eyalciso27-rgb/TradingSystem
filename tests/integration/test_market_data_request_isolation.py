@@ -31,7 +31,7 @@ import threading
 from decimal import Decimal
 
 import pytest
-from trading_application.trading_readiness_runtime import MarketDataState
+from trading_application.trading_readiness_runtime import MarketDataState, QuoteState
 from trading_broker_core.port import BrokerInstrument
 from trading_broker_ibkr.poi_market_data_client import (
     IbkrMarketDataRawClient,
@@ -89,12 +89,21 @@ class ScriptedMarketData:
     the real wrapper now does, so a late callback can be modelled faithfully.
     """
 
-    def __init__(self, *scripts: _Script) -> None:
+    def __init__(
+        self,
+        *scripts: _Script,
+        by_con_id: dict[int, _Script] | None = None,
+    ) -> None:
         self._scripts = list(scripts)
+        #: Keyed by SECURITY. Arrival order proves nothing about which quote a
+        #: security received; keying the gateway's answers by con id is what
+        #: makes "conid:A got A's price" an actual assertion.
+        self._by_con_id = by_con_id or {}
         self.requests: list[tuple[int, int]] = []  # (req_id, con_id)
         self.cancelled: list[int] = []
         self.calls: list[str] = []
         self.cancel_error: Exception | None = None
+        self.request_error: Exception | None = None
         self._sink: MarketDataSink | None = None
 
     # -- lifecycle ---------------------------------------------------------
@@ -127,6 +136,12 @@ class ScriptedMarketData:
     def request_market_data_for_con_id(self, req_id: int, con_id: int) -> None:
         self.requests.append((req_id, con_id))
         self.calls.append(f"reqMktData:{req_id}:{con_id}")
+        if self.request_error is not None:
+            raise self.request_error
+        keyed = self._by_con_id.get(con_id)
+        if keyed is not None:
+            self.play(keyed, req_id)
+            return
         index = len(self.requests) - 1
         if index < len(self._scripts):
             self.play(self._scripts[index], req_id)
@@ -427,29 +442,45 @@ def test_the_poisoned_client_reports_why() -> None:
 # == concurrency ==============================================================
 
 
-def test_two_securities_requested_concurrently_never_share_a_buffer() -> None:
-    """Two DIFFERENT securities, one session, two threads.
 
-    Execution single-flight de-duplicates one identity; it does not serialise
-    two different decisions, so the market-data client has to hold this line
-    itself. The API is synchronous, so it serialises -- and the proof is that
-    each quote contains only its own ticks and each request is cancelled before
-    the next is issued.
+
+#: The gateway's answers keyed by SECURITY. Sorting two prices and checking the
+#: set appear proves only that both arrived somewhere; it says nothing about
+#: which security got which. Neither does ``requested_for``, which comes from
+#: the request argument and stays correct even when the underlying data is
+#: another request's.
+BY_SECURITY = {
+    111111: _Script(market_data_type=1, prices={BID: 100.00, ASK: 100.05}),
+    222222: _Script(market_data_type=1, prices={BID: 250.00, ASK: 250.10}),
+}
+
+
+def _keyed_chain() -> tuple[IbkrQuoteSource, ScriptedMarketData]:
+    transport = ScriptedMarketData(by_con_id=BY_SECURITY)
+    client = IbkrMarketDataRawClient(
+        lambda: transport, now=lambda: CAPTURED_AT, timeout_seconds=1.0
+    )
+    session = IbkrMarketDataSession(client)
+    session.connect("127.0.0.1", 4002)
+    return IbkrQuoteSource(session), transport
+
+
+def test_each_security_receives_exactly_its_own_prices_concurrently() -> None:
+    """Two threads, one session, two securities -- bound by identity.
+
+    Every assertion names a security and the price that security's own request
+    returned. Nothing is sorted, so a swapped pair fails.
     """
-    scripts = [
-        _Script(market_data_type=1, prices={BID: 100.00, ASK: 100.05}),
-        _Script(market_data_type=1, prices={BID: 250.00, ASK: 250.10}),
-    ]
-    source, transport = _chain(*scripts)
+    source, transport = _keyed_chain()
     start = threading.Barrier(2)
-    results: dict[str, object] = {}
+    quotes: dict[str, QuoteState] = {}
     guard = threading.Lock()
 
     def run(instrument: BrokerInstrument) -> None:
         start.wait(timeout=5)
         state = source.current_quote(instrument)
         with guard:
-            results[instrument.broker_instrument_ref] = state
+            quotes[instrument.broker_instrument_ref] = state
 
     threads = [
         threading.Thread(target=run, args=(instrument,)) for instrument in (A, B)
@@ -459,12 +490,14 @@ def test_two_securities_requested_concurrently_never_share_a_buffer() -> None:
     for thread in threads:
         thread.join(timeout=10)
 
-    assert len(results) == 2
-    quotes = {ref: state for ref, state in results.items()}
-    bids = sorted(Decimal(str(getattr(state, "bid", 0))) for state in quotes.values())
-    assert bids == [Decimal("100"), Decimal("250")], bids
-    for ref, state in quotes.items():
-        assert f"requested_for={ref}" in getattr(state, "detail", ""), ref
+    first = quotes["conid:111111"]
+    second = quotes["conid:222222"]
+    assert first.bid == Decimal("100"), f"conid:111111 got {first.bid}"
+    assert first.ask == Decimal("100.05"), f"conid:111111 got {first.ask}"
+    assert second.bid == Decimal("250"), f"conid:222222 got {second.bid}"
+    assert second.ask == Decimal("250.10"), f"conid:222222 got {second.ask}"
+    assert "requested_for=conid:111111" in first.detail
+    assert "requested_for=conid:222222" in second.detail
 
     # Serialised: request, cancel, request, cancel -- never two open at once.
     market_data_calls = [
@@ -472,11 +505,295 @@ def test_two_securities_requested_concurrently_never_share_a_buffer() -> None:
         if call.startswith(("reqMktData:", "cancel:"))
     ]
     assert len(market_data_calls) == 4, market_data_calls
-    assert market_data_calls[0].startswith("reqMktData:")
-    assert market_data_calls[1].startswith("cancel:")
-    assert market_data_calls[2].startswith("reqMktData:")
-    assert market_data_calls[3].startswith("cancel:")
     first_id = market_data_calls[0].split(":")[1]
     assert market_data_calls[1] == f"cancel:{first_id}", (
         "the first request was cancelled before the second was issued"
+    )
+
+
+#: Delayed ticks live in their own family (66 bid / 68 last / 67 ask).
+DELAYED_BID, DELAYED_ASK = 66, 67
+
+#: A is served REALTIME, B is served DELAYED. The classification is the field
+#: that actually leaked: ``market_data_type`` was read from the mutable sink
+#: AFTER ``received_at = self._now()``, so a request completing inside that
+#: window relabelled the finished quote. It gates Paper (REALTIME|DELAYED) and
+#: Live (REALTIME only), so a wrong label is a wrong safety decision.
+RACING_SECURITIES = {
+    111111: _Script(market_data_type=1, prices={BID: 100.00, ASK: 100.05}),
+    222222: _Script(
+        market_data_type=3, prices={DELAYED_BID: 250.00, DELAYED_ASK: 250.10}
+    ),
+}
+
+
+def test_a_quote_is_materialised_before_the_next_request_can_touch_the_sink(
+) -> None:
+    """THE materialisation race, forced rather than hoped for.
+
+    A completes its callbacks and begins building its quote. B is released at
+    exactly that moment and resets the shared sink with its own data. Because
+    the result was still being read from the mutable sink after the request lock
+    had been released, A's finished quote was relabelled with B's served type:
+    A, actually REALTIME, was reported DELAYED.
+
+    The interleaving is forced from inside A's own materialisation path, so this
+    does not depend on scheduling luck.
+    """
+    transport = ScriptedMarketData(by_con_id=RACING_SECURITIES)
+    client = IbkrMarketDataRawClient(
+        lambda: transport, now=lambda: CAPTURED_AT, timeout_seconds=1.0
+    )
+    session = IbkrMarketDataSession(client)
+    session.connect("127.0.0.1", 4002)
+    source = IbkrQuoteSource(session)
+
+    b_started = threading.Event()
+    b_done = threading.Event()
+
+    def start_b() -> None:
+        b_started.set()
+        source.current_quote(B)
+        b_done.set()
+
+    def racing_now() -> str:
+        # Called while A materialises. If materialisation sat outside the
+        # request lock, B would get in here and reset the sink underneath it.
+        if not b_started.is_set():
+            threading.Thread(target=start_b, daemon=True).start()
+            b_started.wait(timeout=2)
+            b_done.wait(timeout=0.5)
+        return CAPTURED_AT
+
+    client._now = racing_now  # noqa: SLF001
+
+    a_quote = source.current_quote(A)
+    b_done.wait(timeout=5)
+
+    assert b_started.is_set(), "the racing request really was started"
+    assert a_quote.market_data_state is MarketDataState.REALTIME, (
+        "A was served REALTIME and came back labelled"
+        f" {a_quote.market_data_state.value}; the next request relabelled a"
+        " finished quote"
+    )
+    assert a_quote.bid == Decimal("100"), a_quote.bid
+    assert a_quote.ask == Decimal("100.05"), a_quote.ask
+    assert "requested_for=conid:111111" in a_quote.detail
+    assert "ibkr_market_data_type=1" in a_quote.detail, a_quote.detail
+
+
+# == atomicity of the identity check and the completion signal ==============
+
+
+def test_an_old_snapshot_end_that_passed_its_check_cannot_complete_the_next(
+) -> None:
+    """TOCTOU: the check and the signal must be ONE critical section.
+
+    If ``on_snapshot_end`` validated under the lock and signalled outside it,
+    an old callback could pass its check, the request could end and the next
+    begin (clearing the event), and the old callback would then complete a
+    snapshot that has no data at all.
+    """
+    sink = MarketDataSink()
+    sink.begin_market_data_request(1)
+    sink.finish_market_data_request(1)
+    sink.begin_market_data_request(2)
+
+    sink.on_snapshot_end(1)  # request 1 is long over
+
+    assert not sink.mkt_data_ready.is_set(), (
+        "an old snapshot end completed the new request"
+    )
+
+
+class _LockWatchingEvent(threading.Event):
+    """Records whether the sink lock was held at the moment ``set()`` ran.
+
+    This is what actually distinguishes atomic from not. Both shapes -- check
+    under the lock and signal inside it, or check under the lock and signal
+    after releasing it -- look identical from outside, because both block on the
+    lock for the check. The difference is only visible at the instant of the
+    signal, so that is where this looks.
+    """
+
+    def __init__(self, lock: threading.Lock) -> None:
+        super().__init__()
+        self._watched_lock = lock
+        self.locked_when_set: bool | None = None
+
+    def set(self) -> None:
+        self.locked_when_set = self._watched_lock.locked()
+        super().set()
+
+
+def _watched_sink() -> MarketDataSink:
+    sink = MarketDataSink()
+    sink.mkt_data_ready = _LockWatchingEvent(sink._lock)  # noqa: SLF001
+    return sink
+
+
+def test_the_completion_signal_is_set_inside_the_identity_check() -> None:
+    """No window exists between "is this request current?" and completing it.
+
+    A separate critical section is a TOCTOU: an old callback passes its check,
+    the request then ends and the next begins (clearing the event), and the old
+    callback completes a snapshot that never had any data.
+    """
+    sink = _watched_sink()
+    sink.begin_market_data_request(1)
+
+    sink.on_snapshot_end(1)
+
+    event = sink.mkt_data_ready
+    assert isinstance(event, _LockWatchingEvent)
+    assert event.is_set()
+    assert event.locked_when_set is True, (
+        "the completion signal ran outside the sink lock, so the identity check"
+        " and the signal are two critical sections and not one"
+    )
+
+
+def test_the_entitlement_error_signal_is_also_set_inside_the_check() -> None:
+    """The error path unblocks the caller too, so it needs the same atomicity."""
+    sink = _watched_sink()
+    sink.begin_market_data_request(1)
+
+    sink.on_error(SUBSCRIPTION_ERROR, "no market data permissions", 1)
+
+    event = sink.mkt_data_ready
+    assert isinstance(event, _LockWatchingEvent)
+    assert event.is_set()
+    assert event.locked_when_set is True, (
+        "a subscription error completed the request from outside the lock"
+    )
+
+
+def test_the_request_reset_clears_the_completion_event_inside_the_lock() -> None:
+    """The other half of the same window: arming must be atomic too."""
+    sink = MarketDataSink()
+    sink.begin_market_data_request(1)
+    sink.on_snapshot_end(1)
+    assert sink.mkt_data_ready.is_set()
+
+    cleared_under_lock: list[bool] = []
+    original_clear = sink.mkt_data_ready.clear
+
+    def watching_clear() -> None:
+        cleared_under_lock.append(sink._lock.locked())  # noqa: SLF001
+        original_clear()
+
+    sink.mkt_data_ready.clear = watching_clear  # type: ignore[method-assign]
+
+    sink.begin_market_data_request(2)
+
+    assert cleared_under_lock == [True], (
+        "the completion event was cleared outside the lock, so a callback that"
+        " had already passed its check could set it again afterwards"
+    )
+
+
+def test_an_old_subscription_error_cannot_complete_the_next_request() -> None:
+    """The same TOCTOU on the error path, which also unblocks the caller."""
+    sink = MarketDataSink()
+    sink.begin_market_data_request(1)
+    sink.finish_market_data_request(1)
+    sink.begin_market_data_request(2)
+
+    sink.on_error(SUBSCRIPTION_ERROR, "no market data permissions", 1)
+
+    assert not sink.mkt_data_ready.is_set(), (
+        "an old request's entitlement error completed the new request"
+    )
+    assert sink.entitlement_errors == [], (
+        "and it did not attach itself to the new request either"
+    )
+
+
+def test_a_completed_snapshot_is_frozen_and_detached_from_the_sink() -> None:
+    """The capture is immutable: later callbacks cannot alter a taken result."""
+    sink = MarketDataSink()
+    sink.begin_market_data_request(1)
+    sink.on_market_data_type(1, 1)
+    sink.on_tick_price(BID, 100.00, 1)
+
+    snapshot = sink.finish_market_data_request(1)
+
+    # A whole new request refills the sink completely.
+    sink.begin_market_data_request(2)
+    sink.on_market_data_type(3, 2)
+    sink.on_tick_price(BID, 250.00, 2)
+
+    assert snapshot.req_id == 1
+    assert snapshot.market_data_type == 1
+    assert snapshot.realtime["bid"] == "100.0"
+    assert snapshot.values("realtime")["bid"] == "100.0"
+
+
+# == the request call itself failing =========================================
+
+
+def test_a_request_that_raises_still_disarms_and_cancels() -> None:
+    """Cleanup is guaranteed from the moment the request is attempted.
+
+    A synchronous failure inside ``request(...)`` used to happen BEFORE the
+    try/finally, so nothing was cancelled -- and that is exactly the boundary
+    where we cannot know how much of the request reached the gateway.
+    """
+    source, transport = _keyed_chain()
+    transport.request_error = RuntimeError("socket died mid-request")
+
+    state = source.current_quote(A)
+
+    assert state.market_data_state is MarketDataState.UNAVAILABLE
+    assert state.bid is None and state.ask is None
+    assert len(transport.requests) == 1
+    req_id = transport.requests[0][0]
+    assert transport.cancelled == [req_id], (
+        "the attempted request was cancelled under its own id"
+    )
+
+    # Cleanup succeeded, so the client is still usable and the next request is
+    # a clean one.
+    transport.request_error = None
+    recovered = source.current_quote(B)
+    assert recovered.bid == Decimal("250"), recovered.bid
+
+
+def test_a_request_that_raises_with_a_failing_cancel_poisons_the_client(
+) -> None:
+    """Two failures at once: we cannot prove the request stopped, so we stop."""
+    source, transport = _keyed_chain()
+    transport.request_error = RuntimeError("socket died mid-request")
+    transport.cancel_error = RuntimeError("cancel rejected")
+
+    first = source.current_quote(A)
+    assert first.market_data_state is MarketDataState.UNAVAILABLE
+
+    transport.request_error = None
+    second = source.current_quote(B)
+
+    assert second.market_data_state is MarketDataState.UNAVAILABLE, (
+        "a poisoned client must refuse rather than answer"
+    )
+    assert "PoiSessionError" in second.detail, second.detail
+    assert len(transport.requests) == 1, (
+        "no further market-data request was issued after the failed cleanup"
+    )
+
+
+def test_no_request_is_cancelled_when_none_was_ever_issued() -> None:
+    """Failing before the request means there is nothing at the gateway."""
+    source, transport = _keyed_chain()
+
+    def exploding(market_data_type: int) -> None:
+        raise RuntimeError("reqMarketDataType failed")
+
+    transport.set_market_data_type = exploding  # type: ignore[method-assign]
+
+    state = source.current_quote(A)
+
+    assert state.market_data_state is MarketDataState.UNAVAILABLE
+    assert transport.requests == [], "no request was issued"
+    assert transport.cancelled == [], (
+        "cancelling an id the gateway never saw is noise, not safety"
     )

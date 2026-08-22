@@ -111,37 +111,42 @@ class FakeTransport:
     def request_market_data_for_con_id(self, req_id: int, con_id: int) -> None:
         """The EXACT security. The execution path uses only this one."""
         self.calls.append(f"market_data_con_id:{con_id}")
-        self._replay_market_data()
+        self._replay_market_data(req_id)
 
     def request_market_data(self, req_id: int, symbol: str) -> None:
         self.calls.append(f"market_data:{symbol}")
-        self._replay_market_data()
+        self._replay_market_data(req_id)
 
-    def _replay_market_data(self) -> None:
+    def _replay_market_data(self, req_id: int) -> None:
+        """Every callback carries the id of the request it belongs to.
+
+        Mandatory now: a fake that could omit it would be a fake in which the
+        correlation protection quietly does not apply.
+        """
         assert self._sink is not None
         if self._market_data_type is not None:
-            self._sink.on_market_data_type(self._market_data_type)
+            self._sink.on_market_data_type(self._market_data_type, req_id)
         custom = self._price_ticks or self._size_ticks or self._string_ticks
         if custom is not None:
             for tick_id, price in (self._price_ticks or {}).items():
-                self._sink.on_tick_price(tick_id, price)
+                self._sink.on_tick_price(tick_id, price, req_id)
             for tick_id, size in (self._size_ticks or {}).items():
-                self._sink.on_tick_size(tick_id, size)
+                self._sink.on_tick_size(tick_id, size, req_id)
             for tick_id, text in (self._string_ticks or {}).items():
-                self._sink.on_tick_string(tick_id, text)
+                self._sink.on_tick_string(tick_id, text, req_id)
         elif self._ticks:
-            self._sink.on_tick_price(BID, 191.20)
-            self._sink.on_tick_price(ASK, 191.24)
-            self._sink.on_tick_price(LAST, 191.22)
-            self._sink.on_tick_size(BID_SIZE, 300)
-            self._sink.on_tick_size(ASK_SIZE, 500)
-            self._sink.on_tick_size(LAST_SIZE, 100)
+            self._sink.on_tick_price(BID, 191.20, req_id)
+            self._sink.on_tick_price(ASK, 191.24, req_id)
+            self._sink.on_tick_price(LAST, 191.22, req_id)
+            self._sink.on_tick_size(BID_SIZE, 300, req_id)
+            self._sink.on_tick_size(ASK_SIZE, 500, req_id)
+            self._sink.on_tick_size(LAST_SIZE, 100, req_id)
             if self._last_timestamp is not None:
-                self._sink.on_tick_string(LAST_TIMESTAMP, self._last_timestamp)
+                self._sink.on_tick_string(LAST_TIMESTAMP, self._last_timestamp, req_id)
         for error in self._mkt_errors:
-            self._sink.on_error(*error)
+            self._sink.on_error(*error, req_id)
         if self._snapshot_end:
-            self._sink.on_snapshot_end()
+            self._sink.on_snapshot_end(req_id)
 
     def cancel_market_data(self, req_id: int) -> None:
         self.calls.append("cancel_market_data")

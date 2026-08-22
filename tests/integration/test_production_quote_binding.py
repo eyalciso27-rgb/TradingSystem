@@ -110,21 +110,22 @@ class RecordingMarketData:
         contract.currency = "USD"
         self.contracts.append(contract)
         self.calls.append(f"reqMktData_by_con_id:{con_id}")
-        self._replay()
+        self._replay(req_id)
 
     def cancel_market_data(self, req_id: int) -> None:
         self.calls.append("cancel_market_data")
 
-    def _replay(self) -> None:
+    def _replay(self, req_id: int) -> None:
+        """Every callback carries its request id, as the real wrapper does."""
         assert self._sink is not None
-        self._sink.on_market_data_type(1)
-        self._sink.on_tick_price(BID, 100.00)
-        self._sink.on_tick_price(ASK, 100.05)
-        self._sink.on_tick_price(LAST, 100.02)
-        self._sink.on_tick_size(BID_SIZE, 500)
-        self._sink.on_tick_size(ASK_SIZE, 400)
-        self._sink.on_tick_size(LAST_SIZE, 100)
-        self._sink.on_snapshot_end()
+        self._sink.on_market_data_type(1, req_id)
+        self._sink.on_tick_price(BID, 100.00, req_id)
+        self._sink.on_tick_price(ASK, 100.05, req_id)
+        self._sink.on_tick_price(LAST, 100.02, req_id)
+        self._sink.on_tick_size(BID_SIZE, 500, req_id)
+        self._sink.on_tick_size(ASK_SIZE, 400, req_id)
+        self._sink.on_tick_size(LAST_SIZE, 100, req_id)
+        self._sink.on_snapshot_end(req_id)
 
 
 def _production_chain() -> tuple[IbkrQuoteSource, RecordingMarketData]:

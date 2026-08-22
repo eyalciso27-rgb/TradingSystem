@@ -38,7 +38,7 @@ Design (ADR-0014; PoI plan v2), mirroring the merged read-only client:
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -216,6 +216,33 @@ def classify_freshness(market_data_type: int | None) -> str:
     return FRESHNESS_BY_IBKR_TYPE.get(market_data_type, "UNKNOWN")
 
 
+@dataclass(frozen=True, slots=True)
+class MarketDataSnapshot:
+    """ONE completed market-data request, frozen and detached from the sink.
+
+    The sink is shared and mutable for the whole connection. Building a quote by
+    reading it after the request lock had been released meant the next request
+    could reset and refill those buffers mid-read -- so a quote for A could be
+    assembled from B's ticks, with the request lock having done nothing to stop
+    it because issuance was serialised and *materialisation* was not.
+
+    Everything a quote needs is copied out under the sink lock, in one operation,
+    at the moment the request completes. After that there is nothing left to
+    race: this object cannot change, and the sink's buffers are irrelevant to it.
+    """
+
+    req_id: int
+    market_data_type: int | None
+    realtime: Mapping[str, str]
+    delayed: Mapping[str, str]
+    source_tick_ids: tuple[int, ...]
+    entitlement_errors: tuple[str, ...]
+    got_tick: bool
+
+    def values(self, family: str) -> Mapping[str, str]:
+        return self.realtime if family == "realtime" else self.delayed
+
+
 @dataclass
 class MarketDataSink:
     """Thread-safe buffers + events that transport callbacks feed."""
@@ -269,10 +296,33 @@ class MarketDataSink:
             self.source_tick_ids = []
             self.entitlement_errors = []
             self.got_tick = False
-        self.mkt_data_ready.clear()
+            # Cleared INSIDE the lock. A callback that had already passed its
+            # identity check could otherwise set the event after this clear, and
+            # the new request would start life already "complete".
+            self.mkt_data_ready.clear()
+
+    def finish_market_data_request(self, req_id: int) -> MarketDataSnapshot:
+        """Freeze this request's evidence and disarm it, in ONE atomic step.
+
+        Copying and disarming cannot be two operations: between them, the next
+        request could arm itself and start refilling the buffers being copied.
+        """
+        with self._lock:
+            snapshot = MarketDataSnapshot(
+                req_id=req_id,
+                market_data_type=self.market_data_type,
+                realtime=dict(self.families["realtime"]),
+                delayed=dict(self.families["delayed"]),
+                source_tick_ids=tuple(self.source_tick_ids),
+                entitlement_errors=tuple(self.entitlement_errors),
+                got_tick=self.got_tick,
+            )
+            if self.active_market_data_req_id == req_id:
+                self.active_market_data_req_id = None
+            return snapshot
 
     def end_market_data_request(self, req_id: int) -> None:
-        """Disarm. Anything arriving for this id afterwards is late."""
+        """Disarm without freezing. Idempotent; safe on a finished request."""
         with self._lock:
             if self.active_market_data_req_id == req_id:
                 self.active_market_data_req_id = None
@@ -280,9 +330,15 @@ class MarketDataSink:
     def _is_current(self, req_id: int | None) -> bool:
         """Does this callback belong to the snapshot being collected NOW?
 
-        ``None`` means the caller could not tell us -- the legacy in-process
-        seams that predate correlation -- and is accepted. The real SDK wrapper
-        always passes IBKR's own reqId.
+        Must be called with ``self._lock`` held: the answer is only meaningful
+        for as long as no begin/finish transition can run between the check and
+        whatever the caller does with it.
+
+        ``req_id`` is MANDATORY for every callback that can put data into a
+        quote -- ticks, classification, completion. It stays optional only for
+        ``on_error``, because IBKR genuinely reports some errors with no request
+        id, and an unattributed error can only make a quote unavailable, never
+        fabricate one.
         """
         if req_id is None:
             return True
@@ -320,17 +376,13 @@ class MarketDataSink:
         self.contract_ready.set()
 
     # -- market data -------------------------------------------------------
-    def on_market_data_type(
-        self, market_data_type: int, req_id: int | None = None
-    ) -> None:
+    def on_market_data_type(self, market_data_type: int, req_id: int) -> None:
         with self._lock:
             if not self._is_current(req_id):
                 return  # a late classification cannot classify this snapshot
             self.market_data_type = int(market_data_type)
 
-    def on_tick_price(
-        self, tick_type: int, price: object, req_id: int | None = None
-    ) -> None:
+    def on_tick_price(self, tick_type: int, price: object, req_id: int) -> None:
         mapping = _PRICE_FIELD_BY_TICK.get(tick_type)
         with self._lock:
             if not self._is_current(req_id):
@@ -340,9 +392,7 @@ class MarketDataSink:
                 family, key = mapping
                 self.families[family][key] = str(price)
 
-    def on_tick_size(
-        self, tick_type: int, size: object, req_id: int | None = None
-    ) -> None:
+    def on_tick_size(self, tick_type: int, size: object, req_id: int) -> None:
         mapping = _SIZE_FIELD_BY_TICK.get(tick_type)
         with self._lock:
             if not self._is_current(req_id):
@@ -352,9 +402,7 @@ class MarketDataSink:
                 family, key = mapping
                 self.families[family][key] = str(size)
 
-    def on_tick_string(
-        self, tick_type: int, value: str, req_id: int | None = None
-    ) -> None:
+    def on_tick_string(self, tick_type: int, value: str, req_id: int) -> None:
         family = _TIMESTAMP_FAMILY_BY_TICK.get(tick_type)
         if family is None:
             return
@@ -369,11 +417,15 @@ class MarketDataSink:
                 datetime.fromtimestamp(int(raw), tz=UTC).isoformat()
             )
 
-    def on_snapshot_end(self, req_id: int | None = None) -> None:
+    def on_snapshot_end(self, req_id: int) -> None:
         with self._lock:
             if not self._is_current(req_id):
                 return  # an old snapshot's end must never complete a new one
-        self.mkt_data_ready.set()
+            # Set INSIDE the lock. Checking under the lock and signalling after
+            # it is a TOCTOU: an old callback could pass its check, the request
+            # could then end and the next one begin (clearing the event), and
+            # the old callback would then complete a snapshot that has no data.
+            self.mkt_data_ready.set()
 
     # -- errors ------------------------------------------------------------
     def on_callback_shape_error(self, detail: str) -> None:
@@ -398,7 +450,9 @@ class MarketDataSink:
                 if not self._is_current(req_id):
                     return  # an old request's entitlement problem is not ours
                 self.entitlement_errors.append(text)
-            self.mkt_data_ready.set()  # no data is coming
+                # Same atomicity as on_snapshot_end: this unblocks the waiting
+                # caller, so the identity check and the signal are one step.
+                self.mkt_data_ready.set()  # no data is coming
             return
         if code in _DELAYED_NOTICE_CODES:
             with self._lock:
@@ -568,7 +622,15 @@ class IbkrMarketDataRawClient:
         symbol: str,
         request: Callable[[MarketDataTransport, int], None],
     ) -> MarketDataQuote:
-        """ONE snapshot: its own id, its own empty buffers, its own cleanup."""
+        """ONE snapshot: its own id, its own empty buffers, its own cleanup.
+
+        The lock is held until the quote has been built from an IMMUTABLE
+        snapshot. Releasing it after cancellation but before materialisation was
+        a real race: the next request could arm itself and refill the shared sink
+        while this caller was still reading it, so a quote for A could be
+        assembled out of B's ticks. Serialising the *request* is not enough --
+        the result has to be captured inside the same boundary.
+        """
         with self._market_data_lock:
             sink, transport = self._require_open()
             req_id = self._next_market_data_req_id
@@ -576,29 +638,50 @@ class IbkrMarketDataRawClient:
             # Arm BEFORE requesting: every buffer starts empty and every
             # callback is matched against this id.
             sink.begin_market_data_request(req_id)
-            # Request the caller's mode explicitly (1 realtime / 3 delayed); the
-            # ACTUAL type served is read from the marketDataType callback below
-            # and never assumed from the request.
-            transport.set_market_data_type(requested_market_data_type)
-            request(transport, req_id)
+            snapshot: MarketDataSnapshot | None = None
+            # Set BEFORE the transport call, not after: a request that partially
+            # reached the gateway and then raised still needs cancelling, and we
+            # cannot tell from here how far it got.
+            requested = False
             try:
+                # Request the caller's mode explicitly (1 realtime / 3 delayed);
+                # the ACTUAL type served is read from the marketDataType
+                # callback and never assumed from the request.
+                transport.set_market_data_type(requested_market_data_type)
+                requested = True
+                request(transport, req_id)
                 self._await(sink.mkt_data_ready, "market data snapshot")
+                # Freeze and disarm in ONE atomic step, while the request lock
+                # is still held. From here the quote depends on nothing mutable.
+                snapshot = sink.finish_market_data_request(req_id)
             finally:
-                # ALWAYS, and for THIS id. A timeout used to skip cancellation
-                # entirely, leaving the gateway streaming into the next
-                # snapshot's buffers. The original failure is preserved:
-                # _release_market_data poisons the client rather than raising
-                # over it, so a cleanup failure can never read as permission.
-                self._release_market_data(transport, sink, req_id)
+                # ALWAYS. A timeout used to skip cancellation entirely, and a
+                # synchronous failure inside request() skipped it too, leaving
+                # the gateway streaming into the next snapshot's buffers. The
+                # original failure is preserved: _release_market_data poisons
+                # the client rather than raising over it, so a cleanup failure
+                # can never read as permission.
+                self._release_market_data(
+                    transport, sink, req_id, cancel=requested
+                )
 
+            assert snapshot is not None  # noqa: S101 - or _await would have raised
+            return self._quote_from(snapshot, requested_for=requested_for, symbol=symbol)
+
+    def _quote_from(
+        self, snapshot: MarketDataSnapshot, *, requested_for: str, symbol: str
+    ) -> MarketDataQuote:
+        """Build the quote from ONE frozen request result, and nothing else."""
         # Draw the quote from the family matching the ACTUAL served type, so a
         # delayed quote uses only delayed ticks (66-71, 88) and a realtime -1
         # placeholder can never clobber it (and vice versa).
-        classification = data_classification(sink.market_data_type)
+        classification = data_classification(snapshot.market_data_type)
         family = (
-            "delayed" if sink.market_data_type in _DELAYED_MARKET_DATA_TYPES else "realtime"
+            "delayed"
+            if snapshot.market_data_type in _DELAYED_MARKET_DATA_TYPES
+            else "realtime"
         )
-        values = sink.families[family]
+        values = snapshot.values(family)
         bid, ask, last = values.get("bid"), values.get("ask"), values.get("last")
         # received_at reflects capture of the SELECTED family's data (not any
         # stray off-family placeholder tick).
@@ -611,7 +694,7 @@ class IbkrMarketDataRawClient:
         return MarketDataQuote(
             symbol=symbol,
             requested_for=requested_for,
-            market_data_type=sink.market_data_type,
+            market_data_type=snapshot.market_data_type,
             bid=bid,
             ask=ask,
             last=last,
@@ -620,11 +703,11 @@ class IbkrMarketDataRawClient:
             last_size=values.get("last_size"),
             exchange_timestamp=values.get("timestamp"),
             received_at=received_at,
-            entitlement_errors=tuple(sink.entitlement_errors),
+            entitlement_errors=snapshot.entitlement_errors,
             missing_fields=missing,
-            freshness=classify_freshness(sink.market_data_type),
+            freshness=classify_freshness(snapshot.market_data_type),
             data_classification=classification,
-            source_tick_ids=tuple(sink.source_tick_ids),
+            source_tick_ids=snapshot.source_tick_ids,
         )
 
     def close(self) -> None:
@@ -645,15 +728,26 @@ class IbkrMarketDataRawClient:
         return self._sink, self._transport
 
     def _release_market_data(
-        self, transport: MarketDataTransport, sink: MarketDataSink, req_id: int
+        self,
+        transport: MarketDataTransport,
+        sink: MarketDataSink,
+        req_id: int,
+        *,
+        cancel: bool,
     ) -> None:
         """Cancel this snapshot and stop accepting its callbacks.
 
         Disarming happens first and unconditionally: even if the cancel call
         fails, the sink must stop treating this request as current, or a late
         tick would land in the next quote.
+
+        ``cancel`` is False only when no request was ever issued -- there is
+        nothing at the gateway to cancel, and calling cancelMktData for an id it
+        never saw would be noise, not safety.
         """
         sink.end_market_data_request(req_id)
+        if not cancel:
+            return
         try:
             transport.cancel_market_data(req_id)  # read-only cleanup only
         except Exception as error:  # noqa: BLE001 - unproven cleanup is unsafe
