@@ -68,7 +68,12 @@ from trading_execution_agent.execution_service import (
     ExecutionService,
     ExecutionStage,
 )
-from trading_execution_agent.safe_logging import install_owner_output_protection
+from trading_execution_agent.safe_logging import (
+    install_owner_output_protection,
+    redact,
+    register_sensitive_value,
+    safe_failure,
+)
 
 #: Owner-host defaults. The account ALIAS is configuration; the account NUMBER
 #: never appears here and never leaves the adapter.
@@ -95,6 +100,12 @@ DEFAULT_ACCOUNT_ALIAS = "paper-poi"
 DEFAULT_HOST = "127.0.0.1"
 #: 4002 is the paper API port. 4001 is live and is refused by the adapter.
 DEFAULT_PAPER_PORT = 4002
+
+#: Stable owner-visible failure codes. A code plus an exception TYPE is
+#: diagnosable without printing text this repository does not control.
+PREFLIGHT_FAILED = "PROBE_PREFLIGHT_FAILED"
+PROBE_START_FAILED = "PROBE_START_FAILED"
+PROBE_RUN_FAILED = "PROBE_RUN_FAILED"
 
 EXIT_OK = 0
 EXIT_BLOCKED = 1
@@ -249,6 +260,9 @@ def _resolve_account_id(account_alias: str) -> str:
 
     override = os.environ.get(ENV_ACCOUNT_ID_OVERRIDE, "").strip()
     if override:
+        # Registered the moment it is known, whatever its format. Pattern
+        # matching is defence in depth; this is the guarantee.
+        register_sensitive_value(override)
         return override
 
     secrets_root = os.environ.get(ENV_SECRETS_ROOT, "").strip()
@@ -275,6 +289,11 @@ def _resolve_account_id(account_alias: str) -> str:
             f"the canonical paper account secret {PAPER_ACCOUNT_SECRET!r} is"
             " empty; refusing to connect without knowing which account this is"
         )
+    # THE defence that does not depend on recognising a format. The first real
+    # owner-host run produced an account identifier the original pattern did not
+    # match, and no regex written today can anticipate the formats IBKR
+    # introduces later. This removes the exact value, wherever it appears.
+    register_sensitive_value(account_id)
     return account_id
 
 
@@ -438,6 +457,21 @@ def _build(
     )
 
 
+def _print_debug_detail(error: BaseException, *, debug: bool) -> None:
+    """Detail for deliberate troubleshooting, through the SAME redactor.
+
+    Debug does not mean secrets are allowed. The message is redacted with the
+    registered literals and the patterns before it is printed, and the traceback
+    is still not shown -- a traceback carries frames, locals in some formats,
+    and the same uncontrolled message text.
+    """
+    if not debug:
+        return
+    detail = redact(str(error)).strip()
+    if detail:
+        print(f"  detail (redacted): {detail}")
+
+
 def render(evaluation: ExecutionEvaluation) -> list[str]:
     """Operator-readable, and honest about what it did not do."""
     quote = evaluation.quote
@@ -567,8 +601,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except SystemExit:
         raise
-    except Exception as error:  # noqa: BLE001
-        print(f"probe could not start: {type(error).__name__}: {error}")
+    except ProbePreflightError as error:
+        # OUR message, written to be shown: it names what to configure and
+        # never carries a value. Redacted anyway, because a future edit to one
+        # of these messages should not be able to leak.
+        print(f"{PREFLIGHT_FAILED}: {redact(str(error))}")
+        return EXIT_ERROR
+    except Exception as error:  # noqa: BLE001 - see safe_failure
+        # Anything else is dependency-controlled text. `print` bypasses every
+        # logging filter, so a psycopg OperationalError would have put the DSN
+        # and its password straight on the terminal. Type and code only.
+        print(safe_failure(PROBE_START_FAILED, error))
+        _print_debug_detail(error, debug=args.debug_broker_logging)
         return EXIT_ERROR
 
     try:
@@ -585,6 +629,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 source_id="owner-host-probe",
             )
         )
+    except Exception as error:  # noqa: BLE001 - see safe_failure
+        # The evidence path was guarded for CLEANUP but not for OUTPUT: an
+        # exception here escaped main and Python printed the traceback, message
+        # included. A traceback is dependency-controlled text on the terminal.
+        print(safe_failure(PROBE_RUN_FAILED, error))
+        _print_debug_detail(error, debug=args.debug_broker_logging)
+        return EXIT_ERROR
     finally:
         # Everything opened above is released here, including on failure.
         resources.close()

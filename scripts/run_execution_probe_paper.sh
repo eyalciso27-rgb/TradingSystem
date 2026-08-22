@@ -48,6 +48,8 @@ fail() {
 
 cleanup() {
   local status=$?
+  # Idempotent: re-applying the paper stack without the probe override is safe
+  # whether or not the override was ever applied.
   if [ "$PROBE_PUBLISH_STARTED" -eq 1 ]; then
     log "-- closing the temporary loopback database publish"
     # Re-apply the paper stack WITHOUT the probe override, which removes the
@@ -86,23 +88,48 @@ command -v docker >/dev/null 2>&1 || fail "docker is required to reach the paper
 
 # -- 3. open the loopback-only publish, briefly ------------------------------
 log "-- opening a temporary loopback database publish on 127.0.0.1:${DB_PORT}"
-PAPER_PROBE_DB_PORT="$DB_PORT" docker compose "${COMPOSE_FILES[@]}" \
-  up -d --no-deps postgres >/dev/null
+# Armed BEFORE the mutating call, not after it. `compose up` can recreate the
+# container with the published port and still exit non-zero, and a flag set only
+# on success would then leave the publish open -- loopback-only, but the stated
+# lifecycle is "temporary and always closed". Cleanup is idempotent, so arming
+# it early costs nothing when nothing changed.
 PROBE_PUBLISH_STARTED=1
+if ! PAPER_PROBE_DB_PORT="$DB_PORT" docker compose "${COMPOSE_FILES[@]}" \
+     up -d --no-deps postgres >/dev/null; then
+  fail "could not start the paper database with the diagnostic publish"
+fi
 
-# Wait for it to accept connections rather than assuming.
+# Wait for it to accept connections, and FAIL if it never does. Exporting
+# DATABASE_URL after a timed-out wait recreates the exact owner-host failure
+# this round is fixing: configuration present, database absent, discovered only
+# after two IBKR sessions are open.
+DB_READY=0
 for _ in $(seq 1 30); do
   if docker compose "${COMPOSE_FILES[@]}" exec -T postgres \
        pg_isready -U "$PAPER_POSTGRES_USER" -d "$PAPER_DB" >/dev/null 2>&1; then
+    DB_READY=1
     break
   fi
   sleep 1
 done
+[ "$DB_READY" -eq 1 ] \
+  || fail "the paper database did not become ready within 30s; not starting the probe (zero IBKR connections were opened)"
 
 # -- 4. run the probe --------------------------------------------------------
-# DATABASE_URL is constructed here and exported to the probe only. It is never
-# echoed, and `set -x` is deliberately not used anywhere in this script.
-export DATABASE_URL="postgresql+psycopg://${PAPER_POSTGRES_USER}:${PAPER_POSTGRES_PASSWORD}@127.0.0.1:${DB_PORT}/${PAPER_DB}"
+# DATABASE_URL is built by SQLAlchemy's own URL.create, which percent-encodes
+# every component. Interpolating the credentials into a string here was wrong:
+# a legal PostgreSQL password containing @ : / # % or a space produces a URL
+# that is malformed, or well-formed and parsed as something else. The secret
+# must not have to avoid characters so that our concatenation works.
+#
+# It is exported to the probe only, never echoed, and `set -x` is deliberately
+# not used anywhere in this script.
+DATABASE_URL="$(
+  PAPER_PROBE_DB_HOST=127.0.0.1 PAPER_PROBE_DB_PORT="$DB_PORT" \
+  PAPER_POSTGRES_DB="$PAPER_DB" \
+  uv run --no-sync python scripts/build_paper_database_url.py
+)" || fail "could not construct the paper database URL"
+export DATABASE_URL
 export TRADING_OBJECT_STORE="${TRADING_OBJECT_STORE:-var/objects/paper}"
 
 log "-- running the probe (nothing will be submitted)"
