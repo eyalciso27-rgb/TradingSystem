@@ -34,6 +34,7 @@ the reimplementation works -- which is exactly how the original defect survived.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -153,7 +154,18 @@ def test_without_the_loader_the_same_shell_cannot_interpolate_the_base_file(
     )
 
     assert result.returncode != 0, "the base file interpolated without credentials"
-    assert "POSTGRES_USER" in result.stderr
+    # Which of the two required variables Compose names first is not
+    # guaranteed -- it reported POSTGRES_USER on one run and POSTGRES_PASSWORD
+    # on the next -- so asserting one name was a flake of this test's own
+    # making. What must hold is that the failure is an interpolation failure
+    # for a GENERIC name, raised by the BASE file. The base file's own `:?`
+    # message identifies it: compose.paper.yaml's says "PAPER credentials come
+    # from the PAPER secret store" instead.
+    assert re.search(
+        r"required variable POSTGRES_(USER|PASSWORD) is missing a value",
+        result.stderr,
+    ), result.stderr
+    assert "no default credentials" in result.stderr, result.stderr
 
 
 @requires_compose
