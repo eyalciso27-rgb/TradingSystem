@@ -70,6 +70,7 @@ from trading_execution_agent.execution_service import (
 )
 from trading_execution_agent.safe_logging import (
     install_owner_output_protection,
+    owner_print,
     redact,
     register_sensitive_value,
     safe_failure,
@@ -469,7 +470,7 @@ def _print_debug_detail(error: BaseException, *, debug: bool) -> None:
         return
     detail = redact(str(error)).strip()
     if detail:
-        print(f"  detail (redacted): {detail}")
+        owner_print(f"  detail (redacted): {detail}")
 
 
 def render(evaluation: ExecutionEvaluation) -> list[str]:
@@ -605,13 +606,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         # OUR message, written to be shown: it names what to configure and
         # never carries a value. Redacted anyway, because a future edit to one
         # of these messages should not be able to leak.
-        print(f"{PREFLIGHT_FAILED}: {redact(str(error))}")
+        owner_print(f"{PREFLIGHT_FAILED}: {error}")
         return EXIT_ERROR
     except Exception as error:  # noqa: BLE001 - see safe_failure
         # Anything else is dependency-controlled text. `print` bypasses every
         # logging filter, so a psycopg OperationalError would have put the DSN
         # and its password straight on the terminal. Type and code only.
-        print(safe_failure(PROBE_START_FAILED, error))
+        owner_print(safe_failure(PROBE_START_FAILED, error))
         _print_debug_detail(error, debug=args.debug_broker_logging)
         return EXIT_ERROR
 
@@ -633,7 +634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # The evidence path was guarded for CLEANUP but not for OUTPUT: an
         # exception here escaped main and Python printed the traceback, message
         # included. A traceback is dependency-controlled text on the terminal.
-        print(safe_failure(PROBE_RUN_FAILED, error))
+        owner_print(safe_failure(PROBE_RUN_FAILED, error))
         _print_debug_detail(error, debug=args.debug_broker_logging)
         return EXIT_ERROR
     finally:
@@ -642,12 +643,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     evaluation = evidence.evaluation
     assert evaluation is not None
-    print("=== INDEPENDENT RUNTIME EVIDENCE (read-only) ===")
+    # Every one of these is dynamic and partly dependency-derived: observation
+    # details, quote details, readiness gate details, blockers, reasons. They go
+    # through the same boundary as everything else.
+    owner_print("=== INDEPENDENT RUNTIME EVIDENCE (read-only) ===")
     for line in evidence.lines():
-        print(line)
-    print()
+        owner_print(line)
+    owner_print()
     for line in render(evaluation):
-        print(line)
+        owner_print(line)
 
     if evaluation.stage in (
         ExecutionStage.AUTHORIZATION_DENIED, ExecutionStage.READY_NOT_AUTHORIZED

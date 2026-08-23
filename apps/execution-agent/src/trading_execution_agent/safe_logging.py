@@ -207,6 +207,25 @@ def install_owner_output_protection(*, debug: bool = False) -> None:
             handler.addFilter(SecretRedactingFilter())
 
 
+def owner_print(text: object = "") -> None:
+    """THE owner-visible output boundary. Everything the probe prints goes here.
+
+    The redaction filter covers ``logging``; it cannot cover ``print``. So the
+    successful path -- the evidence lines and the rendered evaluation -- was
+    writing dynamic text straight to the terminal with nothing in between, and
+    that text is not all ours: quote details, readiness gate details, blockers,
+    evaluation reasons and the authorization reason can all carry
+    dependency-derived strings.
+
+    Most of those fields are safe today. "Safe today" is not the property we
+    want: the claim is that the resolved account secret is removed *wherever* it
+    appears, and that can only be structurally true if there is one place where
+    owner-visible text is written. This is that place, and there is deliberately
+    no second one.
+    """
+    print(redact(str(text)))
+
+
 def safe_failure(code: str, error: BaseException) -> str:
     """A stable owner-visible failure line that cannot carry a secret.
 
@@ -224,6 +243,7 @@ __all__ = [
     "SecretRedactingFilter",
     "clear_sensitive_values",
     "install_owner_output_protection",
+    "owner_print",
     "redact",
     "redact_object",
     "register_sensitive_value",

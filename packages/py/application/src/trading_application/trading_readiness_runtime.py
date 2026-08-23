@@ -698,6 +698,10 @@ __all__ = [
     "AuditSink",
     "BrokerSessionState",
     "ContractState",
+    # The element type of TradingReadinessRuntimeReport.gates -- part of the
+    # report's public shape, so a caller reading gates should not have to reach
+    # for an unexported name.
+    "GateOutcome",
     "MarketDataRules",
     "MarketDataState",
     "ProtectionState",

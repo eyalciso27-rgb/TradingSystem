@@ -20,20 +20,29 @@ from __future__ import annotations
 import inspect
 import logging
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from trading_broker_core.port import OrderSide
 from trading_execution_agent import __main__ as probe
+from trading_execution_agent.execution_service import ExecutionEvaluation
 from trading_execution_agent.safe_logging import (
     NOISY_BROKER_LOGGERS,
     SecretRedactingFilter,
     clear_sensitive_values,
     install_owner_output_protection,
+    owner_print,
     redact,
+    register_sensitive_value,
 )
 
-#: Shaped exactly like a real IBKR paper account, and never a real one.
+#: A synthetic paper account. NOT "shaped exactly like a real one" -- that
+#: claim was in this file until the first owner-host run disproved it: the real
+#: identifier contains an alphabetic character after the prefix, which the
+#: original digits-only pattern did not match. Real-shaped values live in
+#: REAL_SHAPED_ACCOUNTS below; this one exercises the simplest case.
 PAPER_ACCOUNT = "DU" + "1234567"
 ALIAS = "paper-poi"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -699,13 +708,25 @@ def test_debug_detail_passes_through_the_same_redactor(
 
 
 def test_the_probe_never_prints_a_raw_exception_string() -> None:
-    """Structural: no ``{error}`` interpolation survives in main()."""
-    source = inspect.getsource(probe.main)
+    """Structural: exception text can only reach the terminal through the boundary.
 
-    assert "{error}" not in source, (
-        "an f-string prints the exception message verbatim, bypassing every"
-        " logging filter"
-    )
+    ``{error}`` interpolation is allowed ONLY inside an ``owner_print`` call,
+    which redacts. A bare ``print`` of it bypasses every filter -- that is what
+    put a psycopg DSN on the terminal.
+    """
+    source = inspect.getsource(probe.main)
+    offenders = [
+        line.strip()
+        for line in source.splitlines()
+        if "{error}" in line and "owner_print(" not in line
+    ]
+
+    assert offenders == [], offenders
+    # And the only exception text that is interpolated at all is our own
+    # preflight message; everything else reports a code and a type.
+    interpolating = [line.strip() for line in source.splitlines() if "{error}" in line]
+    assert len(interpolating) == 1, interpolating
+    assert "PREFLIGHT_FAILED" in interpolating[0], interpolating
 
 
 # == the wrapper: readiness must fail ========================================
@@ -825,3 +846,350 @@ def test_the_wrapper_no_longer_interpolates_credentials_into_a_url() -> None:
     assert "${PAPER_POSTGRES_PASSWORD}@" not in code
     assert "$PAPER_POSTGRES_PASSWORD@" not in code
     assert "build_paper_database_url.py" in code
+
+
+# == the ONE owner-visible output boundary ===================================
+#
+# The redaction filter covers ``logging``. It cannot cover ``print``. So the
+# SUCCESSFUL path -- the evidence lines and the rendered evaluation -- wrote
+# dynamic text straight to the terminal: quote details, readiness gate details,
+# blockers, evaluation reasons, the authorization reason. Most are safe today,
+# but "safe today" is not the claim being made.
+#
+# The literal used here is deliberately unrecognisable to every pattern, so
+# these tests prove the EXACT-SECRET registry reaches the successful path --
+# not that the DU regex happens to catch something.
+
+UNRECOGNISABLE = "QQ-paper-9f3a-tenant"
+
+
+def test_the_synthetic_literal_is_invisible_to_every_pattern() -> None:
+    """Precondition. If a pattern matched it, these tests would prove nothing."""
+    clear_sensitive_values()
+
+    assert redact(f"detail {UNRECOGNISABLE}") == f"detail {UNRECOGNISABLE}"
+
+
+def test_owner_print_redacts_registered_secrets(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The boundary itself."""
+    register_sensitive_value(UNRECOGNISABLE)
+
+    owner_print(f"quote detail: {UNRECOGNISABLE}")
+
+    captured = capsys.readouterr()
+    assert UNRECOGNISABLE not in captured.out + captured.err
+    assert "[redacted]" in captured.out
+
+
+def test_the_probe_has_no_second_output_path() -> None:
+    """Structural: nothing in the probe writes to the terminal directly.
+
+    A second unredacted path is the whole defect. ``print(`` must not appear in
+    the module at all -- ``owner_print`` is the only writer.
+    """
+    source = inspect.getsource(probe)
+    offenders = [
+        line.strip()
+        for line in source.splitlines()
+        if "print(" in line
+        and "owner_print(" not in line
+        and not line.strip().startswith("#")
+        and "def owner_print" not in line
+    ]
+
+    assert offenders == [], offenders
+
+
+PROBE_NOW = datetime(2026, 8, 23, 15, 30, tzinfo=UTC)
+
+
+def _evaluation_carrying(poison: str) -> ExecutionEvaluation:
+    """A REAL ExecutionEvaluation with the secret in exactly one dynamic field.
+
+    ``render()`` is the production one, so whichever field is poisoned reaches
+    the terminal exactly as it would on the owner host.
+    """
+    from trading_application.trading_readiness_runtime import (
+        GateOutcome,
+        MarketDataState,
+        QuoteState,
+        TradingReadinessRuntimeReport,
+    )
+    from trading_execution_agent.execution_service import (
+        AuthorizationDecision,
+        ExecutionEvaluation,
+        ExecutionIntent,
+        ExecutionStage,
+    )
+    from trading_market_data_core.trading_readiness import TradingMode, TradingReadiness
+
+    intent = ExecutionIntent(
+        strategy_id="owner-host-probe",
+        decision=probe.probe_decision("AAPL", PROBE_NOW),
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("1"),
+        correlation_id="corr-1",
+        client_order_id="probe-1",
+        source_id="owner-host-probe",
+    )
+    quote = QuoteState(
+        Decimal("100.00"),
+        Decimal("100.05"),
+        PROBE_NOW,
+        bid_size=500,
+        ask_size=400,
+        market_data_state=MarketDataState.REALTIME,
+        detail=(
+            f"served from {UNRECOGNISABLE}" if poison == "quote_detail" else "healthy"
+        ),
+    )
+    readiness = TradingReadinessRuntimeReport(
+        mode=TradingMode.PAPER,
+        strategy_id="owner-host-probe",
+        readiness=TradingReadiness.BLOCKED,
+        security_id="conid:265598",
+        symbol="AAPL",
+        gates=(
+            GateOutcome(
+                name="market_data_usable",
+                satisfied=False,
+                detail=(
+                    f"feed {UNRECOGNISABLE}"
+                    if poison == "gate_detail"
+                    else "no subscription"
+                ),
+            ),
+        ),
+        blockers=(
+            (f"blocked by {UNRECOGNISABLE}",) if poison == "blocker" else ("blocked",)
+        ),
+        universe_status=None,
+        optional_context={},
+        evaluated_at=PROBE_NOW,
+        runtime_refs={},
+        notes=(),
+    )
+    return ExecutionEvaluation(
+        intent=intent,
+        stage=ExecutionStage.READY_NOT_AUTHORIZED,
+        reasons=(
+            (f"reason mentions {UNRECOGNISABLE}",)
+            if poison == "reason"
+            else ("readiness satisfied and authorization granted",)
+        ),
+        quote=quote,
+        readiness=readiness,
+        authorization=AuthorizationDecision(
+            allowed=False,
+            reason=(
+                f"denied for {UNRECOGNISABLE}"
+                if poison == "authorization"
+                else "autonomous submission is not enabled"
+            ),
+        ),
+        evaluated_at=PROBE_NOW,
+        intent_mode="PAPER",
+    )
+
+
+def _successful_probe(
+    monkeypatch: pytest.MonkeyPatch, *, poison: str
+) -> tuple[int, str]:
+    """Run the NORMAL successful output path with a secret in one field.
+
+    Nothing connects: the service is replaced, but ``render`` and
+    ``evidence.lines()`` are the real ones, so the text that reaches the
+    terminal is produced exactly as it is in production.
+    """
+    from trading_execution_agent.execution_service import ExecutionEvidence
+
+    register_sensitive_value(UNRECOGNISABLE)
+    evaluation = _evaluation_carrying(poison)
+
+    class _Service:
+        def collect_evidence(self, _intent: object) -> ExecutionEvidence:
+            evidence = ExecutionEvidence(evaluated_at=PROBE_NOW)
+            evidence.record(
+                "quote",
+                True,
+                f"served from {UNRECOGNISABLE}"
+                if poison == "observation"
+                else "healthy",
+            )
+            evidence.evaluation = evaluation
+            return evidence
+
+    class _Resources:
+        service = _Service()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(probe, "build_service", lambda **kwargs: _Resources())
+    return probe.main(["probe", "--symbol", "AAPL"]), poison
+
+
+@pytest.mark.parametrize(
+    "poison",
+    ["observation", "quote_detail", "gate_detail", "blocker", "reason", "authorization"],
+)
+def test_no_dynamic_field_can_leak_through_the_successful_path(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], poison: str
+) -> None:
+    """One secret, six different dynamic fields, the normal success path."""
+    status, field = _successful_probe(monkeypatch, poison=poison)
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert status in (probe.EXIT_OK, probe.EXIT_BLOCKED), output
+    assert UNRECOGNISABLE not in output, f"{field} leaked: {output}"
+    assert "[redacted]" in output, f"{field}: the field was not actually rendered"
+
+
+# == the host-side authenticated database preflight ==========================
+
+
+def test_the_database_preflight_reports_a_code_and_a_type_only() -> None:
+    """Driver text embeds the DSN, so it is never printed."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from check_paper_probe_database import UNUSABLE, check
+
+    # Nothing listening on port 1.
+    status, line = check(
+        "postgresql+psycopg://trading:hunter2@127.0.0.1:1/trading_paper"
+    )
+
+    assert status != 0
+    assert line.startswith(UNUSABLE)
+    for secret in ("hunter2", "trading:hunter2", "postgresql://", "127.0.0.1"):
+        assert secret not in line, line
+
+
+def test_an_unparseable_url_is_refused_without_echoing_it() -> None:
+    import sys as _sys
+
+    _sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from check_paper_probe_database import UNUSABLE, check
+
+    status, line = check("::::not a url::::")
+
+    assert status != 0
+    assert line.startswith(UNUSABLE)
+    assert "not a url" not in line
+
+
+def test_a_missing_url_is_refused() -> None:
+    import sys as _sys
+
+    _sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import check_paper_probe_database as checker
+
+    status = checker.main([])
+
+    assert status != 0
+
+
+def test_the_preflight_runs_before_the_probe_and_gates_it() -> None:
+    """Ordering, and that a failure stops the run.
+
+    ``pg_isready`` inside the container proves the server accepts connections.
+    It does not prove the loopback publish is reachable from the host, that the
+    URL parses, or that these credentials authenticate -- and the PostgreSQL
+    image does not reset an existing role's password when the container is
+    recreated, so an old volume can expect an older one.
+    """
+    code = _code_lines(
+        (REPO_ROOT / "scripts" / "run_execution_probe_paper.sh").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    dsn_build = code.index("build_paper_database_url.py")
+    db_check = code.index("check_paper_probe_database.py")
+    probe_run = code.index("python -m trading_execution_agent probe")
+    assert dsn_build < db_check < probe_run, (
+        "the authenticated check must use the built URL and gate the probe"
+    )
+    # And it must actually stop the run, not merely report.
+    guarded = code[db_check : db_check + 400]
+    assert "fail " in guarded, "a failed database preflight must abort"
+    assert "zero IBKR connections" in guarded
+
+
+def test_a_failing_database_preflight_invokes_zero_probes(tmp_path: Path) -> None:
+    """End to end over the real script fragment, with the checker forced to fail.
+
+    Deterministic: the wrapper's own gating lines are executed by bash with the
+    checker and the probe replaced by recorders, so the assertion is about the
+    script's control flow rather than a re-implementation of it.
+    """
+    import subprocess
+
+    marker = tmp_path / "probe-was-invoked"
+    script = tmp_path / "fragment.sh"
+    script.write_text(
+        "set -Eeuo pipefail\n"
+        'fail() { echo "ERROR: $*" >&2; exit 2; }\n'
+        'log() { :; }\n'
+        "check_db() { return 1; }\n"
+        f'run_probe() {{ touch "{marker.as_posix()}"; }}\n'
+        'if ! check_db; then\n'
+        '  fail "the paper database is not usable from this host; not starting'
+        ' the probe (zero IBKR connections were opened)"\n'
+        "fi\n"
+        "run_probe\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(  # noqa: S603 - a local bash fragment, no input
+        ["bash", str(script)], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 2, result.stderr
+    assert not marker.exists(), "the execution probe was invoked anyway"
+    assert "zero IBKR connections" in result.stderr
+
+
+def test_a_passing_database_preflight_allows_the_probe(tmp_path: Path) -> None:
+    """The control: the same control flow, with the check succeeding."""
+    import subprocess
+
+    marker = tmp_path / "probe-was-invoked"
+    script = tmp_path / "fragment.sh"
+    script.write_text(
+        "set -Eeuo pipefail\n"
+        'fail() { echo "ERROR: $*" >&2; exit 2; }\n'
+        "check_db() { return 0; }\n"
+        f'run_probe() {{ touch "{marker.as_posix()}"; }}\n'
+        'if ! check_db; then fail "db"; fi\n'
+        "run_probe\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(  # noqa: S603 - a local bash fragment, no input
+        ["bash", str(script)], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker.exists(), "the probe should run once the database is proven"
+
+
+def test_the_paper_postgres_environment_contract_is_unchanged() -> None:
+    """No second secret store was invented to remove two environment variables."""
+    compose = (REPO_ROOT / "deploy" / "compose.paper.yaml").read_text(encoding="utf-8")
+
+    assert "PAPER_POSTGRES_USER" in compose
+    assert "PAPER_POSTGRES_PASSWORD" in compose
+    wrapper = (REPO_ROOT / "scripts" / "run_execution_probe_paper.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "PAPER_POSTGRES_USER" in wrapper
+    assert "PAPER_POSTGRES_PASSWORD" in wrapper
+    # And no new file-secret reference was invented for PostgreSQL.
+    assert "postgres-password" not in wrapper
+    assert "PAPER/postgres" not in wrapper

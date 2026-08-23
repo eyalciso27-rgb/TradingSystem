@@ -170,7 +170,17 @@ _MAX_DETAIL = 200
 #: from. Account numbers are the important one -- an IB account id in a probe
 #: transcript is an account id in whatever the operator pastes it into.
 _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\b[DU]U?\d{5,}\b"), "[account]"),
+    # Broker account identifiers. Digits-only was wrong: the first real
+    # owner-host run produced an identifier with an alphabetic character after
+    # the prefix. Kept in step with safe_logging's pattern -- this one is
+    # defence in depth for probe evidence details, and the owner-output
+    # boundary remains the load-bearing check.
+    (
+        re.compile(
+            r"\b(?:DU|DF|U)(?=[A-Za-z0-9]{5,}\b)(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{5,}\b"
+        ),
+        "[account]",
+    ),
     (re.compile(r"\b[a-zA-Z]+://[^\s]+"), "[uri]"),
     (re.compile(r"[A-Za-z]:\\[^\s]+"), "[path]"),
     (re.compile(r"(?<![\w.])/(?:[\w.-]+/){2,}[\w.-]*"), "[path]"),

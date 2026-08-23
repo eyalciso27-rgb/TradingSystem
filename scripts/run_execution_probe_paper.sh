@@ -132,6 +132,19 @@ DATABASE_URL="$(
 export DATABASE_URL
 export TRADING_OBJECT_STORE="${TRADING_OBJECT_STORE:-var/objects/paper}"
 
+# -- 5. prove the database is actually usable FROM THIS HOST -----------------
+# pg_isready ran inside the container: it proves the server accepts connections
+# and nothing else. It does not prove the loopback publish is reachable from
+# here, that this URL parses, or that these credentials authenticate -- and the
+# PostgreSQL image only initialises credentials on an EMPTY data directory, so
+# an existing volume can still expect an older password than the environment
+# now supplies. Every one of those failures would otherwise surface inside the
+# probe, after two IBKR sessions are open.
+log "-- verifying the paper database from this host (authenticated SELECT 1)"
+if ! uv run --no-sync python scripts/check_paper_probe_database.py; then
+  fail "the paper database is not usable from this host; not starting the probe (zero IBKR connections were opened)"
+fi
+
 log "-- running the probe (nothing will be submitted)"
 set +e
 uv run --no-sync python -m trading_execution_agent probe \
