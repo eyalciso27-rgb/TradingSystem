@@ -416,6 +416,28 @@ def test_the_bootstrap_cli_never_prints_the_password(tmp_path: Path) -> None:
     assert "BOOTSTRAP_UNCHANGED" in rerun.stdout
 
 
+@pytest.mark.parametrize(
+    "script", [BOOTSTRAP_SCRIPT, LOADER_SCRIPT], ids=["bootstrap", "loader"]
+)
+def test_neither_cli_ever_emits_a_traceback(tmp_path: Path, script: Path) -> None:
+    """A store root that exists but holds an unreadable tree still has to fail
+    as a code and a message, never as a stack trace.
+
+    The whole point of the previous two rounds was that owner-visible output is
+    written by us, not by whatever library happened to raise.
+    """
+    root = _owner_host_store(tmp_path)
+    # A directory where a secret file must be: the store rejects it, and that
+    # rejection must not arrive as an unhandled exception.
+    (root / "PAPER" / "postgres" / "paper-password").mkdir(parents=True)
+
+    result = _run(script, root)
+
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    assert "FAILED" in result.stderr
+
+
 def test_the_bootstrap_cli_requires_the_canonical_root(tmp_path: Path) -> None:
     del tmp_path
     result = _run(BOOTSTRAP_SCRIPT, None)

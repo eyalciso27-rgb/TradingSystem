@@ -21,11 +21,11 @@ from trading_config.paper_postgres import (
     DATABASE_REF,
     USERNAME_REF,
     BootstrapResult,
-    PaperPostgresError,
     bootstrap,
     is_owner_only,
     load,
 )
+from trading_config.secrets import SecretError
 
 ENV_SECRETS_ROOT = "SECRETS_ROOT"
 
@@ -86,12 +86,19 @@ def main(argv: list[str] | None = None) -> int:
     secrets_root = Path(raw_root)
     try:
         result = bootstrap(secrets_root)
-    except PaperPostgresError as error:
-        # PaperPostgresError messages are constructed from reference names and
-        # paths only -- never from a secret value -- so this is safe to print.
+        described = _describe(result, secrets_root)
+    except SecretError as error:
+        # Our own exceptions only, and their messages are constructed from
+        # reference names and paths -- never from a secret value -- so the text
+        # is safe to print. Anything else gets its type and nothing more.
         sys.stderr.write(f"{FAILED}: {error}\n")
         return 2
-    for line in _describe(result, secrets_root):
+    except OSError as error:
+        # A permission or filesystem failure part-way through. Report the type;
+        # the message can carry a path, and a traceback is never owner output.
+        sys.stderr.write(f"{FAILED}: {type(error).__name__}\n")
+        return 2
+    for line in described:
         sys.stdout.write(line + "\n")
     for warning in _permission_warnings(secrets_root):
         sys.stderr.write(warning + "\n")

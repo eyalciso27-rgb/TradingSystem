@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 from trading_config.paper_postgres import PaperPostgresError, load
+from trading_config.secrets import SecretError
 
 ENV_SECRETS_ROOT = "SECRETS_ROOT"
 
@@ -90,8 +91,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         username, database, password = resolve(dict(os.environ))
         _reject_embedded_newlines((username, database, password))
-    except PaperPostgresError as error:
+    except SecretError as error:
+        # Our own exception text only -- reference names and paths, never a
+        # value. A traceback is never owner-visible output.
         sys.stderr.write(f"{FAILED}: {error}\n")
+        return 2
+    except OSError as error:
+        sys.stderr.write(f"{FAILED}: {type(error).__name__}\n")
         return 2
     # stdout, for capture. The password is the third line so that a truncated
     # read cannot silently yield a username where a password was expected.
