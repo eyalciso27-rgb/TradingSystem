@@ -127,9 +127,11 @@ by destroying the data.
 **Every run after that**, including in a brand-new SSH session:
 
 ```sh
+export SECRETS_ROOT=<your canonical secret store>
 bash scripts/run_execution_probe_paper.sh AAPL
 ```
 
+`SECRETS_ROOT` is the only thing you set, and it is a location, not a secret.
 You export no credentials at all — not the broker account, not the database
 user, not the database password. The wrapper reads them itself from the
 canonical store and exports them only into its own process. The paper account
