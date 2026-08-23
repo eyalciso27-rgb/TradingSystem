@@ -107,17 +107,47 @@ probe, which resolves a contract, takes a live quote, runs the risk engine, asks
 the broker to validate the order with a what-if that places nothing, computes
 readiness and records the decision — and then stops.
 
-**Run it with the wrapper.** It is the canonical invocation:
+**First time only**, on a host that has never run the paper stack, create the
+paper database credentials once:
+
+```sh
+export SECRETS_ROOT=<your canonical secret store>
+bash scripts/bootstrap_paper_postgres.sh
+```
+
+That writes three files into the store you already use — under
+`$SECRETS_ROOT/PAPER/postgres/` — beside the account id that is already there.
+It generates a strong password, stores it owner-readable only, and never
+displays it. Run it again and it changes nothing: it will not rotate, overwrite
+or remove an existing credential, because the PostgreSQL image applies
+`POSTGRES_PASSWORD` only to an *empty* data directory, so a regenerated password
+would orphan an initialised volume — repairable only with the old password, or
+by destroying the data.
+
+**Every run after that**, including in a brand-new SSH session:
 
 ```sh
 bash scripts/run_execution_probe_paper.sh AAPL
 ```
 
-You do not export a broker account id. The paper account is resolved internally
-from the canonical secret store the rest of the owner-host runtime already uses,
-at `$SECRETS_ROOT/PAPER/ibkr/paper-account-id`, and it is never printed — the
-probe reports the configured alias (`paper-poi`), and account identifiers are
-redacted out of *all* logging, including the IBKR SDK's own.
+You export no credentials at all — not the broker account, not the database
+user, not the database password. The wrapper reads them itself from the
+canonical store and exports them only into its own process. The paper account
+comes from `$SECRETS_ROOT/PAPER/ibkr/paper-account-id` and is never printed —
+the probe reports the configured alias (`paper-poi`), and account identifiers
+are redacted out of *all* logging, including the IBKR SDK's own.
+
+On a host with no paper database yet, the first run creates it: `compose up`
+brings up the container, the isolated `trading-paper` network and the persistent
+`pg-data-paper` volume, and PostgreSQL initialises the role and database from
+those credentials. Nothing about that path removes a volume; the wrapper runs no
+`down`, and no `down -v` anywhere.
+
+If the database already exists and was initialised with *different* credentials,
+the authenticated preflight fails and says so, before any IBKR session. That is
+a reconciliation the owner makes deliberately — alter the role in the running
+database, or point `SECRETS_ROOT` at the store that describes it. Deleting the
+volume is not the fix: it holds the durable execution history.
 
 The wrapper exists because the probe needs two things that do not otherwise
 meet. The IB Gateway is reachable only at `127.0.0.1:4002` — both the adapter
@@ -128,12 +158,18 @@ host; and the paper stack publishes no database port at all. The wrapper opens a
 `deploy/compose.paper-probe.yaml`, and closes it again on exit. That override is
 never part of normal paper startup.
 
-What it needs from you, all of which the paper stack already needs:
+What it needs from you:
 
 | variable | why |
 |---|---|
-| `SECRETS_ROOT` | locates the canonical PAPER secret store |
-| `PAPER_POSTGRES_USER` / `PAPER_POSTGRES_PASSWORD` | the paper database, as for the stack itself |
+| `SECRETS_ROOT` | locates the canonical PAPER secret store. That is all. |
+
+`PAPER_POSTGRES_USER` / `PAPER_POSTGRES_PASSWORD` remain the interface
+`compose.paper.yaml` consumes, unchanged; the wrapper is now what supplies them.
+Setting them in the environment still works and takes precedence, but that is an
+exceptional path — for running against a database the secret store does not
+describe — and they must be set together or not at all, since a username from
+one source and a password from another were never chosen as a pair.
 
 Every purely local precondition is validated **before any connection is
 opened**, so a missing one costs a single clear message and zero IBKR sessions.

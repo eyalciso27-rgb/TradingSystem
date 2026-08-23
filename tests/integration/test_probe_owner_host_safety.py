@@ -1179,17 +1179,26 @@ def test_a_passing_database_preflight_allows_the_probe(tmp_path: Path) -> None:
     assert marker.exists(), "the probe should run once the database is proven"
 
 
-def test_the_paper_postgres_environment_contract_is_unchanged() -> None:
-    """No second secret store was invented to remove two environment variables."""
+def test_the_paper_postgres_compose_contract_is_unchanged() -> None:
+    """The compose interface is still the two PAPER_POSTGRES_* variables.
+
+    The second owner-host run changed WHO supplies them -- the wrapper now
+    loads them from the canonical store instead of demanding them from the
+    owner's shell -- and deliberately did not change WHAT the paper stack
+    consumes. The deployment contract in ``compose.paper.yaml`` is untouched.
+    """
     compose = (REPO_ROOT / "deploy" / "compose.paper.yaml").read_text(encoding="utf-8")
 
     assert "PAPER_POSTGRES_USER" in compose
     assert "PAPER_POSTGRES_PASSWORD" in compose
-    wrapper = (REPO_ROOT / "scripts" / "run_execution_probe_paper.sh").read_text(
-        encoding="utf-8"
+    code = _code_lines(
+        (REPO_ROOT / "scripts" / "run_execution_probe_paper.sh").read_text(
+            encoding="utf-8"
+        )
     )
-    assert "PAPER_POSTGRES_USER" in wrapper
-    assert "PAPER_POSTGRES_PASSWORD" in wrapper
-    # And no new file-secret reference was invented for PostgreSQL.
-    assert "postgres-password" not in wrapper
-    assert "PAPER/postgres" not in wrapper
+    assert "export PAPER_POSTGRES_USER=" in code
+    assert "export PAPER_POSTGRES_PASSWORD=" in code
+    # And the wrapper no longer REQUIRES them from the caller's environment,
+    # which is exactly the regression the second owner-host run exposed.
+    assert 'PAPER_POSTGRES_USER:?' not in code
+    assert 'PAPER_POSTGRES_PASSWORD:?' not in code

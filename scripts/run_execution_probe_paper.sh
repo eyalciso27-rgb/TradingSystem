@@ -20,10 +20,16 @@
 # * never publishes PostgreSQL beyond 127.0.0.1;
 # * never writes a secret into the repository or into a compose file;
 # * never submits an order -- the production authority denies, and the probe
-#   has no submission path at all.
+#   has no submission path at all;
+# * never removes the paper database volume, and never runs `down -v`.
 #
-# The broker account is resolved internally from the canonical PAPER secret
-# store ($SECRETS_ROOT/PAPER/ibkr/paper-account-id). You do not export it.
+# Everything secret is resolved internally from the canonical PAPER secret store
+# under $SECRETS_ROOT/PAPER: the broker account (ibkr/paper-account-id) and the
+# database credentials (postgres/paper-username, postgres/paper-password,
+# postgres/paper-database). You export none of them. If the database credentials
+# are not there yet, run the one-time bootstrap:
+#
+#   bash scripts/bootstrap_paper_postgres.sh
 
 set -Eeuo pipefail
 
@@ -80,13 +86,41 @@ log "symbol     : $SYMBOL"
 [ -s "$SECRETS_ROOT/PAPER/ibkr/paper-account-id" ] \
   || fail "the canonical paper account secret is empty"
 
-: "${PAPER_POSTGRES_USER:?PAPER_POSTGRES_USER must come from the PAPER secret store, as for the paper stack itself}"
-: "${PAPER_POSTGRES_PASSWORD:?PAPER_POSTGRES_PASSWORD must come from the PAPER secret store, as for the paper stack itself}"
-PAPER_DB="${PAPER_POSTGRES_DB:-trading_paper}"
+# The PostgreSQL credentials are read from the SAME canonical store, by this
+# script, into this process only. The owner does not export them.
+#
+# Requiring them in the environment was the real owner-host regression: the
+# documentation said "from the PAPER secret store", the store held only the
+# account id, and so a correct, complete, freshly provisioned host could not run
+# the probe at all. A fresh SSH shell must be enough.
+log "-- loading the paper database credentials from the canonical secret store"
+PAPER_CREDENTIALS="$(uv run --no-sync python scripts/load_paper_postgres_env.py)" \
+  || fail "the paper database credentials are not available; run the one-time bootstrap first:
+    bash scripts/bootstrap_paper_postgres.sh
+  (nothing was started, and zero IBKR connections were opened)"
+mapfile -t PAPER_CREDENTIAL_LINES <<<"$PAPER_CREDENTIALS"
+[ "${#PAPER_CREDENTIAL_LINES[@]}" -eq 3 ] \
+  || fail "the paper database credentials are incomplete; not starting anything"
+# Exported into THIS process only, for `docker compose` and for the URL builder.
+# Never echoed; `set -x` is deliberately not used anywhere in this script.
+export PAPER_POSTGRES_USER="${PAPER_CREDENTIAL_LINES[0]}"
+export PAPER_POSTGRES_DB="${PAPER_CREDENTIAL_LINES[1]}"
+export PAPER_POSTGRES_PASSWORD="${PAPER_CREDENTIAL_LINES[2]}"
+unset PAPER_CREDENTIALS PAPER_CREDENTIAL_LINES
+PAPER_DB="$PAPER_POSTGRES_DB"
+log "   role     : ${PAPER_POSTGRES_USER}"
+log "   database : ${PAPER_DB}"
 
 command -v docker >/dev/null 2>&1 || fail "docker is required to reach the paper database"
 
 # -- 3. open the loopback-only publish, briefly ------------------------------
+# On a host that has never run the paper stack there is no container, no
+# network and no volume. `compose up` creates all three, and PostgreSQL
+# initialises the role and database from the credentials just loaded. That is
+# the intended first run; it is reported, not silently performed.
+if [ -z "$(docker compose "${COMPOSE_FILES[@]}" ps -aq postgres 2>/dev/null)" ]; then
+  log "-- first run: creating the paper database (isolated network, persistent volume)"
+fi
 log "-- opening a temporary loopback database publish on 127.0.0.1:${DB_PORT}"
 # Armed BEFORE the mutating call, not after it. `compose up` can recreate the
 # container with the published port and still exit non-zero, and a flag set only
@@ -142,7 +176,16 @@ export TRADING_OBJECT_STORE="${TRADING_OBJECT_STORE:-var/objects/paper}"
 # probe, after two IBKR sessions are open.
 log "-- verifying the paper database from this host (authenticated SELECT 1)"
 if ! uv run --no-sync python scripts/check_paper_probe_database.py; then
-  fail "the paper database is not usable from this host; not starting the probe (zero IBKR connections were opened)"
+  # An authentication failure here almost always means an existing volume was
+  # initialised with different credentials. That needs the owner to reconcile
+  # the two deliberately. It is NOT repaired by removing the volume: the paper
+  # database holds the durable execution history, and `down -v` -- which this
+  # script never runs -- would destroy it to fix a configuration mismatch.
+  fail "the paper database is not usable from this host; not starting the probe (zero IBKR connections were opened).
+  If the database already existed, its stored role/password may differ from the
+  canonical secret set. Reconcile them deliberately -- alter the role in the
+  running database to match, or point SECRETS_ROOT at the store that describes
+  it. Do NOT delete the volume: it holds the durable execution history."
 fi
 
 log "-- running the probe (nothing will be submitted)"

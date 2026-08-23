@@ -46,7 +46,9 @@ def build_url(environ: dict[str, str] | None = None) -> URL:
     if not username or not password:
         raise SystemExit(
             f"{ENV_USER} and {ENV_PASSWORD} must be provided from the PAPER"
-            " secret store, exactly as bringing the paper stack up requires"
+            " secret store. The probe wrapper loads them itself from"
+            " $SECRETS_ROOT/PAPER/postgres/*; if they are not there yet, run:"
+            " bash scripts/bootstrap_paper_postgres.sh"
         )
     raw_port = env.get(ENV_PORT, str(DEFAULT_PORT)).strip() or str(DEFAULT_PORT)
     try:
