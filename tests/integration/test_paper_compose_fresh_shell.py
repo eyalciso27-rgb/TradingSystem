@@ -174,19 +174,69 @@ def test_the_probe_stack_interpolates_from_secrets_root_alone(
 # == the cleanup path sees the same environment ==============================
 
 
+def _join_continuations(body: str) -> list[str]:
+    """Logical shell lines: a trailing backslash continues onto the next line.
+
+    Scanning physical lines was a real defect in an earlier version of this
+    file. The cleanup command is written as
+
+        if ! docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml \\
+             up -d --no-deps postgres >/dev/null 2>&1; then
+
+    so a physical-line scan captured only ``docker compose -f … -f …`` with no
+    subcommand at all. That string exits 0 printing help, and the substitution
+    of ``up -d --no-deps postgres`` then matched nothing -- so the "cleanup
+    interpolates" test passed without ever asking Compose to interpolate.
+    """
+    logical: list[str] = []
+    pending = ""
+    for raw in body.splitlines():
+        stripped = raw.strip()
+        if stripped.endswith(chr(92)):
+            pending += stripped[:-1].rstrip() + " "
+            continue
+        logical.append((pending + stripped).strip())
+        pending = ""
+    if pending:
+        logical.append(pending.strip())
+    return logical
+
+
 def _cleanup_compose_command() -> str:
-    """The compose invocation the wrapper's EXIT trap actually runs.
+    """The COMPLETE compose invocation the wrapper's EXIT trap actually runs.
 
     Read out of the wrapper rather than retyped, so the test follows the code
     if the teardown changes.
     """
     text = WRAPPER.read_text(encoding="utf-8")
     cleanup = text.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
-    for line in cleanup.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("if ! docker compose"):
-            return stripped.removeprefix("if ! ").rstrip(" \\")
+    for line in _join_continuations(cleanup):
+        if line.startswith("if ! docker compose"):
+            command = line.removeprefix("if ! ")
+            for suffix in (">/dev/null 2>&1; then", "; then"):
+                if command.endswith(suffix):
+                    command = command[: -len(suffix)]
+                    break
+            return command.strip()
     raise AssertionError("no compose invocation found in cleanup()")
+
+
+def test_the_extracted_cleanup_command_is_the_whole_command() -> None:
+    """Guards the helper itself, which is what silently broke before.
+
+    Without this, a helper that returns a truncated command makes every test
+    built on it vacuous while still reporting green.
+    """
+    command = _cleanup_compose_command()
+
+    assert command.startswith("docker compose ")
+    assert "up -d --no-deps postgres" in command, (
+        "the extraction lost the continuation line; the cleanup proof would be vacuous"
+    )
+    assert "-f deploy/compose.yaml" in command
+    assert "-f deploy/compose.paper.yaml" in command
+    assert ">/dev/null" not in command
+    assert "; then" not in command
 
 
 @requires_compose
@@ -205,6 +255,8 @@ def test_the_cleanup_invocation_also_interpolates_in_the_same_shell(
         "cleanup must re-apply the stack WITHOUT the probe publish"
     )
     parsed = command.replace("up -d --no-deps postgres", "config -q")
+    assert parsed != command, "the substitution matched nothing; the proof is vacuous"
+    assert parsed.endswith("config -q")
 
     result = _bash(
         f"source scripts/lib/paper_env.sh && load_paper_environment && {parsed}",
@@ -223,9 +275,9 @@ def test_cleanup_still_interpolates_after_a_failure_mid_run(
     Proves the exported environment survives to teardown, and that teardown
     neither publishes a port nor removes a volume.
     """
-    command = _cleanup_compose_command().replace(
-        "up -d --no-deps postgres", "config -q"
-    )
+    extracted = _cleanup_compose_command()
+    command = extracted.replace("up -d --no-deps postgres", "config -q")
+    assert command != extracted, "the substitution matched nothing; the proof is vacuous"
     script = (
         "set -Eeuo pipefail\n"
         "source scripts/lib/paper_env.sh\n"

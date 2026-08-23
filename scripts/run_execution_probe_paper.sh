@@ -189,6 +189,23 @@ if ! uv run --no-sync python scripts/check_paper_probe_database.py; then
   it. Do NOT delete the volume: it holds the durable execution history."
 fi
 
+# -- 6. bring the schema to the canonical head, still before any broker socket
+# An authenticated SELECT 1 proves the server and the credentials. It does not
+# prove the database has any application tables, and a cluster created seconds
+# ago has none. On a host with no volume this run IS the first initialisation,
+# so without this the first evidence of an empty schema would arrive from the
+# durable audit with two IBKR sessions already open.
+#
+# Alembic only, `upgrade head` only. No downgrade, no reset, no volume removal:
+# this may be running against a database that already holds execution history.
+log "-- preparing the paper database schema (alembic upgrade head)"
+if ! uv run --no-sync python scripts/prepare_paper_database.py; then
+  fail "the paper database schema could not be prepared or verified; not starting the probe (zero IBKR connections were opened).
+  Nothing was reset and no data was removed. Re-run after resolving the
+  migration failure; if the schema is genuinely inconsistent, reconcile it
+  deliberately -- deleting the volume is not the fix."
+fi
+
 log "-- running the probe (nothing will be submitted)"
 set +e
 uv run --no-sync python -m trading_execution_agent probe \
