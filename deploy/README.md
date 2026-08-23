@@ -17,15 +17,35 @@ everything that environment needs, including the scheduler — no profile, no
 extra flag, nothing to remember:
 
 ```sh
-# PAPER — the canonical deployment (credentials from the PAPER secret store)
-docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml up -d
+# PAPER — the canonical deployment. SECRETS_ROOT is the only thing you set.
+export SECRETS_ROOT=<your canonical secret store>
+bash scripts/run_paper_stack.sh
 ```
+
+The launcher resolves the PostgreSQL credentials from
+`$SECRETS_ROOT/PAPER/postgres/` and then runs
+`docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml up -d`.
+
+Run that compose command by hand and it fails, which is why the launcher
+exists. Compose interpolates **each file independently, before merging**, so
+`deploy/compose.yaml` must satisfy its own `${POSTGRES_USER:?…}` and
+`${POSTGRES_PASSWORD:?…}` before `compose.paper.yaml` is even considered — an
+override cannot rescue a base file that already failed to interpolate. The
+launcher exports both the `PAPER_POSTGRES_*` and the generic `POSTGRES_*`
+family from the same canonical values, into its own process only. It is
+infrastructure startup: it starts no execution path and places no order.
 
 ```sh
 # PAPER with observability (mandatory from Paper Manual onward)
-docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml \
-               -f deploy/compose.observability.yaml up -d
+bash scripts/run_paper_stack.sh --with-observability
 ```
+
+That goes through the launcher too, and not as a second bare compose command:
+`compose.observability.yaml` also interpolates the generic `POSTGRES_USER` and
+`POSTGRES_PASSWORD` for the postgres exporter. It additionally needs
+`GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD`, a separate secret family that
+is not part of the PAPER PostgreSQL set; the launcher checks for them up front
+rather than letting Compose report an interpolation error.
 
 ```sh
 # development

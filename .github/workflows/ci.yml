@@ -52,7 +52,10 @@ jobs:
         run: uv run python scripts/check_architecture.py
       - name: Contract generation drift check
         run: uv run python scripts/generate_contracts.py --check
-      - name: Docker Compose config validation
+      # Syntax validation only. It injects BOTH credential families itself, so
+      # it deliberately does NOT prove the owner runtime contract -- see the
+      # fresh-shell step below, which is the one that does.
+      - name: Docker Compose config validation (syntax)
         env:
           POSTGRES_USER: ci-syntax-check
           POSTGRES_PASSWORD: ci-syntax-check
@@ -67,6 +70,29 @@ jobs:
           docker compose -f deploy/compose.yaml -f deploy/compose.observability.yaml config -q
           docker compose -f deploy/compose.yaml -f deploy/compose.dev.yaml -f deploy/compose.observability.yaml config -q
           docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml -f deploy/compose.observability.yaml config -q
+      # The owner runtime contract, which the step above cannot prove because it
+      # supplies the credentials itself. A real fresh SSH session has NEITHER
+      # credential family -- only SECRETS_ROOT -- and Compose interpolates each
+      # file independently before merging, so deploy/compose.yaml's `:?` on the
+      # GENERIC names must already be satisfied when the first command runs.
+      # This step starts from an environment with no credentials at all and
+      # proves the canonical loader is what makes the config valid.
+      - name: Paper compose validates from the canonical secret store alone
+        run: |
+          set -euo pipefail
+          unset POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB
+          unset PAPER_POSTGRES_USER PAPER_POSTGRES_PASSWORD PAPER_POSTGRES_DB
+          SECRETS_ROOT="$(mktemp -d)"
+          export SECRETS_ROOT
+          uv run python scripts/bootstrap_paper_postgres.py
+          # Must FAIL without the loader: this pins the root cause rather than
+          # trusting that the success below happened for the right reason.
+          if docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml \
+               config -q 2>/dev/null; then
+            echo "base compose interpolated with no credentials; the :? policy is gone" >&2
+            exit 1
+          fi
+          bash scripts/check_paper_compose_config.sh
       - name: Whitespace check
         run: git diff --check
       - name: Generators must not modify tracked files

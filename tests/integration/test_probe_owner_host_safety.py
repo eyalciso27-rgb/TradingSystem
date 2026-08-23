@@ -1191,13 +1191,20 @@ def test_the_paper_postgres_compose_contract_is_unchanged() -> None:
 
     assert "PAPER_POSTGRES_USER" in compose
     assert "PAPER_POSTGRES_PASSWORD" in compose
+    # The exporting itself now lives in the one shared loader, so the wrapper,
+    # the paper stack launcher and the compose check cannot drift apart.
+    loader = _code_lines(
+        (REPO_ROOT / "scripts" / "lib" / "paper_env.sh").read_text(encoding="utf-8")
+    )
+    assert "export PAPER_POSTGRES_USER=" in loader
+    assert "export PAPER_POSTGRES_PASSWORD=" in loader
+
     code = _code_lines(
         (REPO_ROOT / "scripts" / "run_execution_probe_paper.sh").read_text(
             encoding="utf-8"
         )
     )
-    assert "export PAPER_POSTGRES_USER=" in code
-    assert "export PAPER_POSTGRES_PASSWORD=" in code
+    assert "load_paper_environment" in code
     # And the wrapper no longer REQUIRES them from the caller's environment,
     # which is exactly the regression the second owner-host run exposed.
     assert 'PAPER_POSTGRES_USER:?' not in code

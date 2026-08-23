@@ -37,6 +37,9 @@ SYMBOL="${1:-AAPL}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# shellcheck source=scripts/lib/paper_env.sh
+source "$REPO_ROOT/scripts/lib/paper_env.sh"
+
 COMPOSE_FILES=(
   -f deploy/compose.yaml
   -f deploy/compose.paper.yaml
@@ -93,20 +96,18 @@ log "symbol     : $SYMBOL"
 # documentation said "from the PAPER secret store", the store held only the
 # account id, and so a correct, complete, freshly provisioned host could not run
 # the probe at all. A fresh SSH shell must be enough.
+#
+# The loading itself lives in scripts/lib/paper_env.sh, shared with the paper
+# stack launcher and the compose config check, so there is one answer to "how
+# does Paper get its PostgreSQL credentials?" rather than three that drift. It
+# also exports the generic POSTGRES_* family, which deploy/compose.yaml requires
+# in order to interpolate at all -- see that library for why an override cannot
+# rescue it.
 log "-- loading the paper database credentials from the canonical secret store"
-PAPER_CREDENTIALS="$(uv run --no-sync python scripts/load_paper_postgres_env.py)" \
+load_paper_environment \
   || fail "the paper database credentials are not available; run the one-time bootstrap first:
     bash scripts/bootstrap_paper_postgres.sh
   (nothing was started, and zero IBKR connections were opened)"
-mapfile -t PAPER_CREDENTIAL_LINES <<<"$PAPER_CREDENTIALS"
-[ "${#PAPER_CREDENTIAL_LINES[@]}" -eq 3 ] \
-  || fail "the paper database credentials are incomplete; not starting anything"
-# Exported into THIS process only, for `docker compose` and for the URL builder.
-# Never echoed; `set -x` is deliberately not used anywhere in this script.
-export PAPER_POSTGRES_USER="${PAPER_CREDENTIAL_LINES[0]}"
-export PAPER_POSTGRES_DB="${PAPER_CREDENTIAL_LINES[1]}"
-export PAPER_POSTGRES_PASSWORD="${PAPER_CREDENTIAL_LINES[2]}"
-unset PAPER_CREDENTIALS PAPER_CREDENTIAL_LINES
 PAPER_DB="$PAPER_POSTGRES_DB"
 log "   role     : ${PAPER_POSTGRES_USER}"
 log "   database : ${PAPER_DB}"

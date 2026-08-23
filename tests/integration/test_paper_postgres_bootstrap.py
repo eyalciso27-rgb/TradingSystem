@@ -47,6 +47,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WRAPPER = REPO_ROOT / "scripts" / "run_execution_probe_paper.sh"
 BOOTSTRAP_SCRIPT = REPO_ROOT / "scripts" / "bootstrap_paper_postgres.py"
 LOADER_SCRIPT = REPO_ROOT / "scripts" / "load_paper_postgres_env.py"
+PAPER_ENV_LIB = REPO_ROOT / "scripts" / "lib" / "paper_env.sh"
+LAUNCHER = REPO_ROOT / "scripts" / "run_paper_stack.sh"
+CONFIG_CHECK = REPO_ROOT / "scripts" / "check_paper_compose_config.sh"
 
 #: The account secret the real owner host already had. Present in every state,
 #: because the point is that the PostgreSQL set joins it in the SAME store.
@@ -511,25 +514,63 @@ def test_the_wrapper_loads_the_credentials_before_it_starts_anything() -> None:
     """Order matters: a missing credential must fail before a container exists."""
     code = _code_lines(WRAPPER.read_text(encoding="utf-8"))
 
-    load_at = code.index("load_paper_postgres_env.py")
+    load_at = code.index("load_paper_environment")
     compose_at = code.index('docker compose "${COMPOSE_FILES[@]}" \\')
     probe_at = code.index("python -m trading_execution_agent probe")
 
     assert load_at < compose_at < probe_at
 
 
-def test_the_wrapper_exports_into_its_own_process_only() -> None:
-    """The owner exports nothing. The wrapper exports for its own children."""
-    code = _code_lines(WRAPPER.read_text(encoding="utf-8"))
+def test_the_loader_exports_into_its_own_process_only() -> None:
+    """The owner exports nothing. The loader exports for its caller's children."""
+    code = _code_lines(PAPER_ENV_LIB.read_text(encoding="utf-8"))
 
     assert "export PAPER_POSTGRES_USER=" in code
     assert "export PAPER_POSTGRES_PASSWORD=" in code
     assert "export PAPER_POSTGRES_DB=" in code
-    # And it never echoes what it loaded.
-    assert "set -x" not in code
-    assert "$PAPER_POSTGRES_PASSWORD" not in code.replace(
-        'export PAPER_POSTGRES_PASSWORD="${PAPER_CREDENTIAL_LINES[2]}"', ""
-    )
+    # And no consumer of it echoes what was loaded.
+    for script in (WRAPPER, LAUNCHER, CONFIG_CHECK, PAPER_ENV_LIB):
+        text = _code_lines(script.read_text(encoding="utf-8"))
+        assert "set -x" not in text, script.name
+        assert "$PAPER_POSTGRES_PASSWORD" not in text.replace(
+            'export PAPER_POSTGRES_PASSWORD="${lines[2]}"', ""
+        ).replace('export POSTGRES_PASSWORD="$PAPER_POSTGRES_PASSWORD"', ""), script.name
+
+
+def test_there_is_exactly_one_credential_loading_implementation() -> None:
+    """Three answers to "how does Paper get its credentials?" is how they drift.
+
+    Only the library may call the loader CLI; every consumer goes through it.
+    """
+    callers = [
+        script
+        for script in (WRAPPER, LAUNCHER, CONFIG_CHECK)
+        if "load_paper_postgres_env.py"
+        in _without_string_literals(_code_lines(script.read_text(encoding="utf-8")))
+    ]
+
+    assert callers == [], f"{[c.name for c in callers]} bypass the shared loader"
+    for script in (WRAPPER, LAUNCHER, CONFIG_CHECK):
+        code = _code_lines(script.read_text(encoding="utf-8"))
+        assert "lib/paper_env.sh" in code, f"{script.name} does not source the loader"
+        assert "load_paper_environment" in code
+
+
+def test_the_loader_satisfies_the_base_compose_interpolation_contract() -> None:
+    """The blocker this round closes, pinned structurally.
+
+    Compose interpolates each file independently before merging, so the base
+    file's `:?` on the GENERIC names must be satisfied before any override is
+    even considered. Loading only the PAPER_* family is not enough.
+    """
+    base = (REPO_ROOT / "deploy" / "compose.yaml").read_text(encoding="utf-8")
+    assert "${POSTGRES_USER:?" in base, "the base file's fail-closed policy moved"
+    assert "${POSTGRES_PASSWORD:?" in base
+
+    code = _code_lines(PAPER_ENV_LIB.read_text(encoding="utf-8"))
+    assert 'export POSTGRES_USER="$PAPER_POSTGRES_USER"' in code
+    assert 'export POSTGRES_PASSWORD="$PAPER_POSTGRES_PASSWORD"' in code
+    assert 'export POSTGRES_DB="$PAPER_POSTGRES_DB"' in code
 
 
 def test_the_probe_wrapper_never_bootstraps_credentials() -> None:
@@ -577,18 +618,20 @@ def test_the_first_run_path_creates_the_database_without_asking(tmp_path: Path) 
 
 
 def _credential_block() -> str:
-    """The wrapper's real credential-loading lines, sliced out of the file.
+    """Source the REAL loader and call it.
 
-    Sliced rather than retyped: a test that reimplements the code it is checking
-    proves only that the reimplementation works. The one substitution replaces
-    the ``uv`` invocation with a shell function, which bash resolves ahead of
-    any PATH lookup, so the surrounding mapfile/count/export logic runs byte for
-    byte as it does on the owner host.
+    Not a slice and not a retyping: the shipped ``load_paper_environment`` runs,
+    with ``uv`` replaced by a shell function, which bash resolves ahead of any
+    PATH lookup and which command substitution inherits. So the mapfile, the
+    count guard and both export families execute exactly as they do on the
+    owner host.
     """
-    text = WRAPPER.read_text(encoding="utf-8")
-    start = text.index('PAPER_CREDENTIALS="$(')
-    end = text.index('log "   database')
-    return text[start:end]
+    return (
+        f'source "{(REPO_ROOT / "scripts" / "lib" / "paper_env.sh").as_posix()}"\n'
+        "load_paper_environment || fail \"the paper database credentials are not"
+        ' available; run the one-time bootstrap first:\n'
+        '    bash scripts/bootstrap_paper_postgres.sh"\n'
+    )
 
 
 def _run_bash(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
@@ -611,6 +654,7 @@ def test_the_wrapper_block_exports_exactly_what_the_loader_emitted(
         "set -Eeuo pipefail\n"
         'fail() { echo "ERROR: $*" >&2; exit 2; }\n'
         "log() { :; }\n"
+        'export SECRETS_ROOT="/nonexistent/store"\n'
         f"STUB_PASSWORD={chr(39)}{awkward}{chr(39)}\n"
         "uv() { printf '%s\\n' 'role_x' 'db_x' \"$STUB_PASSWORD\"; }\n"
         + _credential_block()
@@ -633,6 +677,7 @@ def test_the_wrapper_block_fails_closed_when_the_loader_refuses(
         "set -Eeuo pipefail\n"
         'fail() { echo "ERROR: $*" >&2; exit 2; }\n'
         "log() { :; }\n"
+        'export SECRETS_ROOT="/nonexistent/store"\n'
         'uv() { echo "PAPER_POSTGRES_LOAD_FAILED: missing" >&2; return 2; }\n'
         + _credential_block()
         + f'touch "{marker.as_posix()}"\n'
@@ -653,6 +698,7 @@ def test_the_wrapper_block_rejects_a_short_read(tmp_path: Path) -> None:
         "set -Eeuo pipefail\n"
         'fail() { echo "ERROR: $*" >&2; exit 2; }\n'
         "log() { :; }\n"
+        'export SECRETS_ROOT="/nonexistent/store"\n'
         "uv() { printf '%s\\n' 'role_x' 'db_x'; }\n"
         + _credential_block()
         + f'touch "{marker.as_posix()}"\n'
