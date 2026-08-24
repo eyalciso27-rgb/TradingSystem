@@ -65,8 +65,12 @@ cleanup() {
     # published port. Errors here are reported, never hidden.
     if ! docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml \
          up -d --no-deps postgres >/dev/null 2>&1; then
+      # Point at the canonical owner-safe helper, NOT a bare compose command.
+      # After this wrapper exits the owner shell has only SECRETS_ROOT, and a
+      # bare command fails interpolation (it needs the generic POSTGRES_*).
+      # The helper loads both credential families from the store itself.
       log "WARNING: could not close the temporary publish; run:"
-      log "  docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml up -d --no-deps postgres"
+      log "  bash scripts/close_paper_probe_publish.sh"
     fi
   fi
   exit "$status"

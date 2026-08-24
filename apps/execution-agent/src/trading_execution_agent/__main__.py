@@ -312,8 +312,6 @@ def preflight(
     database configuration, the object store path, and the paper-only endpoint.
     Failing here costs one clear message and zero connections.
     """
-    from pathlib import Path
-
     from trading_broker_ibkr.poi_readonly_session import _validate_endpoint
 
     # 1. Paper-only endpoint. Purely local, and the most important refusal.
@@ -335,24 +333,72 @@ def preflight(
             " it from the paper environment without printing it."
         )
 
-    # 4. The object store path must be constructible.
-    raw_store = os.environ.get(ENV_OBJECT_STORE, DEFAULT_OBJECT_STORE)
-    try:
-        object_store = Path(raw_store)
-    except (TypeError, ValueError) as error:
-        raise ProbePreflightError(
-            f"{ENV_OBJECT_STORE} is not a usable path ({type(error).__name__})"
-        ) from error
+    # 4. The object store must be USABLE, not merely a constructible path.
+    #    Constructing a Path proves only that Python can hold a string. The
+    #    real adapter creates its root on __init__ and writes a temporary file
+    #    on put -- so an unwritable or invalid root failed only later, inside
+    #    build_service, AFTER two IBKR sessions were open. That contradicts the
+    #    promise this function makes. The proven instance is RETURNED so it is
+    #    the one the service uses; re-creating it after the sockets would prove
+    #    nothing about the object actually used.
+    objects = _prove_object_store()
 
     return ProbeConfig(
         account_alias=account_alias,
         account_id=account_id,
         database_url_present=True,
-        object_store=object_store,
+        object_store=objects,
         host=host,
         port=port,
         equity_cap=equity_cap,
     )
+
+
+#: A fixed, harmless payload. The store is content-addressed and put is
+#: idempotent, so writing it repeatedly yields one object and never grows the
+#: store. It exercises the exact write/read/verify path the audit sink relies on.
+_OBJECT_STORE_PROBE_PAYLOAD = b"execution-probe object-store readiness check\n"
+
+
+def _prove_object_store() -> object:
+    """Build the real object store and prove a content-addressed round trip.
+
+    Uses the production ``FilesystemObjectStorage`` -- not a parallel os.access
+    check that could disagree with it -- so what is proven is exactly what the
+    service will use. Failure becomes a safe local preflight error: a stable
+    message and the exception type only, never the path or the raw filesystem
+    text, and never a traceback in owner output.
+    """
+    from pathlib import Path
+
+    from trading_persistence.object_storage import (
+        FilesystemObjectStorage,
+        ObjectStorageError,
+    )
+
+    raw_store = os.environ.get(ENV_OBJECT_STORE, DEFAULT_OBJECT_STORE)
+    try:
+        object_store_path = Path(raw_store)
+    except (TypeError, ValueError) as error:
+        raise ProbePreflightError(
+            f"{ENV_OBJECT_STORE} is not a usable path ({type(error).__name__})"
+        ) from error
+    try:
+        objects = FilesystemObjectStorage(object_store_path)
+        stored = objects.put(_OBJECT_STORE_PROBE_PAYLOAD)
+        read_back = objects.get(stored.ref)
+    except (OSError, ObjectStorageError) as error:
+        raise ProbePreflightError(
+            "the object store is not usable, so evidence and audit payloads"
+            f" could not be persisted ({type(error).__name__}). Check that"
+            f" {ENV_OBJECT_STORE} points at a writable location."
+        ) from error
+    if read_back != _OBJECT_STORE_PROBE_PAYLOAD:
+        raise ProbePreflightError(
+            "the object store did not return what was written; refusing to"
+            " continue with an unreliable evidence store"
+        )
+    return objects
 
 
 def build_service(
@@ -362,9 +408,10 @@ def build_service(
     from trading_broker_ibkr.paper_adapter import build_paper_adapter
     from trading_broker_ibkr.poi_market_data_session import create_session
     from trading_persistence.db import create_sync_engine
-    from trading_persistence.object_storage import FilesystemObjectStorage
 
-    # EVERYTHING local first. No socket is opened until this returns.
+    # EVERYTHING local first. No socket is opened until this returns. This
+    # includes an actual object-store write/read round trip, and the store it
+    # proved is REUSED below rather than re-created after the sockets.
     config = preflight(
         account_alias=account_alias, host=host, port=port, equity_cap=equity_cap
     )
@@ -390,9 +437,11 @@ def build_service(
         engine = create_sync_engine()
         stack.callback(_closing(engine, "dispose", "database engine"))
 
-        objects = FilesystemObjectStorage(config.object_store)  # type: ignore[arg-type]
+        # The store proven in preflight, before any socket. Not re-created here:
+        # a fresh instance after the sockets would move the one filesystem
+        # failure back to where it used to be -- after two IBKR sessions.
         service = _build(
-            adapter, session, engine, objects,
+            adapter, session, engine, config.object_store,
             account_alias=account_alias, equity_cap=equity_cap,
         )
     except BaseException:

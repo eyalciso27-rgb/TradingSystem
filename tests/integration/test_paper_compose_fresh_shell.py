@@ -46,6 +46,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_CHECK = REPO_ROOT / "scripts" / "check_paper_compose_config.sh"
 PAPER_ENV_LIB = REPO_ROOT / "scripts" / "lib" / "paper_env.sh"
 WRAPPER = REPO_ROOT / "scripts" / "run_execution_probe_paper.sh"
+RECOVERY_HELPER = REPO_ROOT / "scripts" / "close_paper_probe_publish.sh"
 
 #: Everything a fresh owner SSH session does NOT have. Both families.
 CREDENTIAL_VARIABLES = (
@@ -111,6 +112,13 @@ def _bash(script: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
         check=False,
         env=env,
         cwd=str(REPO_ROOT),
+    )
+
+
+def _code_lines(text: str) -> str:
+    """Executable lines only. A comment naming a thing is not that thing."""
+    return chr(10).join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
     )
 
 
@@ -350,3 +358,133 @@ def test_no_dotenv_file_is_committed() -> None:
     """Credentials must not arrive via a checked-in .env either."""
     for candidate in (REPO_ROOT / ".env", REPO_ROOT / "deploy" / ".env"):
         assert not candidate.exists(), f"{candidate} must not be committed"
+
+
+# == the owner-safe cleanup recovery command =================================
+
+
+def _cleanup_recovery_instruction() -> str:
+    """The exact command the wrapper's cleanup warning tells the owner to run.
+
+    Extracted from the real wrapper, not retyped: the warning and the command
+    it names must not drift. The wrapper prints it via a second `log` line
+    inside the cleanup failure branch.
+    """
+    text = WRAPPER.read_text(encoding="utf-8")
+    cleanup = text.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
+    warning_seen = False
+    for line in _join_continuations(cleanup):
+        if "could not close the temporary publish" in line:
+            warning_seen = True
+            continue
+        if warning_seen and "log " in line:
+            # log "  bash scripts/close_paper_probe_publish.sh"
+            inner = line.split("log ", 1)[1].strip().strip('"').strip()
+            return inner
+    raise AssertionError("no recovery instruction found in cleanup()")
+
+
+def test_the_cleanup_warning_names_the_canonical_recovery_helper() -> None:
+    """Item 3/4: not a bare compose command a fresh shell cannot interpolate."""
+    instruction = _cleanup_recovery_instruction()
+
+    assert instruction == "bash scripts/close_paper_probe_publish.sh"
+    # And the warning does NOT hand the owner a bare `docker compose ... up`,
+    # which would require the generic POSTGRES_* a fresh shell lacks.
+    text = WRAPPER.read_text(encoding="utf-8")
+    cleanup = text.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
+    warning_region = cleanup.split("could not close", 1)[1]
+    assert "docker compose" not in warning_region, (
+        "the recovery instruction must point at the helper, not a bare command"
+    )
+
+
+def test_the_recovery_helper_uses_base_and_paper_without_the_probe_override() -> None:
+    """It removes the publish by re-applying the stack without the probe file."""
+    code = _code_lines(RECOVERY_HELPER.read_text(encoding="utf-8"))
+
+    assert "lib/paper_env.sh" in code, "the helper must load credentials itself"
+    assert "load_paper_environment" in code
+    assert "-f deploy/compose.yaml" in code
+    assert "-f deploy/compose.paper.yaml" in code
+    assert "compose.paper-probe.yaml" not in code, (
+        "re-applying WITH the probe override would keep the publish open"
+    )
+    assert "up -d --no-deps postgres" in code
+    for destructive in ("down -v", " down ", "volume rm", "volume prune"):
+        assert destructive not in code, f"{destructive!r} must not appear"
+
+
+def _docker_shim(tmp_path: Path, log: Path) -> Path:
+    """A `docker` on PATH that turns the helper's `up -d --no-deps postgres`
+    into a harmless `config -q`, records the real arguments, and delegates the
+    rest to the real docker. So the helper's own control flow runs unchanged
+    while nothing is started."""
+    real = shutil.which("docker")
+    assert real is not None
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "docker"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\n" "$*" >> "{log.as_posix()}"\n'
+        'all="$*"\n'
+        'all="${all/up -d --no-deps postgres/config -q}"\n'
+        "# shellcheck disable=SC2086\n"
+        f'exec "{real}" $all\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim_dir
+
+
+@requires_compose
+def test_the_recovery_helper_interpolates_from_secrets_root_alone(
+    canonical_store: Path, tmp_path: Path
+) -> None:
+    """Item 5: the exact named helper, run from a SECRETS_ROOT-only shell.
+
+    Nothing is started -- the shim rewrites `up -d` to `config -q` -- but the
+    helper's real credential loading and its real compose invocation run, so a
+    successful `config` proves interpolation succeeded from the store alone.
+    """
+    instruction = _cleanup_recovery_instruction()
+    log = tmp_path / "docker-args.log"
+    env = _fresh_shell_environment(canonical_store)
+    env["PATH"] = str(_docker_shim(tmp_path, log)) + os.pathsep + env["PATH"]
+
+    result = _bash(instruction, env)
+
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+    recorded = log.read_text(encoding="utf-8")
+    assert "compose.yaml" in recorded
+    assert "compose.paper.yaml" in recorded
+    assert "compose.paper-probe.yaml" not in recorded, "the publish override leaked"
+    # No credential value reached the owner-visible output.
+    from trading_config.paper_postgres import load
+
+    password = load(canonical_store).password.reveal()
+    assert password not in (result.stdout + result.stderr)
+    assert "postgresql" not in (result.stdout + result.stderr)
+
+
+@requires_compose
+def test_the_recovery_compose_files_fail_bare_without_the_loader(
+    canonical_store: Path, tmp_path: Path
+) -> None:
+    """Non-vacuity control: the same files, bare, must fail interpolation.
+
+    This is what makes the helper's success meaningful -- it is the loader, not
+    the ambient shell, that satisfies Compose.
+    """
+    result = _bash(
+        "docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml"
+        " config -q",
+        _fresh_shell_environment(canonical_store),
+    )
+
+    assert result.returncode != 0, "the recovery files interpolated bare"
+    assert re.search(
+        r"required variable POSTGRES_(USER|PASSWORD) is missing a value",
+        result.stderr,
+    ), result.stderr

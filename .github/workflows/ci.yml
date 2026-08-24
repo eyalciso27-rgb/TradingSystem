@@ -126,8 +126,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
+      # postgres:18 to match deploy/compose.yaml (the paper stack the owner
+      # runs). Round 6 makes first-run `alembic upgrade head` a production
+      # startup gate, and tests/db/test_paper_first_run_schema.py proves it
+      # against a real empty database -- so that proof must run on the same
+      # major version the owner will actually initialise.
       postgres:
-        image: postgres:16
+        image: postgres:18
         env:
           POSTGRES_USER: trading
           POSTGRES_PASSWORD: trading
