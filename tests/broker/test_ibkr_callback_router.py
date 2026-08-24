@@ -222,3 +222,56 @@ def test_request_errors_reach_the_request_stream() -> None:
         classify_error_stream(101, order_ids={5}, request_ids={101})
         == request_stream(101)
     )
+
+
+# == retired streams: a late callback cannot recreate a live waiter ==========
+
+
+def test_a_callback_after_release_is_archived_not_re_buffered() -> None:
+    """release() retires a stream; a later publish to it is archived, so it can
+    never recreate a live-looking waiter deque."""
+    router = CallbackRouter()
+    stream = request_stream(9301)
+    router.publish(stream, "pnl", 12.5)
+    first = router.take(stream, timeout=TIMEOUT)
+    assert first is not None and first.payload == 12.5
+
+    router.release(stream)  # waiter done
+    router.publish(stream, "pnl", 999.9)  # a late callback for the finished req
+
+    assert router.pending(stream) == 0, "the retired stream was recreated"
+    assert any(env.payload == 999.9 for env in router.archived()), (
+        "the late callback must be archived, not lost"
+    )
+
+
+def test_a_new_request_stream_is_never_treated_as_retired() -> None:
+    """reqIds are unique and monotonic, so a fresh request's stream is live."""
+    router = CallbackRouter()
+    first = request_stream(9301)
+    router.publish(first, "pnl", 1.0)
+    router.take(first, timeout=TIMEOUT)
+    router.release(first)
+
+    second = request_stream(9302)  # a genuinely new request
+    router.publish(second, "pnl", 2.0)
+
+    assert router.pending(second) == 1, "a new request's stream must stay live"
+    taken = router.take(second, timeout=TIMEOUT)
+    assert taken is not None and taken.payload == 2.0
+
+
+def test_retired_stream_memory_is_bounded() -> None:
+    """The retired set never grows without bound: old keys fall off, and a key
+    that has aged out is treated as new again (still inert -- nothing waits)."""
+    from trading_broker_ibkr.callback_router import RETIRED_STREAM_MEMORY
+
+    router = CallbackRouter()
+    for req_id in range(RETIRED_STREAM_MEMORY + 50):
+        router.release(request_stream(req_id))
+
+    # The very first key has aged out of the bounded window.
+    assert request_stream(0) not in router._retired_set
+    # A recent key is still remembered.
+    assert request_stream(RETIRED_STREAM_MEMORY + 40) in router._retired_set
+    assert len(router._retired) <= RETIRED_STREAM_MEMORY

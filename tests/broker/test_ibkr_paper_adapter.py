@@ -25,6 +25,8 @@ from trading_broker_core.port import (
     InstrumentQuery,
     OrderIntent,
     OrderSide,
+    SessionPnlObservation,
+    SessionPnlStatus,
     TimeInForce,
 )
 from trading_broker_ibkr.paper_adapter import (
@@ -115,15 +117,19 @@ class FakePaperTransport:
             currency="USD",
         )
 
-    def session_pnl(self, account_id: str) -> Decimal | None:
-        """The daily P&L a gateway would serve through reqPnL, or None.
+    def session_pnl(self, account_id: str) -> SessionPnlObservation:
+        """The daily P&L observation a gateway would serve through reqPnL.
 
-        None is the DEFAULT because it is the honest one: IBKR serves a daily
-        figure only when the account carries P&L permission, and the adapter
-        must treat its absence as unknown rather than as a flat day.
+        The default is a bounded TIMEOUT because it is the honest one: absence
+        of an update is not a flat day and not a permission fact. A configured
+        ``daily_pnl`` is served as OK.
         """
         self.calls.append("session_pnl")
-        return self.daily_pnl
+        if self.daily_pnl is None:
+            return SessionPnlObservation(
+                SessionPnlStatus.TIMEOUT, detail="no reqPnL update (fake)"
+            )
+        return SessionPnlObservation(SessionPnlStatus.OK, value=self.daily_pnl)
 
     def account_summary(self, account_id: str) -> Mapping[str, Decimal]:
         self.calls.append(f"summary:{mask_account_id(account_id)}")

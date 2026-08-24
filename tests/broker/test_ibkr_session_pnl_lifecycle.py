@@ -26,6 +26,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from trading_broker_core.port import SessionPnlStatus
 
 
 class _PnlStubEClient:
@@ -92,7 +93,9 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     _install_stub_ibapi(monkeypatch)
     from trading_broker_ibkr.paper_adapter import _build_ibapi_paper_transport
 
-    yield _build_ibapi_paper_transport(timeout_seconds=0.2)
+    yield _build_ibapi_paper_transport(
+        timeout_seconds=0.2, session_pnl_timeout_seconds=0.2
+    )
 
 
 def _stream(req_id: int) -> str:
@@ -108,8 +111,8 @@ def test_two_session_pnl_calls_each_return_their_own_value(transport: Any) -> No
     first = transport.session_pnl("DU1234567")
     second = transport.session_pnl("DU1234567")
 
-    assert first == Decimal("12.50")
-    assert second == Decimal("34.25")
+    assert first.status is SessionPnlStatus.OK and first.value == Decimal("12.50")
+    assert second.status is SessionPnlStatus.OK and second.value == Decimal("34.25")
     ids = transport._app.req_pnl_ids
     assert len(set(ids)) == 2, f"distinct reqPnL ids, got {ids}"
 
@@ -151,7 +154,7 @@ def test_a_late_update_from_the_first_call_cannot_reach_the_second(
     second = transport.session_pnl("DU1234567")
     second_id = transport._app.req_pnl_ids[1]
 
-    assert second == Decimal("34.25"), "the second call served its own value"
+    assert second.value == Decimal("34.25"), "the second call served its own value"
     assert first_id != second_id
     assert transport._app.router.pending(_stream(second_id)) == 0, (
         "the second request's stream is clean; the late #1 update never reached it"
@@ -176,7 +179,7 @@ def test_a_buffered_extra_update_is_archived_on_release(transport: Any) -> None:
 
     value = transport.session_pnl("DU1234567")
 
-    assert value == Decimal("12.50"), "the first update is the daily value taken"
+    assert value.value == Decimal("12.50"), "the first update is the daily value taken"
     archived = transport._app.router.archived()
     assert any(env.payload == 12.51 for env in archived), archived
 
@@ -190,22 +193,27 @@ def test_a_first_timeout_does_not_stop_the_second_call(transport: Any) -> None:
     first = transport.session_pnl("DU1234567")
     second = transport.session_pnl("DU1234567")
 
-    assert first is None, "no update inside the timeout is honestly None"
-    assert second == Decimal("55.75")
+    assert first.status is SessionPnlStatus.TIMEOUT, "no update is TIMEOUT, not a value"
+    assert first.value is None
+    assert second.status is SessionPnlStatus.OK and second.value == Decimal("55.75")
 
 
 def test_an_unavailable_pnl_is_never_zero(transport: Any) -> None:
     """UNKNOWN stays None and must fail closed -- never a fabricated 0."""
     transport._app.pnl_script = [None]
 
-    assert transport.session_pnl("DU1234567") is None
+    observation = transport.session_pnl("DU1234567")
+    assert observation.status is SessionPnlStatus.TIMEOUT
+    assert observation.value is None
 
 
 def test_a_nan_daily_value_is_none_not_zero(transport: Any) -> None:
     """IBKR's nan 'not available' for a float field is None, never 0."""
     transport._app.pnl_script = [float("nan")]
 
-    assert transport.session_pnl("DU1234567") is None
+    observation = transport.session_pnl("DU1234567")
+    assert observation.status is SessionPnlStatus.UNSET
+    assert observation.value is None
 
 
 def test_every_request_is_cancelled_and_released_even_on_timeout(
@@ -218,3 +226,103 @@ def test_every_request_is_cancelled_and_released_even_on_timeout(
     req_id = transport._app.req_pnl_ids[0]
     assert req_id in transport._app.cancel_pnl_ids, "reqPnL was not cancelled"
     assert transport._app.router.pending(_stream(req_id)) == 0, "stream not released"
+
+
+# == request-scoped errors are reported, not hidden as "no P&L" ===============
+
+
+def test_a_request_scoped_error_is_reported_not_hidden_as_timeout(
+    transport: Any,
+) -> None:
+    """The item-1 defect: a reqPnL rejection used to be ignored on the stream
+    and collapsed into the timeout as 'no P&L'. It is now REQUEST_ERROR."""
+
+    def _req_pnl_error(req_id: int, account: str, model_code: str) -> None:
+        transport._app.req_pnl_ids.append(req_id)
+        transport._app.error(req_id, 321, "Server error validating the request")
+
+    transport._app.reqPnL = _req_pnl_error
+
+    observation = transport.session_pnl("DU1234567")
+
+    from trading_broker_core.port import SessionPnlStatus as _S
+
+    assert observation.status is _S.REQUEST_ERROR
+    assert observation.value is None
+    assert "321" in observation.detail
+    # The classified detail must not carry the raw broker text or an account id.
+    assert "Server error" not in observation.detail
+    assert "DU1234567" not in observation.detail
+
+
+def test_a_request_error_does_not_wait_for_the_generic_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It must SHORT-CIRCUIT: with a long window, a rejection still returns
+    quickly. This is what makes one bounded timeout honest for both uses."""
+    import time as _time
+
+    _install_stub_ibapi(monkeypatch)
+    from trading_broker_ibkr.paper_adapter import _build_ibapi_paper_transport
+
+    # A deliberately LONG window, so a slow return would be visible.
+    transport: Any = _build_ibapi_paper_transport(
+        timeout_seconds=0.2, session_pnl_timeout_seconds=30.0
+    )
+
+    def _req_pnl_error(req_id: int, account: str, model_code: str) -> None:
+        transport._app.error(req_id, 321, "rejected")
+
+    transport._app.reqPnL = _req_pnl_error
+
+    started = _time.monotonic()
+    observation = transport.session_pnl("DU1234567")
+    elapsed = _time.monotonic() - started
+
+    assert observation.status is SessionPnlStatus.REQUEST_ERROR
+    assert elapsed < 5.0, f"a rejection waited {elapsed:.1f}s of the 30s window"
+
+
+def test_an_informational_notice_is_ignored_then_pnl_is_returned(
+    transport: Any,
+) -> None:
+    """A farm/connectivity notice on the stream is not a P&L and not an error:
+    keep waiting, then serve the real value."""
+
+    def _req_pnl_notice_then_pnl(req_id: int, account: str, model_code: str) -> None:
+        transport._app.req_pnl_ids.append(req_id)
+        transport._app.error(req_id, 2104, "Market data farm connection is OK")
+        transport._app.pnl(req_id, 42.0, 0.0, 0.0)
+
+    transport._app.reqPnL = _req_pnl_notice_then_pnl
+
+    observation = transport.session_pnl("DU1234567")
+
+    from trading_broker_core.port import SessionPnlStatus as _S
+
+    assert observation.status is _S.OK
+    assert observation.value == Decimal("42")
+
+
+def test_a_first_request_error_does_not_stop_a_second_finite_pnl(
+    transport: Any,
+) -> None:
+    calls = {"n": 0}
+
+    def _req(req_id: int, account: str, model_code: str) -> None:
+        transport._app.req_pnl_ids.append(req_id)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            transport._app.error(req_id, 321, "rejected")
+        else:
+            transport._app.pnl(req_id, 7.0, 0.0, 0.0)
+
+    transport._app.reqPnL = _req
+
+    first = transport.session_pnl("DU1234567")
+    second = transport.session_pnl("DU1234567")
+
+    from trading_broker_core.port import SessionPnlStatus as _S
+
+    assert first.status is _S.REQUEST_ERROR
+    assert second.status is _S.OK and second.value == Decimal("7")

@@ -280,6 +280,47 @@ class BrokerPosition:
     average_price: Decimal
 
 
+class SessionPnlStatus(StrEnum):
+    """WHY a session-P&L observation has, or does not have, a value.
+
+    The value alone (``Decimal | None``) cannot distinguish a broker that
+    rejected the request from one that simply did not answer in time -- both
+    collapse to ``None`` -- and reporting either as "no P&L permission" is a
+    diagnosis the evidence does not support. These four are surfaced so the
+    owner probe can tell them apart WITHOUT exposing the account id.
+    """
+
+    #: A finite daily value was returned.
+    OK = "PNL_OK"
+    #: No P&L callback arrived within the bounded window. Not a permission fact.
+    TIMEOUT = "PNL_TIMEOUT"
+    #: The broker rejected the request with a request-scoped error (classified,
+    #: never the raw text) -- distinct from silence, and no longer hidden as it.
+    REQUEST_ERROR = "PNL_REQUEST_ERROR"
+    #: A callback arrived but the daily value was NaN / not-a-number. UNKNOWN,
+    #: never zero.
+    UNSET = "PNL_UNSET"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionPnlObservation:
+    """One session-P&L observation: its status, its value, and a safe detail.
+
+    ``value`` is a finite ``Decimal`` only when ``status is OK``; it is ``None``
+    for every other status, so a consumer that reads only the value still fails
+    closed. ``detail`` is bounded and safe to show an owner -- a code or class,
+    never the account id, a secret, a DSN or a traceback.
+    """
+
+    status: SessionPnlStatus
+    value: Decimal | None = None
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        if (self.status is SessionPnlStatus.OK) != (self.value is not None):
+            raise ValueError("a session P&L value is present iff the status is OK")
+
+
 @dataclass(frozen=True, slots=True)
 class AccountSnapshot:
     account_alias: str
@@ -300,9 +341,22 @@ class AccountSnapshot:
     #: and calling a cumulative figure a daily one would be a fabrication with
     #: the same consequence.
     session_pnl: Decimal | None = None
+    #: WHY ``session_pnl`` is present or absent -- OK / TIMEOUT / REQUEST_ERROR /
+    #: UNSET. Diagnostic only; the risk gate reads ``session_pnl`` and fails
+    #: closed on anything but a value. Optional so adapters that do not observe
+    #: P&L, and the many test snapshots, need not set it. When a value IS
+    #: present it must be OK, and an absent value must never be reported as OK.
+    session_pnl_status: SessionPnlStatus | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
+        if self.session_pnl_status is SessionPnlStatus.OK and self.session_pnl is None:
+            raise ValueError("session_pnl_status OK requires a session_pnl value")
+        if self.session_pnl is not None and self.session_pnl_status not in (
+            None,
+            SessionPnlStatus.OK,
+        ):
+            raise ValueError("a session_pnl value must carry status OK")
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,6 +523,8 @@ __all__ = [
     "OrderPreview",
     "RecoveredOrder",
     "OrderSide",
+    "SessionPnlObservation",
+    "SessionPnlStatus",
     "TimeInForce",
     "ReconciliationResult",
 ]

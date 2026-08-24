@@ -77,12 +77,14 @@ from trading_application.trading_readiness_runtime import (
     QuoteState,
 )
 from trading_broker_core.port import (
+    AccountSnapshot,
     BrokerCapabilities,
     BrokerCapabilityMode,
     BrokerInstrument,
     InstrumentQuery,
     OrderIntent,
     OrderSide,
+    SessionPnlStatus,
 )
 from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter, decode_instrument_ref
 from trading_contracts.decision import DecisionResult
@@ -2906,6 +2908,65 @@ def test_account_and_session_pnl_share_one_snapshot() -> None:
 
     assert len(calls) == 1, f"the diagnostic phase made {len(calls)} account snapshots"
     assert account_ok and pnl_ok, "both records derive from the one snapshot"
+
+
+def _account_snapshot(
+    *, session_pnl: object = None, status: SessionPnlStatus | None = None
+) -> AccountSnapshot:
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    return AccountSnapshot(
+        account_alias="paper-poi",
+        environment=Environment.PAPER,
+        net_liquidation_value=Decimal("100000"),
+        cash=Decimal("60000"),
+        buying_power=Decimal("120000"),
+        observed_at=datetime(2026, 8, 24, tzinfo=UTC),
+        session_pnl=session_pnl,  # type: ignore[arg-type]
+        session_pnl_status=status,
+    )
+
+
+def test_the_pnl_view_distinguishes_timeout_error_and_unset() -> None:
+    """Item 6: the owner probe can tell the four P&L outcomes apart, and never
+    calls a bounded timeout a permission failure."""
+    from decimal import Decimal
+
+    service, _, _ = _service()
+    view = service._session_pnl_view  # noqa: SLF001
+
+    ok = view(_account_snapshot(session_pnl=Decimal("0"), status=SessionPnlStatus.OK))
+    assert ok[0] is True and "PNL_OK" in ok[1]
+
+    timeout = view(_account_snapshot(status=SessionPnlStatus.TIMEOUT))
+    assert timeout[0] is False
+    assert "PNL_TIMEOUT" in timeout[1]
+    for claim in ("no permission", "lacks permission", "no p&l permission"):
+        assert claim not in timeout[1].lower(), "a timeout is not a permission failure"
+
+    request_error = view(_account_snapshot(status=SessionPnlStatus.REQUEST_ERROR))
+    assert request_error[0] is False and "PNL_REQUEST_ERROR" in request_error[1]
+
+    unset = view(_account_snapshot(status=SessionPnlStatus.UNSET))
+    assert unset[0] is False and "PNL_UNSET" in unset[1]
+
+
+def test_the_pnl_view_never_claims_permission_for_any_unknown() -> None:
+    """No unknown status may be reported as 'no P&L permission'."""
+    service, _, _ = _service()
+    for status in (
+        SessionPnlStatus.TIMEOUT,
+        SessionPnlStatus.REQUEST_ERROR,
+        SessionPnlStatus.UNSET,
+        None,
+    ):
+        _ok, detail = service._session_pnl_view(  # noqa: SLF001
+            _account_snapshot(status=status)
+        )
+        low = detail.lower()
+        for claim in ("no permission", "lacks permission", "no p&l permission"):
+            assert claim not in low, f"{status} was falsely called a permission failure"
 
 
 def test_a_broken_account_snapshot_fails_both_records_not_the_rest() -> None:

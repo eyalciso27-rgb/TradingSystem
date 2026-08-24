@@ -111,6 +111,7 @@ from trading_broker_core.port import (
     OrderIntent,
     OrderSide,
     RecoveredOrder,
+    SessionPnlStatus,
     TimeInForce,
 )
 from trading_contracts.enums import Environment, OrderType, RiskDecisionOutcome
@@ -1367,12 +1368,34 @@ class ExecutionService:
                 "NOT EVALUATED: the account snapshot could not be observed, so"
                 " daily P&L could not be read"
             )
-        if snapshot.session_pnl is None:
+        if snapshot.session_pnl is not None:
+            return True, f"session P&L {snapshot.session_pnl} ({SessionPnlStatus.OK})"
+        # No value. Report WHICH kind of unknown, so the owner can tell a slow
+        # or absent subscription from a real broker rejection -- and so nobody
+        # reads "no permission" into a bounded timeout. Every one of these still
+        # fails the decision closed; the halt limits cannot be evaluated and
+        # UNKNOWN is not zero.
+        status = snapshot.session_pnl_status
+        blocked = (
+            "This blocks execution: the daily halt limits cannot be evaluated"
+            " and UNKNOWN is not zero"
+        )
+        if status is SessionPnlStatus.TIMEOUT:
             return False, (
-                "the gateway served no daily P&L (reqPnL). This blocks execution:"
-                " the daily halt limits cannot be evaluated and UNKNOWN is not zero"
+                f"{SessionPnlStatus.TIMEOUT}: no reqPnL update within the bounded"
+                f" window (NOT a permission fact). {blocked}"
             )
-        return True, f"session P&L {snapshot.session_pnl}"
+        if status is SessionPnlStatus.REQUEST_ERROR:
+            return False, (
+                f"{SessionPnlStatus.REQUEST_ERROR}: the gateway rejected the"
+                f" reqPnL subscription. {blocked}"
+            )
+        if status is SessionPnlStatus.UNSET:
+            return False, (
+                f"{SessionPnlStatus.UNSET}: reqPnL returned a non-numeric daily"
+                f" value. {blocked}"
+            )
+        return False, f"the gateway served no daily P&L (reqPnL). {blocked}"
 
     def _contract_evidence(
         self, intent: ExecutionIntent

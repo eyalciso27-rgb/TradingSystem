@@ -60,6 +60,8 @@ from trading_broker_core.port import (
     OrderSide,
     ReconciliationResult,
     RecoveredOrder,
+    SessionPnlObservation,
+    SessionPnlStatus,
     TimeInForce,
 )
 from trading_contracts.enums import Environment, OrderState, OrderType
@@ -111,9 +113,19 @@ _RECOVERED_ORDER_TYPE: Mapping[str, OrderType] = {
 }
 
 #: How long to wait for the ``reqPnL`` subscription's first update before
-#: calling the daily P&L unknown. Short: a trading decision cannot wait, and a
-#: slow answer is not a better answer than an honest "unknown".
-SESSION_PNL_TIMEOUT_SECONDS = 5.0
+#: reporting a bounded TIMEOUT (not a permission fact).
+#:
+#: One bounded value serves both the owner probe and the execution decision,
+#: and it can do so honestly ONLY because request-scoped errors now
+#: short-circuit: a broker rejection returns immediately as REQUEST_ERROR
+#: rather than consuming the whole window, so this timeout governs just the
+#: "no callback at all" case. IBKR documents that aggregate P&L can take
+#: several seconds to compute for some account structures, and the third
+#: owner-host run showed the previous 5s was too tight to distinguish a slow
+#: subscription from an absent one. 15s matches ``DEFAULT_TIMEOUT_SECONDS``
+#: used elsewhere and stays bounded -- there is never an unbounded wait, and
+#: the execution gate still fails closed on TIMEOUT exactly as on None.
+SESSION_PNL_TIMEOUT_SECONDS = 15.0
 DEFAULT_CLIENT_ID = 1
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
@@ -578,8 +590,8 @@ class PaperTransport(Protocol):
 
     def account_summary(self, account_id: str) -> Mapping[str, Decimal]: ...
 
-    def session_pnl(self, account_id: str) -> Decimal | None:
-        """The account's DAILY P&L, or None when the gateway will not say.
+    def session_pnl(self, account_id: str) -> SessionPnlObservation:
+        """The account's DAILY P&L observation: a status, a value, a safe detail.
 
         A distinct operation rather than an account-summary tag, because IBKR's
         ``reqAccountSummary`` genuinely does not carry a daily figure: the daily
@@ -587,9 +599,11 @@ class PaperTransport(Protocol):
         ``DailyPnL`` summary key would have described a feed that does not
         exist.
 
-        ``None`` means unknown -- a missing subscription, a timeout, an error.
-        It is never zero, because the risk engine computes both daily halt
-        limits from this and a zero would silently disable them.
+        The status distinguishes a value (OK) from silence (TIMEOUT), a broker
+        rejection (REQUEST_ERROR) and a NaN callback (UNSET). Only OK carries a
+        value; every other status means UNKNOWN, and the risk engine, which
+        reads only the value, still fails both daily halt limits closed -- a
+        zero would silently disable them.
 
         Cumulative realized/unrealized totals are a different fact and are
         deliberately not returned here; a cumulative number presented as a daily
@@ -781,6 +795,7 @@ class IbkrPaperAdapter:
         transport = self._require_connected()
         account_id = self._account_id(account_alias)
         values = self._guarded(lambda: transport.account_summary(account_id))
+        pnl = self._session_pnl(transport, account_id)
         try:
             return AccountSnapshot(
                 account_alias=account_alias,
@@ -791,8 +806,11 @@ class IbkrPaperAdapter:
                 # From the transport's own daily-P&L operation (reqPnL), never
                 # from an account-summary tag: IBKR's summary carries no daily
                 # figure. Unknown stays None, and None fails a trading decision
-                # closed rather than pretending the day is flat.
-                session_pnl=self._session_pnl(transport, account_id),
+                # closed rather than pretending the day is flat. The status is
+                # carried alongside so the owner probe can say WHY it is
+                # unknown (timeout vs a real request error vs a NaN callback).
+                session_pnl=pnl.value,
+                session_pnl_status=pnl.status,
                 observed_at=self._now(),
             )
         except KeyError as missing:
@@ -802,22 +820,28 @@ class IbkrPaperAdapter:
             ) from missing
 
     @staticmethod
-    def _session_pnl(transport: PaperTransport, account_id: str) -> Decimal | None:
-        """Ask for the daily P&L. Any failure is UNKNOWN, never zero.
+    def _session_pnl(
+        transport: PaperTransport, account_id: str
+    ) -> SessionPnlObservation:
+        """Ask for the daily P&L observation. Any raise is UNKNOWN, never zero.
 
-        A subscription that is missing, slow or erroring is indistinguishable
-        from a flat day if the failure is swallowed as a number, so it is
-        swallowed as ``None`` instead.
+        The transport already classifies the outcome (OK / TIMEOUT /
+        REQUEST_ERROR / UNSET). A transport that raises outright -- a fake, or
+        an unexpected failure -- is folded into REQUEST_ERROR here so the value
+        is still absent and the decision still fails closed.
         """
         try:
-            value = transport.session_pnl(account_id)
-        except Exception:  # noqa: BLE001 - any failure means UNKNOWN
-            return None
-        if value is None:
-            return None
-        if not value.is_finite():
-            return None
-        return value
+            observation = transport.session_pnl(account_id)
+        except Exception as error:  # noqa: BLE001 - any failure means UNKNOWN
+            return SessionPnlObservation(
+                SessionPnlStatus.REQUEST_ERROR,
+                detail=f"session_pnl raised {type(error).__name__}",
+            )
+        if observation.value is not None and not observation.value.is_finite():
+            return SessionPnlObservation(
+                SessionPnlStatus.UNSET, detail="daily value not a number"
+            )
+        return observation
 
     def get_positions(self, account_alias: str) -> tuple[BrokerPosition, ...]:
         transport = self._require_connected()
@@ -1309,6 +1333,8 @@ def _coerce_decimal(value: object) -> Decimal | None:
 
 def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-IBKR-001
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    *,
+    session_pnl_timeout_seconds: float = SESSION_PNL_TIMEOUT_SECONDS,
 ) -> PaperTransport:
     """Build the real SDK-backed paper transport (gateway host only).
 
@@ -1465,6 +1491,7 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             self._app = _PaperApp()
             self._thread: threading.Thread | None = None
             self._req_id = 100
+            self._session_pnl_timeout = session_pnl_timeout_seconds
 
         def connect(self, host: str, port: int, client_id: int) -> tuple[str, ...]:
             self._app.api_client_id = client_id
@@ -1564,62 +1591,94 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                     values[tag] = Decimal(value)
             return values
 
-        def session_pnl(self, account_id: str) -> Decimal | None:
+        def session_pnl(self, account_id: str) -> SessionPnlObservation:
             """Daily P&L via the canonical ``reqPnL`` subscription.
 
             This is a subscription, not a request/response: there is no "end"
             callback, so the first update is taken and the subscription is
-            cancelled immediately. No update inside the timeout means the
-            gateway is not serving one -- typically no P&L permission on the
-            account -- and the honest answer is None.
+            cancelled immediately. The status distinguishes:
 
-            A ``nan`` daily value (IBKR's "not available" for a float field) is
-            also None. It is never zero.
+            * OK -- a finite daily value;
+            * REQUEST_ERROR -- a request-scoped broker rejection, classified
+              and returned IMMEDIATELY. It used to be silently ignored on this
+              stream and collapsed into the timeout, so a real gateway error
+              read as "no P&L". Farm/informational notices are still ignored;
+            * TIMEOUT -- no callback at all within the bounded window. This is
+              NOT a permission fact;
+            * UNSET -- a callback with a NaN daily value.
+
+            Only OK carries a value; everything else is UNKNOWN, never zero.
             """
             req_id = self._next_request_id()
             try:
                 self._app.reqPnL(req_id, account_id, "")
-            except Exception:  # noqa: BLE001 - unsupported/unavailable => UNKNOWN
-                return None
+            except Exception as error:  # noqa: BLE001 - unsupported => request error
+                return SessionPnlObservation(
+                    SessionPnlStatus.REQUEST_ERROR,
+                    detail=f"reqPnL raised {type(error).__name__}",
+                )
             payload: object = None
+            error_detail: str | None = None
+            timed_out = False
             try:
-                deadline = time.monotonic() + SESSION_PNL_TIMEOUT_SECONDS
-                while payload is None:
+                deadline = time.monotonic() + self._session_pnl_timeout
+                while payload is None and error_detail is None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
+                        timed_out = True
                         break
                     envelope = self._app.router.take(
                         request_stream(req_id), timeout=remaining
                     )
                     if envelope is None:
+                        timed_out = True
                         break
                     if envelope.kind == "pnl":
                         payload = envelope.payload
-                    # Any other envelope on this stream (an error, a farm
-                    # notice) simply is not a daily P&L; keep waiting rather
-                    # than mistaking it for one.
-            except Exception:  # noqa: BLE001 - transport failure => UNKNOWN
-                payload = None
+                    elif envelope.kind == "error":
+                        _req, code, _text, _advanced = cast(
+                            "tuple[int | None, int, str, str]", envelope.payload
+                        )
+                        if is_informational_ibkr_error(code):
+                            continue  # farm/connectivity notice: keep waiting
+                        # A request-scoped rejection. Report it AS one, at once,
+                        # with the code only -- never the raw text, which could
+                        # carry identifiers.
+                        error_detail = f"reqPnL rejected (IBKR {code})"
+                    # Any other envelope kind is simply not a daily P&L.
+            except Exception as error:  # noqa: BLE001 - transport failure
+                error_detail = f"reqPnL transport error ({type(error).__name__})"
             finally:
                 try:
                     self._app.cancelPnL(req_id)
                 except Exception:  # noqa: BLE001 - best-effort unsubscribe
                     pass
-                # Retire this request's stream, exactly as _collect does. Without
-                # it the waiter's deque lingers in the router for the life of the
-                # process, and a ``pnl`` update that arrives after cancelPnL is
-                # neither archived nor cleared -- a leak that grows one entry per
-                # session_pnl call. release() archives any late envelope so it
-                # stays inspectable and drops the stream. reqId is fresh each
+                # Retire this request's stream, exactly as _collect does, so no
+                # waiter deque lingers and a late callback is archived rather
+                # than recreating a live-looking stream. reqId is fresh each
                 # call, so this can never discard a LATER request's data.
                 self._app.router.release(request_stream(req_id))
-            if payload is None:
-                return None
+
+            if error_detail is not None:
+                return SessionPnlObservation(
+                    SessionPnlStatus.REQUEST_ERROR, detail=error_detail
+                )
+            if payload is None or timed_out:
+                return SessionPnlObservation(
+                    SessionPnlStatus.TIMEOUT,
+                    detail=f"no reqPnL update within {self._session_pnl_timeout:g}s",
+                )
             try:
                 value = Decimal(str(payload))
             except (ArithmeticError, ValueError):
-                return None
-            return value if value.is_finite() else None
+                return SessionPnlObservation(
+                    SessionPnlStatus.UNSET, detail="reqPnL daily value not a number"
+                )
+            if not value.is_finite():
+                return SessionPnlObservation(
+                    SessionPnlStatus.UNSET, detail="reqPnL daily value not a number"
+                )
+            return SessionPnlObservation(SessionPnlStatus.OK, value=value)
 
         def positions(self, account_id: str) -> tuple[BrokerPosition, ...]:
             self._app.reqPositions()
