@@ -178,7 +178,11 @@ host; and the paper stack publishes no database port at all. The wrapper opens a
 **loopback-only** publish of the paper database for the duration of the run
 (`127.0.0.1:${PAPER_PROBE_DB_PORT:-55432}`, never `0.0.0.0`) via
 `deploy/compose.paper-probe.yaml`, and closes it again on exit. That override is
-never part of normal paper startup.
+never part of normal paper startup. In the rare case that closing it fails, the
+wrapper points you at one owner-safe recovery command — `bash
+scripts/close_paper_probe_publish.sh` — which re-applies the paper database
+without the publish, loading credentials from the store itself (so, again, only
+`SECRETS_ROOT`), and never touches the volume.
 
 What it needs from you:
 
