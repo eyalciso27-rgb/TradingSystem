@@ -103,6 +103,7 @@ from trading_application.trading_readiness_runtime import (
     TradingReadinessRuntimeReport,
 )
 from trading_broker_core.port import (
+    AccountSnapshot,
     BrokerInstrument,
     BrokerPort,
     BrokerPortError,
@@ -1155,10 +1156,16 @@ class ExecutionService:
         # so the owner learned nothing about the contract, the universe, the
         # portfolio or the audit sink -- exactly the facts a broken host needs.
         evidence.record("halts", *self._isolated("halts", self._halt_evidence, intent))
-        evidence.record("account", *self._isolated("account", self._account_evidence))
-        evidence.record(
-            "session_pnl", *self._isolated("session_pnl", self._session_pnl_evidence)
-        )
+        # ONE account snapshot feeds BOTH the account-metadata and the
+        # session-P&L records. They used to take a snapshot each -- two full
+        # reqPnL subscriptions in the diagnostic phase, back to back, before
+        # canonical evaluation even began. They genuinely share that one
+        # observation, so they share its result (and its failure). The canonical
+        # evaluation below still makes its OWN fresh observation, which is what
+        # exercises the real decision path.
+        account_snapshot, account_ok, account_note = self._isolated_account_snapshot()
+        evidence.record("account", account_ok, account_note)
+        evidence.record("session_pnl", *self._session_pnl_view(account_snapshot))
 
         instrument: BrokerInstrument | None = None
         try:
@@ -1326,22 +1333,40 @@ class ExecutionService:
             return True, "no active halt matches this entry"
         return False, f"halt active ({halt.scope.value})"
 
-    def _account_evidence(self) -> tuple[bool, str]:
+    def _isolated_account_snapshot(self) -> tuple[AccountSnapshot | None, bool, str]:
+        """ONE account observation for the whole diagnostic phase.
+
+        Returns the snapshot (or None on failure) alongside the account record.
+        The session-P&L record is a VIEW of the same snapshot, so the two
+        together cost one ``reqPnL``, not two. Its failure is its own finding --
+        reported, never propagated -- exactly as ``_isolated`` guarantees for
+        every other observation.
+        """
         try:
             snapshot = self._broker.get_account_snapshot(self._config.account_alias)
-        except Exception as error:  # noqa: BLE001
-            return False, f"account snapshot raised {type(error).__name__}"
-        return True, (
+        except Exception as error:  # noqa: BLE001 - reported, not propagated
+            LOGGER.warning(
+                "probe observation failed", extra={"observation": "account"},
+                exc_info=True,
+            )
+            return None, False, _probe_failure("account", error)
+        return snapshot, True, (
             f"alias {snapshot.account_alias} environment"
             f" {snapshot.environment.value} observed"
             f" {snapshot.observed_at.isoformat()}"
         )
 
-    def _session_pnl_evidence(self) -> tuple[bool, str]:
-        try:
-            snapshot = self._broker.get_account_snapshot(self._config.account_alias)
-        except Exception as error:  # noqa: BLE001
-            return False, f"NOT EVALUATED: account snapshot raised {type(error).__name__}"
+    def _session_pnl_view(self, snapshot: AccountSnapshot | None) -> tuple[bool, str]:
+        """The session-P&L finding, read from the ONE account snapshot above.
+
+        No second observation and no second ``reqPnL``. UNKNOWN stays None and
+        fails closed -- it is never turned into zero.
+        """
+        if snapshot is None:
+            return False, (
+                "NOT EVALUATED: the account snapshot could not be observed, so"
+                " daily P&L could not be read"
+            )
         if snapshot.session_pnl is None:
             return False, (
                 "the gateway served no daily P&L (reqPnL). This blocks execution:"

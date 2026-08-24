@@ -228,7 +228,11 @@ def test_realtime_quote_collected_and_classified() -> None:
     assert quote.received_at == "2026-07-14T18:30:00+00:00"
     assert quote.exchange_timestamp == FEED_EPOCH_ISO
     assert "set_market_data_type:1" in transport.calls
-    assert "cancel_market_data" in transport.calls  # read-only cleanup
+    # A COMPLETED snapshot (snapshot_end=True) is not cancelled: snapshot=True
+    # auto-terminates at tickSnapshotEnd, and cancelling it afterwards asked the
+    # gateway to drop an id it no longer had (IBKR 300) -- which the third
+    # owner-host run showed was failing the next quote on the session.
+    assert "cancel_market_data" not in transport.calls
 
 
 def test_delayed_and_frozen_and_unknown_types_map_correctly() -> None:

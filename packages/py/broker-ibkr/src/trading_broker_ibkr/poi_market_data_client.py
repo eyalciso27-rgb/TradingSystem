@@ -121,6 +121,16 @@ _DELAYED_NOTICE_CODES: frozenset[int] = frozenset({10167, 10168, 10169, 10197})
 #: "No security definition" for a contract request.
 _NO_SECURITY_DEFINITION_CODE = 200
 
+#: IBKR 300: "Can't find EId with ticker Id ...". It means the market-data id
+#: named is not currently subscribed. We only ever see it in response to the
+#: cancel we issue during cleanup, and for a snapshot that already completed
+#: that is the EXPECTED answer -- there was nothing left to cancel. It describes
+#: a subscription that is already gone, so it can never be a connection fatal
+#: and must never poison a later quote. (This was the third owner-host defect:
+#: cancelling a completed snapshot produced 300, which was classified fatal and
+#: failed the NEXT quote on the same session.)
+_MARKET_DATA_NOT_SUBSCRIBED_CODE = 300
+
 #: Below this codes are genuine client/connectivity errors; 1100-1102 are
 #: connectivity notices and >= 2000 are benign system/info messages.
 _FATAL_ERROR_CEILING = 1100
@@ -241,6 +251,14 @@ class MarketDataSnapshot:
     source_tick_ids: tuple[int, ...]
     entitlement_errors: tuple[str, ...]
     got_tick: bool
+    #: True iff this request reached ``tickSnapshotEnd``. A ``snapshot=True``
+    #: request that completed is already over at the gateway, so cancelling it
+    #: afterwards asks the gateway to cancel an id it no longer has (error 300).
+    #: The caller uses this to skip that pointless -- and, historically,
+    #: poisoning -- cancel. False means the request did not complete normally
+    #: (timeout, or unblocked by an entitlement/error), where a cancel is still
+    #: the safe thing to do.
+    completed: bool = False
 
     def values(self, family: str) -> Mapping[str, str]:
         return self.realtime if family == "realtime" else self.delayed
@@ -271,6 +289,10 @@ class MarketDataSink:
     entitlement_errors: list[str] = field(default_factory=list)
     got_tick: bool = False
     fatal_error: str | None = None
+    #: Did the request being collected reach ``tickSnapshotEnd``? Reset per
+    #: request; read at ``finish`` so the caller can skip cancelling a snapshot
+    #: the gateway has already closed.
+    snapshot_end_seen: bool = False
     #: The market-data request currently being collected, or None between
     #: snapshots. Every market-data callback carries IBKR's reqId, and a
     #: callback whose id is not this one belongs to a snapshot that is over.
@@ -299,6 +321,7 @@ class MarketDataSink:
             self.source_tick_ids = []
             self.entitlement_errors = []
             self.got_tick = False
+            self.snapshot_end_seen = False
             # Cleared INSIDE the lock. A callback that had already passed its
             # identity check could otherwise set the event after this clear, and
             # the new request would start life already "complete".
@@ -319,6 +342,7 @@ class MarketDataSink:
                 source_tick_ids=tuple(self.source_tick_ids),
                 entitlement_errors=tuple(self.entitlement_errors),
                 got_tick=self.got_tick,
+                completed=self.snapshot_end_seen,
             )
             if self.active_market_data_req_id == req_id:
                 self.active_market_data_req_id = None
@@ -424,6 +448,9 @@ class MarketDataSink:
         with self._lock:
             if not self._is_current(req_id):
                 return  # an old snapshot's end must never complete a new one
+            # Record that THIS request completed normally at the gateway, so the
+            # caller knows not to cancel a subscription that is already gone.
+            self.snapshot_end_seen = True
             # Set INSIDE the lock. Checking under the lock and signalling after
             # it is a TOCTOU: an old callback could pass its check, the request
             # could then end and the next one begin (clearing the event), and
@@ -468,8 +495,28 @@ class MarketDataSink:
                 self.contract_error = text
             self.contract_ready.set()
             return
+        if code == _MARKET_DATA_NOT_SUBSCRIBED_CODE:
+            # "Not currently subscribed": the id in question is already gone.
+            # For the cleanup cancel of a completed snapshot this is the normal
+            # answer and means cleanup is effectively complete. It is never a
+            # connection fatal, and it must never contaminate a later request --
+            # so it is recorded (for audit) only when it refers to the CURRENT
+            # request, and dropped otherwise.
+            with self._lock:
+                if self._is_current(req_id):
+                    self.entitlement_errors.append(text)
+            return
         if code < _FATAL_ERROR_CEILING and code not in _CONNECTIVITY_NOTICES:
             with self._lock:
+                # IBKR reports connection/system-level errors with reqId -1 (or
+                # 0/None); those are genuinely sticky and every waiter must fail.
+                # A positive reqId that is NOT the current request belongs to a
+                # snapshot that is already over -- making that sticky is exactly
+                # what let a finished request's error fail the NEXT quote. It
+                # cannot fail a later request, so it is dropped.
+                connection_level = req_id is None or req_id <= 0
+                if not connection_level and not self._is_current(req_id):
+                    return
                 self.fatal_error = f"IBKR error {text}"
             for event in (
                 self.ready,
@@ -636,6 +683,13 @@ class IbkrMarketDataRawClient:
         """
         with self._market_data_lock:
             sink, transport = self._require_open()
+            # A genuine, sticky, connection-level fatal must fail HERE, before a
+            # second reqMktData is ever issued -- not after waiting a whole
+            # snapshot interval only to read the same fatal in _await. Reconnect
+            # is the only thing that clears it (begin_market_data_request
+            # deliberately leaves fatal_error alone).
+            if sink.fatal_error is not None:
+                raise PoiSessionError(sink.fatal_error)
             req_id = self._next_market_data_req_id
             self._next_market_data_req_id += 1
             # Arm BEFORE requesting: every buffer starts empty and every
@@ -658,14 +712,20 @@ class IbkrMarketDataRawClient:
                 # is still held. From here the quote depends on nothing mutable.
                 snapshot = sink.finish_market_data_request(req_id)
             finally:
-                # ALWAYS. A timeout used to skip cancellation entirely, and a
-                # synchronous failure inside request() skipped it too, leaving
-                # the gateway streaming into the next snapshot's buffers. The
-                # original failure is preserved: _release_market_data poisons
-                # the client rather than raising over it, so a cleanup failure
-                # can never read as permission.
+                # Cancel only a request that is NOT already finished at the
+                # gateway. A snapshot=True that reached tickSnapshotEnd is over;
+                # cancelling it asks the gateway to cancel an id it no longer has
+                # (IBKR 300) -- which used to be classified fatal and fail the
+                # next quote. An uncertain request -- a timeout (snapshot is
+                # None), a synchronous failure inside request() (never issued,
+                # cancel=requested handles that), or an entitlement-unblocked
+                # request that did not reach snapshot end -- is still cancelled,
+                # because it may still be live. _release_market_data poisons the
+                # client on a genuine cleanup failure, so that can never read as
+                # permission.
+                completed = snapshot is not None and snapshot.completed
                 self._release_market_data(
-                    transport, sink, req_id, cancel=requested
+                    transport, sink, req_id, cancel=requested and not completed
                 )
 
             assert snapshot is not None  # noqa: S101 - or _await would have raised

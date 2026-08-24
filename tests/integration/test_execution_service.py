@@ -2862,8 +2862,10 @@ def test_a_failing_observation_does_not_abort_the_whole_probe() -> None:
 
 def test_each_observation_fails_on_its_own() -> None:
     """No shared boundary: breaking any one check leaves the rest reported."""
-    for broken in ("_halt_evidence", "_account_evidence", "_session_pnl_evidence",
-                   "_universe_evidence", "_portfolio_evidence", "_audit_evidence"):
+    # The account/session-P&L pair shares one snapshot and its own internal
+    # boundary; breaking their shared dependency is covered separately below.
+    for broken in ("_halt_evidence", "_universe_evidence",
+                   "_portfolio_evidence", "_audit_evidence"):
         service, _, _ = _service()
 
         def explode(*args: object, _name: str = broken) -> tuple[bool, str]:
@@ -2877,6 +2879,54 @@ def test_each_observation_fails_on_its_own() -> None:
         assert len(checks) >= 8, f"{broken} took other observations with it"
         failed = [d for _ok, d in checks.values() if "NOT OBSERVED" in d]
         assert failed, broken
+
+
+def test_account_and_session_pnl_share_one_snapshot() -> None:
+    """Item 6: the diagnostic phase makes ONE account observation, not two.
+
+    ``_account_evidence`` and ``_session_pnl_evidence`` used to call
+    ``get_account_snapshot`` each -- two full reqPnL subscriptions before
+    canonical evaluation even started. They now share one snapshot.
+    """
+    service, _, _ = _service()
+    broker = service._broker  # noqa: SLF001 - white-box: count the real observations
+    calls: list[str] = []
+    original = broker.get_account_snapshot
+
+    def counting(alias: str) -> object:
+        calls.append(alias)
+        return original(alias)
+
+    broker.get_account_snapshot = counting  # type: ignore[assignment,method-assign]
+
+    # The diagnostic account + session-P&L phase, in isolation: it must observe
+    # the account exactly ONCE (it used to be twice -- one reqPnL per record).
+    snapshot, account_ok, _note = service._isolated_account_snapshot()  # noqa: SLF001
+    pnl_ok, _pnl = service._session_pnl_view(snapshot)  # noqa: SLF001
+
+    assert len(calls) == 1, f"the diagnostic phase made {len(calls)} account snapshots"
+    assert account_ok and pnl_ok, "both records derive from the one snapshot"
+
+
+def test_a_broken_account_snapshot_fails_both_records_not_the_rest() -> None:
+    """They share a dependency, so a broken snapshot fails BOTH -- honestly --
+    while every other observation still reports. The failure is caught inside
+    the shared observation, so collect_evidence still completes."""
+    service, _, _ = _service()
+    broker = service._broker  # noqa: SLF001 - white-box: break the shared dependency
+
+    def explode(alias: str) -> object:
+        raise RuntimeError("account snapshot blew up")
+
+    broker.get_account_snapshot = explode  # type: ignore[assignment,method-assign]
+
+    evidence = service.collect_evidence(_intent())
+
+    checks = {name: (ok, detail) for name, ok, detail in evidence.observations}
+    assert checks["account"][0] is False
+    assert checks["session_pnl"][0] is False
+    for other in ("halts", "contract", "universe", "portfolio", "audit"):
+        assert other in checks, f"{other} was lost to the shared-snapshot failure"
 
 
 def test_a_failing_evaluation_still_returns_the_observations() -> None:

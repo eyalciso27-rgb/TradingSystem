@@ -390,7 +390,11 @@ def test_each_snapshot_takes_a_distinct_request_id() -> None:
     ids = [req_id for req_id, _con in transport.requests]
     assert len(set(ids)) == len(ids) == 3, ids
     assert ids == sorted(ids), "deterministic, monotonic allocation"
-    assert transport.cancelled == ids, "every request was cancelled by its own id"
+    # A COMPLETED snapshot is not cancelled. snapshot=True auto-terminates at
+    # tickSnapshotEnd, so cancelling it afterwards asks the gateway to drop an
+    # id it no longer has (IBKR 300) -- which the third owner-host run showed
+    # was being classified fatal and failing the NEXT quote on the session.
+    assert transport.cancelled == [], "a completed snapshot must not be cancelled"
 
 
 # == cleanup ==================================================================
@@ -408,12 +412,20 @@ def test_cancellation_runs_even_when_the_wait_fails() -> None:
 
 
 def test_a_failed_cleanup_poisons_the_client_rather_than_continuing() -> None:
-    """If we cannot prove the old request stopped, we stop instead."""
-    source, transport = _chain(FULL, FULL)
+    """If we cannot prove an UNCERTAIN request stopped, we stop instead.
+
+    A completed snapshot is no longer cancelled at all, so the failed-cleanup
+    poison is exercised where it actually matters: a request that did NOT
+    complete (a timeout), where the cancel is genuinely needed to stop a
+    possibly-live subscription and genuinely fails.
+    """
+    source, transport = _chain(_Script(snapshot_end=False), FULL)
     transport.cancel_error = RuntimeError("cancel rejected")
 
     first = source.current_quote(A)
-    assert first.bid is not None, "the first quote itself still completed"
+    assert first.market_data_state is MarketDataState.UNAVAILABLE, (
+        "the uncertain request could not complete"
+    )
 
     second = source.current_quote(B)
 
@@ -427,13 +439,16 @@ def test_a_failed_cleanup_poisons_the_client_rather_than_continuing() -> None:
 
 
 def test_the_poisoned_client_reports_why() -> None:
-    transport = ScriptedMarketData(FULL, FULL)
+    # The first request does not complete (no snapshot end), so its cleanup
+    # cancel runs and fails -- the path that still poisons.
+    transport = ScriptedMarketData(_Script(snapshot_end=False), FULL)
     transport.cancel_error = RuntimeError("cancel rejected")
     client = IbkrMarketDataRawClient(
         lambda: transport, now=lambda: CAPTURED_AT, timeout_seconds=0.2
     )
     client.open("127.0.0.1", 4002)
-    client.market_data_for_instrument("conid:111111")
+    with pytest.raises(PoiSessionError):
+        client.market_data_for_instrument("conid:111111")  # times out; cleanup fails
 
     with pytest.raises(PoiSessionError, match="no longer safe to reuse"):
         client.market_data_for_instrument("conid:222222")
@@ -499,16 +514,14 @@ def test_each_security_receives_exactly_its_own_prices_concurrently() -> None:
     assert "requested_for=conid:111111" in first.detail
     assert "requested_for=conid:222222" in second.detail
 
-    # Serialised: request, cancel, request, cancel -- never two open at once.
-    market_data_calls = [
-        call for call in transport.calls
-        if call.startswith(("reqMktData:", "cancel:"))
-    ]
-    assert len(market_data_calls) == 4, market_data_calls
-    first_id = market_data_calls[0].split(":")[1]
-    assert market_data_calls[1] == f"cancel:{first_id}", (
-        "the first request was cancelled before the second was issued"
-    )
+    # Serialised by the request lock, not by a cancel between requests. Both
+    # snapshots complete, so neither is cancelled; the per-security price
+    # binding above is what proves the two requests did not interleave.
+    request_calls = [c for c in transport.calls if c.startswith("reqMktData:")]
+    cancels = [c for c in transport.calls if c.startswith("cancel:")]
+    assert len(request_calls) == 2, request_calls
+    assert cancels == [], "completed snapshots are not cancelled"
+    assert len({c.split(":")[1] for c in request_calls}) == 2, "distinct req ids"
 
 
 #: Delayed ticks live in their own family (66 bid / 68 last / 67 ask).

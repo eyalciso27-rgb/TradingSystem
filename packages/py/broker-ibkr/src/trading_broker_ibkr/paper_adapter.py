@@ -1605,6 +1605,14 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                     self._app.cancelPnL(req_id)
                 except Exception:  # noqa: BLE001 - best-effort unsubscribe
                     pass
+                # Retire this request's stream, exactly as _collect does. Without
+                # it the waiter's deque lingers in the router for the life of the
+                # process, and a ``pnl`` update that arrives after cancelPnL is
+                # neither archived nor cleared -- a leak that grows one entry per
+                # session_pnl call. release() archives any late envelope so it
+                # stays inspectable and drops the stream. reqId is fresh each
+                # call, so this can never discard a LATER request's data.
+                self._app.router.release(request_stream(req_id))
             if payload is None:
                 return None
             try:
