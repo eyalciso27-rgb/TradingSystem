@@ -69,7 +69,6 @@ from trading_contracts.enums import Environment, OrderState, OrderType
 from trading_broker_ibkr.callback_router import (
     DIAGNOSTICS_STREAM,
     OPEN_ORDERS_STREAM,
-    POSITIONS_STREAM,
     CallbackRouter,
     classify_error_stream,
     order_stream,
@@ -1390,6 +1389,12 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             self._issued = threading.Lock()
             self._order_ids: set[int] = set()
             self._request_ids: set[int] = set()
+            #: Fresh identity per open-order snapshot (reqAllOpenOrders /
+            #: reqOpenOrders carry no request id). Assignment is atomic; the
+            #: transport serialises snapshots, so no lock is needed for the
+            #: reader thread to read the current target.
+            self._open_orders_generation: int = 0
+            self._active_open_orders_stream: str | None = None
 
         # -- id bookkeeping (order ids and request ids share a numeric space) --
         def issue_order_id(self, order_id: int) -> None:
@@ -1448,25 +1453,79 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             """
             self.router.publish(request_stream(req_id), "pnl", daily_pnl)
 
+        # Positions are observed with reqPositionsMulti, which carries a request
+        # id: each observation routes to its OWN request_stream(req_id), a unique
+        # lifecycle key the router can safely retire. The global reqPositions
+        # callbacks below are NOT used by any waiter -- they route to
+        # diagnostics -- because their fixed "positions" channel is reusable and
+        # cannot be retired without breaking the next read (round-10 regression).
+        def positionMulti(  # noqa: N802
+            self,
+            req_id: int,
+            account: str,
+            model_code: str,
+            contract: object,
+            position: object,
+            avg_cost: float,
+        ) -> None:
+            self.router.publish(
+                request_stream(req_id),
+                "position",
+                (account, contract, position, avg_cost),
+            )
+
+        def positionMultiEnd(self, req_id: int) -> None:  # noqa: N802
+            self.router.publish(request_stream(req_id), "position_end", None)
+
         def position(  # noqa: N802
             self, account: str, contract: object, position: object, avg_cost: float
         ) -> None:
-            self.router.publish(
-                POSITIONS_STREAM, "position", (account, contract, position, avg_cost)
-            )
+            # Legacy global reqPositions feed -- not consumed by any waiter.
+            self.router.publish(DIAGNOSTICS_STREAM, "position", None)
 
         def positionEnd(self) -> None:  # noqa: N802
-            self.router.publish(POSITIONS_STREAM, "position_end", None)
+            self.router.publish(DIAGNOSTICS_STREAM, "position_end", None)
+
+        # Open-order snapshots (reqAllOpenOrders / reqOpenOrders) carry NO
+        # request id, so each snapshot is given a fresh transport-owned
+        # generation: openOrder/openOrderEnd route to the CURRENT active
+        # generation's stream. That key is unique per snapshot, so retiring it
+        # cannot starve the next snapshot; a callback outside any active
+        # snapshot is diagnostic.
+        def _open_orders_target(self) -> str:
+            active = self._active_open_orders_stream
+            return active if active is not None else DIAGNOSTICS_STREAM
 
         def openOrder(  # noqa: N802
             self, order_id: int, contract: object, order: object, order_state: object
         ) -> None:
             self.router.publish(
-                OPEN_ORDERS_STREAM, "open_order", (order_id, contract, order, order_state)
+                self._open_orders_target(),
+                "open_order",
+                (order_id, contract, order, order_state),
             )
 
         def openOrderEnd(self) -> None:  # noqa: N802
-            self.router.publish(OPEN_ORDERS_STREAM, "open_order_end", None)
+            self.router.publish(self._open_orders_target(), "open_order_end", None)
+
+        # -- open-order snapshot generations ----------------------------------
+        def begin_open_orders_snapshot(self) -> str:
+            """Open a fresh open-order snapshot generation; return its stream.
+
+            Exactly one snapshot is active at a time on this one-request-at-a-
+            time transport. Each gets a DIFFERENT stream identity, so a stale
+            ``openOrderEnd`` can never terminate a later snapshot.
+            """
+            self._open_orders_generation += 1
+            stream = f"{OPEN_ORDERS_STREAM}:{self._open_orders_generation}"
+            self._active_open_orders_stream = stream
+            return stream
+
+        def end_open_orders_snapshot(self, stream: str) -> None:
+            """Close the generation and retire its stream (deterministic)."""
+            if self._active_open_orders_stream == stream:
+                self._active_open_orders_stream = None
+            self.router.release(stream)
 
         def error(self, *args: object, **kwargs: object) -> None:  # noqa: N802
             # The error() signature varies across API versions (10.48 inserts
@@ -1703,11 +1762,28 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             return SessionPnlObservation(SessionPnlStatus.OK, value=value)
 
         def positions(self, account_id: str) -> tuple[BrokerPosition, ...]:
-            self._app.reqPositions()
-            rows = self._collect(
-                POSITIONS_STREAM, end_kind="position_end", want="position", what="positions"
-            )
-            self._app.cancelPositions()
+            # reqPositionsMulti is REQUEST-SCOPED: a fresh id per observation, so
+            # each read routes to its own request_stream(req_id) -- a unique
+            # lifecycle key the router retires cleanly. The old global
+            # reqPositions used the fixed "positions" channel, which round 9
+            # retired after the FIRST read, so a SECOND read (independent
+            # portfolio evidence, then canonical evaluation) had its callbacks
+            # archived and timed out. Cleanup is ONE finally: a synchronous
+            # reqPositionsMulti failure does not prove nothing reached the
+            # gateway, so cancel and retire regardless.
+            req_id = self._next_request_id()
+            stream = request_stream(req_id)
+            try:
+                self._app.reqPositionsMulti(req_id, account_id, "")
+                rows = self._collect(
+                    stream, end_kind="position_end", want="position", what="positions"
+                )
+            finally:
+                try:
+                    self._app.cancelPositionsMulti(req_id)
+                except Exception:  # noqa: BLE001 - best-effort unsubscribe
+                    pass
+                self._app.router.release(stream)
             result: list[BrokerPosition] = []
             for row in rows:
                 account, contract, quantity, avg_cost = cast(
@@ -1822,13 +1898,21 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             # cancels, replaces or modifies an order. It reports orders from
             # every API client and from the TWS/Gateway UI, so the adapter
             # treats it as evidence only, never as cancellation authority.
-            self._app.reqAllOpenOrders()
-            rows = self._collect(
-                OPEN_ORDERS_STREAM,
-                end_kind="open_order_end",
-                want="open_order",
-                what="open orders",
-            )
+            #
+            # Each snapshot gets a FRESH generation stream, so a second snapshot
+            # is never starved by the first's retirement (the same reusable-
+            # channel defect the positions path had). Cleanup is one finally.
+            stream = self._app.begin_open_orders_snapshot()
+            try:
+                self._app.reqAllOpenOrders()
+                rows = self._collect(
+                    stream,
+                    end_kind="open_order_end",
+                    want="open_order",
+                    what="open orders",
+                )
+            finally:
+                self._app.end_open_orders_snapshot(stream)
             return self._open_order_rows(account_id, rows)
 
         def same_client_open_orders(self, account_id: str) -> tuple[RawOpenOrder, ...]:
@@ -1836,13 +1920,17 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             # to this API client id, which is the only basis on which a
             # recovered order may become cancellable. Rows are additionally
             # filtered on the reported clientId (belt and braces).
-            self._app.reqOpenOrders()
-            rows = self._collect(
-                OPEN_ORDERS_STREAM,
-                end_kind="open_order_end",
-                want="open_order",
-                what="same-client open orders",
-            )
+            stream = self._app.begin_open_orders_snapshot()
+            try:
+                self._app.reqOpenOrders()
+                rows = self._collect(
+                    stream,
+                    end_kind="open_order_end",
+                    want="open_order",
+                    what="same-client open orders",
+                )
+            finally:
+                self._app.end_open_orders_snapshot(stream)
             return tuple(
                 row
                 for row in self._open_order_rows(account_id, rows)

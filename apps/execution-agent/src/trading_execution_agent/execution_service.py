@@ -1555,7 +1555,32 @@ class ExecutionService:
                 universe_status=universe_status,
             )
 
-        unclassified = self._unclassified_positions()
+        # The positions observation can fail against a real broker (the owner
+        # run timed out here). That is an EXPECTED safety-observation failure,
+        # so it is handled HERE, fail-closed, preserving the facts already
+        # observed -- instrument, quote, entry/stop price -- and audited like
+        # any other refusal. Letting it escape to collect_evidence's last-resort
+        # handler discarded the contract and quote from the owner summary and
+        # skipped the durable audit. A safe reason names the observation class
+        # and the broker error TYPE only, never the account id or raw text.
+        try:
+            unclassified = self._unclassified_positions()
+        except BrokerPortError as error:
+            return self._refuse(
+                intent, ExecutionStage.OBSERVATION_FAILED,
+                f"the positions observation could not be completed"
+                f" ({error.code.value}); cannot evaluate portfolio risk caps",
+                instrument=instrument, quote=quote, entry_price=entry_price,
+                stop_price=stop_price, universe_status=universe_status,
+            )
+        except Exception as error:  # noqa: BLE001 - fail closed, keep the facts
+            return self._refuse(
+                intent, ExecutionStage.OBSERVATION_FAILED,
+                f"the positions observation raised {type(error).__name__};"
+                " cannot evaluate portfolio risk caps",
+                instrument=instrument, quote=quote, entry_price=entry_price,
+                stop_price=stop_price, universe_status=universe_status,
+            )
         if unclassified:
             return self._refuse(
                 intent, ExecutionStage.PORTFOLIO_UNCLASSIFIED,

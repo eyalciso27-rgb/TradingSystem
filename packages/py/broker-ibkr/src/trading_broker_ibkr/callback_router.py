@@ -140,9 +140,15 @@ class CallbackRouter:
     def _retire(self, stream: str) -> None:
         """Record ``stream`` as retired, evicting the oldest if the cap is hit.
 
-        Called under the condition lock. reqIds are unique and monotonic within
-        a session, so a retired key is never reused by a later request -- a new
-        request always has a new stream key that is not in this set.
+        Called under the condition lock. Retirement is only correct for a stream
+        whose key is used ONCE: a unique lifecycle identity, never a fixed
+        reusable channel name. Every caller that releases a stream upholds this
+        by construction -- ``request:<id>`` and ``order:<id>`` are unique and
+        monotonic, positions use a fresh ``reqPositionsMulti`` request id per
+        read, and open-order snapshots use a fresh ``open-orders:<generation>``
+        per snapshot. A FIXED channel name (an earlier positions/open-orders
+        design) must NOT be released, because retiring it would starve the next
+        use -- so no reusable channel is ever passed here.
         """
         if stream in self._retired_set:
             return

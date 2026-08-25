@@ -1319,6 +1319,37 @@ def test_a_max_double_session_pnl_cannot_pass_the_daily_halt_gate() -> None:
     assert _submits(transport) == [], "a sentinel P&L must never enable a submit"
 
 
+def test_a_positions_observation_failure_preserves_the_facts_and_audits() -> None:
+    """Item 11/12: a broker positions failure in _observe must FAIL CLOSED as
+    OBSERVATION_FAILED while KEEPING the contract and quote already observed,
+    and it must be durably audited. The owner run instead saw the failure
+    escape, and the summary read 'contract NOT RESOLVED / quote NONE'."""
+    from trading_broker_core.port import BrokerErrorCode, BrokerPortError
+
+    service, transport, audit = _service(portfolio=None)
+
+    def _timeout(alias: str) -> object:
+        raise BrokerPortError(BrokerErrorCode.BROKER_REJECTED, "timed out waiting for positions")
+
+    service._broker.get_positions = _timeout  # type: ignore[assignment,method-assign] # noqa: SLF001
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.OBSERVATION_FAILED
+    # The facts observed BEFORE the failure are preserved, not discarded.
+    assert evaluation.instrument is not None, "contract was discarded"
+    assert evaluation.quote is not None, "quote was discarded"
+    assert evaluation.entry_price is not None, "entry price was discarded"
+    # Fail closed, audited.
+    assert _submits(transport) == []
+    assert evaluation.audit_ref is not None, "the refusal was not durably audited"
+    assert audit.records, "no audit record was written"
+    # The safe reason names the observation class, not the raw broker text.
+    reason = " ".join(evaluation.reasons)
+    assert "positions observation" in reason
+    assert "timed out waiting for positions" not in reason, "raw broker text leaked"
+
+
 def test_a_reported_session_pnl_reaches_the_risk_engine() -> None:
     service, _, _ = _service(transport=PnlAwareTransport(daily_pnl=Decimal("-10")))
 
@@ -2876,6 +2907,41 @@ def test_a_failing_observation_does_not_abort_the_whole_probe() -> None:
                   "portfolio", "audit"):
         assert other in checks, f"{other} was lost to an unrelated failure"
     assert evidence.evaluation is not None, "the run still produced a verdict"
+
+
+def test_collect_evidence_reads_positions_twice_without_a_second_failure() -> None:
+    """The owner-shaped regression. The independent portfolio evidence reads
+    positions, and the canonical evaluation reads them AGAIN on the same broker
+    session. Both must succeed -- the owner run had the second time out because
+    the fixed positions stream was retired by the first read.
+
+    Here the broker is a counting fake: every get_positions call must return
+    normally. The evidence must NOT show 'portfolio OK' beside 'evaluation timed
+    out waiting for positions'."""
+    service, _, _ = _service(portfolio=None)
+    broker = service._broker  # noqa: SLF001
+    calls = {"n": 0}
+
+    def _counting(alias: str) -> object:
+        calls["n"] += 1
+        return ()  # no open positions -- exactly the owner-run case
+
+    broker.get_positions = _counting  # type: ignore[assignment,method-assign] # noqa: SLF001
+
+    evidence = service.collect_evidence(_intent())
+
+    checks = {name: (ok, detail) for name, ok, detail in evidence.observations}
+    assert checks["portfolio"][0] is True, "independent portfolio read failed"
+    # The canonical evaluation ALSO read positions, and did not stop on them.
+    assert calls["n"] >= 2, "the canonical evaluation did not re-read positions"
+    assert evidence.evaluation is not None
+    assert evidence.evaluation.stage is not ExecutionStage.OBSERVATION_FAILED, (
+        "the second positions read failed -- the round-10 regression"
+    )
+    detail = " ".join(
+        d for _ok, d in checks.values()
+    ) + " " + " ".join(evidence.evaluation.reasons)
+    assert "timed out waiting for positions" not in detail
 
 
 def test_each_observation_fails_on_its_own() -> None:
