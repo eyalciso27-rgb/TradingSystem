@@ -1303,6 +1303,22 @@ def test_a_missing_session_pnl_is_never_treated_as_zero() -> None:
     assert audit.records, "the refusal is still recorded"
 
 
+def test_a_max_double_session_pnl_cannot_pass_the_daily_halt_gate() -> None:
+    """The safety blocker: IBKR's DBL_MAX unset sentinel is FINITE, so a naive
+    check would hand the risk engine a ~1.8e308 'profit' and pass the halt gate
+    on an UNKNOWN account. It must fail closed exactly as a missing value does."""
+    import sys
+
+    service, transport, _ = _service(
+        transport=PnlAwareTransport(daily_pnl=Decimal(str(sys.float_info.max)))
+    )
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.ACCOUNT_STATE_INCOMPLETE
+    assert _submits(transport) == [], "a sentinel P&L must never enable a submit"
+
+
 def test_a_reported_session_pnl_reaches_the_risk_engine() -> None:
     service, _, _ = _service(transport=PnlAwareTransport(daily_pnl=Decimal("-10")))
 
@@ -2911,7 +2927,10 @@ def test_account_and_session_pnl_share_one_snapshot() -> None:
 
 
 def _account_snapshot(
-    *, session_pnl: object = None, status: SessionPnlStatus | None = None
+    *,
+    session_pnl: object = None,
+    status: SessionPnlStatus | None = None,
+    detail: str | None = None,
 ) -> AccountSnapshot:
     from datetime import UTC, datetime
     from decimal import Decimal
@@ -2925,7 +2944,39 @@ def _account_snapshot(
         observed_at=datetime(2026, 8, 24, tzinfo=UTC),
         session_pnl=session_pnl,  # type: ignore[arg-type]
         session_pnl_status=status,
+        session_pnl_detail=detail,
     )
+
+
+def test_the_pnl_view_surfaces_the_safe_broker_code(monkeypatch: object) -> None:
+    """Item 4: a request-scoped broker code reaches owner evidence, so the next
+    owner run does not need a code change to learn WHICH code occurred."""
+    service, _, _ = _service()
+
+    _ok, detail = service._session_pnl_view(  # noqa: SLF001
+        _account_snapshot(
+            status=SessionPnlStatus.REQUEST_ERROR, detail="reqPnL rejected (IBKR 321)"
+        )
+    )
+
+    assert "PNL_REQUEST_ERROR" in detail
+    assert "IBKR 321" in detail
+
+
+def test_the_pnl_view_never_leaks_raw_text_when_it_carries_a_detail() -> None:
+    """The detail on the snapshot is already code-only; the view must not add
+    raw broker text or an account id even when a detail is present."""
+    service, _, _ = _service()
+
+    _ok, detail = service._session_pnl_view(  # noqa: SLF001
+        _account_snapshot(
+            status=SessionPnlStatus.REQUEST_ERROR, detail="reqPnL rejected (IBKR 321)"
+        )
+    )
+
+    # The safe detail carries the code, not the raw text or an account id.
+    assert "DU" not in detail  # no account-id-looking token
+    assert "321" in detail
 
 
 def test_the_pnl_view_distinguishes_timeout_error_and_unset() -> None:

@@ -1380,22 +1380,27 @@ class ExecutionService:
             "This blocks execution: the daily halt limits cannot be evaluated"
             " and UNKNOWN is not zero"
         )
+        # The adapter's safe, code-only detail (a broker error code, or the
+        # bounded-timeout note) travels through the snapshot, so the owner sees
+        # WHICH broker code occurred without another code change -- and it is
+        # already free of account id, raw text, DSN and traceback.
+        detail = f" [{snapshot.session_pnl_detail}]" if snapshot.session_pnl_detail else ""
         if status is SessionPnlStatus.TIMEOUT:
             return False, (
                 f"{SessionPnlStatus.TIMEOUT}: no reqPnL update within the bounded"
-                f" window (NOT a permission fact). {blocked}"
+                f" window (NOT a permission fact).{detail} {blocked}"
             )
         if status is SessionPnlStatus.REQUEST_ERROR:
             return False, (
                 f"{SessionPnlStatus.REQUEST_ERROR}: the gateway rejected the"
-                f" reqPnL subscription. {blocked}"
+                f" reqPnL subscription.{detail} {blocked}"
             )
         if status is SessionPnlStatus.UNSET:
             return False, (
-                f"{SessionPnlStatus.UNSET}: reqPnL returned a non-numeric daily"
-                f" value. {blocked}"
+                f"{SessionPnlStatus.UNSET}: reqPnL returned no usable daily"
+                f" value.{detail} {blocked}"
             )
-        return False, f"the gateway served no daily P&L (reqPnL). {blocked}"
+        return False, f"the gateway served no daily P&L (reqPnL).{detail} {blocked}"
 
     def _contract_evidence(
         self, intent: ExecutionIntent

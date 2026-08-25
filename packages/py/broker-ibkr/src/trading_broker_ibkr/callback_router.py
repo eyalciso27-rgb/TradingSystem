@@ -19,8 +19,16 @@ streams. A consumer only ever removes envelopes from ITS OWN stream, so:
 - a callback arriving while an unrelated request is in flight stays buffered
   for its real waiter (including one that has not started waiting yet);
 - releasing a finished waiter's stream is explicit and returns whatever was
-  still buffered, so a late broker event is archived rather than silently
-  dropped.
+  still buffered.
+
+**Loss guarantees, precisely.** Callbacks for an ACTIVE waiter stream are
+lossless: nothing is ever overwritten or dropped while a request is in flight.
+A callback that arrives for a RETIRED stream -- one whose waiter has already
+been released -- is moved to a BOUNDED diagnostic archive
+(``ARCHIVE_MEMORY`` entries) so it stays inspectable instead of recreating a
+live-looking waiter. That archive can evict its oldest entries once full; that
+eviction is diagnostic-only and can never affect an active request or a
+decision, because a retired stream has, by definition, no waiter.
 
 The router is deliberately transport-agnostic and free of any ``ibapi``
 import, so the demultiplexing logic is fully unit-testable without a broker.
@@ -104,11 +112,13 @@ class CallbackEnvelope:
 
 
 class CallbackRouter:
-    """Thread-safe, lossless demultiplexer of broker callbacks.
+    """Thread-safe demultiplexer of broker callbacks.
 
-    One publisher (the API reader thread) and one waiter per stream. Streams
-    are unbounded FIFOs: nothing is ever overwritten or dropped by the router
-    itself, and only ``release`` / ``drain`` remove envelopes.
+    One publisher (the API reader thread) and one waiter per stream. An ACTIVE
+    stream is an unbounded FIFO: nothing on it is overwritten or dropped, and
+    only ``release`` / ``drain`` remove its envelopes. A callback for a RETIRED
+    stream is diverted to a bounded diagnostic archive rather than buffered, so
+    a late callback cannot recreate a waiter for a request that is already over.
     """
 
     def __init__(self, *, monotonic: Callable[[], float] | None = None) -> None:
@@ -210,7 +220,12 @@ class CallbackRouter:
             return leftover
 
     def archived(self) -> tuple[CallbackEnvelope, ...]:
-        """Late callbacks retired by ``release`` — append-only, never dropped."""
+        """Late callbacks for retired streams, kept in a BOUNDED archive.
+
+        Retained for inspection up to ``ARCHIVE_MEMORY`` entries; once full, the
+        oldest are evicted. This is diagnostic only -- a retired stream has no
+        waiter, so an evicted entry can never affect a request or a decision.
+        """
         with self._condition:
             return tuple(self._archived)
 

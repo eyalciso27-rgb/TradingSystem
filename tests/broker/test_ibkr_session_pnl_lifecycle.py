@@ -326,3 +326,98 @@ def test_a_first_request_error_does_not_stop_a_second_finite_pnl(
 
     assert first.status is _S.REQUEST_ERROR
     assert second.status is _S.OK and second.value == Decimal("7")
+
+
+# == the IBKR max-double UNSET sentinel is never a value =====================
+
+#: IBKR renders an unset double field as DBL_MAX. Not NaN, not infinity --
+#: a FINITE value, which is exactly why it slipped past the is_finite check.
+DBL_MAX = sys.float_info.max
+
+
+def test_the_max_double_unset_sentinel_becomes_unset_not_ok(transport: Any) -> None:
+    """The safety blocker: DBL_MAX is finite, so it used to pass as PNL_OK with
+    a ~1.8e308 'value'. It must be UNSET, with no value."""
+    transport._app.pnl_script = [DBL_MAX]
+
+    observation = transport.session_pnl("DU1234567")
+
+    assert observation.status is SessionPnlStatus.UNSET
+    assert observation.value is None
+    assert "unset" in observation.detail.lower()
+
+
+def test_a_negative_max_double_is_also_unset(transport: Any) -> None:
+    """The sentinel magnitude, either sign, is unset -- never a huge loss."""
+    transport._app.pnl_script = [-DBL_MAX]
+
+    observation = transport.session_pnl("DU1234567")
+
+    assert observation.status is SessionPnlStatus.UNSET
+    assert observation.value is None
+
+
+def test_a_genuinely_large_but_real_pnl_is_still_ok(transport: Any) -> None:
+    """The threshold does not swallow a real (if large) daily figure."""
+    transport._app.pnl_script = [1_000_000.0]
+
+    observation = transport.session_pnl("DU1234567")
+
+    assert observation.status is SessionPnlStatus.OK
+    assert observation.value == Decimal("1000000")
+
+
+# == a synchronous reqPnL failure still cleans up ============================
+
+
+def test_a_synchronous_reqpnl_raise_still_cancels_and_retires(
+    transport: Any,
+) -> None:
+    """Item 3: reqPnL raising synchronously must not skip cleanup.
+
+    A request that partially reached the SDK before raising must still be
+    cancelled and its stream retired, and a later callback for it must not
+    recreate a live waiter."""
+    issued: list[int] = []
+
+    def _raising_req_pnl(req_id: int, account: str, model_code: str) -> None:
+        issued.append(req_id)
+        transport._app.req_pnl_ids.append(req_id)
+        raise RuntimeError("reqPnL blew up after partially issuing")
+
+    transport._app.reqPnL = _raising_req_pnl
+
+    observation = transport.session_pnl("DU1234567")
+
+    assert observation.status is SessionPnlStatus.REQUEST_ERROR
+    assert observation.value is None
+    req_id = issued[0]
+    # cancelPnL was attempted, and the stream was retired.
+    assert req_id in transport._app.cancel_pnl_ids, "cancelPnL was not attempted"
+    assert _stream(req_id) not in transport._app.router._streams, "stream not retired"
+    assert _stream(req_id) in transport._app.router._retired_set
+
+    # A late callback for the failed request cannot recreate a live waiter.
+    transport._app.pnl(req_id, 12.5, 0.0, 0.0)
+    assert transport._app.router.pending(_stream(req_id)) == 0
+
+
+def test_a_second_request_after_a_sync_failure_is_independent(
+    transport: Any,
+) -> None:
+    calls = {"n": 0}
+
+    def _req(req_id: int, account: str, model_code: str) -> None:
+        transport._app.req_pnl_ids.append(req_id)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("first reqPnL blew up")
+        transport._app.pnl(req_id, 9.0, 0.0, 0.0)
+
+    transport._app.reqPnL = _req
+
+    first = transport.session_pnl("DU1234567")
+    second = transport.session_pnl("DU1234567")
+
+    assert first.status is SessionPnlStatus.REQUEST_ERROR
+    assert second.status is SessionPnlStatus.OK and second.value == Decimal("9")

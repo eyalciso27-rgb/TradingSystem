@@ -806,11 +806,14 @@ class IbkrPaperAdapter:
                 # From the transport's own daily-P&L operation (reqPnL), never
                 # from an account-summary tag: IBKR's summary carries no daily
                 # figure. Unknown stays None, and None fails a trading decision
-                # closed rather than pretending the day is flat. The status is
-                # carried alongside so the owner probe can say WHY it is
-                # unknown (timeout vs a real request error vs a NaN callback).
+                # closed rather than pretending the day is flat. The status and
+                # the SAFE (code-only) detail are carried alongside so the owner
+                # probe can say WHY it is unknown -- a timeout, a real request
+                # error (with the broker CODE), an unset sentinel -- without a
+                # further code change and without exposing the account id.
                 session_pnl=pnl.value,
                 session_pnl_status=pnl.status,
+                session_pnl_detail=pnl.detail or None,
                 observed_at=self._now(),
             )
         except KeyError as missing:
@@ -837,9 +840,16 @@ class IbkrPaperAdapter:
                 SessionPnlStatus.REQUEST_ERROR,
                 detail=f"session_pnl raised {type(error).__name__}",
             )
-        if observation.value is not None and not observation.value.is_finite():
+        # Defence in depth, with the IBKR sentinel knowledge kept HERE in the
+        # adapter (never in broker-core): any OK value that is non-finite or the
+        # DBL_MAX unset sentinel is downgraded to UNSET, so no transport variant
+        # can slip a vast sentinel through as genuine P&L.
+        if observation.value is not None and (
+            not observation.value.is_finite()
+            or abs(observation.value) >= _UNSET_DOUBLE_THRESHOLD
+        ):
             return SessionPnlObservation(
-                SessionPnlStatus.UNSET, detail="daily value not a number"
+                SessionPnlStatus.UNSET, detail="daily value unset or not a number"
             )
         return observation
 
@@ -1609,18 +1619,19 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
 
             Only OK carries a value; everything else is UNKNOWN, never zero.
             """
+            # The id is allocated FIRST, then reqPnL is issued INSIDE the same
+            # try whose finally cancels and retires it. A synchronous reqPnL
+            # failure does not prove nothing reached the gateway -- exactly the
+            # market-data principle -- so cleanup must run either way. The
+            # previous shape returned before the finally on a sync raise, so a
+            # request that partially reached the SDK was never cancelled and its
+            # stream never retired.
             req_id = self._next_request_id()
-            try:
-                self._app.reqPnL(req_id, account_id, "")
-            except Exception as error:  # noqa: BLE001 - unsupported => request error
-                return SessionPnlObservation(
-                    SessionPnlStatus.REQUEST_ERROR,
-                    detail=f"reqPnL raised {type(error).__name__}",
-                )
             payload: object = None
             error_detail: str | None = None
             timed_out = False
             try:
+                self._app.reqPnL(req_id, account_id, "")
                 deadline = time.monotonic() + self._session_pnl_timeout
                 while payload is None and error_detail is None:
                     remaining = deadline - time.monotonic()
@@ -1646,8 +1657,8 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                         # carry identifiers.
                         error_detail = f"reqPnL rejected (IBKR {code})"
                     # Any other envelope kind is simply not a daily P&L.
-            except Exception as error:  # noqa: BLE001 - transport failure
-                error_detail = f"reqPnL transport error ({type(error).__name__})"
+            except Exception as error:  # noqa: BLE001 - sync or transport failure
+                error_detail = f"reqPnL error ({type(error).__name__})"
             finally:
                 try:
                     self._app.cancelPnL(req_id)
@@ -1677,6 +1688,17 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             if not value.is_finite():
                 return SessionPnlObservation(
                     SessionPnlStatus.UNSET, detail="reqPnL daily value not a number"
+                )
+            if abs(value) >= _UNSET_DOUBLE_THRESHOLD:
+                # IBKR renders an UNSET double field as DBL_MAX (~1.7977e308),
+                # which corresponds to an empty TWS cell -- NOT a real value.
+                # DBL_MAX is FINITE, so the is_finite check above passes it, and
+                # calling it P&L would hand the risk engine a vast positive
+                # number and make an UNKNOWN account look wildly profitable. It
+                # is the same sentinel _coerce_decimal already rejects for
+                # prices; here it becomes UNSET, never OK.
+                return SessionPnlObservation(
+                    SessionPnlStatus.UNSET, detail="reqPnL daily value unset (DBL_MAX)"
                 )
             return SessionPnlObservation(SessionPnlStatus.OK, value=value)
 

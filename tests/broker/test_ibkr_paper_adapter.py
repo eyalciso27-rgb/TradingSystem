@@ -818,3 +818,56 @@ def test_protective_stop_gtc_outgoing_fields() -> None:
 def test_day_and_gtc_are_both_supported_and_distinct() -> None:
     assert ibkr_time_in_force(TimeInForce.DAY) == "DAY"
     assert ibkr_time_in_force(TimeInForce.GTC) == "GTC"
+
+
+# == the IBKR max-double sentinel never becomes a P&L value ==================
+
+
+def test_a_max_double_session_pnl_is_none_and_unset_through_the_snapshot() -> None:
+    """A DBL_MAX 'value' must not reach AccountSnapshot as a number.
+
+    DBL_MAX is finite, so a naive is_finite check would pass it. The adapter
+    downgrades it to UNSET, and the snapshot carries None -- so the risk engine,
+    which reads only the value, cannot see a vast fabricated profit."""
+    import sys
+
+    transport = FakePaperTransport(daily_pnl=Decimal(str(sys.float_info.max)))
+    adapter = make_adapter(transport)
+    adapter.connect()
+
+    snapshot = adapter.get_account_snapshot("paper-main")
+
+    assert snapshot.session_pnl is None
+    assert snapshot.session_pnl_status is SessionPnlStatus.UNSET
+
+
+def test_a_finite_session_pnl_reaches_the_snapshot_as_ok() -> None:
+    transport = FakePaperTransport(daily_pnl=Decimal("-125.50"))
+    adapter = make_adapter(transport)
+    adapter.connect()
+
+    snapshot = adapter.get_account_snapshot("paper-main")
+
+    assert snapshot.session_pnl == Decimal("-125.50")
+    assert snapshot.session_pnl_status is SessionPnlStatus.OK
+
+
+def test_a_request_error_detail_reaches_the_snapshot_safely() -> None:
+    """The safe code-only detail is propagated for the owner probe to render."""
+    from trading_broker_core.port import SessionPnlObservation
+
+    class _RejectingTransport(FakePaperTransport):
+        def session_pnl(self, account_id: str) -> SessionPnlObservation:
+            self.calls.append("session_pnl")
+            return SessionPnlObservation(
+                SessionPnlStatus.REQUEST_ERROR, detail="reqPnL rejected (IBKR 321)"
+            )
+
+    adapter = make_adapter(_RejectingTransport())
+    adapter.connect()
+
+    snapshot = adapter.get_account_snapshot("paper-main")
+
+    assert snapshot.session_pnl is None
+    assert snapshot.session_pnl_status is SessionPnlStatus.REQUEST_ERROR
+    assert snapshot.session_pnl_detail == "reqPnL rejected (IBKR 321)"

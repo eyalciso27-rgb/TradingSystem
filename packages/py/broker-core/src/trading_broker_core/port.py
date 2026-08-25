@@ -347,6 +347,12 @@ class AccountSnapshot:
     #: P&L, and the many test snapshots, need not set it. When a value IS
     #: present it must be OK, and an absent value must never be reported as OK.
     session_pnl_status: SessionPnlStatus | None = None
+    #: A bounded, owner-SAFE diagnostic detail for the P&L observation (e.g. a
+    #: broker error CODE, or "no update within Ns"). Generic on purpose: this is
+    #: a free-form safe string, and any broker-specific parsing that produced it
+    #: stays in the adapter. It must never carry an account id, raw broker text,
+    #: a DSN, a secret or a traceback -- the adapter is responsible for that.
+    session_pnl_detail: str | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
