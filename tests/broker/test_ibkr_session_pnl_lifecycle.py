@@ -341,3 +341,80 @@ def test_repeated_snapshots_do_not_create_a_subscription_storm(
 
     assert len(transport._app.req_pnl_ids) == 1
     assert transport._app.cancel_pnl_ids == []
+
+
+# == concurrency: exactly one subscription under a thundering herd ============
+
+
+def test_concurrent_first_calls_start_exactly_one_subscription(
+    transport: Any,
+) -> None:
+    """N threads calling session_pnl at once must create ONE reqPnL, share it,
+    and leave a single subscription for disconnect to cancel."""
+    import threading
+
+    transport._app.initial = 5.0
+    n = 16
+    start = threading.Barrier(n)
+    results: list[Any] = []
+    guard = threading.Lock()
+
+    def worker() -> None:
+        start.wait(timeout=5)
+        observation = transport.session_pnl(ACCOUNT)
+        with guard:
+            results.append(observation)
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert len(transport._app.req_pnl_ids) == 1, (
+        f"a subscription storm: {transport._app.req_pnl_ids}"
+    )
+    assert all(o.value == Decimal("5") for o in results), "callers saw different values"
+    assert transport._pnl_req_id == transport._app.req_pnl_ids[0]
+
+    transport.disconnect()
+    assert transport._app.cancel_pnl_ids == [transport._pnl_req_id] or (
+        transport._app.cancel_pnl_ids == [transport._app.req_pnl_ids[0]]
+    ), transport._app.cancel_pnl_ids
+
+
+# == reqId / orderId collision is attribution-safe ===========================
+
+
+def test_an_order_error_that_aliases_the_pnl_reqid_never_poisons_pnl(
+    transport: Any,
+) -> None:
+    """The collision the reviewer forced: an ORDER error whose orderId equals
+    the active P&L reqId must route to the order stream (order attribution
+    wins) and never become PNL_REQUEST_ERROR."""
+    transport._app.initial = 3.0
+    transport.session_pnl(ACCOUNT)
+    pnl_req_id = transport._pnl_req_id
+
+    # Make that exact id ALSO an issued ORDER id, then deliver an order error.
+    transport._app.issue_order_id(pnl_req_id)
+    transport._app.error(pnl_req_id, 201, "Order rejected")
+
+    observation = transport.session_pnl(ACCOUNT)
+    assert observation.status is SessionPnlStatus.OK, "an order error poisoned P&L"
+    assert observation.value == Decimal("3")
+
+
+def test_a_genuine_pnl_request_error_still_reports_request_error(
+    transport: Any,
+) -> None:
+    """A request-scoped error for the P&L reqId (NOT an order id) is captured."""
+    transport._app.initial = 3.0
+    transport.session_pnl(ACCOUNT)
+    pnl_req_id = transport._pnl_req_id
+
+    transport._app.error(pnl_req_id, 321, "Server error validating the request")
+
+    observation = transport.session_pnl(ACCOUNT)
+    assert observation.status is SessionPnlStatus.REQUEST_ERROR
+    assert "321" in observation.detail

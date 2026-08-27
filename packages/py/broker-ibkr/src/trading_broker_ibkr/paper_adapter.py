@@ -1624,20 +1624,26 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                 normalized = normalize_error_callback(*args, **kwargs)
             except ErrorCallbackShapeError:
                 return
-            # A request-scoped error for the ACTIVE P&L subscription is captured
-            # in the P&L cache (code only), so a rejection surfaces as
-            # PNL_REQUEST_ERROR rather than being waited out. Informational farm
-            # notices are not errors and are left to fall through to diagnostics.
-            if (
-                normalized.request_id is not None
-                and normalized.request_id == self._pnl_active_req_id
-                and not is_informational_ibkr_error(normalized.code)
-            ):
-                self.record_session_pnl_error(normalized.request_id, normalized.code)
             order_ids, request_ids = self._issued_ids()
             stream = classify_error_stream(
                 normalized.request_id, order_ids=order_ids, request_ids=request_ids
             )
+            # Capture a P&L rejection ONLY when this error classified to the
+            # ACTIVE P&L request stream. Order ids and request ids share one
+            # numeric error space and ORDER attribution wins in
+            # classify_error_stream -- so an order error whose orderId happens
+            # to equal the P&L reqId routes to the order stream here and can
+            # never be mistaken for a P&L rejection. A genuine P&L error (a
+            # request id that is not an order id) classifies to this stream and
+            # is captured, code only. Informational farm notices are not errors.
+            if (
+                self._pnl_active_req_id is not None
+                and stream == request_stream(self._pnl_active_req_id)
+                and not is_informational_ibkr_error(normalized.code)
+            ):
+                self.record_session_pnl_error(
+                    self._pnl_active_req_id, normalized.code
+                )
             payload = (
                 normalized.request_id,
                 normalized.code,
@@ -1666,6 +1672,14 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             # transport and therefore a new subscription with a new id.
             self._pnl_req_id: int | None = None
             self._pnl_account: str | None = None
+            # Serialises subscription creation and teardown: concurrent first
+            # callers must not each start a reqPnL, and disconnect must not race
+            # an in-progress init and leave an orphan broker subscription.
+            self._pnl_init_lock = threading.Lock()
+            # Serialises the ENTIRE open-order snapshot lifecycle so two
+            # snapshots can never be ACTIVE at once (their id-less callbacks
+            # would otherwise cross generations). One-request-at-a-time.
+            self._open_orders_lock = threading.Lock()
             # Open-order snapshot lifecycle latch. reqAllOpenOrders /
             # reqOpenOrders carry NO request id, so once a snapshot does NOT
             # reach a provable normal end (timeout, sync failure), we cannot
@@ -1690,14 +1704,17 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
         def disconnect(self) -> None:
             # Cancel the persistent P&L subscription exactly once, best effort,
             # and detach the cache so no late callback updates a dead connection.
-            if self._pnl_req_id is not None:
-                try:
-                    self._app.cancelPnL(self._pnl_req_id)
-                except Exception:  # noqa: BLE001 - best-effort unsubscribe
-                    pass
-                self._app.stop_session_pnl()
-                self._pnl_req_id = None
-                self._pnl_account = None
+            # Under the init lock, so it cannot race an in-progress init and
+            # leave an orphan subscription.
+            with self._pnl_init_lock:
+                if self._pnl_req_id is not None:
+                    try:
+                        self._app.cancelPnL(self._pnl_req_id)
+                    except Exception:  # noqa: BLE001 - best-effort unsubscribe
+                        pass
+                    self._app.stop_session_pnl()
+                    self._pnl_req_id = None
+                    self._pnl_account = None
             try:
                 if self._app.isConnected():
                     self._app.disconnect()
@@ -1793,26 +1810,33 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             for a different account than the one this connection subscribed to,
             fail closed rather than serve another account's number.
             """
-            if self._pnl_account is not None and self._pnl_account != account_id:
-                return SessionPnlObservation(
-                    SessionPnlStatus.REQUEST_ERROR,
-                    detail="session P&L subscription is bound to another account",
-                )
-            if self._pnl_req_id is not None:
+            # Fast path: an established subscription needs no lock. A concurrent
+            # miss here simply enters the lock and re-checks -- double-checked
+            # locking, so exactly one reqPnL is ever created per connection.
+            if self._pnl_req_id is not None and self._pnl_account == account_id:
                 return None
-            req_id = self._next_request_id()
-            self._app.start_session_pnl(req_id)
-            try:
-                self._app.reqPnL(req_id, account_id, "")
-            except Exception as error:  # noqa: BLE001 - sync failure => request error
-                self._app.stop_session_pnl()
-                return SessionPnlObservation(
-                    SessionPnlStatus.REQUEST_ERROR,
-                    detail=f"reqPnL error ({type(error).__name__})",
-                )
-            self._pnl_req_id = req_id
-            self._pnl_account = account_id
-            return None
+            with self._pnl_init_lock:
+                if self._pnl_account is not None and self._pnl_account != account_id:
+                    return SessionPnlObservation(
+                        SessionPnlStatus.REQUEST_ERROR,
+                        detail="session P&L subscription is bound to another account",
+                    )
+                if self._pnl_req_id is not None:
+                    return None  # another thread won the race; share it
+                req_id = self._next_request_id()
+                self._app.start_session_pnl(req_id)
+                try:
+                    self._app.reqPnL(req_id, account_id, "")
+                except Exception as error:  # noqa: BLE001 - sync failure
+                    # Roll back atomically: no half-started subscription lingers.
+                    self._app.stop_session_pnl()
+                    return SessionPnlObservation(
+                        SessionPnlStatus.REQUEST_ERROR,
+                        detail=f"reqPnL error ({type(error).__name__})",
+                    )
+                self._pnl_req_id = req_id
+                self._pnl_account = account_id
+                return None
 
         def session_pnl(self, account_id: str) -> SessionPnlObservation:
             """Daily P&L from the connection's PERSISTENT ``reqPnL`` subscription.
@@ -2060,26 +2084,35 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             carry no request id and a late callback from the incomplete snapshot
             could otherwise be mistaken for a current one.
             """
-            if self._open_orders_uncertain:
-                raise BrokerPortError(
-                    BrokerErrorCode.BROKER_UNHEALTHY,
-                    "open-order snapshot lifecycle is UNCERTAIN after an"
-                    " incomplete snapshot; reconnect before another",
-                )
-            stream = self._app.begin_open_orders_snapshot()
-            completed = False
-            try:
-                request()
-                rows = self._collect(
-                    stream, end_kind="open_order_end", want="open_order", what=what
-                )
-                completed = True
-                return rows
-            finally:
-                self._app.end_open_orders_snapshot(stream)
-                if not completed:
-                    # Did NOT reach a provable normal end -> fail closed.
-                    self._open_orders_uncertain = True
+            # The WHOLE lifecycle -- UNCERTAIN check, begin generation, request,
+            # collect, end/release, transition -- is serialised, so two
+            # snapshots can never be ACTIVE at once. Their callbacks carry no
+            # request id, so a second concurrent generation would let snapshot
+            # A's openOrder/openOrderEnd be routed into snapshot B. A concurrent
+            # second caller waits behind the first (one-request-at-a-time), then
+            # runs -- or, if the first left the lifecycle UNCERTAIN, fails closed
+            # here before issuing any broker request.
+            with self._open_orders_lock:
+                if self._open_orders_uncertain:
+                    raise BrokerPortError(
+                        BrokerErrorCode.BROKER_UNHEALTHY,
+                        "open-order snapshot lifecycle is UNCERTAIN after an"
+                        " incomplete snapshot; reconnect before another",
+                    )
+                stream = self._app.begin_open_orders_snapshot()
+                completed = False
+                try:
+                    request()
+                    rows = self._collect(
+                        stream, end_kind="open_order_end", want="open_order", what=what
+                    )
+                    completed = True
+                    return rows
+                finally:
+                    self._app.end_open_orders_snapshot(stream)
+                    if not completed:
+                        # Did NOT reach a provable normal end -> fail closed.
+                        self._open_orders_uncertain = True
 
         def same_client_open_orders(self, account_id: str) -> tuple[RawOpenOrder, ...]:
             # Read-only SAME-CLIENT feed: reqOpenOrders returns the orders bound

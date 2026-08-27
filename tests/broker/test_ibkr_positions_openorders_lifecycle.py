@@ -420,3 +420,102 @@ def test_a_timeout_never_produces_an_empty_no_orders_snapshot(
 
     with pytest.raises(Exception):  # noqa: B017,PT011
         transport.open_order_snapshot(ACCOUNT)
+
+
+# == concurrency: open-order snapshots are serialised ========================
+
+
+def test_two_concurrent_open_order_snapshots_never_overlap(transport: Any) -> None:
+    """Item 2.A/B: two threads calling open_order_snapshot at once must not run
+    two ACTIVE generations. The lock serialises them; each sees its own result,
+    and at no point are two generations active together."""
+    import threading
+
+    transport._app.open_orders_script = [[], []]
+    overlap = {"max_active": 0, "active": 0}
+    guard = threading.Lock()
+
+    real_begin = transport._app.begin_open_orders_snapshot
+    real_end = transport._app.end_open_orders_snapshot
+
+    def counting_begin() -> str:
+        with guard:
+            overlap["active"] += 1
+            overlap["max_active"] = max(overlap["max_active"], overlap["active"])
+        stream: str = real_begin()
+        return stream
+
+    def counting_end(stream: str) -> None:
+        with guard:
+            overlap["active"] -= 1
+        real_end(stream)
+
+    transport._app.begin_open_orders_snapshot = counting_begin
+    transport._app.end_open_orders_snapshot = counting_end
+
+    start = threading.Barrier(2)
+    results: list[Any] = []
+
+    def worker() -> None:
+        start.wait(timeout=5)
+        r = transport.open_order_snapshot(ACCOUNT)
+        with guard:
+            results.append(r)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert overlap["max_active"] == 1, "two snapshots were ACTIVE at once"
+    assert all(r == () for r in results)
+
+
+def test_concurrent_global_and_same_client_obey_one_lifecycle(
+    transport: Any,
+) -> None:
+    """Item 2.D: a global and a same-client snapshot at once still serialise."""
+    import threading
+
+    transport._app.open_orders_script = [[], []]
+    start = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def run(fn: Any) -> None:
+        start.wait(timeout=5)
+        try:
+            fn(ACCOUNT)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=run, args=(transport.open_order_snapshot,)),
+        threading.Thread(target=run, args=(transport.same_client_open_orders,)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert errors == [], f"a concurrent snapshot failed: {errors}"
+
+
+def test_a_concurrent_caller_after_uncertain_issues_zero_requests(
+    transport: Any,
+) -> None:
+    """Item 2.C: once #1 times out and latches UNCERTAIN, #2 issues no request.
+
+    Sequential here (the latch is a state, not a race), but proves the ordering
+    the serialization guarantees: the UNCERTAIN check is inside the lock, so a
+    caller that acquires the lock after the latch is set issues nothing."""
+    transport._app.open_orders_script = [None]
+    with pytest.raises(Exception):  # noqa: B017,PT011
+        transport.open_order_snapshot(ACCOUNT)
+    before = _open_order_calls(transport)
+
+    with pytest.raises(Exception) as raised:  # noqa: PT011
+        transport.open_order_snapshot(ACCOUNT)
+
+    assert "UNCERTAIN" in str(raised.value)
+    assert _open_order_calls(transport) == before
