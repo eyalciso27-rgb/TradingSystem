@@ -745,6 +745,15 @@ class IbkrPaperAdapter:
     # -- BrokerPort ----------------------------------------------------------
     def connect(self) -> None:
         _validate_paper_endpoint(self._host, self._port)
+        # Refuse a second connect while one is live: connect() builds a fresh
+        # transport, so a second call without an intervening disconnect would
+        # orphan the first transport -- and its live reqPnL subscription, which
+        # nothing could then cancel. One live connection per adapter.
+        if self._transport is not None:
+            raise BrokerPortError(
+                BrokerErrorCode.BROKER_UNHEALTHY,
+                "already connected; disconnect before connecting again",
+            )
         try:
             transport = self._factory()
             managed = transport.connect(self._host, self._port, self._client_id)
@@ -1684,12 +1693,27 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             # reqOpenOrders carry NO request id, so once a snapshot does NOT
             # reach a provable normal end (timeout, sync failure), we cannot
             # tell a later late callback from a current one. We therefore refuse
-            # further snapshots until a reconnect provides a clean lifecycle.
+            # further snapshots until a reconnect (a new transport) provides a
+            # clean lifecycle.
             self._open_orders_uncertain = False
+            # Single-use guard: this transport is one broker connection.
+            self._started = False
 
         def connect(self, host: str, port: int, client_id: int) -> tuple[str, ...]:
-            # A reconnect provides a clean open-order lifecycle.
-            self._open_orders_uncertain = False
+            # A transport is SINGLE-USE: one broker connection per object. A
+            # reconnect builds a NEW transport (IbkrPaperAdapter.connect calls
+            # the factory), which is what guarantees no stale P&L cache, event,
+            # error, account, open-order generation, UNCERTAIN latch, issued-id
+            # set or router state can carry into a logically new connection.
+            # Refusing a second connect enforces that assumption rather than
+            # relying on convention.
+            if self._started:
+                raise BrokerPortError(
+                    BrokerErrorCode.BROKER_UNHEALTHY,
+                    "this transport has already been connected; a reconnect must"
+                    " use a new transport",
+                )
+            self._started = True
             self._app.api_client_id = client_id
             self._app.connect(host, port, client_id)
             self._thread = threading.Thread(target=self._app.run, daemon=True)
@@ -1782,17 +1806,25 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             return _resolve_one_contract(details, query, contract)
 
         def account_summary(self, account_id: str) -> Mapping[str, Decimal]:
+            # reqAccountSummary is a SUBSCRIPTION: cancel it in a finally, so a
+            # _collect timeout or error cannot orphan it at the gateway. The old
+            # shape cancelled only after a successful collect, so an incomplete
+            # observation left a live subscription behind.
             req_id = self._next_request_id()
-            self._app.reqAccountSummary(
-                req_id, "All", "NetLiquidation,TotalCashValue,BuyingPower"
-            )
-            rows = self._collect(
-                request_stream(req_id),
-                end_kind="account_end",
-                want="account",
-                what="account summary",
-            )
-            self._app.cancelAccountSummary(req_id)
+            stream = request_stream(req_id)
+            try:
+                self._app.reqAccountSummary(
+                    req_id, "All", "NetLiquidation,TotalCashValue,BuyingPower"
+                )
+                rows = self._collect(
+                    stream, end_kind="account_end", want="account", what="account summary"
+                )
+            finally:
+                try:
+                    self._app.cancelAccountSummary(req_id)
+                except Exception:  # noqa: BLE001 - best-effort unsubscribe
+                    pass
+                self._app.router.release(stream)
             values: dict[str, Decimal] = {}
             for row in rows:
                 account, tag, value = cast("tuple[str, str, str]", row)
@@ -1828,14 +1860,27 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                 try:
                     self._app.reqPnL(req_id, account_id, "")
                 except Exception as error:  # noqa: BLE001 - sync failure
-                    # Roll back atomically: no half-started subscription lingers.
+                    # A synchronous reqPnL failure does NOT prove the request
+                    # never reached the gateway, so cleanup must assume it MAY
+                    # have: cancel best-effort before detaching. Local rollback
+                    # alone (stop_session_pnl) would leave a live broker
+                    # subscription that disconnect can never cancel, because
+                    # _pnl_req_id was never committed. Same ownership rule as
+                    # positions/market-data cleanup.
+                    try:
+                        self._app.cancelPnL(req_id)
+                    except Exception:  # noqa: BLE001 - best-effort
+                        pass
                     self._app.stop_session_pnl()
                     return SessionPnlObservation(
                         SessionPnlStatus.REQUEST_ERROR,
                         detail=f"reqPnL error ({type(error).__name__})",
                     )
-                self._pnl_req_id = req_id
+                # Assign the account BEFORE the id: a lock-free fast-path reader
+                # that sees a committed _pnl_req_id then also sees its account,
+                # never a torn (id-set, account-still-None) pair.
                 self._pnl_account = account_id
+                self._pnl_req_id = req_id
                 return None
 
         def session_pnl(self, account_id: str) -> SessionPnlObservation:

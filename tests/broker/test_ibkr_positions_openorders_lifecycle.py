@@ -118,6 +118,21 @@ class _StubEClient:
     def reqOpenOrders(self) -> None:  # noqa: N802
         self._deliver_open_orders("reqOpenOrders")
 
+    #: account-summary support, to prove the cancel-in-finally cleanup.
+    account_summary_delivers: bool = False
+    cancel_account_summary_ids: list[int] | None = None
+
+    def reqAccountSummary(self, req_id: int, group: str, tags: str) -> None:  # noqa: N802
+        self.calls.append(("reqAccountSummary", req_id))
+        if self.account_summary_delivers:
+            self.accountSummaryEnd(req_id)  # type: ignore[attr-defined]
+        # else: deliver nothing -> the collector times out (orphan scenario)
+
+    def cancelAccountSummary(self, req_id: int) -> None:  # noqa: N802
+        if self.cancel_account_summary_ids is None:
+            self.cancel_account_summary_ids = []
+        self.cancel_account_summary_ids.append(req_id)
+
     def isConnected(self) -> bool:  # noqa: N802
         return False
 
@@ -519,3 +534,23 @@ def test_a_concurrent_caller_after_uncertain_issues_zero_requests(
 
     assert "UNCERTAIN" in str(raised.value)
     assert _open_order_calls(transport) == before
+
+
+# == adversarial: account_summary must not orphan on timeout =================
+
+
+def test_account_summary_timeout_still_cancels_the_subscription(
+    transport: Any,
+) -> None:
+    """reqAccountSummary is a subscription; a _collect timeout must still cancel
+    it in a finally, not leave it live at the gateway."""
+    transport._app.account_summary_delivers = False  # no accountSummaryEnd
+
+    with pytest.raises(Exception):  # noqa: B017,PT011 - BrokerPortError timeout
+        transport.account_summary(ACCOUNT)
+
+    req_ids = [c[1] for c in transport._app.calls if c[0] == "reqAccountSummary"]
+    assert req_ids, "reqAccountSummary was never issued"
+    assert transport._app.cancel_account_summary_ids == req_ids, (
+        "the subscription was not cancelled after the timeout"
+    )

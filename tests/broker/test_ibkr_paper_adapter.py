@@ -871,3 +871,51 @@ def test_a_request_error_detail_reaches_the_snapshot_safely() -> None:
     assert snapshot.session_pnl is None
     assert snapshot.session_pnl_status is SessionPnlStatus.REQUEST_ERROR
     assert snapshot.session_pnl_detail == "reqPnL rejected (IBKR 321)"
+
+
+# == adversarial: one live connection per adapter; reconnect is a new transport ==
+
+
+def test_a_second_connect_is_refused_and_does_not_orphan_the_first() -> None:
+    """connect() builds a fresh transport, so a second connect without a
+    disconnect would orphan the first (and its live reqPnL subscription).
+    It must be refused, and no second transport built."""
+    built: list[FakePaperTransport] = []
+
+    def factory() -> FakePaperTransport:
+        t = FakePaperTransport()
+        built.append(t)
+        return t
+
+    adapter = IbkrPaperAdapter(
+        factory, account_aliases=dict(ALIASES), host="127.0.0.1", port=4002,
+        clock=deterministic_clock(),
+    )
+    adapter.connect()
+
+    with pytest.raises(BrokerPortError, match="already connected"):
+        adapter.connect()
+
+    assert len(built) == 1, "a second transport was built (orphaning the first)"
+
+
+def test_reconnect_builds_a_brand_new_transport() -> None:
+    """disconnect then connect must construct a NEW transport, so no stale P&L
+    cache / open-order latch / issued ids carry into the new connection."""
+    built: list[FakePaperTransport] = []
+
+    def factory() -> FakePaperTransport:
+        t = FakePaperTransport()
+        built.append(t)
+        return t
+
+    adapter = IbkrPaperAdapter(
+        factory, account_aliases=dict(ALIASES), host="127.0.0.1", port=4002,
+        clock=deterministic_clock(),
+    )
+    adapter.connect()
+    adapter.disconnect()
+    adapter.connect()
+
+    assert len(built) == 2, "reconnect reused the old transport"
+    assert built[0] is not built[1]

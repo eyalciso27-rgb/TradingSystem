@@ -418,3 +418,102 @@ def test_a_genuine_pnl_request_error_still_reports_request_error(
     observation = transport.session_pnl(ACCOUNT)
     assert observation.status is SessionPnlStatus.REQUEST_ERROR
     assert "321" in observation.detail
+
+
+# == adversarial: a sync reqPnL failure must not orphan a broker subscription ==
+
+
+def test_a_synchronous_reqpnl_failure_cancels_to_avoid_an_orphan(
+    transport: Any,
+) -> None:
+    """A synchronous reqPnL failure does not prove the request never reached the
+    gateway, so cleanup must cancel it. Local rollback alone would leave a live
+    subscription that disconnect could never cancel (id never committed)."""
+    issued: list[int] = []
+
+    def _raising(req_id: int, account: str, model_code: str) -> None:
+        issued.append(req_id)
+        transport._app.req_pnl_ids.append(req_id)
+        raise RuntimeError("reqPnL blew up mid-send")
+
+    transport._app.reqPnL = _raising
+
+    observation = transport.session_pnl(ACCOUNT)
+
+    assert observation.status is SessionPnlStatus.REQUEST_ERROR
+    # The would-be subscription was cancelled, so nothing is orphaned...
+    assert issued[0] in transport._app.cancel_pnl_ids, "cancelPnL was not attempted"
+    # ...and no subscription is committed locally.
+    assert transport._pnl_req_id is None
+    assert transport._app.session_pnl_state()[0] is None, "cache still attached"
+
+
+def test_a_retry_after_a_sync_failure_can_start_a_fresh_subscription(
+    transport: Any,
+) -> None:
+    calls = {"n": 0}
+
+    def _req(req_id: int, account: str, model_code: str) -> None:
+        transport._app.req_pnl_ids.append(req_id)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("first reqPnL blew up")
+        transport._app.pnl(req_id, 4.0, 0.0, 0.0)
+
+    transport._app.reqPnL = _req
+
+    first = transport.session_pnl(ACCOUNT)
+    second = transport.session_pnl(ACCOUNT)
+
+    assert first.status is SessionPnlStatus.REQUEST_ERROR
+    assert second.status is SessionPnlStatus.OK and second.value == Decimal("4")
+    # Two attempts, two distinct reqIds, each cleaned up or committed once.
+    assert len(set(transport._app.req_pnl_ids)) == 2
+
+
+# == error-attribution matrix (real error() path) ============================
+
+
+@pytest.mark.parametrize(
+    ("setup", "expect_pnl_error"),
+    [
+        pytest.param("order_id", False, id="order-id-only-wins-over-pnl"),
+        pytest.param("both", False, id="numeric-collision-order-wins"),
+        pytest.param("unknown", False, id="never-issued-id-to-diagnostics"),
+        pytest.param("connection", False, id="reqId--1-to-diagnostics"),
+        pytest.param("informational", False, id="farm-notice-not-an-error"),
+        pytest.param("pnl_request", True, id="genuine-pnl-request-error"),
+    ],
+)
+def test_error_attribution_matrix(
+    transport: Any, setup: str, expect_pnl_error: bool
+) -> None:
+    """For every id situation, prove exactly whether P&L is affected. No consumer
+    infers ownership merely because a numeric id matches."""
+    transport._app.initial = 2.0
+    transport.session_pnl(ACCOUNT)
+    pnl_id = transport._pnl_req_id
+
+    if setup == "order_id":
+        transport._app.issue_order_id(999_999)
+        transport._app.error(999_999, 201, "Order rejected")
+    elif setup == "both":
+        transport._app.issue_order_id(pnl_id)  # numeric collision with the P&L id
+        transport._app.error(pnl_id, 201, "Order rejected")
+    elif setup == "unknown":
+        transport._app.error(777_777, 500, "unknown id")
+    elif setup == "connection":
+        transport._app.error(-1, 1100, "connectivity")
+    elif setup == "informational":
+        transport._app.error(pnl_id, 2104, "Market data farm connection is OK")
+    elif setup == "pnl_request":
+        transport._app.error(pnl_id, 321, "Server error validating the request")
+
+    observation = transport.session_pnl(ACCOUNT)
+    if expect_pnl_error:
+        assert observation.status is SessionPnlStatus.REQUEST_ERROR
+    else:
+        assert observation.status is SessionPnlStatus.OK, (
+            f"{setup} wrongly affected P&L"
+        )
+        assert observation.value == Decimal("2")
