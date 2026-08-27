@@ -9,6 +9,10 @@ from uuid import UUID
 import pytest
 from trading_application.decision_engine import DecisionExplanation, EngineDecision
 from trading_application.emergency import HaltRecord
+from trading_application.execution_identity import (
+    decision_identity,
+    risk_policy_identity,
+)
 from trading_application.risk_engine import (
     AccountState,
     PositionExposure,
@@ -337,7 +341,11 @@ def test_explanation_contains_full_trace() -> None:
     result = evaluate(request(quantity="126"), account())
     assert result.decision_ref.startswith("decision:")
     assert "sha256:" in result.decision_ref
-    assert result.policy_ref == "risk-policy:risk-policy-test-1"
+    # The policy identity carries the version AND a hash of every limit, so two
+    # policies sharing a version but differing in a limit are distinguishable.
+    assert result.policy_ref == risk_policy_identity(POLICY)
+    assert result.policy_ref.startswith("risk-policy:risk-policy-test-1@sha256:")
+    assert result.decision_ref == decision_identity(decision())
     assert result.input_refs == ("observation:a-1@src-1",)
     names = [check.name for check in result.checks]
     assert "decision_gate" in names and "per_trade_risk" in names

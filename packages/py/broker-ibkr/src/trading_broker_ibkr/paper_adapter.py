@@ -34,7 +34,8 @@ the separately-approved POI-IBKR-001 experiment, not part of this task.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping
+import itertools
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -57,7 +58,11 @@ from trading_broker_core.port import (
     IntegrationHealth,
     OrderIntent,
     OrderPreview,
+    OrderSide,
     ReconciliationResult,
+    RecoveredOrder,
+    SessionPnlObservation,
+    SessionPnlStatus,
     TimeInForce,
 )
 from trading_contracts.enums import Environment, OrderState, OrderType
@@ -65,7 +70,6 @@ from trading_contracts.enums import Environment, OrderState, OrderType
 from trading_broker_ibkr.callback_router import (
     DIAGNOSTICS_STREAM,
     OPEN_ORDERS_STREAM,
-    POSITIONS_STREAM,
     CallbackRouter,
     classify_error_stream,
     order_stream,
@@ -76,6 +80,10 @@ from trading_broker_ibkr.ibkr_error_callback import (
     normalize_error_callback,
     normalize_message,
 )
+from trading_broker_ibkr.instrument_ref import (
+    decode_instrument_ref,
+    encode_instrument_ref,
+)
 
 _T = TypeVar("_T")
 
@@ -85,6 +93,54 @@ ALLOWED_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost"})
 PAPER_API_PORT = 4002
 LIVE_API_PORT = 4001
 PAPER_ACCOUNT_PREFIX = "DU"
+
+#: IBKR order fields -> canonical enums, for recovery. Anything absent here is
+#: a shape we cannot express canonically, and an order we will not describe
+#: approximately.
+_RECOVERED_SIDE: Mapping[str, OrderSide] = {
+    "BUY": OrderSide.BUY,
+    "SELL": OrderSide.SELL,
+}
+_RECOVERED_ORDER_TYPE: Mapping[str, OrderType] = {
+    "LMT": OrderType.LIMIT,
+    "STP": OrderType.STOP,
+    "STP LMT": OrderType.STOP_LIMIT,
+    "MKT": OrderType.MARKET,
+    "LIMIT": OrderType.LIMIT,
+    "STOP": OrderType.STOP,
+    "STOP_LIMIT": OrderType.STOP_LIMIT,
+    "MARKET": OrderType.MARKET,
+}
+
+#: How long to wait for the ``reqPnL`` subscription's first update before
+#: reporting a bounded TIMEOUT (not a permission fact).
+#:
+#: One bounded value serves both the owner probe and the execution decision,
+#: and it can do so honestly ONLY because request-scoped errors now
+#: short-circuit: a broker rejection returns immediately as REQUEST_ERROR
+#: rather than consuming the whole window, so this timeout governs just the
+#: "no callback at all" case. IBKR documents that aggregate P&L can take
+#: several seconds to compute for some account structures, and the third
+#: owner-host run showed the previous 5s was too tight to distinguish a slow
+#: subscription from an absent one. 15s matches ``DEFAULT_TIMEOUT_SECONDS``
+#: used elsewhere and stays bounded -- there is never an unbounded wait, and
+#: the execution gate still fails closed on TIMEOUT exactly as on None.
+#: Process-global request-id sequence, so a reconnect (a NEW transport) never
+#: reuses a request id from a previous connection -- a stale reqId can then
+#: never be mistaken for a current subscription's. ``itertools.count.__next__``
+#: is atomic under the GIL. Starts high enough to stay clear of the fixed
+#: account-summary/contract-details ids.
+_GLOBAL_REQUEST_ID = itertools.count(10_000)
+
+SESSION_PNL_TIMEOUT_SECONDS = 15.0
+
+#: Maximum age of the persistent subscription's latest ``pnl`` callback for its
+#: value to count as CURRENT. IBKR delivers reqPnL updates roughly once a
+#: second, so a value last seen more than this long ago means the subscription
+#: has gone quiet -- the value is reported STALE and fails closed, never used as
+#: if it were current. Generous enough to tolerate a gateway hiccup, tight
+#: enough to catch a dead subscription; bounded, never an unbounded wait.
+SESSION_PNL_FRESHNESS_SECONDS = 30.0
 DEFAULT_CLIENT_ID = 1
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
@@ -492,6 +548,8 @@ class RawOpenOrder:
     order_ref: str
     status: str
     symbol: str
+    #: The broker's own security identity, when the callback reported one.
+    broker_instrument_ref: str = ""
     client_id: int = FOREIGN_CLIENT_ID
     perm_id: int = 0
     account: str = ""
@@ -546,6 +604,27 @@ class PaperTransport(Protocol):
     def resolve_instrument(self, query: InstrumentQuery) -> BrokerInstrument | None: ...
 
     def account_summary(self, account_id: str) -> Mapping[str, Decimal]: ...
+
+    def session_pnl(self, account_id: str) -> SessionPnlObservation:
+        """The account's DAILY P&L observation: a status, a value, a safe detail.
+
+        A distinct operation rather than an account-summary tag, because IBKR's
+        ``reqAccountSummary`` genuinely does not carry a daily figure: the daily
+        number comes from the separate ``reqPnL`` subscription, and inventing a
+        ``DailyPnL`` summary key would have described a feed that does not
+        exist.
+
+        The status distinguishes a value (OK) from silence (TIMEOUT), a broker
+        rejection (REQUEST_ERROR) and a NaN callback (UNSET). Only OK carries a
+        value; every other status means UNKNOWN, and the risk engine, which
+        reads only the value, still fails both daily halt limits closed -- a
+        zero would silently disable them.
+
+        Cumulative realized/unrealized totals are a different fact and are
+        deliberately not returned here; a cumulative number presented as a daily
+        one is the same fabrication wearing a different hat.
+        """
+        ...
 
     def positions(self, account_id: str) -> tuple[BrokerPosition, ...]: ...
 
@@ -666,6 +745,15 @@ class IbkrPaperAdapter:
     # -- BrokerPort ----------------------------------------------------------
     def connect(self) -> None:
         _validate_paper_endpoint(self._host, self._port)
+        # Refuse a second connect while one is live: connect() builds a fresh
+        # transport, so a second call without an intervening disconnect would
+        # orphan the first transport -- and its live reqPnL subscription, which
+        # nothing could then cancel. One live connection per adapter.
+        if self._transport is not None:
+            raise BrokerPortError(
+                BrokerErrorCode.BROKER_UNHEALTHY,
+                "already connected; disconnect before connecting again",
+            )
         try:
             transport = self._factory()
             managed = transport.connect(self._host, self._port, self._client_id)
@@ -731,6 +819,7 @@ class IbkrPaperAdapter:
         transport = self._require_connected()
         account_id = self._account_id(account_alias)
         values = self._guarded(lambda: transport.account_summary(account_id))
+        pnl = self._session_pnl(transport, account_id)
         try:
             return AccountSnapshot(
                 account_alias=account_alias,
@@ -738,6 +827,20 @@ class IbkrPaperAdapter:
                 net_liquidation_value=values["NetLiquidation"],
                 cash=values["TotalCashValue"],
                 buying_power=values["BuyingPower"],
+                # From the transport's own daily-P&L operation (reqPnL), never
+                # from an account-summary tag: IBKR's summary carries no daily
+                # figure. Unknown stays None, and None fails a trading decision
+                # closed rather than pretending the day is flat. The status and
+                # the SAFE (code-only) detail are carried alongside so the owner
+                # probe can say WHY it is unknown -- a timeout, a real request
+                # error (with the broker CODE), an unset sentinel -- without a
+                # further code change and without exposing the account id.
+                session_pnl=pnl.value,
+                session_pnl_status=pnl.status,
+                session_pnl_detail=pnl.detail or None,
+                # WHEN the pnl callback actually arrived, not when this snapshot
+                # was built -- the freshness fact the risk gate needs.
+                session_pnl_observed_at=pnl.observed_at,
                 observed_at=self._now(),
             )
         except KeyError as missing:
@@ -745,6 +848,39 @@ class IbkrPaperAdapter:
                 BrokerErrorCode.UNKNOWN_BROKER_RESPONSE,
                 f"account summary missing tag {missing}; failing closed",
             ) from missing
+
+    @staticmethod
+    def _session_pnl(
+        transport: PaperTransport, account_id: str
+    ) -> SessionPnlObservation:
+        """Ask for the daily P&L observation. Any raise is UNKNOWN, never zero.
+
+        The transport already classifies the outcome (OK / TIMEOUT /
+        REQUEST_ERROR / UNSET). A transport that raises outright -- a fake, or
+        an unexpected failure -- is folded into REQUEST_ERROR here so the value
+        is still absent and the decision still fails closed.
+        """
+        try:
+            observation = transport.session_pnl(account_id)
+        except Exception as error:  # noqa: BLE001 - any failure means UNKNOWN
+            return SessionPnlObservation(
+                SessionPnlStatus.REQUEST_ERROR,
+                detail=f"session_pnl raised {type(error).__name__}",
+            )
+        # Defence in depth, with the IBKR sentinel knowledge kept HERE in the
+        # adapter (never in broker-core): any OK value that is non-finite or the
+        # DBL_MAX unset sentinel is downgraded to UNSET, so no transport variant
+        # can slip a vast sentinel through as genuine P&L.
+        if observation.value is not None and (
+            not observation.value.is_finite()
+            or abs(observation.value) >= _UNSET_DOUBLE_THRESHOLD
+        ):
+            return SessionPnlObservation(
+                SessionPnlStatus.UNSET,
+                detail="daily value unset or not a number",
+                observed_at=observation.observed_at,
+            )
+        return observation
 
     def get_positions(self, account_alias: str) -> tuple[BrokerPosition, ...]:
         transport = self._require_connected()
@@ -795,6 +931,47 @@ class IbkrPaperAdapter:
                 received_at=self._now(),
             )
         return tuple(receipts.values())
+
+    def recover_working_orders(
+        self, account_alias: str
+    ) -> tuple[RecoveredOrder, ...]:
+        """The same eligible set, described as the BROKER reports it.
+
+        Every field comes from the ``reqOpenOrders`` row: symbol, side,
+        quantity, order type and prices are what IBKR says it is holding. The
+        original correlation id is deliberately absent -- it was ours, the
+        broker never stored it, and manufacturing one would fabricate the
+        identity a caller is trying to verify.
+        """
+        transport = self._require_connected()
+        account_id = self._account_id(account_alias)
+        raws = self._guarded(lambda: transport.same_client_open_orders(account_id))
+        eligible = self._eligible_recovered_orders(raws, account_id)
+        recovered: list[RecoveredOrder] = []
+        for client_order_id, raw in eligible.items():
+            side = _RECOVERED_SIDE.get(raw.action.upper())
+            order_type = _RECOVERED_ORDER_TYPE.get(raw.order_type.upper())
+            if side is None or order_type is None:
+                # An order shape we cannot express canonically is not one we may
+                # describe approximately.
+                continue
+            recovered.append(
+                RecoveredOrder(
+                    client_order_id=client_order_id,
+                    broker_order_ref=f"ibkr-paper:{raw.broker_order_id}",
+                    state=IBKR_STATUS_MAP[raw.status],
+                    account_alias=account_alias,
+                    symbol=raw.symbol,
+                    broker_instrument_ref=raw.broker_instrument_ref,
+                    side=side,
+                    quantity=raw.quantity,
+                    order_type=order_type,
+                    limit_price=raw.limit_price,
+                    stop_price=getattr(raw, "aux_price", None),
+                    observed_at=self._now(),
+                )
+            )
+        return tuple(recovered)
 
     def recover_cancellable_orders(
         self, account_alias: str
@@ -1121,6 +1298,52 @@ class IbkrPaperAdapter:
             ) from error
 
 
+def _resolve_one_contract(
+    details: Sequence[object], query: InstrumentQuery, requested: object
+) -> BrokerInstrument | None:
+    """The ONE security this query names, or nothing.
+
+    Two failures used to pass silently. ``details[0]`` took whichever contract
+    IBKR happened to list first, so an ambiguous query -- several listings,
+    several currencies, several share classes under one root -- resolved to an
+    arbitrary one of them. And a contract with no usable ``conId`` still
+    produced ``"conid:0"``, a reference that identifies nothing.
+
+    An ambiguous or unusable answer is now no answer, which the caller turns
+    into INSTRUMENT_NOT_FOUND and zero submits. A security we cannot name is a
+    security we will not trade.
+    """
+    candidates: list[tuple[int, object]] = []
+    for detail in details:
+        resolved = getattr(detail, "contract", None)
+        if resolved is None:
+            continue
+        con_id = _coerce_int(getattr(resolved, "conId", None), 0)
+        if con_id <= 0:
+            # IBKR answered without a usable identity. Not a security.
+            continue
+        candidates.append((con_id, resolved))
+    if not candidates:
+        return None
+    distinct = {con_id for con_id, _ in candidates}
+    if len(distinct) > 1:
+        # Genuinely ambiguous: the query names more than one security. Choosing
+        # one would be choosing at random.
+        return None
+    con_id, resolved = candidates[0]
+    reference = encode_instrument_ref(con_id)
+    if not reference:
+        return None
+    return BrokerInstrument(
+        broker_instrument_ref=reference,
+        symbol=str(getattr(resolved, "symbol", query.symbol)),
+        exchange=str(getattr(resolved, "exchange", getattr(requested, "exchange", ""))),
+        currency=str(
+            getattr(resolved, "currency", getattr(requested, "currency", ""))
+        ),
+    )
+
+
 def _coerce_int(value: object, default: int) -> int:
     """Read an integer broker field, falling back to a fail-closed default."""
     try:
@@ -1149,6 +1372,10 @@ def _coerce_decimal(value: object) -> Decimal | None:
 
 def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-IBKR-001
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    *,
+    session_pnl_timeout_seconds: float = SESSION_PNL_TIMEOUT_SECONDS,
+    session_pnl_freshness_seconds: float = SESSION_PNL_FRESHNESS_SECONDS,
+    monotonic_clock: Callable[[], float] | None = None,
 ) -> PaperTransport:
     """Build the real SDK-backed paper transport (gateway host only).
 
@@ -1162,6 +1389,11 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
     turned a real cancellation into a false timeout.
     """
     import threading
+    import time
+
+    #: Injectable for deterministic freshness tests; the real host uses the
+    #: wall-independent monotonic clock.
+    _monotonic: Callable[[], float] = monotonic_clock or time.monotonic
 
     try:
         from ibapi.client import EClient  # type: ignore[import-not-found]
@@ -1193,6 +1425,24 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             self._issued = threading.Lock()
             self._order_ids: set[int] = set()
             self._request_ids: set[int] = set()
+            #: Fresh identity per open-order snapshot (reqAllOpenOrders /
+            #: reqOpenOrders carry no request id). Assignment is atomic; the
+            #: transport serialises snapshots, so no lock is needed for the
+            #: reader thread to read the current target.
+            self._open_orders_generation: int = 0
+            self._active_open_orders_stream: str | None = None
+            # -- persistent session-P&L subscription state --------------------
+            # reqPnL is a SUBSCRIPTION: one is started per connection and stays
+            # active, its ``pnl`` callbacks caching the latest daily value and
+            # the monotonic + wall-clock time it arrived. Callbacks for any other
+            # reqId (a previous subscription, a stale reconnect) are ignored.
+            self._pnl_lock = threading.Lock()
+            self._pnl_active_req_id: int | None = None
+            self._pnl_daily: float | None = None
+            self._pnl_observed_monotonic: float | None = None
+            self._pnl_observed_at: datetime | None = None
+            self._pnl_error_code: int | None = None
+            self._pnl_first_update = threading.Event()
 
         # -- id bookkeeping (order ids and request ids share a numeric space) --
         def issue_order_id(self, order_id: int) -> None:
@@ -1235,25 +1485,144 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
         def accountSummaryEnd(self, req_id: int) -> None:  # noqa: N802
             self.router.publish(request_stream(req_id), "account_end", req_id)
 
+        def pnl(  # noqa: N802
+            self,
+            req_id: int,
+            daily_pnl: float,
+            unrealized_pnl: float,
+            realized_pnl: float,
+        ) -> None:
+            """``reqPnL`` update. ONLY the daily figure is cached.
+
+            IBKR sends all three on the same callback, and the unrealized and
+            realized numbers are CUMULATIVE. Caching them here would invite
+            exactly the substitution this whole path exists to prevent, so the
+            daily value travels alone. A callback whose reqId is not the active
+            subscription belongs to a previous (or reconnected) subscription and
+            is ignored.
+            """
+            with self._pnl_lock:
+                if req_id != self._pnl_active_req_id:
+                    return
+                self._pnl_daily = daily_pnl
+                self._pnl_observed_monotonic = _monotonic()
+                self._pnl_observed_at = datetime.now(UTC)
+                self._pnl_error_code = None
+                self._pnl_first_update.set()
+
+        # -- persistent session-P&L subscription -----------------------------
+        def start_session_pnl(self, req_id: int) -> None:
+            """Arm the cache for a fresh subscription id, discarding any prior."""
+            with self._pnl_lock:
+                self._pnl_active_req_id = req_id
+                self._pnl_daily = None
+                self._pnl_observed_monotonic = None
+                self._pnl_observed_at = None
+                self._pnl_error_code = None
+                self._pnl_first_update.clear()
+
+        def stop_session_pnl(self) -> None:
+            """Detach: subsequent pnl callbacks for the old id are ignored."""
+            with self._pnl_lock:
+                self._pnl_active_req_id = None
+
+        def record_session_pnl_error(self, req_id: int, code: int) -> None:
+            """A request-scoped error for the active subscription. Unblocks the
+            initial wait; the code only, never the raw text."""
+            with self._pnl_lock:
+                if req_id != self._pnl_active_req_id:
+                    return
+                self._pnl_error_code = code
+                self._pnl_observed_monotonic = _monotonic()
+                self._pnl_first_update.set()
+
+        def session_pnl_state(
+            self,
+        ) -> tuple[int | None, float | None, float | None, datetime | None, int | None]:
+            """A consistent snapshot of the cached P&L: (active id, daily,
+            observed monotonic, observed wall-clock, error code)."""
+            with self._pnl_lock:
+                return (
+                    self._pnl_active_req_id,
+                    self._pnl_daily,
+                    self._pnl_observed_monotonic,
+                    self._pnl_observed_at,
+                    self._pnl_error_code,
+                )
+
+        # Positions are observed with reqPositionsMulti, which carries a request
+        # id: each observation routes to its OWN request_stream(req_id), a unique
+        # lifecycle key the router can safely retire. The global reqPositions
+        # callbacks below are NOT used by any waiter -- they route to
+        # diagnostics -- because their fixed "positions" channel is reusable and
+        # cannot be retired without breaking the next read (round-10 regression).
+        def positionMulti(  # noqa: N802
+            self,
+            req_id: int,
+            account: str,
+            model_code: str,
+            contract: object,
+            position: object,
+            avg_cost: float,
+        ) -> None:
+            self.router.publish(
+                request_stream(req_id),
+                "position",
+                (account, contract, position, avg_cost),
+            )
+
+        def positionMultiEnd(self, req_id: int) -> None:  # noqa: N802
+            self.router.publish(request_stream(req_id), "position_end", None)
+
         def position(  # noqa: N802
             self, account: str, contract: object, position: object, avg_cost: float
         ) -> None:
-            self.router.publish(
-                POSITIONS_STREAM, "position", (account, contract, position, avg_cost)
-            )
+            # Legacy global reqPositions feed -- not consumed by any waiter.
+            self.router.publish(DIAGNOSTICS_STREAM, "position", None)
 
         def positionEnd(self) -> None:  # noqa: N802
-            self.router.publish(POSITIONS_STREAM, "position_end", None)
+            self.router.publish(DIAGNOSTICS_STREAM, "position_end", None)
+
+        # Open-order snapshots (reqAllOpenOrders / reqOpenOrders) carry NO
+        # request id, so each snapshot is given a fresh transport-owned
+        # generation: openOrder/openOrderEnd route to the CURRENT active
+        # generation's stream. That key is unique per snapshot, so retiring it
+        # cannot starve the next snapshot; a callback outside any active
+        # snapshot is diagnostic.
+        def _open_orders_target(self) -> str:
+            active = self._active_open_orders_stream
+            return active if active is not None else DIAGNOSTICS_STREAM
 
         def openOrder(  # noqa: N802
             self, order_id: int, contract: object, order: object, order_state: object
         ) -> None:
             self.router.publish(
-                OPEN_ORDERS_STREAM, "open_order", (order_id, contract, order, order_state)
+                self._open_orders_target(),
+                "open_order",
+                (order_id, contract, order, order_state),
             )
 
         def openOrderEnd(self) -> None:  # noqa: N802
-            self.router.publish(OPEN_ORDERS_STREAM, "open_order_end", None)
+            self.router.publish(self._open_orders_target(), "open_order_end", None)
+
+        # -- open-order snapshot generations ----------------------------------
+        def begin_open_orders_snapshot(self) -> str:
+            """Open a fresh open-order snapshot generation; return its stream.
+
+            Exactly one snapshot is active at a time on this one-request-at-a-
+            time transport. Each gets a DIFFERENT stream identity, so a stale
+            ``openOrderEnd`` can never terminate a later snapshot.
+            """
+            self._open_orders_generation += 1
+            stream = f"{OPEN_ORDERS_STREAM}:{self._open_orders_generation}"
+            self._active_open_orders_stream = stream
+            return stream
+
+        def end_open_orders_snapshot(self, stream: str) -> None:
+            """Close the generation and retire its stream (deterministic)."""
+            if self._active_open_orders_stream == stream:
+                self._active_open_orders_stream = None
+            self.router.release(stream)
 
         def error(self, *args: object, **kwargs: object) -> None:  # noqa: N802
             # The error() signature varies across API versions (10.48 inserts
@@ -1268,6 +1637,22 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             stream = classify_error_stream(
                 normalized.request_id, order_ids=order_ids, request_ids=request_ids
             )
+            # Capture a P&L rejection ONLY when this error classified to the
+            # ACTIVE P&L request stream. Order ids and request ids share one
+            # numeric error space and ORDER attribution wins in
+            # classify_error_stream -- so an order error whose orderId happens
+            # to equal the P&L reqId routes to the order stream here and can
+            # never be mistaken for a P&L rejection. A genuine P&L error (a
+            # request id that is not an order id) classifies to this stream and
+            # is captured, code only. Informational farm notices are not errors.
+            if (
+                self._pnl_active_req_id is not None
+                and stream == request_stream(self._pnl_active_req_id)
+                and not is_informational_ibkr_error(normalized.code)
+            ):
+                self.record_session_pnl_error(
+                    self._pnl_active_req_id, normalized.code
+                )
             payload = (
                 normalized.request_id,
                 normalized.code,
@@ -1288,8 +1673,47 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             self._app = _PaperApp()
             self._thread: threading.Thread | None = None
             self._req_id = 100
+            self._session_pnl_timeout = session_pnl_timeout_seconds
+            self._session_pnl_freshness = session_pnl_freshness_seconds
+            # The persistent subscription's id and the account it is bound to,
+            # for the life of THIS transport (i.e. this connection). None until
+            # the first session_pnl call starts it; a reconnect is a new
+            # transport and therefore a new subscription with a new id.
+            self._pnl_req_id: int | None = None
+            self._pnl_account: str | None = None
+            # Serialises subscription creation and teardown: concurrent first
+            # callers must not each start a reqPnL, and disconnect must not race
+            # an in-progress init and leave an orphan broker subscription.
+            self._pnl_init_lock = threading.Lock()
+            # Serialises the ENTIRE open-order snapshot lifecycle so two
+            # snapshots can never be ACTIVE at once (their id-less callbacks
+            # would otherwise cross generations). One-request-at-a-time.
+            self._open_orders_lock = threading.Lock()
+            # Open-order snapshot lifecycle latch. reqAllOpenOrders /
+            # reqOpenOrders carry NO request id, so once a snapshot does NOT
+            # reach a provable normal end (timeout, sync failure), we cannot
+            # tell a later late callback from a current one. We therefore refuse
+            # further snapshots until a reconnect (a new transport) provides a
+            # clean lifecycle.
+            self._open_orders_uncertain = False
+            # Single-use guard: this transport is one broker connection.
+            self._started = False
 
         def connect(self, host: str, port: int, client_id: int) -> tuple[str, ...]:
+            # A transport is SINGLE-USE: one broker connection per object. A
+            # reconnect builds a NEW transport (IbkrPaperAdapter.connect calls
+            # the factory), which is what guarantees no stale P&L cache, event,
+            # error, account, open-order generation, UNCERTAIN latch, issued-id
+            # set or router state can carry into a logically new connection.
+            # Refusing a second connect enforces that assumption rather than
+            # relying on convention.
+            if self._started:
+                raise BrokerPortError(
+                    BrokerErrorCode.BROKER_UNHEALTHY,
+                    "this transport has already been connected; a reconnect must"
+                    " use a new transport",
+                )
+            self._started = True
             self._app.api_client_id = client_id
             self._app.connect(host, port, client_id)
             self._thread = threading.Thread(target=self._app.run, daemon=True)
@@ -1302,6 +1726,19 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             return self._app.managed
 
         def disconnect(self) -> None:
+            # Cancel the persistent P&L subscription exactly once, best effort,
+            # and detach the cache so no late callback updates a dead connection.
+            # Under the init lock, so it cannot race an in-progress init and
+            # leave an orphan subscription.
+            with self._pnl_init_lock:
+                if self._pnl_req_id is not None:
+                    try:
+                        self._app.cancelPnL(self._pnl_req_id)
+                    except Exception:  # noqa: BLE001 - best-effort unsubscribe
+                        pass
+                    self._app.stop_session_pnl()
+                    self._pnl_req_id = None
+                    self._pnl_account = None
             try:
                 if self._app.isConnected():
                     self._app.disconnect()
@@ -1314,7 +1751,7 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             return bool(self._app.isConnected())
 
         def _next_request_id(self) -> int:
-            self._req_id += 1
+            self._req_id = next(_GLOBAL_REQUEST_ID)
             self._app.issue_request_id(self._req_id)
             return self._req_id
 
@@ -1366,31 +1803,28 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                 want="contract",
                 what="contract details",
             )
-            if not details:
-                return None
-            first = details[0]
-            resolved = getattr(first, "contract", None)
-            if resolved is None:
-                return None
-            return BrokerInstrument(
-                broker_instrument_ref=f"conid:{getattr(resolved, 'conId', 0)}",
-                symbol=str(getattr(resolved, "symbol", query.symbol)),
-                exchange=str(getattr(resolved, "exchange", contract.exchange)),
-                currency=str(getattr(resolved, "currency", contract.currency)),
-            )
+            return _resolve_one_contract(details, query, contract)
 
         def account_summary(self, account_id: str) -> Mapping[str, Decimal]:
+            # reqAccountSummary is a SUBSCRIPTION: cancel it in a finally, so a
+            # _collect timeout or error cannot orphan it at the gateway. The old
+            # shape cancelled only after a successful collect, so an incomplete
+            # observation left a live subscription behind.
             req_id = self._next_request_id()
-            self._app.reqAccountSummary(
-                req_id, "All", "NetLiquidation,TotalCashValue,BuyingPower"
-            )
-            rows = self._collect(
-                request_stream(req_id),
-                end_kind="account_end",
-                want="account",
-                what="account summary",
-            )
-            self._app.cancelAccountSummary(req_id)
+            stream = request_stream(req_id)
+            try:
+                self._app.reqAccountSummary(
+                    req_id, "All", "NetLiquidation,TotalCashValue,BuyingPower"
+                )
+                rows = self._collect(
+                    stream, end_kind="account_end", want="account", what="account summary"
+                )
+            finally:
+                try:
+                    self._app.cancelAccountSummary(req_id)
+                except Exception:  # noqa: BLE001 - best-effort unsubscribe
+                    pass
+                self._app.router.release(stream)
             values: dict[str, Decimal] = {}
             for row in rows:
                 account, tag, value = cast("tuple[str, str, str]", row)
@@ -1398,12 +1832,168 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                     values[tag] = Decimal(value)
             return values
 
-        def positions(self, account_id: str) -> tuple[BrokerPosition, ...]:
-            self._app.reqPositions()
-            rows = self._collect(
-                POSITIONS_STREAM, end_kind="position_end", want="position", what="positions"
+        def _ensure_session_pnl_subscription(
+            self, account_id: str
+        ) -> SessionPnlObservation | None:
+            """Start the persistent subscription ONCE. Returns an error
+            observation if it cannot be started, else None.
+
+            A P&L observation is never shared across accounts: if a caller asks
+            for a different account than the one this connection subscribed to,
+            fail closed rather than serve another account's number.
+            """
+            # Fast path: an established subscription needs no lock. A concurrent
+            # miss here simply enters the lock and re-checks -- double-checked
+            # locking, so exactly one reqPnL is ever created per connection.
+            if self._pnl_req_id is not None and self._pnl_account == account_id:
+                return None
+            with self._pnl_init_lock:
+                if self._pnl_account is not None and self._pnl_account != account_id:
+                    return SessionPnlObservation(
+                        SessionPnlStatus.REQUEST_ERROR,
+                        detail="session P&L subscription is bound to another account",
+                    )
+                if self._pnl_req_id is not None:
+                    return None  # another thread won the race; share it
+                req_id = self._next_request_id()
+                self._app.start_session_pnl(req_id)
+                try:
+                    self._app.reqPnL(req_id, account_id, "")
+                except Exception as error:  # noqa: BLE001 - sync failure
+                    # A synchronous reqPnL failure does NOT prove the request
+                    # never reached the gateway, so cleanup must assume it MAY
+                    # have: cancel best-effort before detaching. Local rollback
+                    # alone (stop_session_pnl) would leave a live broker
+                    # subscription that disconnect can never cancel, because
+                    # _pnl_req_id was never committed. Same ownership rule as
+                    # positions/market-data cleanup.
+                    try:
+                        self._app.cancelPnL(req_id)
+                    except Exception:  # noqa: BLE001 - best-effort
+                        pass
+                    self._app.stop_session_pnl()
+                    return SessionPnlObservation(
+                        SessionPnlStatus.REQUEST_ERROR,
+                        detail=f"reqPnL error ({type(error).__name__})",
+                    )
+                # Assign the account BEFORE the id: a lock-free fast-path reader
+                # that sees a committed _pnl_req_id then also sees its account,
+                # never a torn (id-set, account-still-None) pair.
+                self._pnl_account = account_id
+                self._pnl_req_id = req_id
+                return None
+
+        def session_pnl(self, account_id: str) -> SessionPnlObservation:
+            """Daily P&L from the connection's PERSISTENT ``reqPnL`` subscription.
+
+            reqPnL is a subscription that emits ~1/s. One is started per
+            connection and stays active; every ``get_account_snapshot`` consumes
+            the LATEST cached callback rather than subscribing and cancelling
+            again (the previous one-shot shape blocked each decision for the full
+            timeout, and the intermittent owner-host result was consistent with
+            that). The status distinguishes:
+
+            * OK -- a finite daily value observed within the freshness window;
+            * STALE -- a finite value, but its callback is older than the window
+              (the subscription has gone quiet); fails closed;
+            * TIMEOUT -- no callback has EVER arrived yet (not a permission fact);
+            * REQUEST_ERROR -- a request-scoped broker rejection (code only);
+            * UNSET -- a NaN or DBL_MAX (unset) callback.
+
+            Only OK carries a value; everything else is UNKNOWN, never zero. The
+            subscription is NOT cancelled here -- a later callback can make a
+            later snapshot OK -- and there is no busy-poll and no retry loop.
+            """
+            started = self._ensure_session_pnl_subscription(account_id)
+            if started is not None:
+                return started
+            # Wait, bounded, for the FIRST callback if none has arrived yet. Once
+            # one has, this returns immediately -- no per-call subscribe/cancel.
+            if not self._app._pnl_first_update.is_set():
+                self._app._pnl_first_update.wait(self._session_pnl_timeout)
+            return self._classify_session_pnl()
+
+        def _classify_session_pnl(self) -> SessionPnlObservation:
+            _active, daily, observed_monotonic, observed_at, error_code = (
+                self._app.session_pnl_state()
             )
-            self._app.cancelPositions()
+            if error_code is not None:
+                return SessionPnlObservation(
+                    SessionPnlStatus.REQUEST_ERROR,
+                    detail=f"reqPnL rejected (IBKR {error_code})",
+                    observed_at=observed_at,
+                )
+            if daily is None or observed_monotonic is None:
+                return SessionPnlObservation(
+                    SessionPnlStatus.TIMEOUT,
+                    detail=f"no reqPnL update within {self._session_pnl_timeout:g}s",
+                )
+            try:
+                value = Decimal(str(daily))
+            except (ArithmeticError, ValueError):
+                return SessionPnlObservation(
+                    SessionPnlStatus.UNSET,
+                    detail="reqPnL daily value not a number",
+                    observed_at=observed_at,
+                )
+            if not value.is_finite():
+                return SessionPnlObservation(
+                    SessionPnlStatus.UNSET,
+                    detail="reqPnL daily value not a number",
+                    observed_at=observed_at,
+                )
+            if abs(value) >= _UNSET_DOUBLE_THRESHOLD:
+                # IBKR renders an UNSET double field as DBL_MAX (~1.7977e308),
+                # which corresponds to an empty TWS cell -- NOT a real value.
+                # DBL_MAX is FINITE, so the is_finite check above passes it, and
+                # calling it P&L would hand the risk engine a vast positive
+                # number and make an UNKNOWN account look wildly profitable. It
+                # is the same sentinel _coerce_decimal already rejects for
+                # prices; here it becomes UNSET, never OK.
+                return SessionPnlObservation(
+                    SessionPnlStatus.UNSET,
+                    detail="reqPnL daily value unset (DBL_MAX)",
+                    observed_at=observed_at,
+                )
+            age = _monotonic() - observed_monotonic
+            if age > self._session_pnl_freshness:
+                # A finite value WAS observed, but the subscription has gone
+                # quiet. A stale value is not a current one, so it fails closed.
+                return SessionPnlObservation(
+                    SessionPnlStatus.STALE,
+                    detail=(
+                        f"reqPnL last update {age:.0f}s ago"
+                        f" (> {self._session_pnl_freshness:g}s)"
+                    ),
+                    observed_at=observed_at,
+                )
+            return SessionPnlObservation(
+                SessionPnlStatus.OK, value=value, observed_at=observed_at
+            )
+
+        def positions(self, account_id: str) -> tuple[BrokerPosition, ...]:
+            # reqPositionsMulti is REQUEST-SCOPED: a fresh id per observation, so
+            # each read routes to its own request_stream(req_id) -- a unique
+            # lifecycle key the router retires cleanly. The old global
+            # reqPositions used the fixed "positions" channel, which round 9
+            # retired after the FIRST read, so a SECOND read (independent
+            # portfolio evidence, then canonical evaluation) had its callbacks
+            # archived and timed out. Cleanup is ONE finally: a synchronous
+            # reqPositionsMulti failure does not prove nothing reached the
+            # gateway, so cancel and retire regardless.
+            req_id = self._next_request_id()
+            stream = request_stream(req_id)
+            try:
+                self._app.reqPositionsMulti(req_id, account_id, "")
+                rows = self._collect(
+                    stream, end_kind="position_end", want="position", what="positions"
+                )
+            finally:
+                try:
+                    self._app.cancelPositionsMulti(req_id)
+                except Exception:  # noqa: BLE001 - best-effort unsubscribe
+                    pass
+                self._app.router.release(stream)
             result: list[BrokerPosition] = []
             for row in rows:
                 account, contract, quantity, avg_cost = cast(
@@ -1427,9 +2017,25 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             return order_id
 
         def submit(self, broker_order_id: int, account_id: str, intent: OrderIntent) -> str:
+            # THE resolved security, by its broker id -- not a fresh
+            # STK/SMART/USD contract rebuilt from the ticker. Rebuilding it
+            # meant the security that was resolved, quoted, risked and
+            # authorized was not provably the security that was sent: IBKR
+            # re-resolved the string itself, at submission time, with no one
+            # comparing the two answers.
+            con_id = decode_instrument_ref(intent.broker_instrument_ref)
+            if con_id is None:
+                raise BrokerPortError(
+                    BrokerErrorCode.VALIDATION_FAILED,
+                    "the order carries no usable broker instrument reference;"
+                    " refusing to submit a contract rebuilt from a ticker",
+                )
             contract = Contract()
+            contract.conId = con_id
             contract.symbol = intent.symbol
             contract.secType = "STK"
+            # SMART routes the ORDER; conId identifies the SECURITY, and with a
+            # conId present IBKR does not have to guess which listing this is.
             contract.exchange = "SMART"
             contract.currency = "USD"
             # Translate + validate every outbound field BEFORE placeOrder. A
@@ -1474,6 +2080,14 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                     continue
                 snapshot[order_id] = RawOpenOrder(
                     broker_order_id=order_id,
+                    # The openOrder callback carries the Contract, so when IBKR
+                    # reports a usable conId the recovered order can name the
+                    # security it actually is. Empty when it does not -- absent
+                    # is absent, and a working order whose security cannot be
+                    # proven is reconciled rather than claimed.
+                    broker_instrument_ref=encode_instrument_ref(
+                        getattr(contract, "conId", None)
+                    ),
                     order_ref=str(getattr(order, "orderRef", "") or ""),
                     status=str(getattr(order_state, "status", "") or ""),
                     symbol=str(getattr(contract, "symbol", "") or ""),
@@ -1494,26 +2108,64 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             # cancels, replaces or modifies an order. It reports orders from
             # every API client and from the TWS/Gateway UI, so the adapter
             # treats it as evidence only, never as cancellation authority.
-            self._app.reqAllOpenOrders()
-            rows = self._collect(
-                OPEN_ORDERS_STREAM,
-                end_kind="open_order_end",
-                want="open_order",
-                what="open orders",
+            #
+            # Each snapshot gets a FRESH generation stream, so a second snapshot
+            # is never starved by the first's retirement (the same reusable-
+            # channel defect the positions path had). Cleanup is one finally.
+            rows = self._open_orders_snapshot(
+                self._app.reqAllOpenOrders, what="open orders"
             )
             return self._open_order_rows(account_id, rows)
+
+        def _open_orders_snapshot(
+            self, request: Callable[[], None], *, what: str
+        ) -> list[object]:
+            """Run ONE fail-closed open-order snapshot.
+
+            State machine: CLEAN -> ACTIVE -> (normal end) SUCCESS -> CLEAN, or
+            (timeout / synchronous failure / any incomplete lifecycle) ->
+            UNCERTAIN. In UNCERTAIN, no further snapshot is issued on this
+            transport until a reconnect, because reqAllOpenOrders/reqOpenOrders
+            carry no request id and a late callback from the incomplete snapshot
+            could otherwise be mistaken for a current one.
+            """
+            # The WHOLE lifecycle -- UNCERTAIN check, begin generation, request,
+            # collect, end/release, transition -- is serialised, so two
+            # snapshots can never be ACTIVE at once. Their callbacks carry no
+            # request id, so a second concurrent generation would let snapshot
+            # A's openOrder/openOrderEnd be routed into snapshot B. A concurrent
+            # second caller waits behind the first (one-request-at-a-time), then
+            # runs -- or, if the first left the lifecycle UNCERTAIN, fails closed
+            # here before issuing any broker request.
+            with self._open_orders_lock:
+                if self._open_orders_uncertain:
+                    raise BrokerPortError(
+                        BrokerErrorCode.BROKER_UNHEALTHY,
+                        "open-order snapshot lifecycle is UNCERTAIN after an"
+                        " incomplete snapshot; reconnect before another",
+                    )
+                stream = self._app.begin_open_orders_snapshot()
+                completed = False
+                try:
+                    request()
+                    rows = self._collect(
+                        stream, end_kind="open_order_end", want="open_order", what=what
+                    )
+                    completed = True
+                    return rows
+                finally:
+                    self._app.end_open_orders_snapshot(stream)
+                    if not completed:
+                        # Did NOT reach a provable normal end -> fail closed.
+                        self._open_orders_uncertain = True
 
         def same_client_open_orders(self, account_id: str) -> tuple[RawOpenOrder, ...]:
             # Read-only SAME-CLIENT feed: reqOpenOrders returns the orders bound
             # to this API client id, which is the only basis on which a
             # recovered order may become cancellable. Rows are additionally
             # filtered on the reported clientId (belt and braces).
-            self._app.reqOpenOrders()
-            rows = self._collect(
-                OPEN_ORDERS_STREAM,
-                end_kind="open_order_end",
-                want="open_order",
-                what="same-client open orders",
+            rows = self._open_orders_snapshot(
+                self._app.reqOpenOrders, what="same-client open orders"
             )
             return tuple(
                 row
@@ -1624,6 +2276,8 @@ __all__ = [
     "IbkrPaperAdapter",
     "OrderRefTooLongError",
     "OutgoingOrder",
+    "SESSION_PNL_FRESHNESS_SECONDS",
+    "SESSION_PNL_TIMEOUT_SECONDS",
     "PaperTransport",
     "RawOpenOrder",
     "RecoveredIdentity",
@@ -1633,6 +2287,8 @@ __all__ = [
     "classify_cancel_status",
     "classify_ibkr_order_error",
     "decode_order_ref",
+    "decode_instrument_ref",
+    "encode_instrument_ref",
     "encode_order_ref",
     "format_ibkr_error",
     "ibkr_order_type",

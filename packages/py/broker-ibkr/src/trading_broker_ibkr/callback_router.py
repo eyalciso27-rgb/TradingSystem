@@ -19,8 +19,16 @@ streams. A consumer only ever removes envelopes from ITS OWN stream, so:
 - a callback arriving while an unrelated request is in flight stays buffered
   for its real waiter (including one that has not started waiting yet);
 - releasing a finished waiter's stream is explicit and returns whatever was
-  still buffered, so a late broker event is archived rather than silently
-  dropped.
+  still buffered.
+
+**Loss guarantees, precisely.** Callbacks for an ACTIVE waiter stream are
+lossless: nothing is ever overwritten or dropped while a request is in flight.
+A callback that arrives for a RETIRED stream -- one whose waiter has already
+been released -- is moved to a BOUNDED diagnostic archive
+(``ARCHIVE_MEMORY`` entries) so it stays inspectable instead of recreating a
+live-looking waiter. That archive can evict its oldest entries once full; that
+eviction is diagnostic-only and can never affect an active request or a
+decision, because a retired stream has, by definition, no waiter.
 
 The router is deliberately transport-agnostic and free of any ``ibapi``
 import, so the demultiplexing logic is fully unit-testable without a broker.
@@ -47,6 +55,17 @@ POSITIONS_STREAM = "positions"
 #: attributed to a specific in-flight order or request. Never consumed by an
 #: operation waiter — it exists so diagnostics stay observable.
 DIAGNOSTICS_STREAM = "diagnostics"
+
+#: Most-recently-retired stream keys remembered, so a callback that arrives
+#: shortly after its waiter was released is archived rather than recreating a
+#: live-looking stream. Bounded: the router never grows an unbounded registry
+#: of every request id it has ever seen. A late callback beyond this window is
+#: rare (it would have to arrive after this many later requests) and, lacking a
+#: waiter, is inert either way.
+RETIRED_STREAM_MEMORY = 1024
+
+#: Cap on archived late callbacks kept for inspection. Generous but bounded.
+ARCHIVE_MEMORY = 4096
 
 
 def order_stream(broker_order_id: int) -> str:
@@ -93,27 +112,66 @@ class CallbackEnvelope:
 
 
 class CallbackRouter:
-    """Thread-safe, lossless demultiplexer of broker callbacks.
+    """Thread-safe demultiplexer of broker callbacks.
 
-    One publisher (the API reader thread) and one waiter per stream. Streams
-    are unbounded FIFOs: nothing is ever overwritten or dropped by the router
-    itself, and only ``release`` / ``drain`` remove envelopes.
+    One publisher (the API reader thread) and one waiter per stream. An ACTIVE
+    stream is an unbounded FIFO: nothing on it is overwritten or dropped, and
+    only ``release`` / ``drain`` remove its envelopes. A callback for a RETIRED
+    stream is diverted to a bounded diagnostic archive rather than buffered, so
+    a late callback cannot recreate a waiter for a request that is already over.
     """
 
     def __init__(self, *, monotonic: Callable[[], float] | None = None) -> None:
         self._condition = threading.Condition()
         self._streams: dict[str, deque[CallbackEnvelope]] = {}
-        self._archived: list[CallbackEnvelope] = []
+        # Both bounded, so the router's memory is lifecycle-owned rather than
+        # growing for the life of the process. Archived late callbacks stay
+        # inspectable up to a generous cap; the very oldest fall off first.
+        self._archived: deque[CallbackEnvelope] = deque(maxlen=ARCHIVE_MEMORY)
+        # Streams that have been released. A callback that arrives AFTER its
+        # waiter finished must NOT recreate a live-looking stream (publish used
+        # ``setdefault``), so it is archived instead. Bounded and in a fixed
+        # order, with a mirror set for O(1) lookup kept in step with the deque.
+        self._retired: deque[str] = deque(maxlen=RETIRED_STREAM_MEMORY)
+        self._retired_set: set[str] = set()
         self._monotonic = monotonic or time.monotonic
         self._closed = False
 
+    def _retire(self, stream: str) -> None:
+        """Record ``stream`` as retired, evicting the oldest if the cap is hit.
+
+        Called under the condition lock. Retirement is only correct for a stream
+        whose key is used ONCE: a unique lifecycle identity, never a fixed
+        reusable channel name. Every caller that releases a stream upholds this
+        by construction -- ``request:<id>`` and ``order:<id>`` are unique and
+        monotonic, positions use a fresh ``reqPositionsMulti`` request id per
+        read, and open-order snapshots use a fresh ``open-orders:<generation>``
+        per snapshot. A FIXED channel name (an earlier positions/open-orders
+        design) must NOT be released, because retiring it would starve the next
+        use -- so no reusable channel is ever passed here.
+        """
+        if stream in self._retired_set:
+            return
+        if len(self._retired) == self._retired.maxlen:
+            evicted = self._retired[0]  # about to be pushed out by the append
+            self._retired_set.discard(evicted)
+        self._retired.append(stream)
+        self._retired_set.add(stream)
+
     # -- producer side -------------------------------------------------------
     def publish(self, stream: str, kind: str, payload: object) -> None:
-        """Append one callback to its stream and wake any waiter."""
+        """Append one callback to its stream and wake any waiter.
+
+        A callback for a RETIRED stream -- one whose waiter has already been
+        released -- is archived, never buffered, so it can neither recreate a
+        live-looking waiter deque nor be mistaken for a current request's data.
+        """
         with self._condition:
-            self._streams.setdefault(stream, deque()).append(
-                CallbackEnvelope(stream=stream, kind=kind, payload=payload)
-            )
+            envelope = CallbackEnvelope(stream=stream, kind=kind, payload=payload)
+            if stream in self._retired_set:
+                self._archived.append(envelope)
+                return
+            self._streams.setdefault(stream, deque()).append(envelope)
             self._condition.notify_all()
 
     # -- consumer side -------------------------------------------------------
@@ -160,6 +218,7 @@ class CallbackRouter:
         """
         with self._condition:
             pending = self._streams.pop(stream, None)
+            self._retire(stream)
             if not pending:
                 return ()
             leftover = tuple(pending)
@@ -167,7 +226,12 @@ class CallbackRouter:
             return leftover
 
     def archived(self) -> tuple[CallbackEnvelope, ...]:
-        """Late callbacks retired by ``release`` — append-only, never dropped."""
+        """Late callbacks for retired streams, kept in a BOUNDED archive.
+
+        Retained for inspection up to ``ARCHIVE_MEMORY`` entries; once full, the
+        oldest are evicted. This is diagnostic only -- a retired stream has no
+        waiter, so an evicted entry can never affect a request or a decision.
+        """
         with self._condition:
             return tuple(self._archived)
 

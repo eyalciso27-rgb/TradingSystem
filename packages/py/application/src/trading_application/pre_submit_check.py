@@ -42,12 +42,26 @@ from datetime import datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
 
-from trading_contracts.enums import DecisionOutcome, Environment, RiskDecisionOutcome
+from trading_contracts.enums import (
+    DecisionOutcome,
+    Environment,
+    OrderType,
+    RiskDecisionOutcome,
+)
 
 from trading_application.decision_engine import EngineDecision
 from trading_application.emergency import EntryContext, HaltRecord, match_halt
+from trading_application.execution_identity import (
+    allocation_identity,
+    decision_identity,
+    plan_identity,
+    pre_submit_policy_identity,
+    risk_request_identity,
+    risk_result_identity,
+)
+from trading_application.execution_plan import ExecutablePlan
 from trading_application.portfolio_allocator import CandidateAllocation
-from trading_application.risk_engine import RiskResult
+from trading_application.risk_engine import RiskResult, TradeRiskRequest
 
 PRE_SUBMIT_VERSION = "pre-submit-check-1.0.0"
 
@@ -162,18 +176,86 @@ class PreSubmitRequest:
     allocation: CandidateAllocation
     risk_result: RiskResult
     decision: EngineDecision
+    risk_request: TradeRiskRequest
     symbol: str
     strategy_id: str
     source_id: str
     environment: Environment
     planned_entry_price: Decimal
     planned_stop_price: Decimal
+    #: The rest of the broker-bound order. These used to live outside the check
+    #: entirely: the service chose the side, account, order type and time in
+    #: force AFTER the authorization was minted, so the check could approve one
+    #: order while a different one was sent. They are inputs now, and the
+    #: authorized plan is sealed over them.
+    side: str
+    account_alias: str
+    order_type: OrderType
+    time_in_force: str
+    #: The broker-bound order id. Part of the order, therefore part of what is
+    #: checked and part of what is sealed.
+    client_order_id: str
+    #: The resolved security, opaque. Also part of the order: the check that
+    #: approves an entry must approve WHICH security is entered.
+    broker_instrument_ref: str
+    broker_exchange: str
+    broker_currency: str
 
     def __post_init__(self) -> None:
+        if not self.client_order_id.strip():
+            raise PreSubmitError("client_order_id is mandatory")
+        if not self.broker_instrument_ref.strip():
+            raise PreSubmitError(
+                "broker_instrument_ref is mandatory: a final pre-submit check"
+                " that cannot name the security is not a check"
+            )
         if self.planned_entry_price <= 0 or self.planned_stop_price <= 0:
             raise PreSubmitError("planned entry/stop prices must be positive")
         if self.planned_entry_price == self.planned_stop_price:
             raise PreSubmitError("planned stop must differ from entry")
+        # The allocation must belong to THIS decision and THIS risk evaluation.
+        # Taking its action and quantity on trust would let an allocation sized
+        # against a different decision -- or a different evaluation of the same
+        # decision -- authorize this one.
+        expected_decision = decision_identity(self.decision)
+        if self.allocation.decision_ref != expected_decision:
+            raise PreSubmitError(
+                f"the allocation names decision {self.allocation.decision_ref!r}"
+                f" but this request is for {expected_decision!r}"
+            )
+        if self.risk_result.decision_ref != expected_decision:
+            raise PreSubmitError(
+                f"the risk result names decision {self.risk_result.decision_ref!r}"
+                f" but this request is for {expected_decision!r}"
+            )
+        expected_risk = risk_result_identity(self.risk_result)
+        if self.allocation.risk_ref != expected_risk:
+            raise PreSubmitError(
+                "the allocation was sized against a different risk evaluation"
+                f" ({self.allocation.risk_ref!r} != {expected_risk!r})"
+            )
+        # The risk result must answer THE question this request describes. A
+        # result is a set of output numbers, and two different questions can
+        # produce identical numbers -- so without this, a risk evaluation of a
+        # different symbol, source or size could authorize this order purely
+        # because the figures happened to coincide.
+        expected_request = risk_request_identity(self.risk_request)
+        if self.risk_result.request_ref != expected_request:
+            raise PreSubmitError(
+                "the risk result answers a different risk request"
+                f" ({self.risk_result.request_ref!r} != {expected_request!r})"
+            )
+        for name, mine, theirs in (
+            ("symbol", self.symbol, self.risk_request.symbol),
+            ("strategy", self.strategy_id, self.risk_request.strategy_id),
+            ("source", self.source_id, self.risk_request.source_id),
+            ("environment", self.environment.value, self.risk_request.environment.value),
+        ):
+            if mine != theirs:
+                raise PreSubmitError(
+                    f"the risk request was evaluated for a different {name}"
+                    f" ({theirs!r} != {mine!r})"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +265,11 @@ class SubmitAuthorization:
     candidate_id: str
     authorized_quantity: Decimal
     authorized_at: datetime
+    #: The EXACT order this authorizes. Not a quantity that some later
+    #: component pairs with an order of its own choosing: an authorization
+    #: whose plan reference does not match the order being sent authorizes a
+    #: different order, which is to say it does not authorize this one.
+    plan_ref: str = ""
     note: str = "execution-agent-only; single-use; not a broker submission"
 
 
@@ -210,6 +297,10 @@ class PreSubmitCheckResult:
     checks: tuple[PreSubmitCheck, ...]
     reason_codes: tuple[str, ...]
     input_refs: tuple[str, ...]
+    #: The sealed order this result authorizes, and its identity. Present only
+    #: when an authorization was minted -- a CANCEL authorizes no plan at all.
+    authorized_plan: ExecutablePlan | None = None
+    plan_ref: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,12 +360,43 @@ class FinalPreSubmitCheck:
             result.action in (PreSubmitAction.ALLOW, PreSubmitAction.RESIZE)
             and result.authorized_quantity > 0
         ):
+            # THE seal, and the only place a sealed plan is ever built. It is
+            # constructed from the request that was just checked, using the
+            # quantity that was just authorized -- so what a later component
+            # sends cannot differ from what was checked without differing from
+            # this hash. A caller cannot supply a plan of its own, because a
+            # caller never constructs one.
+            plan = ExecutablePlan(
+                client_order_id=request.client_order_id,
+                broker_instrument_ref=request.broker_instrument_ref,
+                broker_exchange=request.broker_exchange,
+                broker_currency=request.broker_currency,
+                decision_ref=result.decision_ref,
+                risk_request_ref=request.risk_result.request_ref,
+                risk_ref=result.risk_ref,
+                allocation_ref=result.allocation_ref,
+                strategy_id=request.strategy_id,
+                source_id=request.source_id,
+                environment=request.environment,
+                account_alias=request.account_alias,
+                symbol=request.symbol,
+                side=request.side,
+                quantity=result.authorized_quantity,
+                order_type=request.order_type,
+                time_in_force=request.time_in_force,
+                limit_price=request.planned_entry_price,
+                stop_price=request.planned_stop_price,
+            )
+            sealed = plan_identity(plan)
             return replace(
                 result,
+                authorized_plan=plan,
+                plan_ref=sealed,
                 authorization=SubmitAuthorization(
                     candidate_id=result.candidate_id,
                     authorized_quantity=result.authorized_quantity,
                     authorized_at=as_of,
+                    plan_ref=sealed,
                 ),
             )
         return result
@@ -347,12 +469,20 @@ class FinalPreSubmitCheck:
                 action=action,
                 authorized_quantity=quantity,
                 authorization=None,
-                allocation_ref=(
-                    f"allocation:{allocation.candidate_id}@{allocation.action.value}"
-                ),
-                risk_ref=f"risk:{request.risk_result.outcome.value}",
-                decision_ref=request.decision.result.decision_hash,
-                policy_ref=f"pre-submit-policy:{policy.policy_version}",
+                # THE exact allocation, content-addressed. The candidate plus
+                # the action could never prove WHICH allocation this was sized
+                # against: many allocations for one candidate share an action.
+                allocation_ref=allocation_identity(allocation),
+                # The EXACT risk result, not merely its outcome: every
+                # approving evaluation in the system shares "risk:APPROVE", so
+                # that could never prove WHICH evaluation was authorized.
+                risk_ref=risk_result_identity(request.risk_result),
+                # The same decision reference the risk engine emits, so a
+                # consumer can actually compare them.
+                decision_ref=decision_identity(request.decision),
+                # The PRE-SUBMIT policy, in its own namespace. Never the risk
+                # policy: they govern different checks.
+                policy_ref=pre_submit_policy_identity(policy),
                 checks=tuple(checks),
                 reason_codes=tuple(dict.fromkeys(reasons)),
                 input_refs=tuple(allocation.input_refs),
@@ -562,6 +692,13 @@ class SingleUseAuthorization:
         self._authorization = authorization
         self._consumed = False
 
+    def peek(self) -> SubmitAuthorization:
+        """Read the wrapped authorization WITHOUT consuming the single use.
+
+        Verification must not spend the one use it is verifying.
+        """
+        return self._authorization
+
     def consume(self) -> SubmitAuthorization:
         if self._consumed:
             raise AuthorizationConsumedError(
@@ -571,8 +708,55 @@ class SingleUseAuthorization:
         return self._authorization
 
 
+def single_use_authorization(result: PreSubmitCheckResult) -> SingleUseAuthorization:
+    """Derive the single-use wrapper FROM the result that minted it.
+
+    ``AuthorizationDecision`` carries a ``PreSubmitCheckResult`` and a
+    ``SingleUseAuthorization``. Accepting those as two independently created
+    objects would let a buggy or malicious authority present a result approving
+    1 alongside an authorization for 10 — the consumer would check the result
+    and the agent would submit the authorization.
+
+    Deriving one from the other removes the gap: there is nothing to
+    substitute, because there is only one object.
+    """
+    if result.authorization is None:
+        raise PreSubmitError(
+            f"pre-submit result for {result.candidate_id!r} minted no"
+            f" authorization ({result.action.value}); there is nothing to consume"
+        )
+    return SingleUseAuthorization(result.authorization)
+
+
+def authorization_matches(
+    result: PreSubmitCheckResult, authorization: SingleUseAuthorization
+) -> str | None:
+    """Is this the authorization THAT result minted? A reason means no.
+
+    For callers that receive the pair rather than deriving it. Compares the
+    identity of the wrapped ``SubmitAuthorization`` against the result's own,
+    without consuming the single use.
+    """
+    if result.authorization is None:
+        return "the pre-submit result minted no authorization"
+    wrapped = authorization.peek()
+    if wrapped is not result.authorization and wrapped != result.authorization:
+        return (
+            "the single-use authorization does not wrap the SubmitAuthorization"
+            f" this pre-submit result minted (candidate {result.candidate_id!r})"
+        )
+    if wrapped.authorized_quantity != result.authorized_quantity:
+        return (
+            f"the authorization permits {wrapped.authorized_quantity} but the"
+            f" result authorized {result.authorized_quantity}"
+        )
+    return None
+
+
 __all__ = [
     "PRE_SUBMIT_VERSION",
+    "authorization_matches",
+    "single_use_authorization",
     "ApprovalState",
     "AuthorizationConsumedError",
     "ChangeAction",

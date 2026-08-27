@@ -41,6 +41,10 @@ from decimal import ROUND_FLOOR, Decimal
 
 from trading_contracts.enums import PortfolioAction, RiskDecisionOutcome
 
+from trading_application.execution_identity import (
+    portfolio_policy_identity,
+    risk_result_identity,
+)
 from trading_application.risk_engine import RiskResult
 
 ALLOCATOR_VERSION = "portfolio-allocator-1.0.0"
@@ -238,7 +242,7 @@ class PortfolioAllocator:
         # Return in the deterministic ranked order (stable, explainable).
         return AllocationPlan(
             as_of=as_of,
-            policy_ref=f"portfolio-policy:{policy.policy_version}",
+            policy_ref=portfolio_policy_identity(policy),
             allocator_version=ALLOCATOR_VERSION,
             allocations=tuple(allocations),
         )
@@ -304,9 +308,14 @@ class PortfolioAllocator:
                 allocated_quantity=quantity,
                 allocated_risk=allocated_risk,
                 allocated_notional=allocated_notional,
+                # Canonical lineage: the SAME decision reference the risk
+                # engine emits, the EXACT risk result (not its outcome, which
+                # every approving evaluation shares), and the portfolio policy
+                # by content. A downstream consumer can therefore verify that
+                # this allocation belongs to this decision and this evaluation.
                 decision_ref=risk.decision_ref,
-                risk_ref=f"risk:{risk.policy_ref}:{risk.outcome.value}",
-                policy_ref=f"portfolio-policy:{policy.policy_version}",
+                risk_ref=risk_result_identity(risk),
+                policy_ref=portfolio_policy_identity(policy),
                 caps_evaluated=tuple(caps),
                 reason_codes=tuple(dict.fromkeys(reasons)),
                 input_refs=tuple(risk.input_refs),

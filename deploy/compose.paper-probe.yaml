@@ -1,0 +1,45 @@
+# DIAGNOSTIC-ONLY override for the owner-safe execution probe (PAPER).
+#
+# Why this file exists
+# --------------------
+# The probe must run on the HOST: the IBKR paper adapter and the market-data
+# session both refuse any endpoint but 127.0.0.1:4002, and the Gateway runs on
+# the host. A container on the trading-paper network could reach PostgreSQL but
+# not the Gateway; a container on the host network could reach the Gateway but
+# not PostgreSQL, because the paper stack deliberately publishes no ports.
+#
+# So the probe needs the paper database reachable from the host, briefly, and
+# nothing more than that.
+#
+# What this does, and what it deliberately does not
+# -------------------------------------------------
+# Publishes PostgreSQL on the LOOPBACK interface only:
+#
+#     127.0.0.1:${PAPER_PROBE_DB_PORT:-55432} -> postgres:5432
+#
+# It is NOT 0.0.0.0 and it is NOT a public port. Nothing outside the host can
+# reach it, and it exists only while a probe run is in progress:
+# scripts/run_execution_probe_paper.sh brings it up and takes it down again.
+#
+# This file is never part of normal paper startup. Bringing the paper stack up
+# the documented way --
+#
+#     docker compose -f deploy/compose.yaml -f deploy/compose.paper.yaml up -d
+#
+# -- does not include it, so the database stays unreachable from the host during
+# normal operation. Adding it is an explicit, temporary, owner-invoked act.
+#
+# No credentials appear here. The PAPER_* variables come from the PAPER secret
+# store at deploy time exactly as compose.paper.yaml requires them.
+#
+# Usage (do not run by hand -- use the wrapper, which tears this down again):
+#   docker compose -f deploy/compose.yaml \
+#                  -f deploy/compose.paper.yaml \
+#                  -f deploy/compose.paper-probe.yaml up -d postgres
+
+services:
+  postgres:
+    ports:
+      # Loopback-bound on purpose. Removing "127.0.0.1:" would expose the paper
+      # database to the network; that is never correct for this file.
+      - "127.0.0.1:${PAPER_PROBE_DB_PORT:-55432}:5432"

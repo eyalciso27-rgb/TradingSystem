@@ -61,6 +61,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from trading_application.execution_identity import plan_identity
+from trading_application.execution_plan import ExecutablePlan
 from trading_application.owner_run_journal import (
     OwnerRunJournal,
     OwnerRunJournalError,
@@ -75,6 +77,7 @@ from trading_application.pre_submit_check import (
 )
 from trading_broker_core.port import (
     BrokerCapabilityMode,
+    BrokerInstrument,
     BrokerOrderEvent,
     BrokerOrderReceipt,
     BrokerPort,
@@ -628,6 +631,7 @@ class LifecycleReport:
 def _authorized_request(
     envelope: LifecycleEnvelope,
     *,
+    instrument: BrokerInstrument,
     client_order_id: str,
     order_type: OrderType,
     side: OrderSide,
@@ -648,10 +652,40 @@ def _authorized_request(
     the reason codes below say so.
     """
     candidate_id = f"{CLIENT_ORDER_PREFIX}:{client_order_id}"
+    # The SEALED order. The agent reads every order field from this plan and
+    # refuses to send anything whose identity does not match the pre-submit
+    # result and the single-use token, so the owner-confirmed envelope and the
+    # order that reaches the gateway cannot drift apart.
+    plan = ExecutablePlan(
+        client_order_id=client_order_id,
+        decision_ref="owner-run:owner-confirmed",
+        risk_request_ref="owner-run:poi-envelope-request",
+        risk_ref="owner-run:poi-envelope",
+        allocation_ref="owner-run:manual-minimal-size",
+        strategy_id="poi-ibkr-001-manual",
+        source_id="owner-manual",
+        environment=Environment.PAPER,
+        account_alias=envelope.account_alias,
+        symbol=envelope.symbol,
+        # The security the owner-confirmed envelope resolved through the
+        # broker. The harness resolves it before building the plan, so the
+        # order names a security rather than a ticker.
+        broker_instrument_ref=instrument.broker_instrument_ref,
+        broker_exchange=instrument.exchange,
+        broker_currency=instrument.currency,
+        side=side.value,
+        quantity=quantity,
+        order_type=order_type,
+        time_in_force=time_in_force.value,
+        limit_price=limit_price,
+        stop_price=stop_price,
+    )
+    sealed = plan_identity(plan)
     authorization = SubmitAuthorization(
         candidate_id=candidate_id,
         authorized_quantity=quantity,
         authorized_at=now,
+        plan_ref=sealed,
     )
     pre_submit = PreSubmitCheckResult(
         candidate_id=candidate_id,
@@ -684,22 +718,14 @@ def _authorized_request(
         ),
         reason_codes=("OWNER_CONFIRMED_POI_RUN", "NOT_AN_AUTOMATED_DECISION"),
         input_refs=(f"envelope:{envelope.scenario}",),
+        authorized_plan=plan,
+        plan_ref=sealed,
     )
     return ExecutionRequest(
-        client_order_id=client_order_id,
         correlation_id=correlation_id,
         pre_submit=pre_submit,
         authorization=SingleUseAuthorization(authorization),
-        environment=Environment.PAPER,
-        account_alias=envelope.account_alias,
-        symbol=envelope.symbol,
-        side=side,
-        order_type=order_type,
-        limit_price=limit_price,
-        stop_price=stop_price,
-        strategy_id="poi-ibkr-001-manual",
-        source_id="owner-manual",
-        time_in_force=time_in_force,
+        plan=plan,
     )
 
 
@@ -1235,6 +1261,9 @@ def _run_cancel_path(
 ) -> None:
     """Submit a non-marketable resting LIMIT, acknowledge, then cancel."""
     _record_intended_parameters(report, envelope)
+    # Resolve the SECURITY before building any order. A ticker is not a
+    # security, and the adapter refuses to submit an order that names one.
+    instrument = broker.resolve_instrument(InstrumentQuery(symbol=envelope.symbol))
     # LifecycleEnvelope already refused to construct without a reference
     # price and a limit far enough below it; this records the proof. Note the
     # claim: NON-MARKETABLE at the observed quote. A limit below the market
@@ -1265,6 +1294,7 @@ def _run_cancel_path(
     correlation_id = f"{CLIENT_ORDER_PREFIX}-cancel-{int(now.timestamp())}"
     request = _authorized_request(
         envelope,
+        instrument=instrument,
         client_order_id=envelope.client_order_id,
         order_type=OrderType.LIMIT,
         side=envelope.side,
@@ -1403,9 +1433,11 @@ def _run_fill_path(
 ) -> None:
     """Submit a marketable LIMIT, then protect the resulting position."""
     _record_intended_parameters(report, envelope)
+    instrument = broker.resolve_instrument(InstrumentQuery(symbol=envelope.symbol))
     correlation_id = f"{CLIENT_ORDER_PREFIX}-fill-{int(now.timestamp())}"
     request = _authorized_request(
         envelope,
+        instrument=instrument,
         client_order_id=envelope.client_order_id,
         order_type=OrderType.LIMIT,
         side=envelope.side,
@@ -1568,6 +1600,7 @@ def _run_fill_path(
         protective_id = f"{envelope.client_order_id}-{spec.spec_ref}"
         protective = _authorized_request(
             envelope,
+            instrument=instrument,
             client_order_id=protective_id,
             order_type=spec.order_type,
             side=spec.side,
@@ -2316,9 +2349,15 @@ def run_lifecycle(
         elif not execute:
             # What-if only. preview_order never places anything, and the
             # intent below is discarded — no authorization is ever minted.
+            what_if_instrument = broker.resolve_instrument(
+                InstrumentQuery(symbol=envelope.symbol)
+            )
             preview = broker.preview_order(
                 OrderIntent(
                     client_order_id=envelope.client_order_id,
+                    broker_instrument_ref=(
+                        what_if_instrument.broker_instrument_ref
+                    ),
                     authorization_ref="dry-run:what-if-only",
                     correlation_id=f"{CLIENT_ORDER_PREFIX}-dry-run",
                     environment=Environment.PAPER,

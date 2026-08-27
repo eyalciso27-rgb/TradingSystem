@@ -27,6 +27,7 @@ from trading_broker_core.port import (
     BrokerPosition,
     InstrumentQuery,
     OrderIntent,
+    SessionPnlObservation,
 )
 from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter, RawOpenOrder
 
@@ -48,6 +49,9 @@ class ExplodingTransport:
     def __init__(self, *, connect_ok: bool = True) -> None:
         self._connect_ok = connect_ok
         self.disconnected = False
+
+    def session_pnl(self, account_id: str) -> SessionPnlObservation:
+        raise RuntimeError("arbitrary SDK explosion")
 
     def connect(self, host: str, port: int, client_id: int) -> tuple[str, ...]:
         if not self._connect_ok:
@@ -103,6 +107,7 @@ READ_METHODS: tuple[tuple[str, Callable[[IbkrPaperAdapter], object]], ...] = (
     ("get_open_orders", lambda a: a.get_open_orders("paper-main")),
     ("get_positions", lambda a: a.get_positions("paper-main")),
     ("recover_cancellable_orders", lambda a: a.recover_cancellable_orders("paper-main")),
+    ("recover_working_orders", lambda a: a.recover_working_orders("paper-main")),
     ("reconcile", lambda a: a.reconcile("paper-main")),
 )
 

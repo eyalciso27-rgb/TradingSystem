@@ -593,6 +593,10 @@ dependencies = [
     { name = "trading-application" },
     { name = "trading-broker-core" },
     { name = "trading-broker-ibkr" },
+    { name = "trading-contracts" },
+    { name = "trading-market-data-core" },
+    { name = "trading-observability" },
+    { name = "trading-persistence" },
 ]
 
 [package.metadata]
@@ -600,6 +604,10 @@ requires-dist = [
     { name = "trading-application", editable = "packages/py/application" },
     { name = "trading-broker-core", editable = "packages/py/broker-core" },
     { name = "trading-broker-ibkr", editable = "packages/py/broker-ibkr" },
+    { name = "trading-contracts", editable = "packages/py/contracts" },
+    { name = "trading-market-data-core", editable = "packages/py/market-data-core" },
+    { name = "trading-observability", editable = "packages/py/observability" },
+    { name = "trading-persistence", editable = "packages/py/persistence" },
 ]
 
 [[package]]

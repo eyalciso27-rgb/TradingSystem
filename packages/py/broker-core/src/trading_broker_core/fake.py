@@ -35,6 +35,7 @@ from trading_broker_core.port import (
     OrderIntent,
     OrderPreview,
     ReconciliationResult,
+    RecoveredOrder,
 )
 
 FAKE_ORDER_REF_PREFIX = "FAKE-"
@@ -135,6 +136,18 @@ class FakeBroker:
         return tuple(
             receipt for receipt in self._orders.values() if receipt.state in open_states
         )
+
+    def recover_cancellable_orders(
+        self, account_alias: str
+    ) -> tuple[BrokerOrderReceipt, ...]:
+        """Same-client recovery. This fake owns everything it can see."""
+        return self.get_open_orders(account_alias)
+
+    def recover_working_orders(
+        self, account_alias: str
+    ) -> tuple[RecoveredOrder, ...]:
+        """Broker-observed working orders. This fake owns what it can see."""
+        return ()
 
     def preview_order(self, intent: OrderIntent) -> OrderPreview:
         self._require_ready()

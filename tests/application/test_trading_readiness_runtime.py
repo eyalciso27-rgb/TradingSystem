@@ -25,6 +25,7 @@ from trading_application.trading_readiness_runtime import (
     BrokerSessionState,
     ContractState,
     MarketDataRules,
+    MarketDataState,
     ProtectionState,
     QuoteState,
     RuntimeInputs,
@@ -46,6 +47,18 @@ from trading_market_data_core.trading_readiness import (
 
 NOW = datetime(2026, 8, 18, 15, 30, tzinfo=UTC)
 
+def _quote(*args: object, **kw: object) -> QuoteState:
+    """A quote that states its feed, because an unstated feed now blocks.
+
+    ``market_data_state`` defaults to UNKNOWN in production for exactly that
+    reason; these tests are about other properties, so they declare a healthy
+    realtime feed rather than silently relying on a default that must not exist.
+    """
+    kw.setdefault("market_data_state", MarketDataState.REALTIME)
+    return QuoteState(*args, **kw)  # type: ignore[arg-type]
+
+
+
 
 def _risk(
     outcome: RiskDecisionOutcome | str = RiskDecisionOutcome.APPROVE,
@@ -65,6 +78,7 @@ def _risk(
         max_loss_amount=Decimal("500"),
         risk_budget_equity=Decimal("100000"),
         decision_ref="decision-1",
+        request_ref="risk-request:AAPL@sha256:" + "1" * 64,
         policy_ref="policy-1",
         engine_version="test",
         checks=(),
@@ -102,7 +116,7 @@ def _inputs(**kw: object) -> RuntimeInputs:
             exchange="SMART", currency="USD",
         ),
         "tradability": TradabilityState(proven_tradable=True),
-        "quote": QuoteState(
+        "quote": _quote(
             bid=Decimal("100.00"), ask=Decimal("100.05"),
             observed_at=NOW - timedelta(seconds=1),
         ),
@@ -275,7 +289,7 @@ def test_tradability_defaults_to_nothing_at_all() -> None:
 
 def test_a_missing_quote_blocks() -> None:
     report = evaluate_runtime_readiness(
-        _inputs(quote=QuoteState(None, None, NOW - timedelta(seconds=1)))
+        _inputs(quote=_quote(None, None, NOW - timedelta(seconds=1)))
     )
     assert report.readiness is TradingReadiness.BLOCKED
     assert any("market_data_usable" in b for b in report.blockers)
@@ -284,7 +298,7 @@ def test_a_missing_quote_blocks() -> None:
 def test_a_stale_quote_blocks() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
-            quote=QuoteState(
+            quote=_quote(
                 Decimal("100"), Decimal("100.05"), NOW - timedelta(minutes=5)
             )
         )
@@ -295,7 +309,7 @@ def test_a_stale_quote_blocks() -> None:
 
 def test_a_quote_with_no_timestamp_blocks() -> None:
     report = evaluate_runtime_readiness(
-        _inputs(quote=QuoteState(Decimal("100"), Decimal("100.05"), None))
+        _inputs(quote=_quote(Decimal("100"), Decimal("100.05"), None))
     )
     assert report.readiness is TradingReadiness.BLOCKED
 
@@ -303,7 +317,7 @@ def test_a_quote_with_no_timestamp_blocks() -> None:
 def test_a_crossed_market_blocks_when_prohibited() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
-            quote=QuoteState(
+            quote=_quote(
                 Decimal("100.10"), Decimal("100.00"), NOW - timedelta(seconds=1)
             )
         )
@@ -315,7 +329,7 @@ def test_a_crossed_market_blocks_when_prohibited() -> None:
 def test_a_locked_market_blocks_when_prohibited() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
-            quote=QuoteState(Decimal("100"), Decimal("100"), NOW - timedelta(seconds=1))
+            quote=_quote(Decimal("100"), Decimal("100"), NOW - timedelta(seconds=1))
         )
     )
     assert report.readiness is TradingReadiness.BLOCKED
@@ -325,7 +339,7 @@ def test_a_locked_market_blocks_when_prohibited() -> None:
 def test_a_non_positive_quote_blocks() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
-            quote=QuoteState(Decimal("0"), Decimal("0.05"), NOW - timedelta(seconds=1))
+            quote=_quote(Decimal("0"), Decimal("0.05"), NOW - timedelta(seconds=1))
         )
     )
     assert report.readiness is TradingReadiness.BLOCKED
@@ -337,7 +351,7 @@ def test_a_non_positive_quote_blocks() -> None:
 def test_a_wide_spread_blocks_under_the_configured_rule() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
-            quote=QuoteState(
+            quote=_quote(
                 Decimal("100"), Decimal("105"), NOW - timedelta(seconds=1)
             )
         )
@@ -349,7 +363,7 @@ def test_a_wide_spread_blocks_under_the_configured_rule() -> None:
 def test_a_price_below_the_configured_minimum_blocks() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
-            quote=QuoteState(
+            quote=_quote(
                 Decimal("0.40"), Decimal("0.41"), NOW - timedelta(seconds=1)
             )
         )
@@ -362,7 +376,7 @@ def test_unset_rules_are_not_invented() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
             rules=MarketDataRules(),
-            quote=QuoteState(
+            quote=_quote(
                 Decimal("0.01"), Decimal("0.02"), NOW - timedelta(seconds=1)
             ),
         )
@@ -564,7 +578,7 @@ def test_a_configured_min_bid_size_is_actually_evaluated() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
             rules=MarketDataRules(min_bid_size=1000),
-            quote=QuoteState(
+            quote=_quote(
                 Decimal("100"), Decimal("100.05"), NOW - timedelta(seconds=1),
                 bid_size=10,
             ),
@@ -578,7 +592,7 @@ def test_an_unknown_bid_size_fails_a_configured_rule_closed() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
             rules=MarketDataRules(min_bid_size=100),
-            quote=QuoteState(
+            quote=_quote(
                 Decimal("100"), Decimal("100.05"), NOW - timedelta(seconds=1)
             ),
         )
@@ -591,7 +605,7 @@ def test_a_satisfied_bid_size_passes() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
             rules=MarketDataRules(min_bid_size=100),
-            quote=QuoteState(
+            quote=_quote(
                 Decimal("100"), Decimal("100.05"), NOW - timedelta(seconds=1),
                 bid_size=500,
             ),

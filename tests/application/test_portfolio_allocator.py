@@ -50,6 +50,7 @@ def risk_result(
         max_loss_amount=Decimal(quantity) * per_share_risk,
         risk_budget_equity=EQUITY,
         decision_ref="decision:d1@sha256:" + "a" * 64,
+        request_ref="risk-request:AAPL@sha256:" + "a" * 64,
         policy_ref="risk-policy:risk-policy-test-1",
         engine_version="risk-engine-1.0.0",
         checks=(),
@@ -318,8 +319,13 @@ def test_explanation_contains_full_trace() -> None:
     existing = position(risk="480", symbol="ZZZ", cluster="z")
     alloc = by_id(allocate((candidate("a"),), state(existing)), "a")
     assert alloc.decision_ref.startswith("decision:")
-    assert alloc.risk_ref.startswith("risk:")
-    assert alloc.policy_ref == "portfolio-policy:portfolio-policy-test-1"
+    # The EXACT risk evaluation, content-addressed. "risk:{policy}:{outcome}"
+    # was shared by every approving evaluation under one policy and could never
+    # prove which one an allocation was sized against.
+    assert alloc.risk_ref.startswith("risk-result:sha256:")
+    assert alloc.policy_ref.startswith("portfolio-policy:")
+    assert "@sha256:" in alloc.policy_ref, "policy identity is content-addressed"
+    assert alloc.policy_ref.startswith("portfolio-policy:portfolio-policy-test-1@sha256:")
     assert alloc.input_refs == ("observation:a-1@src-1",)
     names = [cap.name for cap in alloc.caps_evaluated]
     assert "risk_gate" in names and "total_portfolio_risk" in names

@@ -29,6 +29,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 from trading_contracts.enums import RiskDecisionOutcome
@@ -53,6 +54,11 @@ DEFAULT_MAX_QUOTE_AGE_SECONDS = 15.0
 
 #: A health observation older than this cannot prove the session is up NOW.
 DEFAULT_MAX_SESSION_AGE_SECONDS = 60.0
+
+#: Clock tolerance for a quote timestamped slightly ahead of us. Host and feed
+#: clocks disagree by milliseconds in practice; anything beyond this is not
+#: skew, it is a wrong timestamp, and pricing a decision on it is not safe.
+DEFAULT_MAX_QUOTE_FUTURE_SKEW_SECONDS = 2.0
 
 
 class RuntimeReadinessError(Exception):
@@ -122,6 +128,38 @@ class TradabilityState:
     detail: str = ""
 
 
+class MarketDataState(StrEnum):
+    """What the market-data feed is ACTUALLY serving, as the broker reports it.
+
+    IBKR answers a quote request with the data it is entitled to serve, which is
+    not always the data that was asked for: an account without a realtime
+    subscription silently receives delayed ticks. Collapsing that into "we got a
+    quote" is how a delayed price becomes a realtime decision, so the served
+    state is modelled explicitly and carried all the way to the gate.
+
+    ``UNKNOWN`` is not a mild case of ``REALTIME``. It means the feed never said
+    what it was serving, and it blocks.
+    """
+
+    REALTIME = "REALTIME"
+    DELAYED = "DELAYED"
+    FROZEN = "FROZEN"
+    DELAYED_FROZEN = "DELAYED_FROZEN"
+    UNAVAILABLE = "UNAVAILABLE"
+    UNKNOWN = "UNKNOWN"
+
+
+#: Which feed states may support a trading decision, per mode. Paper tolerates
+#: delayed data because its purpose is exercising the path; Live does not, and
+#: the difference is deliberate rather than incidental. Neither mode ever
+#: accepts UNKNOWN or UNAVAILABLE — a policy that admits "we do not know" is not
+#: a policy. Override per strategy through ``MarketDataRules``.
+DEFAULT_MARKET_DATA_POLICY: Mapping[TradingMode, tuple[MarketDataState, ...]] = {
+    TradingMode.PAPER: (MarketDataState.REALTIME, MarketDataState.DELAYED),
+    TradingMode.LIVE: (MarketDataState.REALTIME,),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class QuoteState:
     """A live quote observation. Absence and staleness are both failures."""
@@ -133,6 +171,10 @@ class QuoteState:
     #: never be silently ignored: an unknown size fails the rule closed.
     bid_size: int | None = None
     ask_size: int | None = None
+    #: What the feed said it was serving. Defaults to UNKNOWN, which blocks:
+    #: a quote whose provenance was never stated cannot be trusted to price a
+    #: decision, and a caller that forgets to set this must not get a pass.
+    market_data_state: MarketDataState = MarketDataState.UNKNOWN
     detail: str = ""
 
     @property
@@ -157,6 +199,13 @@ class MarketDataRules:
     min_bid_size: int | None = None
     allow_crossed_or_locked: bool = False
     max_quote_age_seconds: float = DEFAULT_MAX_QUOTE_AGE_SECONDS
+    #: Feed states this strategy accepts. ``None`` means "use the mode default"
+    #: (see DEFAULT_MARKET_DATA_POLICY); an EMPTY tuple accepts nothing and
+    #: blocks, which is the correct reading of a policy that permits no state.
+    allowed_market_data_states: tuple[MarketDataState, ...] | None = None
+    #: How far a quote observation may sit in the future before it is refused.
+    #: Small, non-zero: clocks drift, but a quote from the future is a bug.
+    max_quote_future_skew_seconds: float = DEFAULT_MAX_QUOTE_FUTURE_SKEW_SECONDS
     #: How old the broker health observation may be. Sourced from the canonical
     #: BrokerPort.health_check(), not invented per call site.
     max_session_age_seconds: float = DEFAULT_MAX_SESSION_AGE_SECONDS
@@ -380,11 +429,27 @@ def _gate_market_data(inputs: RuntimeInputs) -> GateOutcome:
     quote = inputs.quote
     rules = inputs.rules
     name = "market_data_usable"
+    allowed = (
+        rules.allowed_market_data_states
+        if rules.allowed_market_data_states is not None
+        else DEFAULT_MARKET_DATA_POLICY[inputs.mode]
+    )
+    if quote.market_data_state not in allowed:
+        return GateOutcome(
+            name, False,
+            f"market data is {quote.market_data_state.value}; {inputs.mode.value}"
+            f" accepts {[state.value for state in allowed]}",
+        )
     if quote.observed_at is None:
         return GateOutcome(name, False, "no quote observation time")
     age = (inputs.evaluated_at - quote.observed_at).total_seconds()
-    if age < 0:
-        return GateOutcome(name, False, "quote timestamp is in the future")
+    if age < -rules.max_quote_future_skew_seconds:
+        return GateOutcome(
+            name, False,
+            f"quote is timestamped {-age:.1f}s in the future, beyond the"
+            f" {rules.max_quote_future_skew_seconds}s clock tolerance",
+        )
+    age = max(age, 0.0)
     if age > rules.max_quote_age_seconds:
         return GateOutcome(
             name, False, f"quote is stale: {age:.1f}s > {rules.max_quote_age_seconds}s"
@@ -399,7 +464,11 @@ def _gate_market_data(inputs: RuntimeInputs) -> GateOutcome:
         return GateOutcome(name, False, "market is locked and locked markets are prohibited")
     if quote.midpoint is None or quote.midpoint <= 0:
         return GateOutcome(name, False, "midpoint is unusable")
-    return GateOutcome(name, True, f"bid={quote.bid} ask={quote.ask} age={age:.1f}s")
+    return GateOutcome(
+        name, True,
+        f"bid={quote.bid} ask={quote.ask} age={age:.1f}s"
+        f" feed={quote.market_data_state.value}",
+    )
 
 
 def _gate_price_spread_liquidity(inputs: RuntimeInputs) -> GateOutcome:
@@ -584,6 +653,7 @@ def evaluate_runtime_readiness(inputs: RuntimeInputs) -> TradingReadinessRuntime
         "quote_observed_at": (
             inputs.quote.observed_at.isoformat() if inputs.quote.observed_at else "none"
         ),
+        "market_data_state": inputs.quote.market_data_state.value,
     }
 
     return TradingReadinessRuntimeReport(
@@ -620,13 +690,20 @@ def within_freshness(observed_at: datetime | None, now: datetime, max_age: timed
 
 
 __all__ = [
+    "DEFAULT_MARKET_DATA_POLICY",
     "DEFAULT_MAX_QUOTE_AGE_SECONDS",
+    "DEFAULT_MAX_QUOTE_FUTURE_SKEW_SECONDS",
     "DEFAULT_MAX_SESSION_AGE_SECONDS",
     "RUNTIME_READINESS_VERSION",
     "AuditSink",
     "BrokerSessionState",
     "ContractState",
+    # The element type of TradingReadinessRuntimeReport.gates -- part of the
+    # report's public shape, so a caller reading gates should not have to reach
+    # for an unexported name.
+    "GateOutcome",
     "MarketDataRules",
+    "MarketDataState",
     "ProtectionState",
     "TradabilityState",
     "QuoteState",

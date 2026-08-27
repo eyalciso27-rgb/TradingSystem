@@ -3,10 +3,19 @@
 Provides ``create_session()`` for ``scripts/poi_ibkr_market_data_readonly.py``:
 a session object exposing exactly the harness allowlist — ``connect``,
 ``req_current_time``, ``req_account_summary``, ``resolve_contract``,
-``req_market_data``, ``disconnect`` — and nothing else. There is deliberately
-no order-placing, cancellation, modification or global-cancel surface here at
-all; this is a market-data pre-check, NOT the IMP-1002 adapter and NOT
-POI-IBKR-001 execution.
+``req_market_data``, ``disconnect`` — plus ONE addition for the canonical
+execution path, ``req_market_data_for_instrument``, which quotes a security by
+the broker's own resolved reference rather than by ticker. Nothing else. There
+is deliberately no order-placing, cancellation, modification or global-cancel
+surface here at all; this is a market-data pre-check, NOT the IMP-1002 adapter
+and NOT POI-IBKR-001 execution.
+
+The two market-data operations are not interchangeable. ``req_market_data``
+takes a ticker and predates contract resolution; it is kept for the read-only
+PoI tooling that still uses it. The execution path may only use
+``req_market_data_for_instrument``, because asking for a price by ticker after a
+security has been resolved lets IBKR resolve the string a second time, with
+nobody comparing the two answers.
 
 The shared safety gates are REUSED from the merged POI-IBKR-READONLY session
 (``_validate_endpoint``, ``mask_account_id``, ``PoiSessionError``,
@@ -85,6 +94,10 @@ class RawMarketDataClient(Protocol):
         self, symbol: str, requested_market_data_type: int = 1
     ) -> MarketDataQuote: ...
 
+    def market_data_for_instrument(
+        self, broker_instrument_ref: str, requested_market_data_type: int = 1
+    ) -> MarketDataQuote: ...
+
     def close(self) -> None: ...
 
 
@@ -132,9 +145,29 @@ class IbkrMarketDataSession:
     def req_market_data(
         self, symbol: str, requested_market_data_type: int = 1
     ) -> MarketDataQuote:
+        """Ticker-shaped, read-only. Kept for the PoI tooling that predates
+        contract resolution; the execution path uses
+        ``req_market_data_for_instrument``.
+        """
         self._require_connected()
         return self._guarded(
             lambda: self._client.market_data(symbol, requested_market_data_type)
+        )
+
+    def req_market_data_for_instrument(
+        self, broker_instrument_ref: str, requested_market_data_type: int = 1
+    ) -> MarketDataQuote:
+        """A quote for THE resolved security, by its opaque reference.
+
+        The execution path's only market-data operation. The reference is
+        decoded inside the raw client; an unusable one raises there, before any
+        request reaches the gateway.
+        """
+        self._require_connected()
+        return self._guarded(
+            lambda: self._client.market_data_for_instrument(
+                broker_instrument_ref, requested_market_data_type
+            )
         )
 
     def disconnect(self) -> None:

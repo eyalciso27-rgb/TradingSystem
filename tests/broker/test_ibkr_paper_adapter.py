@@ -25,6 +25,8 @@ from trading_broker_core.port import (
     InstrumentQuery,
     OrderIntent,
     OrderSide,
+    SessionPnlObservation,
+    SessionPnlStatus,
     TimeInForce,
 )
 from trading_broker_ibkr.paper_adapter import (
@@ -60,8 +62,16 @@ class FakePaperTransport:
         healthy: bool = True,
         submit_status: str = "Submitted",
         cancel_status: str = "Cancelled",
+        daily_pnl: Decimal | None = None,
     ) -> None:
         self.calls: list[str] = []
+        #: Every OrderIntent this transport was actually handed. The call
+        #: log records that a submit happened; this records WHAT was sent,
+        #: which is what a seal test has to compare against.
+        self.submitted_intents: list[OrderIntent] = []
+        #: What reqPnL would answer. None (the default) means the gateway does
+        #: not serve one, which is the common real case.
+        self.daily_pnl = daily_pnl
         self._managed = managed
         self._healthy = healthy
         self._submit_status = submit_status
@@ -107,6 +117,20 @@ class FakePaperTransport:
             currency="USD",
         )
 
+    def session_pnl(self, account_id: str) -> SessionPnlObservation:
+        """The daily P&L observation a gateway would serve through reqPnL.
+
+        The default is a bounded TIMEOUT because it is the honest one: absence
+        of an update is not a flat day and not a permission fact. A configured
+        ``daily_pnl`` is served as OK.
+        """
+        self.calls.append("session_pnl")
+        if self.daily_pnl is None:
+            return SessionPnlObservation(
+                SessionPnlStatus.TIMEOUT, detail="no reqPnL update (fake)"
+            )
+        return SessionPnlObservation(SessionPnlStatus.OK, value=self.daily_pnl)
+
     def account_summary(self, account_id: str) -> Mapping[str, Decimal]:
         self.calls.append(f"summary:{mask_account_id(account_id)}")
         return {
@@ -127,6 +151,7 @@ class FakePaperTransport:
 
     def submit(self, broker_order_id: int, account_id: str, intent: OrderIntent) -> str:
         self.calls.append(f"submit:{broker_order_id}:{intent.client_order_id}")
+        self.submitted_intents.append(intent)
         # Faithfully round-trip the orderRef codec so the snapshot can recover
         # the client_order_id after a "restart" (a fresh adapter instance).
         self._live[broker_order_id] = RawOpenOrder(
@@ -217,6 +242,9 @@ def make_intent(client_order_id: str = "ord-1", **overrides: Any) -> OrderIntent
         "environment": Environment.PAPER,
         "account_alias": "paper-main",
         "symbol": "AAPL",
+        # The SECURITY the broker resolved. An order that names only a ticker
+        # is refused by the port now, which is the point.
+        "broker_instrument_ref": "conid:265598",
         "side": OrderSide.BUY,
         "order_type": OrderType.LIMIT,
         "quantity": Decimal("100"),
@@ -790,3 +818,104 @@ def test_protective_stop_gtc_outgoing_fields() -> None:
 def test_day_and_gtc_are_both_supported_and_distinct() -> None:
     assert ibkr_time_in_force(TimeInForce.DAY) == "DAY"
     assert ibkr_time_in_force(TimeInForce.GTC) == "GTC"
+
+
+# == the IBKR max-double sentinel never becomes a P&L value ==================
+
+
+def test_a_max_double_session_pnl_is_none_and_unset_through_the_snapshot() -> None:
+    """A DBL_MAX 'value' must not reach AccountSnapshot as a number.
+
+    DBL_MAX is finite, so a naive is_finite check would pass it. The adapter
+    downgrades it to UNSET, and the snapshot carries None -- so the risk engine,
+    which reads only the value, cannot see a vast fabricated profit."""
+    import sys
+
+    transport = FakePaperTransport(daily_pnl=Decimal(str(sys.float_info.max)))
+    adapter = make_adapter(transport)
+    adapter.connect()
+
+    snapshot = adapter.get_account_snapshot("paper-main")
+
+    assert snapshot.session_pnl is None
+    assert snapshot.session_pnl_status is SessionPnlStatus.UNSET
+
+
+def test_a_finite_session_pnl_reaches_the_snapshot_as_ok() -> None:
+    transport = FakePaperTransport(daily_pnl=Decimal("-125.50"))
+    adapter = make_adapter(transport)
+    adapter.connect()
+
+    snapshot = adapter.get_account_snapshot("paper-main")
+
+    assert snapshot.session_pnl == Decimal("-125.50")
+    assert snapshot.session_pnl_status is SessionPnlStatus.OK
+
+
+def test_a_request_error_detail_reaches_the_snapshot_safely() -> None:
+    """The safe code-only detail is propagated for the owner probe to render."""
+    from trading_broker_core.port import SessionPnlObservation
+
+    class _RejectingTransport(FakePaperTransport):
+        def session_pnl(self, account_id: str) -> SessionPnlObservation:
+            self.calls.append("session_pnl")
+            return SessionPnlObservation(
+                SessionPnlStatus.REQUEST_ERROR, detail="reqPnL rejected (IBKR 321)"
+            )
+
+    adapter = make_adapter(_RejectingTransport())
+    adapter.connect()
+
+    snapshot = adapter.get_account_snapshot("paper-main")
+
+    assert snapshot.session_pnl is None
+    assert snapshot.session_pnl_status is SessionPnlStatus.REQUEST_ERROR
+    assert snapshot.session_pnl_detail == "reqPnL rejected (IBKR 321)"
+
+
+# == adversarial: one live connection per adapter; reconnect is a new transport ==
+
+
+def test_a_second_connect_is_refused_and_does_not_orphan_the_first() -> None:
+    """connect() builds a fresh transport, so a second connect without a
+    disconnect would orphan the first (and its live reqPnL subscription).
+    It must be refused, and no second transport built."""
+    built: list[FakePaperTransport] = []
+
+    def factory() -> FakePaperTransport:
+        t = FakePaperTransport()
+        built.append(t)
+        return t
+
+    adapter = IbkrPaperAdapter(
+        factory, account_aliases=dict(ALIASES), host="127.0.0.1", port=4002,
+        clock=deterministic_clock(),
+    )
+    adapter.connect()
+
+    with pytest.raises(BrokerPortError, match="already connected"):
+        adapter.connect()
+
+    assert len(built) == 1, "a second transport was built (orphaning the first)"
+
+
+def test_reconnect_builds_a_brand_new_transport() -> None:
+    """disconnect then connect must construct a NEW transport, so no stale P&L
+    cache / open-order latch / issued ids carry into the new connection."""
+    built: list[FakePaperTransport] = []
+
+    def factory() -> FakePaperTransport:
+        t = FakePaperTransport()
+        built.append(t)
+        return t
+
+    adapter = IbkrPaperAdapter(
+        factory, account_aliases=dict(ALIASES), host="127.0.0.1", port=4002,
+        clock=deterministic_clock(),
+    )
+    adapter.connect()
+    adapter.disconnect()
+    adapter.connect()
+
+    assert len(built) == 2, "reconnect reused the old transport"
+    assert built[0] is not built[1]

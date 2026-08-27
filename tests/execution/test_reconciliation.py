@@ -69,6 +69,7 @@ def submit(broker: FakeBroker, client_order_id: str) -> None:
             environment=Environment.PAPER,
             account_alias="paper-main",
             symbol="AAPL",
+            broker_instrument_ref="conid:265598",
             side=OrderSide.BUY,
             order_type=OrderType.LIMIT,
             quantity=Decimal("100"),

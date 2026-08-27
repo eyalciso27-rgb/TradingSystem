@@ -41,6 +41,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from trading_application.execution_identity import plan_identity
+from trading_application.execution_plan import ExecutablePlan
 from trading_application.pre_submit_check import (
     PreSubmitAction,
     PreSubmitCheckResult,
@@ -139,11 +141,36 @@ class LifecycleDrill:
         quantity: str = "1",
     ) -> ExecutionRequest:
         allow = pre_submit_action in (PreSubmitAction.ALLOW, PreSubmitAction.RESIZE)
+        # The SEALED order. Every order field the agent sends is read from it,
+        # and its identity has to match both the result and the token.
+        plan = ExecutablePlan(
+            client_order_id=client_order_id,
+            decision_ref="decision:d1@sha256:" + "c" * 64,
+            risk_request_ref="risk-request:AAPL@sha256:" + "c" * 64,
+            risk_ref="risk-result:sha256:" + "c" * 64,
+            allocation_ref=f"allocation:cand-{client_order_id}@sha256:" + "c" * 64,
+            strategy_id="strat-1",
+            source_id="src-1",
+            environment=Environment.PAPER,
+            account_alias="paper-main",
+            symbol="AAPL",
+            broker_instrument_ref="conid:265598",
+            broker_exchange="SMART",
+            broker_currency="USD",
+            side=OrderSide.BUY.value,
+            quantity=Decimal(quantity),
+            order_type=OrderType.LIMIT,
+            time_in_force="DAY",
+            limit_price=Decimal("10"),
+            stop_price=None,
+        )
+        sealed = plan_identity(plan)
         authorization = (
             SubmitAuthorization(
                 candidate_id=f"cand-{client_order_id}",
                 authorized_quantity=Decimal(quantity),
                 authorized_at=AS_OF,
+                plan_ref=sealed,
             )
             if owner_approved and allow
             else None
@@ -160,21 +187,14 @@ class LifecycleDrill:
             checks=(),
             reason_codes=("PRE_SUBMIT_CLEARED",) if allow else ("PRE_SUBMIT_CANCELLED",),
             input_refs=("observation:a-1@src-1",),
+            authorized_plan=plan if authorization else None,
+            plan_ref=sealed if authorization else "",
         )
         return ExecutionRequest(
-            client_order_id=client_order_id,
             correlation_id=f"corr-{client_order_id}",
             pre_submit=pre_submit,
             authorization=SingleUseAuthorization(authorization) if authorization else None,
-            environment=Environment.PAPER,
-            account_alias="paper-main",
-            symbol="AAPL",
-            side=OrderSide.BUY,
-            order_type=OrderType.LIMIT,
-            limit_price=Decimal("10"),
-            stop_price=None,
-            strategy_id="strat-1",
-            source_id="src-1",
+            plan=plan,
         )
 
     def fill(

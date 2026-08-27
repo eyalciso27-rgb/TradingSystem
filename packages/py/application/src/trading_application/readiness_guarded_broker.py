@@ -30,7 +30,8 @@ The order of operations closes the audit race:
 A blocked decision is still persisted — a refusal is a decision worth auditing —
 and a persistence failure blocks submission rather than proceeding unrecorded.
 Because the record is written before submission and ``client_order_id`` is the
-broker's idempotency key, an audit retry cannot cause a double submission.
+canonical idempotency key -- which the ADAPTER honours, not the broker --
+an audit retry cannot cause a double submission.
 
 **Readiness is not authorization.** Passing this guard does not authorize Paper
 Auto or Live; those prohibitions are separate and unchanged.
@@ -59,8 +60,9 @@ from trading_broker_core.port import (
     OrderIntent,
     OrderPreview,
     ReconciliationResult,
+    RecoveredOrder,
 )
-from trading_contracts.enums import Environment, OrderType
+from trading_contracts.enums import Environment
 from trading_market_data_core.trading_readiness import (
     StrategyDataRequirements,
     TradingMode,
@@ -113,9 +115,54 @@ class AuditPersistenceError(Exception):
 
 @runtime_checkable
 class QuoteSource(Protocol):
-    """The canonical live-quote surface for the symbol being submitted."""
+    """The canonical live-quote surface for the SECURITY being submitted.
 
-    def current_quote(self, symbol: str) -> QuoteState: ...
+    It used to take a ticker. That meant the quote was attributable to whatever
+    the market-data feed resolved the string to, which is not necessarily the
+    instrument the contract resolver returned -- so a price could belong to one
+    listing while the order belonged to another, and nothing compared them.
+
+    It now takes the resolved ``BrokerInstrument``, so the quote is attributable
+    to the exact security. An implementation may interpret its own opaque
+    reference; it must not re-resolve the ticker into a different instrument.
+    """
+
+    def current_quote(self, instrument: BrokerInstrument) -> QuoteState: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectionEvidence:
+    """Proof that the broker will actually hold protection for this entry.
+
+    Evidence, not capability. A capability flag says the broker *could* accept
+    a protective order if one were sent; it says nothing about one existing. The
+    distinction is the whole safety property, so this carries the broker's own
+    references to the protective orders involved and is refused without them.
+    """
+
+    #: The lifecycle established (or will atomically establish) real
+    #: broker-resident protection for this entry.
+    established: bool
+    #: What actually does it: "native-bracket", "oca-group", "resting-stop"...
+    mechanism: str = ""
+    #: Broker-side references for the protective order(s). REQUIRED when
+    #: ``established`` is True: a mechanism with nothing to point at is a
+    #: promise, not protection.
+    protective_order_refs: tuple[str, ...] = ()
+    detail: str = ""
+
+
+@runtime_checkable
+class ProtectedEntryLifecycle(Protocol):
+    """The authority that can establish broker-resident protection.
+
+    There is deliberately no default implementation. A guard with no lifecycle
+    cannot prove protection and therefore refuses when protection is required —
+    which is the correct answer today, because no adapter in this repository can
+    establish protection atomically with an entry.
+    """
+
+    def protection_for(self, intent: OrderIntent) -> ProtectionEvidence: ...
 
 
 @runtime_checkable
@@ -169,6 +216,7 @@ class ReadinessGuardedBroker:
         quotes: QuoteSource,
         risk: RiskSource,
         audit: AuditSink,
+        protection: ProtectedEntryLifecycle | None = None,
         universe_status: Callable[[], UniverseListStatus | None] | None = None,
         gics_sector: Callable[[str], str | None] | None = None,
         pit_membership_available: bool = False,
@@ -179,6 +227,9 @@ class ReadinessGuardedBroker:
         self._quotes = quotes
         self._risk = risk
         self._audit = audit
+        # None means protection cannot be proven -- and therefore cannot pass
+        # when it is required. There is no production implementation yet.
+        self._protection = protection
         self._universe_status = universe_status
         self._gics_sector = gics_sector
         self._pit_membership_available = pit_membership_available
@@ -230,6 +281,32 @@ class ReadinessGuardedBroker:
             detail=health.detail,
         )
 
+    def _quote_for(self, intent: OrderIntent, contract: ContractState) -> QuoteState:
+        """Quote the security this boundary just resolved, or nothing.
+
+        An unresolved contract has no security to quote, and quoting the ticker
+        instead would produce a price for something we have not identified.
+        """
+        if not contract.resolved or not contract.broker_instrument_ref:
+            return QuoteState(
+                bid=None, ask=None, observed_at=None,
+                detail="no resolved security to quote",
+            )
+        try:
+            return self._quotes.current_quote(
+                BrokerInstrument(
+                    broker_instrument_ref=contract.broker_instrument_ref,
+                    symbol=contract.symbol or intent.symbol,
+                    exchange=contract.exchange or "",
+                    currency=contract.currency or "",
+                )
+            )
+        except Exception as error:  # noqa: BLE001
+            return QuoteState(
+                bid=None, ask=None, observed_at=None,
+                detail=f"quote source raised {type(error).__name__}",
+            )
+
     def _observe_contract(self, intent: OrderIntent) -> ContractState:
         """Resolve the instrument through the broker's own resolver.
 
@@ -253,13 +330,33 @@ class ReadinessGuardedBroker:
                 exchange=None, currency=None,
                 detail=f"resolve_instrument raised {type(error).__name__}",
             )
+        if instrument.broker_instrument_ref != intent.broker_instrument_ref:
+            # THE just-in-time security check. The boundary re-resolves, and the
+            # security it resolves NOW must be the security this order was
+            # authorized for. Same ticker, different instrument -- a share class,
+            # a second listing, a re-used symbol after a corporate action -- is a
+            # different security, and the authorization does not cover it.
+            return ContractState(
+                resolved=False,
+                broker_instrument_ref=None,
+                symbol=instrument.symbol or None,
+                exchange=instrument.exchange or None,
+                currency=instrument.currency or None,
+                detail=(
+                    "the security resolved at the submission boundary is NOT the"
+                    " security this order was authorized for"
+                    f" ({instrument.broker_instrument_ref!r} !="
+                    f" {intent.broker_instrument_ref!r}); a ticker is not a"
+                    " security identity"
+                ),
+            )
         return ContractState(
             resolved=bool(instrument.broker_instrument_ref),
             broker_instrument_ref=instrument.broker_instrument_ref or None,
             symbol=instrument.symbol or None,
             exchange=instrument.exchange or None,
             currency=instrument.currency or None,
-            detail="resolved by the broker",
+            detail="resolved by the broker, and it is the authorized security",
         )
 
     def _observe_tradability(self, intent: OrderIntent) -> TradabilityState:
@@ -304,21 +401,56 @@ class ReadinessGuardedBroker:
         return TradabilityState(proven_tradable=True, detail=detail)
 
     def _observe_protection(self, intent: OrderIntent) -> ProtectionState:
-        """Broker capability AND the plan's own protective stop."""
-        supported = False
-        detail = ""
-        try:
-            mode = self._broker.capabilities().order_types.get(OrderType.STOP)
-            supported = mode in (
-                BrokerCapabilityMode.NATIVE, BrokerCapabilityMode.EMULATED
-            )
-            detail = f"STOP capability: {mode}"
-        except Exception as error:  # noqa: BLE001
-            detail = f"capabilities raised {type(error).__name__}"
-        # The intent itself must carry the protective level.
+        """Protection is PROVEN by a lifecycle, never inferred from a flag.
+
+        This used to read "the broker supports STOP orders" plus "the intent
+        carries a stop price" as broker-side protection. Both are true of an
+        entry that goes out completely unprotected: the order is a single LIMIT
+        whose stop price becomes that order's aux price, and a supported order
+        TYPE is a statement about what the broker would accept, not about what
+        it holds.
+
+        So the flag is gone. Evidence comes from a ``ProtectedEntryLifecycle``
+        that can actually establish broker-resident protection, and it must
+        name the protective order(s) it established. No lifecycle, no evidence,
+        no references -> not protected. Since no adapter here can do this today,
+        a protection-required entry is refused at this boundary, which is the
+        intended architecture (ADR-0018, option B).
+        """
+        # The plan must still carry the protective level -- necessary, and
+        # nowhere near sufficient.
         has_stop = intent.stop_price is not None and intent.stop_price > 0
+
+        if self._protection is None:
+            return ProtectionState(
+                protective_order_supported=False,
+                plan_has_protective_stop=has_stop,
+                protection_required=self._config.protection_required,
+                detail=(
+                    "no protected-entry lifecycle is wired, so broker-side"
+                    " protection cannot be established or proven; a supported"
+                    " STOP order type is not a resting protective order"
+                ),
+            )
+        try:
+            evidence = self._protection.protection_for(intent)
+        except Exception as error:  # noqa: BLE001 - unproven is unprotected
+            return ProtectionState(
+                protective_order_supported=False,
+                plan_has_protective_stop=has_stop,
+                protection_required=self._config.protection_required,
+                detail=f"protection lifecycle raised {type(error).__name__}",
+            )
+        # Established WITHOUT a broker reference is a promise, not protection.
+        proven = bool(evidence.established and evidence.protective_order_refs)
+        detail = evidence.detail or (
+            f"protection via {evidence.mechanism}:"
+            f" {list(evidence.protective_order_refs)}"
+            if proven
+            else "the lifecycle established no broker-resident protection"
+        )
         return ProtectionState(
-            protective_order_supported=supported,
+            protective_order_supported=proven,
             plan_has_protective_stop=has_stop,
             protection_required=self._config.protection_required,
             detail=detail,
@@ -331,19 +463,16 @@ class ReadinessGuardedBroker:
         contract, tradability, quote, risk verdict, protection and audit sink
         are all read from the components that own them.
         """
-        symbol = intent.symbol
-        try:
-            quote = self._quotes.current_quote(symbol)
-        except Exception as error:  # noqa: BLE001
-            quote = QuoteState(
-                bid=None, ask=None, observed_at=None,
-                detail=f"quote source raised {type(error).__name__}",
-            )
+        # The contract is resolved FIRST, because the quote is now asked for
+        # the resolved security rather than the ticker -- and because the
+        # security this boundary resolves must be the security the order names.
+        contract = self._observe_contract(intent)
+        quote = self._quote_for(intent, contract)
         return RuntimeInputs(
             mode=self._config.mode,
             requirements=self._config.requirements,
             broker=self._observe_session(),
-            contract=self._observe_contract(intent),
+            contract=contract,
             tradability=self._observe_tradability(intent),
             quote=quote,
             rules=self._config.rules,
@@ -352,10 +481,12 @@ class ReadinessGuardedBroker:
             audit=self._audit,
             evaluated_at=self._now(),
             universe_status=self._universe_status() if self._universe_status else None,
-            gics_sector=self._gics_sector(symbol) if self._gics_sector else None,
+            gics_sector=(
+                self._gics_sector(intent.symbol) if self._gics_sector else None
+            ),
             pit_membership_available=self._pit_membership_available,
             expected_account_alias=self._config.account_alias,
-            expected_symbol=symbol,
+            expected_symbol=intent.symbol,
             allowed_currencies=self._config.allowed_currencies,
             allowed_exchanges=self._config.allowed_exchanges,
         )
@@ -383,6 +514,17 @@ class ReadinessGuardedBroker:
                 " unrecorded order"
             )
         return str(reference)
+
+    def evaluate_readiness(self, intent: OrderIntent) -> TradingReadinessRuntimeReport:
+        """Observe and report, WITHOUT persisting or submitting anything.
+
+        Exists so an operator probe reads the same observations the gate will
+        use, rather than a parallel re-implementation that could drift from it.
+        It is explicitly NOT the check: ``submit_order`` evaluates again at the
+        boundary, because a report computed a second ago describes a market that
+        has already moved on.
+        """
+        return evaluate_runtime_readiness(self._build_inputs(intent))
 
     def submit_order(self, intent: OrderIntent) -> BrokerOrderReceipt:
         """THE gate. Readiness, then audit, then — only then — the broker."""
@@ -427,6 +569,18 @@ class ReadinessGuardedBroker:
     def get_open_orders(self, account_alias: str) -> tuple[BrokerOrderReceipt, ...]:
         return self._broker.get_open_orders(account_alias)
 
+    def recover_cancellable_orders(
+        self, account_alias: str
+    ) -> tuple[BrokerOrderReceipt, ...]:
+        """Never gated: recovering what already exists reduces uncertainty."""
+        return self._broker.recover_cancellable_orders(account_alias)
+
+    def recover_working_orders(
+        self, account_alias: str
+    ) -> tuple[RecoveredOrder, ...]:
+        """Never gated: reading what the broker holds cannot create exposure."""
+        return self._broker.recover_working_orders(account_alias)
+
     def preview_order(self, intent: OrderIntent) -> OrderPreview:
         """What-if only; it places nothing, so it is not gated."""
         return self._broker.preview_order(intent)
@@ -449,7 +603,7 @@ def readiness_record_fields() -> Mapping[str, str]:
     """The pre-trade audit fields this guard guarantees, for documentation."""
     return {
         "checkpoint": "always PRE_SUBMIT",
-        "client_order_id": "the broker idempotency key",
+        "client_order_id": "our canonical idempotency key",
         "correlation_id": "decision correlation",
         "trading_readiness": "PAPER_READY / LIVE_READY / BLOCKED",
         "gates": "all eleven outcomes with details",
@@ -468,6 +622,8 @@ __all__ = [
     "GuardConfig",
     "QuoteSource",
     "ReadinessBlockedError",
+    "ProtectedEntryLifecycle",
+    "ProtectionEvidence",
     "ReadinessGuardedBroker",
     "RiskSource",
     "readiness_record_fields",

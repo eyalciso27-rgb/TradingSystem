@@ -373,3 +373,78 @@ def test_an_unparseable_error_callback_is_dropped_not_raised(transport: Any) -> 
     app.error(object(), object(), object())  # unrecognised shape
     # No exception, and nothing bogus was routed onto an order stream.
     assert app.router.archived() == ()
+
+
+# -- E. the outgoing contract names the RESOLVED security -------------------
+
+
+def _submit_intent(**overrides: Any) -> Any:
+    from decimal import Decimal
+
+    from trading_broker_core.port import OrderIntent, OrderSide
+    from trading_contracts.enums import Environment, OrderType
+
+    fields: dict[str, Any] = {
+        "client_order_id": "ord-conid-1",
+        "authorization_ref": "submit-auth:cand-1@sha256:" + "a" * 64,
+        "correlation_id": "corr-1",
+        "environment": Environment.PAPER,
+        "account_alias": "paper-main",
+        "symbol": "AAPL",
+        "broker_instrument_ref": "conid:265598",
+        "side": OrderSide.BUY,
+        "order_type": OrderType.LIMIT,
+        "quantity": Decimal("1"),
+        "limit_price": Decimal("100.00"),
+    }
+    fields.update(overrides)
+    return OrderIntent(**fields)
+
+
+def test_the_outgoing_contract_carries_the_resolved_con_id(transport: Any) -> None:
+    """The identity break this closes.
+
+    The transport used to build a fresh ``STK / SMART / USD`` contract from the
+    ticker at submission time, so IBKR re-resolved the string itself and nobody
+    compared its answer to the security that had been resolved, quoted, risked
+    and authorized. The order now carries the resolved contract id.
+    """
+    app = _app(transport)
+    app.submit_script[11] = [("orderStatus", (11, "Submitted"))]
+
+    assert transport.submit(11, "DU1234567", _submit_intent()) == "Submitted"
+
+    (_name, (order_id, contract, _order)), = [
+        call for call in app.calls if call[0] == "placeOrder"
+    ]
+    assert order_id == 11
+    assert contract.conId == 265598, "the RESOLVED security, not a re-resolved ticker"
+    assert contract.symbol == "AAPL"
+
+
+def test_an_order_without_a_usable_security_is_never_placed(transport: Any) -> None:
+    """No silent fallback from a bad reference to a ticker-shaped contract."""
+    from trading_broker_core.port import BrokerErrorCode, BrokerPortError
+
+    app = _app(transport)
+
+    with pytest.raises(BrokerPortError) as refused:
+        transport.submit(12, "DU1234567", _submit_intent(broker_instrument_ref="conid:0"))
+
+    assert refused.value.code is BrokerErrorCode.VALIDATION_FAILED
+    assert [call for call in app.calls if call[0] == "placeOrder"] == []
+
+
+def test_a_foreign_reference_scheme_is_never_placed(transport: Any) -> None:
+    """A reference this package did not mint is not a contract it can send."""
+    from trading_broker_core.port import BrokerErrorCode, BrokerPortError
+
+    app = _app(transport)
+
+    with pytest.raises(BrokerPortError) as refused:
+        transport.submit(
+            13, "DU1234567", _submit_intent(broker_instrument_ref="research:AAPL")
+        )
+
+    assert refused.value.code is BrokerErrorCode.VALIDATION_FAILED
+    assert [call for call in app.calls if call[0] == "placeOrder"] == []

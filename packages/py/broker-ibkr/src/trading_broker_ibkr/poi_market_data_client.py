@@ -37,8 +37,9 @@ Design (ADR-0014; PoI plan v2), mirroring the merged read-only client:
 
 from __future__ import annotations
 
+import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -48,11 +49,14 @@ from trading_broker_ibkr.ibkr_error_callback import (
     normalize_error_callback,
     normalize_message,
 )
+from trading_broker_ibkr.instrument_ref import decode_instrument_ref
 from trading_broker_ibkr.poi_readonly_session import (
     PoiSessionError,
     ReadOnlyAccountSummary,
     _validate_endpoint,
 )
+
+_LOGGER = logging.getLogger("trading_broker_ibkr.market_data")
 
 MARKET_DATA_CLIENT_VERSION = "poi-ibkr-market-data-client-1.0.0"
 
@@ -60,7 +64,12 @@ DEFAULT_CLIENT_ID = 0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 15.0
 _ACCOUNT_SUMMARY_REQ_ID = 9101
 _CONTRACT_DETAILS_REQ_ID = 9201
-_MARKET_DATA_REQ_ID = 9301
+#: The FIRST market-data request id. Each snapshot takes the next one, so a
+#: late callback from a finished snapshot carries an id the sink no longer
+#: accepts. A single fixed id could not distinguish them at all: an old
+#: tickSnapshotEnd would have completed the next request, and old ticks would
+#: have entered the next quote.
+_MARKET_DATA_REQ_ID_BASE = 9301
 _ACCOUNT_SUMMARY_TAGS = "NetLiquidation,TotalCashValue,BuyingPower"
 
 #: We ASK for live data; IBKR reports what it actually served via the
@@ -112,6 +121,16 @@ _DELAYED_NOTICE_CODES: frozenset[int] = frozenset({10167, 10168, 10169, 10197})
 #: "No security definition" for a contract request.
 _NO_SECURITY_DEFINITION_CODE = 200
 
+#: IBKR 300: "Can't find EId with ticker Id ...". It means the market-data id
+#: named is not currently subscribed. We only ever see it in response to the
+#: cancel we issue during cleanup, and for a snapshot that already completed
+#: that is the EXPECTED answer -- there was nothing left to cancel. It describes
+#: a subscription that is already gone, so it can never be a connection fatal
+#: and must never poison a later quote. (This was the third owner-host defect:
+#: cancelling a completed snapshot produced 300, which was classified fatal and
+#: failed the NEXT quote on the same session.)
+_MARKET_DATA_NOT_SUBSCRIBED_CODE = 300
+
 #: Below this codes are genuine client/connectivity errors; 1100-1102 are
 #: connectivity notices and >= 2000 are benign system/info messages.
 _FATAL_ERROR_CEILING = 1100
@@ -136,6 +155,17 @@ class MarketDataTransport(Protocol):
     def set_market_data_type(self, market_data_type: int) -> None: ...
 
     def request_market_data(self, req_id: int, symbol: str) -> None: ...
+
+    def request_market_data_for_con_id(self, req_id: int, con_id: int) -> None:
+        """Request market data for ONE broker-identified security.
+
+        The ticker-shaped ``request_market_data`` above stays for the read-only
+        PoI tooling that predates contract resolution. The execution path must
+        not use it: after a security has been resolved, asking for a price by
+        ticker lets IBKR resolve the string a second time, and nothing compares
+        its answer to the security the order was authorized for.
+        """
+        ...
 
     def cancel_market_data(self, req_id: int) -> None: ...
 
@@ -162,6 +192,11 @@ class MarketDataQuote:
     """
 
     symbol: str
+    #: EXACTLY what this snapshot was requested for -- ``conid:265598`` on the
+    #: execution path, ``symbol:AAPL`` on the legacy read-only path. Taken from
+    #: the request we made, never inferred from what came back, so a quote can
+    #: always be attributed to the security it was asked about.
+    requested_for: str
     market_data_type: int | None
     bid: str | None
     ask: str | None
@@ -194,6 +229,41 @@ def classify_freshness(market_data_type: int | None) -> str:
     return FRESHNESS_BY_IBKR_TYPE.get(market_data_type, "UNKNOWN")
 
 
+@dataclass(frozen=True, slots=True)
+class MarketDataSnapshot:
+    """ONE completed market-data request, frozen and detached from the sink.
+
+    The sink is shared and mutable for the whole connection. Building a quote by
+    reading it after the request lock had been released meant the next request
+    could reset and refill those buffers mid-read -- so a quote for A could be
+    assembled from B's ticks, with the request lock having done nothing to stop
+    it because issuance was serialised and *materialisation* was not.
+
+    Everything a quote needs is copied out under the sink lock, in one operation,
+    at the moment the request completes. After that there is nothing left to
+    race: this object cannot change, and the sink's buffers are irrelevant to it.
+    """
+
+    req_id: int
+    market_data_type: int | None
+    realtime: Mapping[str, str]
+    delayed: Mapping[str, str]
+    source_tick_ids: tuple[int, ...]
+    entitlement_errors: tuple[str, ...]
+    got_tick: bool
+    #: True iff this request reached ``tickSnapshotEnd``. A ``snapshot=True``
+    #: request that completed is already over at the gateway, so cancelling it
+    #: afterwards asks the gateway to cancel an id it no longer has (error 300).
+    #: The caller uses this to skip that pointless -- and, historically,
+    #: poisoning -- cancel. False means the request did not complete normally
+    #: (timeout, or unblocked by an entitlement/error), where a cancel is still
+    #: the safe thing to do.
+    completed: bool = False
+
+    def values(self, family: str) -> Mapping[str, str]:
+        return self.realtime if family == "realtime" else self.delayed
+
+
 @dataclass
 class MarketDataSink:
     """Thread-safe buffers + events that transport callbacks feed."""
@@ -219,6 +289,87 @@ class MarketDataSink:
     entitlement_errors: list[str] = field(default_factory=list)
     got_tick: bool = False
     fatal_error: str | None = None
+    #: Did the request being collected reach ``tickSnapshotEnd``? Reset per
+    #: request; read at ``finish`` so the caller can skip cancelling a snapshot
+    #: the gateway has already closed.
+    snapshot_end_seen: bool = False
+    #: The market-data request currently being collected, or None between
+    #: snapshots. Every market-data callback carries IBKR's reqId, and a
+    #: callback whose id is not this one belongs to a snapshot that is over.
+    active_market_data_req_id: int | None = None
+
+    # -- one snapshot at a time, starting from nothing ---------------------
+    def begin_market_data_request(self, req_id: int) -> None:
+        """Arm the sink for ONE snapshot, discarding every previous one.
+
+        The buffers below are REQUEST-local, and the client used to clear only
+        ``mkt_data_ready`` before the next request. So a snapshot that received
+        no ticks -- or only some of them -- was built from whatever the previous
+        security had left behind: B's bid beside A's ask, or A's prices entirely,
+        stamped with a fresh ``received_at`` because ``values`` was non-empty.
+        That made stale data look freshly observed and could defeat the quote
+        freshness gate, all while ``requested_for`` correctly named B.
+
+        Connection-level state is deliberately NOT reset. ``fatal_error`` is
+        sticky until reconnect, which is the canonical fail-closed behaviour,
+        and contract/account/time state belongs to other requests entirely.
+        """
+        with self._lock:
+            self.active_market_data_req_id = req_id
+            self.market_data_type = None
+            self.families = {"realtime": {}, "delayed": {}}
+            self.source_tick_ids = []
+            self.entitlement_errors = []
+            self.got_tick = False
+            self.snapshot_end_seen = False
+            # Cleared INSIDE the lock. A callback that had already passed its
+            # identity check could otherwise set the event after this clear, and
+            # the new request would start life already "complete".
+            self.mkt_data_ready.clear()
+
+    def finish_market_data_request(self, req_id: int) -> MarketDataSnapshot:
+        """Freeze this request's evidence and disarm it, in ONE atomic step.
+
+        Copying and disarming cannot be two operations: between them, the next
+        request could arm itself and start refilling the buffers being copied.
+        """
+        with self._lock:
+            snapshot = MarketDataSnapshot(
+                req_id=req_id,
+                market_data_type=self.market_data_type,
+                realtime=dict(self.families["realtime"]),
+                delayed=dict(self.families["delayed"]),
+                source_tick_ids=tuple(self.source_tick_ids),
+                entitlement_errors=tuple(self.entitlement_errors),
+                got_tick=self.got_tick,
+                completed=self.snapshot_end_seen,
+            )
+            if self.active_market_data_req_id == req_id:
+                self.active_market_data_req_id = None
+            return snapshot
+
+    def end_market_data_request(self, req_id: int) -> None:
+        """Disarm without freezing. Idempotent; safe on a finished request."""
+        with self._lock:
+            if self.active_market_data_req_id == req_id:
+                self.active_market_data_req_id = None
+
+    def _is_current(self, req_id: int | None) -> bool:
+        """Does this callback belong to the snapshot being collected NOW?
+
+        Must be called with ``self._lock`` held: the answer is only meaningful
+        for as long as no begin/finish transition can run between the check and
+        whatever the caller does with it.
+
+        ``req_id`` is MANDATORY for every callback that can put data into a
+        quote -- ticks, classification, completion. It stays optional only for
+        ``on_error``, because IBKR genuinely reports some errors with no request
+        id, and an unattributed error can only make a quote unavailable, never
+        fabricate one.
+        """
+        if req_id is None:
+            return True
+        return self.active_market_data_req_id == req_id
 
     def _note_tick(self, tick_type: int) -> None:
         self.got_tick = True
@@ -252,27 +403,33 @@ class MarketDataSink:
         self.contract_ready.set()
 
     # -- market data -------------------------------------------------------
-    def on_market_data_type(self, market_data_type: int) -> None:
+    def on_market_data_type(self, market_data_type: int, req_id: int) -> None:
         with self._lock:
+            if not self._is_current(req_id):
+                return  # a late classification cannot classify this snapshot
             self.market_data_type = int(market_data_type)
 
-    def on_tick_price(self, tick_type: int, price: object) -> None:
+    def on_tick_price(self, tick_type: int, price: object, req_id: int) -> None:
         mapping = _PRICE_FIELD_BY_TICK.get(tick_type)
         with self._lock:
+            if not self._is_current(req_id):
+                return  # a late tick belongs to a security we already answered
             self._note_tick(tick_type)
             if mapping is not None:
                 family, key = mapping
                 self.families[family][key] = str(price)
 
-    def on_tick_size(self, tick_type: int, size: object) -> None:
+    def on_tick_size(self, tick_type: int, size: object, req_id: int) -> None:
         mapping = _SIZE_FIELD_BY_TICK.get(tick_type)
         with self._lock:
+            if not self._is_current(req_id):
+                return
             self._note_tick(tick_type)
             if mapping is not None:
                 family, key = mapping
                 self.families[family][key] = str(size)
 
-    def on_tick_string(self, tick_type: int, value: str) -> None:
+    def on_tick_string(self, tick_type: int, value: str, req_id: int) -> None:
         family = _TIMESTAMP_FAMILY_BY_TICK.get(tick_type)
         if family is None:
             return
@@ -280,13 +437,25 @@ class MarketDataSink:
         if not raw or raw == "0":
             return  # nothing received => never invent a timestamp
         with self._lock:
+            if not self._is_current(req_id):
+                return
             self._note_tick(tick_type)
             self.families[family]["timestamp"] = (
                 datetime.fromtimestamp(int(raw), tz=UTC).isoformat()
             )
 
-    def on_snapshot_end(self) -> None:
-        self.mkt_data_ready.set()
+    def on_snapshot_end(self, req_id: int) -> None:
+        with self._lock:
+            if not self._is_current(req_id):
+                return  # an old snapshot's end must never complete a new one
+            # Record that THIS request completed normally at the gateway, so the
+            # caller knows not to cancel a subscription that is already gone.
+            self.snapshot_end_seen = True
+            # Set INSIDE the lock. Checking under the lock and signalling after
+            # it is a TOCTOU: an old callback could pass its check, the request
+            # could then end and the next one begin (clearing the event), and
+            # the old callback would then complete a snapshot that has no data.
+            self.mkt_data_ready.set()
 
     # -- errors ------------------------------------------------------------
     def on_callback_shape_error(self, detail: str) -> None:
@@ -302,17 +471,23 @@ class MarketDataSink:
         ):
             event.set()
 
-    def on_error(self, code: int, message: object) -> None:
+    def on_error(self, code: int, message: object, req_id: int | None = None) -> None:
         # ``message`` is normalized defensively: the wrapper already delivers a
         # str, but a non-str payload must never raise (that is the 10.48 bug).
         text = f"{code}: {normalize_message(message)}"
         if code in _SUBSCRIPTION_ERROR_CODES:
             with self._lock:
+                if not self._is_current(req_id):
+                    return  # an old request's entitlement problem is not ours
                 self.entitlement_errors.append(text)
-            self.mkt_data_ready.set()  # no data is coming
+                # Same atomicity as on_snapshot_end: this unblocks the waiting
+                # caller, so the identity check and the signal are one step.
+                self.mkt_data_ready.set()  # no data is coming
             return
         if code in _DELAYED_NOTICE_CODES:
             with self._lock:
+                if not self._is_current(req_id):
+                    return
                 self.entitlement_errors.append(text)
             return  # delayed ticks still arrive; wait for snapshot end
         if code == _NO_SECURITY_DEFINITION_CODE:
@@ -320,8 +495,28 @@ class MarketDataSink:
                 self.contract_error = text
             self.contract_ready.set()
             return
+        if code == _MARKET_DATA_NOT_SUBSCRIBED_CODE:
+            # "Not currently subscribed": the id in question is already gone.
+            # For the cleanup cancel of a completed snapshot this is the normal
+            # answer and means cleanup is effectively complete. It is never a
+            # connection fatal, and it must never contaminate a later request --
+            # so it is recorded (for audit) only when it refers to the CURRENT
+            # request, and dropped otherwise.
+            with self._lock:
+                if self._is_current(req_id):
+                    self.entitlement_errors.append(text)
+            return
         if code < _FATAL_ERROR_CEILING and code not in _CONNECTIVITY_NOTICES:
             with self._lock:
+                # IBKR reports connection/system-level errors with reqId -1 (or
+                # 0/None); those are genuinely sticky and every waiter must fail.
+                # A positive reqId that is NOT the current request belongs to a
+                # snapshot that is already over -- making that sticky is exactly
+                # what let a finished request's error fail the NEXT quote. It
+                # cannot fail a later request, so it is dropped.
+                connection_level = req_id is None or req_id <= 0
+                if not connection_level and not self._is_current(req_id):
+                    return
                 self.fatal_error = f"IBKR error {text}"
             for event in (
                 self.ready,
@@ -354,6 +549,17 @@ class IbkrMarketDataRawClient:
         self._now = now
         self._transport: MarketDataTransport | None = None
         self._sink: MarketDataSink | None = None
+        #: ONE market-data snapshot at a time per client. This API is
+        #: synchronous, so serialising is both sufficient and honest: two
+        #: different securities can genuinely be executed concurrently (the
+        #: execution single-flight de-duplicates one identity, it does not
+        #: serialise two), and they would otherwise share these buffers.
+        self._market_data_lock = threading.Lock()
+        self._next_market_data_req_id = _MARKET_DATA_REQ_ID_BASE
+        #: Set when cleanup for a snapshot could not be completed. The gateway
+        #: may still be streaming that request, so anything this client returns
+        #: afterwards could carry data from it -- refuse instead.
+        self._poisoned: str | None = None
 
     def open(self, host: str, port: int) -> None:
         _validate_endpoint(host, port)
@@ -407,27 +613,138 @@ class IbkrMarketDataRawClient:
             )
         return ContractResolution(symbol, True, True, "single contract resolved")
 
+    def market_data_for_instrument(
+        self,
+        broker_instrument_ref: str,
+        requested_market_data_type: int = _REQUESTED_MARKET_DATA_TYPE,
+    ) -> MarketDataQuote:
+        """A quote for THE resolved security, by its opaque reference.
+
+        This is the execution path's only market-data entry point. The
+        reference is decoded here -- inside the package that minted it -- and an
+        unusable, foreign or missing one raises before any request is made.
+        There is deliberately no ticker to fall back to: a caller that has
+        resolved a security and then asks for a price by symbol has thrown away
+        the identity it just established.
+        """
+        con_id = decode_instrument_ref(broker_instrument_ref)
+        if con_id is None:
+            raise PoiSessionError(
+                "market data was requested with no usable broker instrument"
+                " reference; refusing to price a security we cannot name"
+            )
+        return self._market_data(
+            requested_market_data_type,
+            # The request lineage IS the attribution: we know which security
+            # this snapshot was asked for because we asked for it by id. It is
+            # never inferred from a ticker in the response.
+            requested_for=broker_instrument_ref,
+            # Deliberately blank: this request named no symbol, and inventing
+            # one from the reference would fabricate exactly the identity the
+            # opaque reference exists to keep honest.
+            symbol="",
+            request=lambda transport, req_id: (
+                transport.request_market_data_for_con_id(req_id, con_id)
+            ),
+        )
+
     def market_data(
         self, symbol: str, requested_market_data_type: int = _REQUESTED_MARKET_DATA_TYPE
     ) -> MarketDataQuote:
-        sink, transport = self._require_open()
-        sink.mkt_data_ready.clear()
-        # Request the caller's mode explicitly (1 realtime / 3 delayed); the
-        # ACTUAL type served is read from the marketDataType callback below and
-        # never assumed from the request.
-        transport.set_market_data_type(requested_market_data_type)
-        transport.request_market_data(_MARKET_DATA_REQ_ID, symbol)
-        self._await(sink.mkt_data_ready, "market data snapshot")
-        transport.cancel_market_data(_MARKET_DATA_REQ_ID)  # read-only cleanup only
+        """Ticker-shaped read-only quote, for the PoI tooling that predates
+        contract resolution. NOT for the execution path -- see
+        ``market_data_for_instrument``.
+        """
+        return self._market_data(
+            requested_market_data_type,
+            requested_for=f"symbol:{symbol}",
+            symbol=symbol,
+            request=lambda transport, req_id: (
+                transport.request_market_data(req_id, symbol)
+            ),
+        )
 
+    def _market_data(
+        self,
+        requested_market_data_type: int,
+        *,
+        requested_for: str,
+        symbol: str,
+        request: Callable[[MarketDataTransport, int], None],
+    ) -> MarketDataQuote:
+        """ONE snapshot: its own id, its own empty buffers, its own cleanup.
+
+        The lock is held until the quote has been built from an IMMUTABLE
+        snapshot. Releasing it after cancellation but before materialisation was
+        a real race: the next request could arm itself and refill the shared sink
+        while this caller was still reading it, so a quote for A could be
+        assembled out of B's ticks. Serialising the *request* is not enough --
+        the result has to be captured inside the same boundary.
+        """
+        with self._market_data_lock:
+            sink, transport = self._require_open()
+            # A genuine, sticky, connection-level fatal must fail HERE, before a
+            # second reqMktData is ever issued -- not after waiting a whole
+            # snapshot interval only to read the same fatal in _await. Reconnect
+            # is the only thing that clears it (begin_market_data_request
+            # deliberately leaves fatal_error alone).
+            if sink.fatal_error is not None:
+                raise PoiSessionError(sink.fatal_error)
+            req_id = self._next_market_data_req_id
+            self._next_market_data_req_id += 1
+            # Arm BEFORE requesting: every buffer starts empty and every
+            # callback is matched against this id.
+            sink.begin_market_data_request(req_id)
+            snapshot: MarketDataSnapshot | None = None
+            # Set BEFORE the transport call, not after: a request that partially
+            # reached the gateway and then raised still needs cancelling, and we
+            # cannot tell from here how far it got.
+            requested = False
+            try:
+                # Request the caller's mode explicitly (1 realtime / 3 delayed);
+                # the ACTUAL type served is read from the marketDataType
+                # callback and never assumed from the request.
+                transport.set_market_data_type(requested_market_data_type)
+                requested = True
+                request(transport, req_id)
+                self._await(sink.mkt_data_ready, "market data snapshot")
+                # Freeze and disarm in ONE atomic step, while the request lock
+                # is still held. From here the quote depends on nothing mutable.
+                snapshot = sink.finish_market_data_request(req_id)
+            finally:
+                # Cancel only a request that is NOT already finished at the
+                # gateway. A snapshot=True that reached tickSnapshotEnd is over;
+                # cancelling it asks the gateway to cancel an id it no longer has
+                # (IBKR 300) -- which used to be classified fatal and fail the
+                # next quote. An uncertain request -- a timeout (snapshot is
+                # None), a synchronous failure inside request() (never issued,
+                # cancel=requested handles that), or an entitlement-unblocked
+                # request that did not reach snapshot end -- is still cancelled,
+                # because it may still be live. _release_market_data poisons the
+                # client on a genuine cleanup failure, so that can never read as
+                # permission.
+                completed = snapshot is not None and snapshot.completed
+                self._release_market_data(
+                    transport, sink, req_id, cancel=requested and not completed
+                )
+
+            assert snapshot is not None  # noqa: S101 - or _await would have raised
+            return self._quote_from(snapshot, requested_for=requested_for, symbol=symbol)
+
+    def _quote_from(
+        self, snapshot: MarketDataSnapshot, *, requested_for: str, symbol: str
+    ) -> MarketDataQuote:
+        """Build the quote from ONE frozen request result, and nothing else."""
         # Draw the quote from the family matching the ACTUAL served type, so a
         # delayed quote uses only delayed ticks (66-71, 88) and a realtime -1
         # placeholder can never clobber it (and vice versa).
-        classification = data_classification(sink.market_data_type)
+        classification = data_classification(snapshot.market_data_type)
         family = (
-            "delayed" if sink.market_data_type in _DELAYED_MARKET_DATA_TYPES else "realtime"
+            "delayed"
+            if snapshot.market_data_type in _DELAYED_MARKET_DATA_TYPES
+            else "realtime"
         )
-        values = sink.families[family]
+        values = snapshot.values(family)
         bid, ask, last = values.get("bid"), values.get("ask"), values.get("last")
         # received_at reflects capture of the SELECTED family's data (not any
         # stray off-family placeholder tick).
@@ -439,7 +756,8 @@ class IbkrMarketDataRawClient:
         )
         return MarketDataQuote(
             symbol=symbol,
-            market_data_type=sink.market_data_type,
+            requested_for=requested_for,
+            market_data_type=snapshot.market_data_type,
             bid=bid,
             ask=ask,
             last=last,
@@ -448,11 +766,11 @@ class IbkrMarketDataRawClient:
             last_size=values.get("last_size"),
             exchange_timestamp=values.get("timestamp"),
             received_at=received_at,
-            entitlement_errors=tuple(sink.entitlement_errors),
+            entitlement_errors=snapshot.entitlement_errors,
             missing_fields=missing,
-            freshness=classify_freshness(sink.market_data_type),
+            freshness=classify_freshness(snapshot.market_data_type),
             data_classification=classification,
-            source_tick_ids=tuple(sink.source_tick_ids),
+            source_tick_ids=snapshot.source_tick_ids,
         )
 
     def close(self) -> None:
@@ -460,12 +778,51 @@ class IbkrMarketDataRawClient:
             self._transport.stop()
         self._transport = None
         self._sink = None
+        # A reconnect is the one thing that clears a poisoned client: the
+        # subscription we could not cancel dies with the connection.
+        self._poisoned = None
 
     # -- internals ----------------------------------------------------------
     def _require_open(self) -> tuple[MarketDataSink, MarketDataTransport]:
+        if self._poisoned is not None:
+            raise PoiSessionError(self._poisoned)
         if self._sink is None or self._transport is None:
             raise PoiSessionError("client is not open")
         return self._sink, self._transport
+
+    def _release_market_data(
+        self,
+        transport: MarketDataTransport,
+        sink: MarketDataSink,
+        req_id: int,
+        *,
+        cancel: bool,
+    ) -> None:
+        """Cancel this snapshot and stop accepting its callbacks.
+
+        Disarming happens first and unconditionally: even if the cancel call
+        fails, the sink must stop treating this request as current, or a late
+        tick would land in the next quote.
+
+        ``cancel`` is False only when no request was ever issued -- there is
+        nothing at the gateway to cancel, and calling cancelMktData for an id it
+        never saw would be noise, not safety.
+        """
+        sink.end_market_data_request(req_id)
+        if not cancel:
+            return
+        try:
+            transport.cancel_market_data(req_id)  # read-only cleanup only
+        except Exception as error:  # noqa: BLE001 - unproven cleanup is unsafe
+            # The gateway may still be streaming this request. Anything this
+            # client returned afterwards could carry its data, so the client
+            # refuses until a reconnect kills the subscription.
+            self._poisoned = (
+                "market-data cleanup failed"
+                f" ({type(error).__name__}); this client is no longer safe to"
+                " reuse because a cancelled request may still be streaming."
+                " Reconnect before requesting another quote."
+            )
 
     def _await(self, event: threading.Event, what: str) -> None:
         if not event.wait(self._timeout):
@@ -499,6 +856,19 @@ def _build_ibapi_transport() -> MarketDataTransport:
         contract.currency = "USD"
         return contract
 
+    def _by_con_id(con_id: int) -> Any:
+        """The contract for ONE resolved security. No symbol, by design.
+
+        A symbol here would be a second identity for the same request, and the
+        two could disagree; ``conId`` alone is unambiguous to IBKR.
+        """
+        contract = Contract()
+        contract.conId = con_id
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        return contract
+
     class _MarketDataApp(EWrapper, EClient):  # type: ignore[misc]  # pragma: no cover
         """EClient+EWrapper limited to read-only requests and callbacks."""
 
@@ -506,7 +876,7 @@ def _build_ibapi_transport() -> MarketDataTransport:
             EClient.__init__(self, self)
             self._sink: MarketDataSink | None = None
 
-        def bind(self, sink: MarketDataSink) -> None:
+        def bind(self, sink: MarketDataSink | None) -> None:
             self._sink = sink
 
         def nextValidId(self, order_id: int) -> None:  # noqa: N802
@@ -535,27 +905,30 @@ def _build_ibapi_transport() -> MarketDataTransport:
             if self._sink is not None:
                 self._sink.on_contract_end()
 
+        # Every market-data callback carries IBKR's reqId, and every one of
+        # them passes it on. Dropping it made a late callback from a finished
+        # snapshot indistinguishable from one belonging to the current request.
         def marketDataType(self, req_id: int, market_data_type: int) -> None:  # noqa: N802
             if self._sink is not None:
-                self._sink.on_market_data_type(market_data_type)
+                self._sink.on_market_data_type(market_data_type, req_id)
 
         def tickPrice(  # noqa: N802
             self, req_id: int, tick_type: int, price: float, attrib: Any
         ) -> None:
             if self._sink is not None:
-                self._sink.on_tick_price(tick_type, price)
+                self._sink.on_tick_price(tick_type, price, req_id)
 
         def tickSize(self, req_id: int, tick_type: int, size: object) -> None:  # noqa: N802
             if self._sink is not None:
-                self._sink.on_tick_size(tick_type, size)
+                self._sink.on_tick_size(tick_type, size, req_id)
 
         def tickString(self, req_id: int, tick_type: int, value: str) -> None:  # noqa: N802
             if self._sink is not None:
-                self._sink.on_tick_string(tick_type, value)
+                self._sink.on_tick_string(tick_type, value, req_id)
 
         def tickSnapshotEnd(self, req_id: int) -> None:  # noqa: N802
             if self._sink is not None:
-                self._sink.on_snapshot_end()
+                self._sink.on_snapshot_end(req_id)
 
         def error(self, *args: object, **kwargs: object) -> None:  # noqa: N802
             # Accepts the IBKR 10.48 shape (reqId, errorTime, errorCode,
@@ -569,7 +942,11 @@ def _build_ibapi_transport() -> MarketDataTransport:
             except ErrorCallbackShapeError as shape_error:
                 self._sink.on_callback_shape_error(str(shape_error))
                 return
-            self._sink.on_error(normalized.code, normalized.message)
+            # The reqId travels too, so a request-scoped market-data error
+            # from a finished snapshot cannot attach itself to the current one.
+            self._sink.on_error(
+                normalized.code, normalized.message, normalized.request_id
+            )
 
     class _IbApiTransport:  # pragma: no cover - exercised only on the host
         """Adapts ``_MarketDataApp`` to the ``MarketDataTransport`` seam."""
@@ -585,12 +962,41 @@ def _build_ibapi_transport() -> MarketDataTransport:
             self._thread.start()
 
         def stop(self) -> None:
+            """Deterministic teardown, including from a PARTIAL connection.
+
+            The first real owner-host run aborted startup between connecting and
+            finishing, and the SDK reader thread then tore down through
+            ``serverVersion() == None`` and printed a traceback from a
+            background thread. A probe that aborts cleanly must not leave that
+            behind: every step here tolerates a half-established connection and
+            none of them may raise past this method.
+            """
             try:
-                if self._app.isConnected():
+                connected = bool(self._app.isConnected())
+            except Exception:  # noqa: BLE001 - a partial connect cannot answer
+                connected = False
+            if connected:
+                try:
                     self._app.disconnect()
-            finally:
-                if self._thread is not None:
-                    self._thread.join(timeout=5)
+                except Exception as error:  # noqa: BLE001 - teardown is best effort
+                    _LOGGER.debug(
+                        "market-data disconnect raised %s", type(error).__name__
+                    )
+            else:
+                # Never connected, or connected far enough to have a socket and
+                # no server version. Release the reader loop either way.
+                try:
+                    self._app.done = True
+                except Exception:  # noqa: BLE001 - attribute may not exist yet
+                    pass
+            if self._thread is not None:
+                self._thread.join(timeout=5)
+                if self._thread.is_alive():
+                    _LOGGER.warning(
+                        "the market-data SDK thread did not stop within 5s"
+                    )
+                self._thread = None
+            self._app.bind(None)
 
         def request_current_time(self) -> None:
             self._app.reqCurrentTime()
@@ -611,6 +1017,16 @@ def _build_ibapi_transport() -> MarketDataTransport:
             # snapshot=True auto-completes via tickSnapshotEnd;
             # regulatorySnapshot=False avoids any paid snapshot fee.
             self._app.reqMktData(req_id, _stock(symbol), "", True, False, [])
+
+        def request_market_data_for_con_id(self, req_id: int, con_id: int) -> None:
+            """reqMktData for the EXACT resolved security.
+
+            ``conId`` identifies the security; the ticker travels beside it for
+            IBKR's own logging and is not what the request is keyed on.
+            """
+            self._app.reqMktData(
+                req_id, _by_con_id(con_id), "", True, False, []
+            )
 
         def cancel_market_data(self, req_id: int) -> None:
             self._app.cancelMktData(req_id)
