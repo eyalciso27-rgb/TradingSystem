@@ -149,6 +149,63 @@ class BrokerInstrument:
 
 
 @dataclass(frozen=True, slots=True)
+class ProtectiveBracket:
+    """The protective structure that MUST be established ATOMICALLY with an entry.
+
+    Carried on an ``OrderIntent`` when — and only when — the entry must be born
+    protected. Its presence tells the adapter to submit a native bracket: the
+    entry parent and the protective child(ren) as one broker action, never the
+    entry alone followed by a separately-transmitted stop. "Submit the entry,
+    place the stop afterwards" is a window of unbounded exposure (ADR-0018,
+    ADR-0019), so the protective level and the child correlation refs are frozen
+    here, before submission, and travel with the entry.
+
+    ``stop_price`` is the protective stop for the child order, distinct from the
+    entry's own ``OrderIntent.stop_price`` (which is the aux price of a STOP-TYPE
+    entry and is ``None`` for the canonical protected LIMIT entry). The child
+    refs are OUR canonical correlation on each protective leg's ``orderRef`` —
+    never broker deduplication — and are deterministic so a replay names the same
+    legs.
+    """
+
+    #: The protective stop level for the resting protective child. Positive.
+    stop_price: Decimal
+    #: OUR canonical id for the protective STOP child (its ``orderRef``).
+    stop_client_order_id: str
+    #: Optional take-profit level; when present the adapter adds a LIMIT child in
+    #: the same one-cancels-all group as the stop.
+    take_profit_price: Decimal | None = None
+    #: OUR canonical id for the take-profit child. REQUIRED iff a take-profit
+    #: price is present — a leg with no id is a leg a replay cannot name.
+    take_profit_client_order_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.stop_price <= 0:
+            raise ValueError("protective stop_price must be positive")
+        if not self.stop_client_order_id.strip():
+            raise ValueError("stop_client_order_id is mandatory for a protective bracket")
+        has_tp_price = self.take_profit_price is not None
+        has_tp_ref = bool(
+            self.take_profit_client_order_id
+            and self.take_profit_client_order_id.strip()
+        )
+        if has_tp_price and self.take_profit_price is not None and self.take_profit_price <= 0:
+            raise ValueError("take_profit_price, when present, must be positive")
+        if has_tp_price != has_tp_ref:
+            raise ValueError(
+                "a take-profit leg needs BOTH a price and a client id, or neither"
+            )
+        if (
+            self.take_profit_client_order_id is not None
+            and self.take_profit_client_order_id.strip()
+            == self.stop_client_order_id.strip()
+        ):
+            raise ValueError(
+                "the stop and take-profit children must carry distinct client ids"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class OrderIntent:
     """A NOT-YET-SUBMITTED domain order intent handed to the port.
 
@@ -189,6 +246,12 @@ class OrderIntent:
     #: implicitly empty here; the adapter still validates it is a broker-
     #: supported TIF before ``placeOrder`` (IBKR rejects an empty TIF: 10052).
     time_in_force: TimeInForce = TimeInForce.DAY
+    #: When present, the entry MUST be established atomically with this
+    #: protective structure (a native bracket). ``None`` is an ordinary,
+    #: unbracketed order and behaves exactly as before this field existed. The
+    #: protective child ids must be distinct from the entry's own
+    #: ``client_order_id`` so the three legs never collide.
+    protective: ProtectiveBracket | None = None
 
     def __post_init__(self) -> None:
         if not self.client_order_id.strip():
@@ -215,6 +278,22 @@ class OrderIntent:
             self.stop_price is None or self.stop_price <= 0
         ):
             raise ValueError(f"{self.order_type.value} requires a positive stop_price")
+        if self.protective is not None:
+            # A protected entry must have a reference price for the parent, and
+            # the three legs (entry + stop child + optional target child) must
+            # carry three distinct client ids so nothing aliases.
+            if self.order_type not in (OrderType.LIMIT, OrderType.MARKET):
+                raise ValueError(
+                    "a protective bracket entry must be a LIMIT or MARKET parent"
+                )
+            child_ids = {self.protective.stop_client_order_id.strip()}
+            if self.protective.take_profit_client_order_id:
+                child_ids.add(self.protective.take_profit_client_order_id.strip())
+            if self.client_order_id.strip() in child_ids:
+                raise ValueError(
+                    "the entry client_order_id must differ from every protective"
+                    " child id"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,6 +622,7 @@ __all__ = [
     "ModifyOrderRequest",
     "OrderIntent",
     "OrderPreview",
+    "ProtectiveBracket",
     "RecoveredOrder",
     "OrderSide",
     "SessionPnlObservation",
