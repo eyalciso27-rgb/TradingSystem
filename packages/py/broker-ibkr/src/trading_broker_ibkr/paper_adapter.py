@@ -34,6 +34,7 @@ the separately-approved POI-IBKR-001 experiment, not part of this task.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -124,7 +125,22 @@ _RECOVERED_ORDER_TYPE: Mapping[str, OrderType] = {
 #: subscription from an absent one. 15s matches ``DEFAULT_TIMEOUT_SECONDS``
 #: used elsewhere and stays bounded -- there is never an unbounded wait, and
 #: the execution gate still fails closed on TIMEOUT exactly as on None.
+#: Process-global request-id sequence, so a reconnect (a NEW transport) never
+#: reuses a request id from a previous connection -- a stale reqId can then
+#: never be mistaken for a current subscription's. ``itertools.count.__next__``
+#: is atomic under the GIL. Starts high enough to stay clear of the fixed
+#: account-summary/contract-details ids.
+_GLOBAL_REQUEST_ID = itertools.count(10_000)
+
 SESSION_PNL_TIMEOUT_SECONDS = 15.0
+
+#: Maximum age of the persistent subscription's latest ``pnl`` callback for its
+#: value to count as CURRENT. IBKR delivers reqPnL updates roughly once a
+#: second, so a value last seen more than this long ago means the subscription
+#: has gone quiet -- the value is reported STALE and fails closed, never used as
+#: if it were current. Generous enough to tolerate a gateway hiccup, tight
+#: enough to catch a dead subscription; bounded, never an unbounded wait.
+SESSION_PNL_FRESHNESS_SECONDS = 30.0
 DEFAULT_CLIENT_ID = 1
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
@@ -813,6 +829,9 @@ class IbkrPaperAdapter:
                 session_pnl=pnl.value,
                 session_pnl_status=pnl.status,
                 session_pnl_detail=pnl.detail or None,
+                # WHEN the pnl callback actually arrived, not when this snapshot
+                # was built -- the freshness fact the risk gate needs.
+                session_pnl_observed_at=pnl.observed_at,
                 observed_at=self._now(),
             )
         except KeyError as missing:
@@ -848,7 +867,9 @@ class IbkrPaperAdapter:
             or abs(observation.value) >= _UNSET_DOUBLE_THRESHOLD
         ):
             return SessionPnlObservation(
-                SessionPnlStatus.UNSET, detail="daily value unset or not a number"
+                SessionPnlStatus.UNSET,
+                detail="daily value unset or not a number",
+                observed_at=observation.observed_at,
             )
         return observation
 
@@ -1344,6 +1365,8 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     *,
     session_pnl_timeout_seconds: float = SESSION_PNL_TIMEOUT_SECONDS,
+    session_pnl_freshness_seconds: float = SESSION_PNL_FRESHNESS_SECONDS,
+    monotonic_clock: Callable[[], float] | None = None,
 ) -> PaperTransport:
     """Build the real SDK-backed paper transport (gateway host only).
 
@@ -1358,6 +1381,10 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
     """
     import threading
     import time
+
+    #: Injectable for deterministic freshness tests; the real host uses the
+    #: wall-independent monotonic clock.
+    _monotonic: Callable[[], float] = monotonic_clock or time.monotonic
 
     try:
         from ibapi.client import EClient  # type: ignore[import-not-found]
@@ -1395,6 +1422,18 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             #: reader thread to read the current target.
             self._open_orders_generation: int = 0
             self._active_open_orders_stream: str | None = None
+            # -- persistent session-P&L subscription state --------------------
+            # reqPnL is a SUBSCRIPTION: one is started per connection and stays
+            # active, its ``pnl`` callbacks caching the latest daily value and
+            # the monotonic + wall-clock time it arrived. Callbacks for any other
+            # reqId (a previous subscription, a stale reconnect) are ignored.
+            self._pnl_lock = threading.Lock()
+            self._pnl_active_req_id: int | None = None
+            self._pnl_daily: float | None = None
+            self._pnl_observed_monotonic: float | None = None
+            self._pnl_observed_at: datetime | None = None
+            self._pnl_error_code: int | None = None
+            self._pnl_first_update = threading.Event()
 
         # -- id bookkeeping (order ids and request ids share a numeric space) --
         def issue_order_id(self, order_id: int) -> None:
@@ -1444,14 +1483,63 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             unrealized_pnl: float,
             realized_pnl: float,
         ) -> None:
-            """``reqPnL`` update. ONLY the daily figure is forwarded.
+            """``reqPnL`` update. ONLY the daily figure is cached.
 
             IBKR sends all three on the same callback, and the unrealized and
-            realized numbers are CUMULATIVE. Forwarding them here would invite
+            realized numbers are CUMULATIVE. Caching them here would invite
             exactly the substitution this whole path exists to prevent, so the
-            daily value travels alone.
+            daily value travels alone. A callback whose reqId is not the active
+            subscription belongs to a previous (or reconnected) subscription and
+            is ignored.
             """
-            self.router.publish(request_stream(req_id), "pnl", daily_pnl)
+            with self._pnl_lock:
+                if req_id != self._pnl_active_req_id:
+                    return
+                self._pnl_daily = daily_pnl
+                self._pnl_observed_monotonic = _monotonic()
+                self._pnl_observed_at = datetime.now(UTC)
+                self._pnl_error_code = None
+                self._pnl_first_update.set()
+
+        # -- persistent session-P&L subscription -----------------------------
+        def start_session_pnl(self, req_id: int) -> None:
+            """Arm the cache for a fresh subscription id, discarding any prior."""
+            with self._pnl_lock:
+                self._pnl_active_req_id = req_id
+                self._pnl_daily = None
+                self._pnl_observed_monotonic = None
+                self._pnl_observed_at = None
+                self._pnl_error_code = None
+                self._pnl_first_update.clear()
+
+        def stop_session_pnl(self) -> None:
+            """Detach: subsequent pnl callbacks for the old id are ignored."""
+            with self._pnl_lock:
+                self._pnl_active_req_id = None
+
+        def record_session_pnl_error(self, req_id: int, code: int) -> None:
+            """A request-scoped error for the active subscription. Unblocks the
+            initial wait; the code only, never the raw text."""
+            with self._pnl_lock:
+                if req_id != self._pnl_active_req_id:
+                    return
+                self._pnl_error_code = code
+                self._pnl_observed_monotonic = _monotonic()
+                self._pnl_first_update.set()
+
+        def session_pnl_state(
+            self,
+        ) -> tuple[int | None, float | None, float | None, datetime | None, int | None]:
+            """A consistent snapshot of the cached P&L: (active id, daily,
+            observed monotonic, observed wall-clock, error code)."""
+            with self._pnl_lock:
+                return (
+                    self._pnl_active_req_id,
+                    self._pnl_daily,
+                    self._pnl_observed_monotonic,
+                    self._pnl_observed_at,
+                    self._pnl_error_code,
+                )
 
         # Positions are observed with reqPositionsMulti, which carries a request
         # id: each observation routes to its OWN request_stream(req_id), a unique
@@ -1536,6 +1624,16 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                 normalized = normalize_error_callback(*args, **kwargs)
             except ErrorCallbackShapeError:
                 return
+            # A request-scoped error for the ACTIVE P&L subscription is captured
+            # in the P&L cache (code only), so a rejection surfaces as
+            # PNL_REQUEST_ERROR rather than being waited out. Informational farm
+            # notices are not errors and are left to fall through to diagnostics.
+            if (
+                normalized.request_id is not None
+                and normalized.request_id == self._pnl_active_req_id
+                and not is_informational_ibkr_error(normalized.code)
+            ):
+                self.record_session_pnl_error(normalized.request_id, normalized.code)
             order_ids, request_ids = self._issued_ids()
             stream = classify_error_stream(
                 normalized.request_id, order_ids=order_ids, request_ids=request_ids
@@ -1561,8 +1659,23 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             self._thread: threading.Thread | None = None
             self._req_id = 100
             self._session_pnl_timeout = session_pnl_timeout_seconds
+            self._session_pnl_freshness = session_pnl_freshness_seconds
+            # The persistent subscription's id and the account it is bound to,
+            # for the life of THIS transport (i.e. this connection). None until
+            # the first session_pnl call starts it; a reconnect is a new
+            # transport and therefore a new subscription with a new id.
+            self._pnl_req_id: int | None = None
+            self._pnl_account: str | None = None
+            # Open-order snapshot lifecycle latch. reqAllOpenOrders /
+            # reqOpenOrders carry NO request id, so once a snapshot does NOT
+            # reach a provable normal end (timeout, sync failure), we cannot
+            # tell a later late callback from a current one. We therefore refuse
+            # further snapshots until a reconnect provides a clean lifecycle.
+            self._open_orders_uncertain = False
 
         def connect(self, host: str, port: int, client_id: int) -> tuple[str, ...]:
+            # A reconnect provides a clean open-order lifecycle.
+            self._open_orders_uncertain = False
             self._app.api_client_id = client_id
             self._app.connect(host, port, client_id)
             self._thread = threading.Thread(target=self._app.run, daemon=True)
@@ -1575,6 +1688,16 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             return self._app.managed
 
         def disconnect(self) -> None:
+            # Cancel the persistent P&L subscription exactly once, best effort,
+            # and detach the cache so no late callback updates a dead connection.
+            if self._pnl_req_id is not None:
+                try:
+                    self._app.cancelPnL(self._pnl_req_id)
+                except Exception:  # noqa: BLE001 - best-effort unsubscribe
+                    pass
+                self._app.stop_session_pnl()
+                self._pnl_req_id = None
+                self._pnl_account = None
             try:
                 if self._app.isConnected():
                     self._app.disconnect()
@@ -1587,7 +1710,7 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             return bool(self._app.isConnected())
 
         def _next_request_id(self) -> int:
-            self._req_id += 1
+            self._req_id = next(_GLOBAL_REQUEST_ID)
             self._app.issue_request_id(self._req_id)
             return self._req_id
 
@@ -1660,93 +1783,95 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                     values[tag] = Decimal(value)
             return values
 
-        def session_pnl(self, account_id: str) -> SessionPnlObservation:
-            """Daily P&L via the canonical ``reqPnL`` subscription.
+        def _ensure_session_pnl_subscription(
+            self, account_id: str
+        ) -> SessionPnlObservation | None:
+            """Start the persistent subscription ONCE. Returns an error
+            observation if it cannot be started, else None.
 
-            This is a subscription, not a request/response: there is no "end"
-            callback, so the first update is taken and the subscription is
-            cancelled immediately. The status distinguishes:
-
-            * OK -- a finite daily value;
-            * REQUEST_ERROR -- a request-scoped broker rejection, classified
-              and returned IMMEDIATELY. It used to be silently ignored on this
-              stream and collapsed into the timeout, so a real gateway error
-              read as "no P&L". Farm/informational notices are still ignored;
-            * TIMEOUT -- no callback at all within the bounded window. This is
-              NOT a permission fact;
-            * UNSET -- a callback with a NaN daily value.
-
-            Only OK carries a value; everything else is UNKNOWN, never zero.
+            A P&L observation is never shared across accounts: if a caller asks
+            for a different account than the one this connection subscribed to,
+            fail closed rather than serve another account's number.
             """
-            # The id is allocated FIRST, then reqPnL is issued INSIDE the same
-            # try whose finally cancels and retires it. A synchronous reqPnL
-            # failure does not prove nothing reached the gateway -- exactly the
-            # market-data principle -- so cleanup must run either way. The
-            # previous shape returned before the finally on a sync raise, so a
-            # request that partially reached the SDK was never cancelled and its
-            # stream never retired.
+            if self._pnl_account is not None and self._pnl_account != account_id:
+                return SessionPnlObservation(
+                    SessionPnlStatus.REQUEST_ERROR,
+                    detail="session P&L subscription is bound to another account",
+                )
+            if self._pnl_req_id is not None:
+                return None
             req_id = self._next_request_id()
-            payload: object = None
-            error_detail: str | None = None
-            timed_out = False
+            self._app.start_session_pnl(req_id)
             try:
                 self._app.reqPnL(req_id, account_id, "")
-                deadline = time.monotonic() + self._session_pnl_timeout
-                while payload is None and error_detail is None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        timed_out = True
-                        break
-                    envelope = self._app.router.take(
-                        request_stream(req_id), timeout=remaining
-                    )
-                    if envelope is None:
-                        timed_out = True
-                        break
-                    if envelope.kind == "pnl":
-                        payload = envelope.payload
-                    elif envelope.kind == "error":
-                        _req, code, _text, _advanced = cast(
-                            "tuple[int | None, int, str, str]", envelope.payload
-                        )
-                        if is_informational_ibkr_error(code):
-                            continue  # farm/connectivity notice: keep waiting
-                        # A request-scoped rejection. Report it AS one, at once,
-                        # with the code only -- never the raw text, which could
-                        # carry identifiers.
-                        error_detail = f"reqPnL rejected (IBKR {code})"
-                    # Any other envelope kind is simply not a daily P&L.
-            except Exception as error:  # noqa: BLE001 - sync or transport failure
-                error_detail = f"reqPnL error ({type(error).__name__})"
-            finally:
-                try:
-                    self._app.cancelPnL(req_id)
-                except Exception:  # noqa: BLE001 - best-effort unsubscribe
-                    pass
-                # Retire this request's stream, exactly as _collect does, so no
-                # waiter deque lingers and a late callback is archived rather
-                # than recreating a live-looking stream. reqId is fresh each
-                # call, so this can never discard a LATER request's data.
-                self._app.router.release(request_stream(req_id))
-
-            if error_detail is not None:
+            except Exception as error:  # noqa: BLE001 - sync failure => request error
+                self._app.stop_session_pnl()
                 return SessionPnlObservation(
-                    SessionPnlStatus.REQUEST_ERROR, detail=error_detail
+                    SessionPnlStatus.REQUEST_ERROR,
+                    detail=f"reqPnL error ({type(error).__name__})",
                 )
-            if payload is None or timed_out:
+            self._pnl_req_id = req_id
+            self._pnl_account = account_id
+            return None
+
+        def session_pnl(self, account_id: str) -> SessionPnlObservation:
+            """Daily P&L from the connection's PERSISTENT ``reqPnL`` subscription.
+
+            reqPnL is a subscription that emits ~1/s. One is started per
+            connection and stays active; every ``get_account_snapshot`` consumes
+            the LATEST cached callback rather than subscribing and cancelling
+            again (the previous one-shot shape blocked each decision for the full
+            timeout, and the intermittent owner-host result was consistent with
+            that). The status distinguishes:
+
+            * OK -- a finite daily value observed within the freshness window;
+            * STALE -- a finite value, but its callback is older than the window
+              (the subscription has gone quiet); fails closed;
+            * TIMEOUT -- no callback has EVER arrived yet (not a permission fact);
+            * REQUEST_ERROR -- a request-scoped broker rejection (code only);
+            * UNSET -- a NaN or DBL_MAX (unset) callback.
+
+            Only OK carries a value; everything else is UNKNOWN, never zero. The
+            subscription is NOT cancelled here -- a later callback can make a
+            later snapshot OK -- and there is no busy-poll and no retry loop.
+            """
+            started = self._ensure_session_pnl_subscription(account_id)
+            if started is not None:
+                return started
+            # Wait, bounded, for the FIRST callback if none has arrived yet. Once
+            # one has, this returns immediately -- no per-call subscribe/cancel.
+            if not self._app._pnl_first_update.is_set():
+                self._app._pnl_first_update.wait(self._session_pnl_timeout)
+            return self._classify_session_pnl()
+
+        def _classify_session_pnl(self) -> SessionPnlObservation:
+            _active, daily, observed_monotonic, observed_at, error_code = (
+                self._app.session_pnl_state()
+            )
+            if error_code is not None:
+                return SessionPnlObservation(
+                    SessionPnlStatus.REQUEST_ERROR,
+                    detail=f"reqPnL rejected (IBKR {error_code})",
+                    observed_at=observed_at,
+                )
+            if daily is None or observed_monotonic is None:
                 return SessionPnlObservation(
                     SessionPnlStatus.TIMEOUT,
                     detail=f"no reqPnL update within {self._session_pnl_timeout:g}s",
                 )
             try:
-                value = Decimal(str(payload))
+                value = Decimal(str(daily))
             except (ArithmeticError, ValueError):
                 return SessionPnlObservation(
-                    SessionPnlStatus.UNSET, detail="reqPnL daily value not a number"
+                    SessionPnlStatus.UNSET,
+                    detail="reqPnL daily value not a number",
+                    observed_at=observed_at,
                 )
             if not value.is_finite():
                 return SessionPnlObservation(
-                    SessionPnlStatus.UNSET, detail="reqPnL daily value not a number"
+                    SessionPnlStatus.UNSET,
+                    detail="reqPnL daily value not a number",
+                    observed_at=observed_at,
                 )
             if abs(value) >= _UNSET_DOUBLE_THRESHOLD:
                 # IBKR renders an UNSET double field as DBL_MAX (~1.7977e308),
@@ -1757,9 +1882,25 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                 # is the same sentinel _coerce_decimal already rejects for
                 # prices; here it becomes UNSET, never OK.
                 return SessionPnlObservation(
-                    SessionPnlStatus.UNSET, detail="reqPnL daily value unset (DBL_MAX)"
+                    SessionPnlStatus.UNSET,
+                    detail="reqPnL daily value unset (DBL_MAX)",
+                    observed_at=observed_at,
                 )
-            return SessionPnlObservation(SessionPnlStatus.OK, value=value)
+            age = _monotonic() - observed_monotonic
+            if age > self._session_pnl_freshness:
+                # A finite value WAS observed, but the subscription has gone
+                # quiet. A stale value is not a current one, so it fails closed.
+                return SessionPnlObservation(
+                    SessionPnlStatus.STALE,
+                    detail=(
+                        f"reqPnL last update {age:.0f}s ago"
+                        f" (> {self._session_pnl_freshness:g}s)"
+                    ),
+                    observed_at=observed_at,
+                )
+            return SessionPnlObservation(
+                SessionPnlStatus.OK, value=value, observed_at=observed_at
+            )
 
         def positions(self, account_id: str) -> tuple[BrokerPosition, ...]:
             # reqPositionsMulti is REQUEST-SCOPED: a fresh id per observation, so
@@ -1902,35 +2043,52 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             # Each snapshot gets a FRESH generation stream, so a second snapshot
             # is never starved by the first's retirement (the same reusable-
             # channel defect the positions path had). Cleanup is one finally.
-            stream = self._app.begin_open_orders_snapshot()
-            try:
-                self._app.reqAllOpenOrders()
-                rows = self._collect(
-                    stream,
-                    end_kind="open_order_end",
-                    want="open_order",
-                    what="open orders",
+            rows = self._open_orders_snapshot(
+                self._app.reqAllOpenOrders, what="open orders"
+            )
+            return self._open_order_rows(account_id, rows)
+
+        def _open_orders_snapshot(
+            self, request: Callable[[], None], *, what: str
+        ) -> list[object]:
+            """Run ONE fail-closed open-order snapshot.
+
+            State machine: CLEAN -> ACTIVE -> (normal end) SUCCESS -> CLEAN, or
+            (timeout / synchronous failure / any incomplete lifecycle) ->
+            UNCERTAIN. In UNCERTAIN, no further snapshot is issued on this
+            transport until a reconnect, because reqAllOpenOrders/reqOpenOrders
+            carry no request id and a late callback from the incomplete snapshot
+            could otherwise be mistaken for a current one.
+            """
+            if self._open_orders_uncertain:
+                raise BrokerPortError(
+                    BrokerErrorCode.BROKER_UNHEALTHY,
+                    "open-order snapshot lifecycle is UNCERTAIN after an"
+                    " incomplete snapshot; reconnect before another",
                 )
+            stream = self._app.begin_open_orders_snapshot()
+            completed = False
+            try:
+                request()
+                rows = self._collect(
+                    stream, end_kind="open_order_end", want="open_order", what=what
+                )
+                completed = True
+                return rows
             finally:
                 self._app.end_open_orders_snapshot(stream)
-            return self._open_order_rows(account_id, rows)
+                if not completed:
+                    # Did NOT reach a provable normal end -> fail closed.
+                    self._open_orders_uncertain = True
 
         def same_client_open_orders(self, account_id: str) -> tuple[RawOpenOrder, ...]:
             # Read-only SAME-CLIENT feed: reqOpenOrders returns the orders bound
             # to this API client id, which is the only basis on which a
             # recovered order may become cancellable. Rows are additionally
             # filtered on the reported clientId (belt and braces).
-            stream = self._app.begin_open_orders_snapshot()
-            try:
-                self._app.reqOpenOrders()
-                rows = self._collect(
-                    stream,
-                    end_kind="open_order_end",
-                    want="open_order",
-                    what="same-client open orders",
-                )
-            finally:
-                self._app.end_open_orders_snapshot(stream)
+            rows = self._open_orders_snapshot(
+                self._app.reqOpenOrders, what="same-client open orders"
+            )
             return tuple(
                 row
                 for row in self._open_order_rows(account_id, rows)
@@ -2040,6 +2198,7 @@ __all__ = [
     "IbkrPaperAdapter",
     "OrderRefTooLongError",
     "OutgoingOrder",
+    "SESSION_PNL_FRESHNESS_SECONDS",
     "SESSION_PNL_TIMEOUT_SECONDS",
     "PaperTransport",
     "RawOpenOrder",

@@ -149,13 +149,21 @@ ACCOUNT = "DU" + "1234567"
 
 
 @pytest.fixture
-def transport(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+def build(monkeypatch: pytest.MonkeyPatch) -> Any:
     _install_stub_ibapi(monkeypatch)
     from trading_broker_ibkr.paper_adapter import _build_ibapi_paper_transport
 
-    t: Any = _build_ibapi_paper_transport(timeout_seconds=0.2)
-    t._app.api_client_id = 1
-    yield t
+    def _factory() -> Any:
+        t: Any = _build_ibapi_paper_transport(timeout_seconds=0.2)
+        t._app.api_client_id = 1
+        return t
+
+    return _factory
+
+
+@pytest.fixture
+def transport(build: Any) -> Iterator[Any]:
+    yield build()
 
 
 # == positions: repeatable on one session ====================================
@@ -298,21 +306,117 @@ def test_first_snapshot_empty_second_has_an_order(transport: Any) -> None:
     assert [o.symbol for o in second] == ["AAPL"]
 
 
-def test_a_stale_open_order_end_cannot_terminate_a_later_snapshot(
+def _open_order_calls(transport: Any) -> int:
+    return sum(
+        1
+        for c in transport._app.calls
+        if c[0] in ("reqAllOpenOrders", "reqOpenOrders")
+    )
+
+
+def test_a_global_snapshot_timeout_latches_uncertain(transport: Any) -> None:
+    """Item 6: an incomplete snapshot (no end marker) leaves the lifecycle
+    UNCERTAIN, because a late callback could not then be told from a current
+    one."""
+    transport._app.open_orders_script = [None]  # no end marker -> timeout
+
+    with pytest.raises(Exception):  # noqa: B017,PT011 - BrokerPortError timeout
+        transport.open_order_snapshot(ACCOUNT)
+
+    assert transport._open_orders_uncertain is True
+
+
+def test_a_second_snapshot_is_refused_before_issuing_the_request(
     transport: Any,
 ) -> None:
-    """Each snapshot has its own generation, so an end marker from a finished
-    generation lands on a retired stream, not the current one."""
-    transport._app.open_orders_script = [[], []]
+    """Item 7: once UNCERTAIN, no reqAllOpenOrders/reqOpenOrders is issued."""
+    transport._app.open_orders_script = [None]
+    with pytest.raises(Exception):  # noqa: B017,PT011
+        transport.open_order_snapshot(ACCOUNT)
+    calls_after_first = _open_order_calls(transport)
 
-    transport.open_order_snapshot(ACCOUNT)
-    # A stale end marker arrives after the first generation retired. It must not
-    # satisfy the next snapshot.
-    from trading_broker_ibkr.callback_router import OPEN_ORDERS_STREAM
+    with pytest.raises(Exception) as raised:  # noqa: PT011
+        transport.open_order_snapshot(ACCOUNT)
 
-    stale_stream = f"{OPEN_ORDERS_STREAM}:1"
-    transport._app.router.publish(stale_stream, "open_order_end", None)
+    assert "UNCERTAIN" in str(raised.value)
+    assert _open_order_calls(transport) == calls_after_first, (
+        "a second request was issued despite UNCERTAIN"
+    )
 
-    # The second snapshot still completes on its own (generation 2) callbacks.
-    assert transport.open_order_snapshot(ACCOUNT) == ()
-    assert transport._app._open_orders_generation >= 2
+
+def test_a_same_client_timeout_also_latches_uncertain(transport: Any) -> None:
+    """Item 8."""
+    transport._app.open_orders_script = [None]
+    with pytest.raises(Exception):  # noqa: B017,PT011
+        transport.same_client_open_orders(ACCOUNT)
+    assert transport._open_orders_uncertain is True
+    with pytest.raises(Exception) as raised:  # noqa: PT011
+        transport.same_client_open_orders(ACCOUNT)
+    assert "UNCERTAIN" in str(raised.value)
+
+
+def test_a_synchronous_request_failure_latches_uncertain(transport: Any) -> None:
+    """Item 9: a sync failure does not prove nothing reached the gateway."""
+
+    def _raising() -> None:
+        raise RuntimeError("reqAllOpenOrders blew up")
+
+    transport._app.reqAllOpenOrders = _raising
+
+    with pytest.raises(Exception):  # noqa: B017,PT011
+        transport.open_order_snapshot(ACCOUNT)
+
+    assert transport._open_orders_uncertain is True
+
+
+def test_a_late_open_order_end_after_timeout_is_diagnostics_only(
+    transport: Any,
+) -> None:
+    """Item 9/10, NON-VACUOUS: the delayed openOrderEnd goes through the REAL
+    ``_PaperApp.openOrderEnd`` -- the exact site of the round-11 mis-attribution.
+    It must NOT complete a later snapshot, and a later snapshot is refused
+    anyway. Under the un-latched design a second snapshot would begin and this
+    callback would wrongly complete it with an empty result."""
+    from trading_broker_ibkr.callback_router import DIAGNOSTICS_STREAM
+
+    transport._app.open_orders_script = [None]
+    with pytest.raises(Exception):  # noqa: B017,PT011
+        transport.open_order_snapshot(ACCOUNT)
+
+    diagnostics_before = transport._app.router.pending(DIAGNOSTICS_STREAM)
+    # A delayed callback from the timed-out snapshot, via the real EWrapper.
+    transport._app.openOrderEnd()
+    transport._app.openOrder(900000, _Contract("AAPL"), _Order(ACCOUNT), _OrderState())
+
+    assert transport._app.router.pending(DIAGNOSTICS_STREAM) > diagnostics_before, (
+        "the late callbacks were not routed to diagnostics"
+    )
+    # And a subsequent snapshot is still refused -- the late end cleared nothing.
+    with pytest.raises(Exception) as raised:  # noqa: PT011
+        transport.open_order_snapshot(ACCOUNT)
+    assert "UNCERTAIN" in str(raised.value)
+
+
+def test_a_fresh_transport_after_uncertain_is_clean_and_succeeds(build: Any) -> None:
+    """Item 12: a reconnect (a NEW transport) has a clean lifecycle."""
+    stuck = build()
+    stuck._app.open_orders_script = [None]
+    with pytest.raises(Exception):  # noqa: B017,PT011
+        stuck.open_order_snapshot(ACCOUNT)
+    assert stuck._open_orders_uncertain is True
+
+    fresh = build()  # reconnect
+    fresh._app.open_orders_script = [[]]
+    assert fresh.open_order_snapshot(ACCOUNT) == ()
+    assert fresh._open_orders_uncertain is False
+
+
+def test_a_timeout_never_produces_an_empty_no_orders_snapshot(
+    transport: Any,
+) -> None:
+    """Item 14: an incomplete snapshot must RAISE, never return () as if the
+    account had no orders."""
+    transport._app.open_orders_script = [None]
+
+    with pytest.raises(Exception):  # noqa: B017,PT011
+        transport.open_order_snapshot(ACCOUNT)

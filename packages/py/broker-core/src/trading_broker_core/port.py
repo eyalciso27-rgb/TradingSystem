@@ -300,6 +300,10 @@ class SessionPnlStatus(StrEnum):
     #: A callback arrived but the daily value was NaN / not-a-number. UNKNOWN,
     #: never zero.
     UNSET = "PNL_UNSET"
+    #: A finite value WAS observed, but the latest callback is older than the
+    #: bounded freshness window -- the persistent subscription has gone quiet.
+    #: A stale value is not a current one, so this fails closed like the rest.
+    STALE = "PNL_STALE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +319,11 @@ class SessionPnlObservation:
     status: SessionPnlStatus
     value: Decimal | None = None
     detail: str = ""
+    #: WHEN the underlying ``pnl`` callback actually arrived from the broker --
+    #: NOT when this object was built. ``None`` when no callback has ever been
+    #: observed. This is what makes freshness decidable: a value observed long
+    #: ago is not a current one, and only the arrival time can tell them apart.
+    observed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if (self.status is SessionPnlStatus.OK) != (self.value is not None):
@@ -353,9 +362,16 @@ class AccountSnapshot:
     #: stays in the adapter. It must never carry an account id, raw broker text,
     #: a DSN, a secret or a traceback -- the adapter is responsible for that.
     session_pnl_detail: str | None = None
+    #: WHEN the P&L callback behind ``session_pnl`` actually arrived. Distinct
+    #: from ``observed_at`` (when this snapshot was built): a persistent
+    #: subscription delivers ~1/s, and the risk gate needs the callback age to
+    #: reject a stale value. ``None`` when no callback has ever been observed.
+    session_pnl_observed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.observed_at, "observed_at")
+        if self.session_pnl_observed_at is not None:
+            _require_aware(self.session_pnl_observed_at, "session_pnl_observed_at")
         if self.session_pnl_status is SessionPnlStatus.OK and self.session_pnl is None:
             raise ValueError("session_pnl_status OK requires a session_pnl value")
         if self.session_pnl is not None and self.session_pnl_status not in (

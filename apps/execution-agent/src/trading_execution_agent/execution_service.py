@@ -1400,6 +1400,11 @@ class ExecutionService:
                 f"{SessionPnlStatus.UNSET}: reqPnL returned no usable daily"
                 f" value.{detail} {blocked}"
             )
+        if status is SessionPnlStatus.STALE:
+            return False, (
+                f"{SessionPnlStatus.STALE}: the reqPnL subscription has a value"
+                f" but it is older than the freshness window.{detail} {blocked}"
+            )
         return False, f"the gateway served no daily P&L (reqPnL).{detail} {blocked}"
 
     def _contract_evidence(

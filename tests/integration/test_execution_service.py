@@ -3076,14 +3076,26 @@ def test_the_pnl_view_never_claims_permission_for_any_unknown() -> None:
         SessionPnlStatus.TIMEOUT,
         SessionPnlStatus.REQUEST_ERROR,
         SessionPnlStatus.UNSET,
+        SessionPnlStatus.STALE,
         None,
     ):
-        _ok, detail = service._session_pnl_view(  # noqa: SLF001
+        ok, detail = service._session_pnl_view(  # noqa: SLF001
             _account_snapshot(status=status)
         )
+        assert ok is False, f"{status} must fail closed"
         low = detail.lower()
         for claim in ("no permission", "lacks permission", "no p&l permission"):
             assert claim not in low, f"{status} was falsely called a permission failure"
+
+
+def test_the_pnl_view_reports_stale_explicitly() -> None:
+    """A stale value fails closed and says so -- never used as if current."""
+    service, _, _ = _service()
+    ok, detail = service._session_pnl_view(  # noqa: SLF001
+        _account_snapshot(status=SessionPnlStatus.STALE, detail="reqPnL last update 40s ago")
+    )
+    assert ok is False
+    assert "PNL_STALE" in detail
 
 
 def test_a_broken_account_snapshot_fails_both_records_not_the_rest() -> None:
