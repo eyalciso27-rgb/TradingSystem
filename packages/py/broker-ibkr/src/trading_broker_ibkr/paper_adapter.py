@@ -59,6 +59,7 @@ from trading_broker_core.port import (
     OrderIntent,
     OrderPreview,
     OrderSide,
+    ProtectiveBracket,
     ReconciliationResult,
     RecoveredOrder,
     SessionPnlObservation,
@@ -147,11 +148,12 @@ DEFAULT_TIMEOUT_SECONDS = 15.0
 #: IBKR paper capability matrix (Integration 20.4). MVP hard rules:
 #: fractional and outside-RTH DISABLED; trailing not auto-approved.
 #: HONESTY RULE: a capability is advertised only at the level this adapter
-#: actually implements TODAY. Bracket/OCA are broker-native at IBKR, but
-#: this adapter has no bracket/OCO wiring yet (execution tasks), so they
-#: are declared UNSUPPORTED — never NATIVE-by-promise and never silently
-#: emulated (20.4: emulation requires explicit policy). Flip to NATIVE only
-#: together with the actual implementation + conformance coverage.
+#: actually implements TODAY. ``bracket`` and ``oco`` are NATIVE as of ADR-0019:
+#: ``submit_order`` establishes a real native bracket (parent entry + protective
+#: STOP child under one ``parentId``, an OCA group, and a single transmit) atomically
+#: through ``PaperTransport.submit_bracket``. They were UNSUPPORTED until that
+#: wiring + its conformance coverage existed; the flip and the implementation
+#: land together, never NATIVE-by-promise and never silently emulated (20.4).
 IBKR_PAPER_CAPABILITIES = BrokerCapabilities(
     order_types={
         OrderType.LIMIT: BrokerCapabilityMode.NATIVE,
@@ -159,13 +161,25 @@ IBKR_PAPER_CAPABILITIES = BrokerCapabilities(
         OrderType.STOP_LIMIT: BrokerCapabilityMode.NATIVE,
         OrderType.MARKET: BrokerCapabilityMode.NATIVE,
     },
-    bracket=BrokerCapabilityMode.UNSUPPORTED,
-    oco=BrokerCapabilityMode.UNSUPPORTED,
+    bracket=BrokerCapabilityMode.NATIVE,
+    oco=BrokerCapabilityMode.NATIVE,
     trailing=BrokerCapabilityMode.MANUAL_ONLY,
     fractional=BrokerCapabilityMode.DISABLED,
     outside_rth=BrokerCapabilityMode.DISABLED,
     what_if=BrokerCapabilityMode.NATIVE,
     streaming_events=BrokerCapabilityMode.NATIVE,
+)
+
+#: Order states in which a leg is genuinely at the broker doing its job — the
+#: protective stop must be one of these alongside a working parent, or the entry
+#: is unprotected and the bracket fails closed.
+WORKING_OR_BETTER_STATES: frozenset[OrderState] = frozenset(
+    {
+        OrderState.SUBMITTING,
+        OrderState.ACKNOWLEDGED,
+        OrderState.PARTIALLY_FILLED,
+        OrderState.FILLED,
+    }
 )
 
 #: IBKR order-status strings -> canonical OrderState (Decision_Contract
@@ -560,6 +574,24 @@ class RawOpenOrder:
     aux_price: Decimal | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class BracketSubmission:
+    """The broker's answer to one atomic protected-bracket submission.
+
+    Both legs are placed under one transmit (only the last leg carries
+    ``transmit=True``), so the broker returns a status for each. The adapter uses
+    the pair to decide the lifecycle state: the entry is PROTECTED only when the
+    protective stop is working-or-better alongside a working entry. A parent that
+    is live while the stop is not is the exact unprotected window this milestone
+    exists to close, so the adapter fails closed and cancels the parent.
+    """
+
+    parent_broker_order_id: int
+    parent_status: str
+    stop_broker_order_id: int
+    stop_status: str
+
+
 def mask_account_id(account_id: str) -> str:
     """``DU1234567`` -> ``DU*****67``; the full id never leaves the adapter."""
     if len(account_id) <= 4:
@@ -657,6 +689,27 @@ class PaperTransport(Protocol):
         """Send the order; return the broker's status string."""
         ...
 
+    def submit_bracket(
+        self,
+        *,
+        parent_order_id: int,
+        stop_order_id: int,
+        account_id: str,
+        intent: OrderIntent,
+    ) -> BracketSubmission:
+        """Send an ATOMIC native bracket: parent entry + protective stop child.
+
+        The implementation builds the parent (entry) with ``transmit=False`` and
+        the protective STOP child with ``parentId = parent_order_id``, an OCA
+        group binding the protective legs, and ``transmit=True`` on the last leg
+        only — so IBKR transmits the whole structure at once and the entry is
+        never live without its stop. ``intent.protective`` names the stop level
+        and the child's ``orderRef``; the parent's ``orderRef`` is
+        ``intent.client_order_id``. Returns both broker ids and both status
+        strings. Never re-resolves the instrument by ticker.
+        """
+        ...
+
     def cancel(self, broker_order_id: int) -> str:
         """Cancel by broker order id; return the broker's status string."""
         ...
@@ -741,6 +794,10 @@ class IbkrPaperAdapter:
         self._broker_ids: dict[str, int] = {}
         self._events: list[BrokerOrderEvent] = []
         self._unresolved: set[str] = set()
+        # Parent entry client id -> its protective stop child client id. The
+        # in-memory half of the protective relationship; the durable half rides
+        # the execution audit chain (ADR-0019) so a restart can rebuild it.
+        self._protective_child: dict[str, str] = {}
 
     # -- BrokerPort ----------------------------------------------------------
     def connect(self) -> None:
@@ -1099,6 +1156,10 @@ class IbkrPaperAdapter:
         if existing is not None:
             # Idempotent: the original receipt, nothing new sent to the broker.
             return existing
+        if intent.protective is not None:
+            # A protected entry is an ATOMIC native bracket, never a lone entry
+            # followed by a separate stop (ADR-0019). It has its own path.
+            return self._submit_bracket(transport, intent)
         account_id = self._account_id(intent.account_alias)
         broker_order_id = self._guarded(transport.next_order_id)
         status = self._guarded(lambda: transport.submit(broker_order_id, account_id, intent))
@@ -1115,6 +1176,129 @@ class IbkrPaperAdapter:
         self._broker_ids[intent.client_order_id] = broker_order_id
         self._append_event(receipt)
         return receipt
+
+    def _submit_bracket(
+        self, transport: PaperTransport, intent: OrderIntent
+    ) -> BrokerOrderReceipt:
+        """Establish the parent entry and its protective stop as ONE broker action.
+
+        Returns the PARENT receipt. The protective child is recorded under its
+        own client id so it is reconcilable and cancellable. If the broker
+        accepts the entry but NOT the stop, the entry is unprotected — the exact
+        window this milestone closes — so the adapter cancels the parent
+        best-effort (cleanup ownership: an attempted order may have reached the
+        gateway) and fails closed.
+        """
+        bracket = intent.protective
+        assert bracket is not None  # guarded by the caller; narrows for typing
+        self._validate_protective(intent, bracket)
+        account_id = self._account_id(intent.account_alias)
+        # Two monotonic ids, parent first: the child's parentId is the parent id,
+        # and IBKR requires the child id to be greater than the parent id.
+        parent_order_id = self._guarded(transport.next_order_id)
+        stop_order_id = self._guarded(transport.next_order_id)
+        result = self._guarded(
+            lambda: transport.submit_bracket(
+                parent_order_id=parent_order_id,
+                stop_order_id=stop_order_id,
+                account_id=account_id,
+                intent=intent,
+            )
+        )
+        received_at = self._now()
+        parent_state = self._map_status(
+            result.parent_status, intent.client_order_id, intent.correlation_id
+        )
+        stop_state = self._map_status(
+            result.stop_status, bracket.stop_client_order_id, intent.correlation_id
+        )
+        # The safety gate: a working entry whose protective stop is NOT
+        # working-or-better is an unprotected position. Refuse it, and take the
+        # parent back down — best effort, because it may already be live.
+        if (
+            parent_state in WORKING_OR_BETTER_STATES
+            and stop_state not in WORKING_OR_BETTER_STATES
+        ):
+            self._unresolved.add(intent.client_order_id)
+            try:
+                self._guarded(lambda: transport.cancel(parent_order_id))
+            except BrokerPortError:
+                # The cancel itself is uncertain now; reconciliation owns it.
+                pass
+            raise BrokerPortError(
+                BrokerErrorCode.BROKER_REJECTED,
+                "protective stop was not accepted alongside the entry; the entry"
+                " would rest unprotected, so it was cancelled and the bracket"
+                " refused (reconcile to confirm)",
+                correlation_id=intent.correlation_id,
+            )
+        parent_receipt = BrokerOrderReceipt(
+            client_order_id=intent.client_order_id,
+            broker_order_ref=f"ibkr-paper:{parent_order_id}",
+            state=parent_state,
+            authorization_ref=intent.authorization_ref,
+            correlation_id=intent.correlation_id,
+            received_at=received_at,
+        )
+        stop_receipt = BrokerOrderReceipt(
+            client_order_id=bracket.stop_client_order_id,
+            broker_order_ref=f"ibkr-paper:{stop_order_id}",
+            state=stop_state,
+            authorization_ref=intent.authorization_ref,
+            correlation_id=intent.correlation_id,
+            received_at=received_at,
+        )
+        self._orders[intent.client_order_id] = parent_receipt
+        self._orders[bracket.stop_client_order_id] = stop_receipt
+        self._broker_ids[intent.client_order_id] = parent_order_id
+        self._broker_ids[bracket.stop_client_order_id] = stop_order_id
+        self._protective_child[intent.client_order_id] = bracket.stop_client_order_id
+        self._append_event(parent_receipt)
+        self._append_event(stop_receipt)
+        return parent_receipt
+
+    def _validate_protective(
+        self, intent: OrderIntent, bracket: ProtectiveBracket
+    ) -> None:
+        """The protective structure must be one the adapter can build natively."""
+        if IBKR_PAPER_CAPABILITIES.bracket is not BrokerCapabilityMode.NATIVE:
+            raise BrokerPortError(
+                BrokerErrorCode.CAPABILITY_UNSUPPORTED,
+                "native bracket is not supported by this adapter",
+                correlation_id=intent.correlation_id,
+            )
+        # The protective STOP child must itself be a natively-supported type.
+        stop_mode = IBKR_PAPER_CAPABILITIES.order_types.get(
+            OrderType.STOP, BrokerCapabilityMode.UNSUPPORTED
+        )
+        if stop_mode is not BrokerCapabilityMode.NATIVE:
+            raise BrokerPortError(
+                BrokerErrorCode.CAPABILITY_UNSUPPORTED,
+                f"protective STOP is {stop_mode.value} for IBKR paper",
+                correlation_id=intent.correlation_id,
+            )
+        # A child id already bound to a different order is a collision, and a
+        # collision is never silently reused.
+        for child_id in (
+            bracket.stop_client_order_id,
+            bracket.take_profit_client_order_id,
+        ):
+            if child_id and child_id in self._orders:
+                raise BrokerPortError(
+                    BrokerErrorCode.VALIDATION_FAILED,
+                    "a protective child id is already bound to another order",
+                    correlation_id=intent.correlation_id,
+                )
+        # This milestone establishes the protective STOP only; a take-profit leg
+        # is carried by the contract but not yet wired, and silently dropping it
+        # would under-deliver the requested structure.
+        if bracket.take_profit_price is not None:
+            raise BrokerPortError(
+                BrokerErrorCode.CAPABILITY_UNSUPPORTED,
+                "take-profit legs are not yet wired; this milestone establishes"
+                " the protective stop only",
+                correlation_id=intent.correlation_id,
+            )
 
     def cancel_order(self, request: CancelOrderRequest) -> CancelReceipt:
         transport = self._require_connected()
@@ -2064,6 +2248,90 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             self._app.placeOrder(broker_order_id, contract, order)
             return self._await_status(broker_order_id)
 
+        def submit_bracket(
+            self,
+            *,
+            parent_order_id: int,
+            stop_order_id: int,
+            account_id: str,
+            intent: OrderIntent,
+        ) -> BracketSubmission:
+            # A real IBKR native bracket: the parent entry with transmit=False,
+            # and the protective STOP child attached by parentId in an OCA group
+            # with transmit=True. Only the last leg transmits, so IBKR receives
+            # and activates the WHOLE structure at once -- the entry is never
+            # live at the broker without its stop attached.
+            bracket = intent.protective
+            if bracket is None:  # pragma: no cover - adapter guards this first
+                raise BrokerPortError(
+                    BrokerErrorCode.VALIDATION_FAILED,
+                    "submit_bracket requires a protective bracket on the intent",
+                    correlation_id=intent.correlation_id,
+                )
+            con_id = decode_instrument_ref(intent.broker_instrument_ref)
+            if con_id is None:
+                raise BrokerPortError(
+                    BrokerErrorCode.VALIDATION_FAILED,
+                    "the order carries no usable broker instrument reference;"
+                    " refusing to submit a contract rebuilt from a ticker",
+                    correlation_id=intent.correlation_id,
+                )
+            contract = Contract()
+            contract.conId = con_id
+            contract.symbol = intent.symbol
+            contract.secType = "STK"
+            contract.exchange = "SMART"
+            contract.currency = "USD"
+            oca_group = f"oca:{intent.client_order_id}"
+            # Parent entry -- same translation as a plain order, but held
+            # (transmit=False) until the protective child is attached.
+            parent_fields = build_outgoing_order(intent, account_id)
+            parent = Order()
+            parent.account = parent_fields.account
+            parent.action = parent_fields.action
+            parent.orderType = parent_fields.order_type
+            parent.tif = parent_fields.tif
+            parent.totalQuantity = parent_fields.total_quantity
+            if parent_fields.limit_price is not None:
+                parent.lmtPrice = parent_fields.limit_price
+            if parent_fields.aux_price is not None:
+                parent.auxPrice = parent_fields.aux_price
+            parent.outsideRth = parent_fields.outside_rth
+            parent.eTradeOnly = parent_fields.e_trade_only
+            parent.firmQuoteOnly = parent_fields.firm_quote_only
+            parent.transmit = False
+            parent.orderRef = parent_fields.order_ref
+            # Protective STOP child: opposite side, attached to the parent,
+            # one-cancels-all with any sibling, transmitted last.
+            stop_side = OrderSide.SELL if intent.side is OrderSide.BUY else OrderSide.BUY
+            child = Order()
+            child.account = account_id
+            child.action = stop_side.value
+            child.orderType = ibkr_order_type(OrderType.STOP)
+            child.tif = ibkr_time_in_force(intent.time_in_force)
+            child.totalQuantity = int(intent.quantity)
+            child.auxPrice = float(bracket.stop_price)
+            child.parentId = parent_order_id
+            child.ocaGroup = oca_group
+            child.ocaType = 1
+            child.outsideRth = False
+            child.eTradeOnly = False
+            child.firmQuoteOnly = False
+            child.transmit = True
+            child.orderRef = encode_order_ref(bracket.stop_client_order_id)
+            self._app.issue_order_id(parent_order_id)
+            self._app.issue_order_id(stop_order_id)
+            self._app.placeOrder(parent_order_id, contract, parent)
+            self._app.placeOrder(stop_order_id, contract, child)
+            parent_status = self._await_status(parent_order_id)
+            stop_status = self._await_status(stop_order_id)
+            return BracketSubmission(
+                parent_broker_order_id=parent_order_id,
+                parent_status=parent_status,
+                stop_broker_order_id=stop_order_id,
+                stop_status=stop_status,
+            )
+
         def _open_order_rows(
             self, account_id: str, rows: list[object]
         ) -> tuple[RawOpenOrder, ...]:
@@ -2256,7 +2524,9 @@ def build_paper_adapter(
 __all__ = [
     "ADAPTER_VERSION",
     "ALLOWED_HOSTS",
+    "BracketSubmission",
     "CANCEL_CONFIRMED_ERROR_CODES",
+    "WORKING_OR_BETTER_STATES",
     "DEFAULT_CLIENT_ID",
     "DETERMINISTIC_ORDER_REJECT_CODES",
     "FOREIGN_CLIENT_ID",

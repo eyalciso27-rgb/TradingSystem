@@ -22,9 +22,11 @@ from trading_broker_core.port import (
     BrokerInstrument,
     BrokerPortError,
     BrokerPosition,
+    CancelOrderRequest,
     InstrumentQuery,
     OrderIntent,
     OrderSide,
+    ProtectiveBracket,
     SessionPnlObservation,
     SessionPnlStatus,
     TimeInForce,
@@ -35,6 +37,7 @@ from trading_broker_ibkr.paper_adapter import (
     IBKR_TIME_IN_FORCE_MAP,
     LIFECYCLE_ORDER_REF_PREFIX,
     ORDER_REF_MAX_LEN,
+    BracketSubmission,
     IbkrPaperAdapter,
     OrderRefTooLongError,
     RawOpenOrder,
@@ -63,8 +66,13 @@ class FakePaperTransport:
         submit_status: str = "Submitted",
         cancel_status: str = "Cancelled",
         daily_pnl: Decimal | None = None,
+        bracket_stop_status: str | None = None,
     ) -> None:
         self.calls: list[str] = []
+        #: Status the protective STOP child comes back with. Defaults to the same
+        #: status as the parent; a test can set it to a rejected state to drive
+        #: the "entry accepted, stop rejected" fail-closed window.
+        self._bracket_stop_status = bracket_stop_status or submit_status
         #: Every OrderIntent this transport was actually handed. The call
         #: log records that a submit happened; this records WHAT was sent,
         #: which is what a seal test has to compare against.
@@ -83,6 +91,9 @@ class FakePaperTransport:
         # tracked live orders: broker_order_id -> RawOpenOrder (for the
         # read-only reqAllOpenOrders snapshot)
         self._live: dict[int, RawOpenOrder] = {}
+        #: broker_order_id -> OCA group, so cancelling one bracket leg cancels
+        #: the whole group like a real native bracket.
+        self._oca_groups: dict[int, str] = {}
         #: injected snapshot rows (for restart / foreign / malformed drills)
         self.snapshot_override: tuple[RawOpenOrder, ...] | None = None
         self.snapshot_error: Exception | None = None
@@ -169,11 +180,74 @@ class FakePaperTransport:
         )
         return self._submit_status
 
+    def submit_bracket(
+        self,
+        *,
+        parent_order_id: int,
+        stop_order_id: int,
+        account_id: str,
+        intent: OrderIntent,
+    ) -> BracketSubmission:
+        self.calls.append(
+            f"submit_bracket:{parent_order_id}:{stop_order_id}:{intent.client_order_id}"
+        )
+        self.submitted_intents.append(intent)
+        bracket = intent.protective
+        assert bracket is not None
+        stop_side = OrderSide.SELL if intent.side is OrderSide.BUY else OrderSide.BUY
+        oca = f"oca:{intent.client_order_id}"
+        # Parent entry leg.
+        self._live[parent_order_id] = RawOpenOrder(
+            broker_order_id=parent_order_id,
+            order_ref=encode_order_ref(intent.client_order_id),
+            status=self._submit_status,
+            symbol=intent.symbol,
+            client_id=self.client_id,
+            perm_id=900000 + parent_order_id,
+            account=account_id,
+            action=intent.side.value,
+            quantity=intent.quantity,
+            order_type=intent.order_type.value,
+            limit_price=intent.limit_price,
+        )
+        # Protective STOP child leg: opposite side, STOP type, aux = stop price.
+        self._live[stop_order_id] = RawOpenOrder(
+            broker_order_id=stop_order_id,
+            order_ref=encode_order_ref(bracket.stop_client_order_id),
+            status=self._bracket_stop_status,
+            symbol=intent.symbol,
+            client_id=self.client_id,
+            perm_id=900000 + stop_order_id,
+            account=account_id,
+            action=stop_side.value,
+            quantity=intent.quantity,
+            order_type=OrderType.STOP.value,
+            limit_price=None,
+            aux_price=bracket.stop_price,
+        )
+        self._oca_groups[parent_order_id] = oca
+        self._oca_groups[stop_order_id] = oca
+        return BracketSubmission(
+            parent_broker_order_id=parent_order_id,
+            parent_status=self._submit_status,
+            stop_broker_order_id=stop_order_id,
+            stop_status=self._bracket_stop_status,
+        )
+
     def cancel(self, broker_order_id: int) -> str:
         self.calls.append(f"cancel:{broker_order_id}")
         existing = self._live.get(broker_order_id)
         if existing is not None:
             self._live[broker_order_id] = replace(existing, status=self._cancel_status)
+            # Cancelling any leg of an OCA group cancels the whole group, exactly
+            # as a native bracket behaves.
+            group = self._oca_groups.get(broker_order_id)
+            if group is not None:
+                for other_id, other_group in self._oca_groups.items():
+                    if other_group == group and other_id in self._live:
+                        self._live[other_id] = replace(
+                            self._live[other_id], status=self._cancel_status
+                        )
         return self._cancel_status
 
     def open_order_snapshot(self, account_id: str) -> tuple[RawOpenOrder, ...]:
@@ -314,18 +388,18 @@ def test_live_environment_intent_rejected() -> None:
 def test_unimplemented_capabilities_are_never_advertised() -> None:
     """A capability may be NATIVE/EMULATED only if the adapter implements it.
 
-    This adapter has no bracket/OCO wiring yet, so it must not advertise
-    them as available at any level — and there must be no silent emulation
-    path (Integration 20.4: emulation requires explicit policy).
+    As of ADR-0019 ``bracket``/``oco`` ARE wired — ``submit_order`` establishes a
+    real native bracket atomically — so they are NATIVE. There is still no silent
+    emulation path anywhere (Integration 20.4), and the bracket is delivered
+    through the standard ``submit_order`` surface, not a separate public method.
     """
     from trading_broker_ibkr.paper_adapter import IBKR_PAPER_CAPABILITIES
 
     capabilities = make_adapter_capabilities()
     assert capabilities == IBKR_PAPER_CAPABILITIES  # adapter publishes the module matrix
-    # not implemented => not advertised as usable
-    unusable = (BrokerCapabilityMode.UNSUPPORTED, BrokerCapabilityMode.DISABLED)
-    assert capabilities.bracket in unusable
-    assert capabilities.oco in unusable
+    # implemented as of ADR-0019 => advertised NATIVE, and honestly so.
+    assert capabilities.bracket is BrokerCapabilityMode.NATIVE
+    assert capabilities.oco is BrokerCapabilityMode.NATIVE
     # no silent emulation anywhere in the matrix
     for mode in (
         capabilities.bracket,
@@ -337,14 +411,15 @@ def test_unimplemented_capabilities_are_never_advertised() -> None:
     ):
         assert mode is not BrokerCapabilityMode.EMULATED
     # nothing NATIVE that the adapter cannot actually do today: the only
-    # NATIVE entries are the four wired order types + preview + events
+    # NATIVE order types are the four wired ones
     assert set(capabilities.order_types) == {
         OrderType.LIMIT,
         OrderType.STOP,
         OrderType.STOP_LIMIT,
         OrderType.MARKET,
     }
-    # and there is no bracket/OCO surface on the adapter to call silently
+    # the bracket is delivered through submit_order; there is deliberately no
+    # separate PUBLIC bracket/OCO method for a caller to reach around it.
     bracket_like = [
         name
         for name in dir(IbkrPaperAdapter)
@@ -919,3 +994,137 @@ def test_reconnect_builds_a_brand_new_transport() -> None:
 
     assert len(built) == 2, "reconnect reused the old transport"
     assert built[0] is not built[1]
+
+
+# -- ADR-0019: native protected-entry bracket ------------------------------
+
+
+def _bracket_intent(
+    client_order_id: str = "brk-1",
+    *,
+    stop_price: Decimal = Decimal("9"),
+    stop_ref: str | None = None,
+    **overrides: Any,
+) -> OrderIntent:
+    return make_intent(
+        client_order_id,
+        protective=ProtectiveBracket(
+            stop_price=stop_price,
+            stop_client_order_id=stop_ref or f"{client_order_id}:stop",
+        ),
+        **overrides,
+    )
+
+
+def test_ibkr_paper_declares_native_bracket() -> None:
+    caps = make_adapter().capabilities()
+    assert caps.bracket is BrokerCapabilityMode.NATIVE
+    assert caps.oco is BrokerCapabilityMode.NATIVE
+
+
+def test_protected_entry_submits_one_atomic_bracket_not_a_lone_order() -> None:
+    transport = FakePaperTransport()
+    adapter = make_adapter(transport)
+    adapter.connect()
+
+    receipt = adapter.submit_order(_bracket_intent())
+
+    # The bracket path, never the plain single-order path.
+    assert any(c.startswith("submit_bracket:") for c in transport.calls)
+    assert not any(c.startswith("submit:") for c in transport.calls)
+    # The returned receipt is the PARENT entry, acknowledged.
+    assert receipt.client_order_id == "brk-1"
+    assert receipt.state is OrderState.ACKNOWLEDGED
+    # BOTH legs are working at the broker: the entry is born protected.
+    open_orders = adapter.get_open_orders("paper-main")
+    refs = {o.client_order_id for o in open_orders}
+    assert refs == {"brk-1", "brk-1:stop"}
+
+
+def test_protective_stop_child_is_the_opposite_side_stop(
+) -> None:
+    transport = FakePaperTransport()
+    adapter = make_adapter(transport)
+    adapter.connect()
+    adapter.submit_order(_bracket_intent())
+
+    recovered = {o.client_order_id: o for o in adapter.recover_working_orders("paper-main")}
+    stop = recovered["brk-1:stop"]
+    assert stop.side is OrderSide.SELL  # opposite a BUY entry
+    assert stop.order_type is OrderType.STOP
+    assert stop.stop_price == Decimal("9")
+
+
+def test_entry_accepted_but_stop_rejected_cancels_parent_and_fails_closed() -> None:
+    # The failure window this milestone exists to close: a working entry with no
+    # working protective stop is an unprotected position. Refuse it, take the
+    # parent back down, and mark it for reconciliation.
+    transport = FakePaperTransport(bracket_stop_status="Inactive")  # REJECTED
+    adapter = make_adapter(transport)
+    adapter.connect()
+
+    with pytest.raises(BrokerPortError) as error:
+        adapter.submit_order(_bracket_intent())
+
+    assert error.value.code is BrokerErrorCode.BROKER_REJECTED
+    # The parent was cancelled best-effort (cleanup ownership).
+    assert any(c.startswith("cancel:") for c in transport.calls)
+    # And it is surfaced as unresolved, never silently dropped.
+    result = adapter.reconcile("paper-main")
+    assert "brk-1" in result.unresolved_client_order_ids
+
+
+def test_bracket_child_id_colliding_with_an_existing_order_is_refused() -> None:
+    transport = FakePaperTransport()
+    adapter = make_adapter(transport)
+    adapter.connect()
+    adapter.submit_order(make_intent("existing"))
+
+    colliding = _bracket_intent("brk-2", stop_ref="existing")
+    with pytest.raises(BrokerPortError) as error:
+        adapter.submit_order(colliding)
+    assert error.value.code is BrokerErrorCode.VALIDATION_FAILED
+
+
+def test_take_profit_leg_is_refused_for_this_milestone() -> None:
+    transport = FakePaperTransport()
+    adapter = make_adapter(transport)
+    adapter.connect()
+    intent = make_intent(
+        "brk-3",
+        protective=ProtectiveBracket(
+            stop_price=Decimal("9"),
+            stop_client_order_id="brk-3:stop",
+            take_profit_price=Decimal("12"),
+            take_profit_client_order_id="brk-3:tp",
+        ),
+    )
+    with pytest.raises(BrokerPortError) as error:
+        adapter.submit_order(intent)
+    assert error.value.code is BrokerErrorCode.CAPABILITY_UNSUPPORTED
+
+
+def test_duplicate_protected_entry_is_idempotent() -> None:
+    transport = FakePaperTransport()
+    adapter = make_adapter(transport)
+    adapter.connect()
+
+    first = adapter.submit_order(_bracket_intent())
+    second = adapter.submit_order(_bracket_intent())
+
+    assert first == second
+    # Exactly one bracket reached the broker.
+    assert sum(c.startswith("submit_bracket:") for c in transport.calls) == 1
+
+
+def test_cancelling_the_entry_cancels_the_whole_oca_bracket() -> None:
+    transport = FakePaperTransport()
+    adapter = make_adapter(transport)
+    adapter.connect()
+    adapter.submit_order(_bracket_intent())
+
+    adapter.cancel_order(
+        CancelOrderRequest(client_order_id="brk-1", correlation_id="corr-brk-1")
+    )
+    # Both legs leave the working set: no unprotected remnant, no orphan stop.
+    assert adapter.get_open_orders("paper-main") == ()

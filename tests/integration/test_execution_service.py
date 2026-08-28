@@ -84,6 +84,7 @@ from trading_broker_core.port import (
     InstrumentQuery,
     OrderIntent,
     OrderSide,
+    ProtectiveBracket,
     SessionPnlStatus,
 )
 from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter, decode_instrument_ref
@@ -1535,15 +1536,42 @@ def test_a_real_protection_lifecycle_satisfies_both_layers_identically() -> None
     assert guard_state.protective_order_supported is True
 
 
-def test_the_real_adapter_cannot_currently_hold_atomic_protection() -> None:
-    """Pinned so flipping a capability flag without wiring it is caught."""
-    capabilities = _adapter().capabilities()
+def test_the_real_adapter_now_holds_atomic_protection_and_it_is_wired() -> None:
+    """ADR-0019: bracket/oco are NATIVE AND backed by real wiring.
 
-    assert capabilities.bracket is BrokerCapabilityMode.UNSUPPORTED
-    assert capabilities.oco is BrokerCapabilityMode.UNSUPPORTED
-    assert capabilities.order_types[OrderType.STOP] is BrokerCapabilityMode.NATIVE, (
-        "a supported STOP order type is exactly the thing that must NOT be"
-        " mistaken for broker-side protection"
+    The inverse of the old option-B guard: pinned so the flag can never be
+    NATIVE without ``submit_order`` actually establishing BOTH legs atomically. A
+    bare flag flip with no wiring would leave only one leg here and fail.
+    """
+    adapter = _adapter()
+    capabilities = adapter.capabilities()
+    assert capabilities.bracket is BrokerCapabilityMode.NATIVE
+    assert capabilities.oco is BrokerCapabilityMode.NATIVE
+    assert capabilities.order_types[OrderType.STOP] is BrokerCapabilityMode.NATIVE
+
+    alias = next(iter(ALIASES))
+    receipt = adapter.submit_order(
+        OrderIntent(
+            client_order_id="brk-real",
+            authorization_ref="submit-auth:brk-real",
+            correlation_id="corr-brk-real",
+            environment=Environment.PAPER,
+            account_alias=alias,
+            symbol="AAPL",
+            broker_instrument_ref="conid:265598",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=Decimal("1"),
+            limit_price=Decimal("190"),
+            protective=ProtectiveBracket(
+                stop_price=Decimal("180"), stop_client_order_id="brk-real:stop"
+            ),
+        )
+    )
+    assert receipt.client_order_id == "brk-real"
+    legs = {o.client_order_id for o in adapter.get_open_orders(alias)}
+    assert legs == {"brk-real", "brk-real:stop"}, (
+        "a NATIVE bracket flag must be backed by BOTH legs actually resting"
     )
 
 
@@ -1630,17 +1658,18 @@ def test_protection_evidence_without_a_broker_reference_is_not_protection() -> N
     assert state.protective_order_supported is False
 
 
-def test_the_real_adapter_has_no_protected_entry_lifecycle_so_entries_block() -> None:
-    """Option B, end to end, against the real adapter and the real guard.
+def test_without_a_wired_protected_entry_lifecycle_entries_still_block() -> None:
+    """Defence in depth: a NATIVE bracket capability is NOT enough on its own.
 
-    STOP order type may be NATIVE; bracket and OCO are not; there is no atomic
-    protected-entry implementation; the final readiness gate blocks; and the
-    broker's transport sees ZERO submits.
+    The adapter can now hold a bracket, but the execution service is constructed
+    here WITHOUT a ``ProtectedEntryLifecycle`` wired in. Protection is proven by
+    a lifecycle, never inferred from a capability flag, so the final readiness
+    gate still blocks and the broker's transport sees ZERO submits. Wiring the
+    lifecycle is a separate, explicit step.
     """
     capabilities = _adapter().capabilities()
     assert capabilities.order_types[OrderType.STOP] is BrokerCapabilityMode.NATIVE
-    assert capabilities.bracket is BrokerCapabilityMode.UNSUPPORTED
-    assert capabilities.oco is BrokerCapabilityMode.UNSUPPORTED
+    assert capabilities.bracket is BrokerCapabilityMode.NATIVE
 
     service, transport, _ = _service(
         protection_required=True, authorization=_TestOnlyAuthorization()
