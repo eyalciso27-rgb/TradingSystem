@@ -1197,14 +1197,32 @@ class IbkrPaperAdapter:
         # and IBKR requires the child id to be greater than the parent id.
         parent_order_id = self._guarded(transport.next_order_id)
         stop_order_id = self._guarded(transport.next_order_id)
-        result = self._guarded(
-            lambda: transport.submit_bracket(
-                parent_order_id=parent_order_id,
-                stop_order_id=stop_order_id,
-                account_id=account_id,
-                intent=intent,
+        try:
+            result = self._guarded(
+                lambda: transport.submit_bracket(
+                    parent_order_id=parent_order_id,
+                    stop_order_id=stop_order_id,
+                    account_id=account_id,
+                    intent=intent,
+                )
             )
-        )
+        except BrokerPortError:
+            # Cleanup ownership: a bracket sends the parent and the stop as
+            # separate placeOrder calls, so a synchronous failure PART-WAY
+            # through can leave the parent live and unprotected while the stop
+            # never arrived. Once an outbound placeOrder has been ATTEMPTED it
+            # MAY have reached the gateway, so both ids are cancelled
+            # best-effort, and the order is marked unresolved for reconciliation
+            # rather than left as a silent orphan.
+            self._unresolved.add(intent.client_order_id)
+            for orphan_id in (parent_order_id, stop_order_id):
+                # Invoked immediately in the loop body, so the closure sees the
+                # current id (no late-binding surprise).
+                try:
+                    self._guarded(lambda: transport.cancel(orphan_id))  # noqa: B023
+                except BrokerPortError:
+                    pass
+            raise
         received_at = self._now()
         parent_state = self._map_status(
             result.parent_status, intent.client_order_id, intent.correlation_id

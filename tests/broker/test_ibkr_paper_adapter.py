@@ -1128,3 +1128,30 @@ def test_cancelling_the_entry_cancels_the_whole_oca_bracket() -> None:
     )
     # Both legs leave the working set: no unprotected remnant, no orphan stop.
     assert adapter.get_open_orders("paper-main") == ()
+
+
+def test_a_synchronous_bracket_failure_cancels_both_legs_and_reconciles() -> None:
+    # Cleanup ownership: if submit_bracket fails part-way (parent may be live,
+    # stop never arrived), the adapter cancels BOTH ids best-effort and marks
+    # the order unresolved -- never a silent, unprotected orphan.
+    class _BracketExplodes(FakePaperTransport):
+        def submit_bracket(
+            self, *, parent_order_id: int, stop_order_id: int, account_id: str,
+            intent: OrderIntent,
+        ) -> BracketSubmission:
+            self.calls.append(f"submit_bracket:{parent_order_id}")
+            raise RuntimeError("socket died mid-bracket")
+
+    transport = _BracketExplodes()
+    adapter = make_adapter(transport)
+    adapter.connect()
+
+    with pytest.raises(BrokerPortError):
+        adapter.submit_order(_bracket_intent("brk-boom"))
+
+    # Both reserved ids were cancelled best-effort (parent=1001, stop=1002).
+    assert any(c == "cancel:1001" for c in transport.calls)
+    assert any(c == "cancel:1002" for c in transport.calls)
+    # And it is surfaced for reconciliation, never dropped.
+    result = adapter.reconcile("paper-main")
+    assert "brk-boom" in result.unresolved_client_order_ids
