@@ -410,22 +410,40 @@ def _code_lines(text: str) -> str:
     )
 
 
+def _bootstrap_code() -> str:
+    """The executable lines of the shared Paper DB/env bootstrap library.
+
+    The loopback publish, the readiness wait, the DATABASE_URL construction, the
+    authenticated preflight, the schema-to-head step and the cleanup now live in
+    ONE library both owner wrappers source, so the owner-safety properties are
+    asserted where the logic lives rather than duplicated per wrapper.
+    """
+    return _code_lines(
+        (REPO_ROOT / "scripts" / "lib" / "paper_probe_bootstrap.sh").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
 def test_the_probe_wrapper_exists_and_is_owner_invoked() -> None:
     """One documented command, and it is not part of paper startup."""
     wrapper = REPO_ROOT / "scripts" / "run_execution_probe_paper.sh"
     assert wrapper.is_file()
     code = _code_lines(wrapper.read_text(encoding="utf-8"))
+    lib = _bootstrap_code()
 
-    # Never trace the shell: the DSN is built in this script.
-    assert "set -x" not in code
-    # The DSN is exported to the child and never echoed or logged.
+    # Never trace the shell: the DSN is built for this run.
+    assert "set -x" not in code and "set -x" not in lib
+    # The DSN is exported to the child and never echoed or logged, in either.
     for leak in ("echo $DATABASE_URL", 'echo "$DATABASE_URL"', "log $DATABASE_URL"):
-        assert leak not in code, leak
-    # It resolves the account from the secret store and never asks for it.
-    assert "SECRETS_ROOT" in code
-    assert "TRADING_PAPER_ACCOUNT_ID" not in code
-    # And it always cleans up the temporary publish.
-    assert "trap cleanup EXIT" in code
+        assert leak not in code and leak not in lib, leak
+    # It resolves the account from the secret store (now in the shared library)
+    # and never asks the owner for it.
+    assert "SECRETS_ROOT" in lib
+    assert "TRADING_PAPER_ACCOUNT_ID" not in code and "TRADING_PAPER_ACCOUNT_ID" not in lib
+    # The wrapper sources the shared bootstrap and always cleans up the publish.
+    assert "paper_probe_bootstrap.sh" in code
+    assert "trap 'paper_probe_close_db' EXIT" in code
 
 
 def test_the_diagnostic_publish_is_loopback_only_and_not_in_paper_startup() -> None:
@@ -739,39 +757,46 @@ def test_the_wrapper_fails_when_the_database_never_becomes_ready() -> None:
     DATABASE_URL and starting Python anyway -- configuration present, database
     absent, discovered only after two IBKR sessions were open.
     """
-    code = _code_lines(
+    lib = _bootstrap_code()
+
+    assert "db_ready=0" in lib and "db_ready=1" in lib
+    ready_check = lib.index('[ "$db_ready" -ne 1 ]')
+    dsn_build = lib.index("build_paper_database_url.py")
+    assert ready_check < dsn_build, (
+        "readiness must be asserted before the DSN is built"
+    )
+    # And the wrapper only runs the probe AFTER the bootstrap returns.
+    wrapper = _code_lines(
         (REPO_ROOT / "scripts" / "run_execution_probe_paper.sh").read_text(
             encoding="utf-8"
         )
     )
-
-    assert "DB_READY=0" in code and "DB_READY=1" in code
-    ready_check = code.index('[ "$DB_READY" -eq 1 ]')
-    probe_invocation = code.index("python -m trading_execution_agent probe")
-    dsn_build = code.index("build_paper_database_url.py")
-    assert ready_check < dsn_build < probe_invocation, (
-        "readiness must be asserted before the DSN is built and the probe runs"
+    assert wrapper.index("paper_probe_open_db") < wrapper.index(
+        "python -m trading_execution_agent probe"
     )
 
 
 def test_the_wrapper_arms_cleanup_before_it_mutates_anything() -> None:
     """A compose call can change state and still fail."""
-    code = _code_lines(
+    lib = _bootstrap_code()
+
+    armed = lib.index("PAPER_PROBE_PUBLISH_STARTED=1")
+    # The MUTATING call, not the restore inside the cleanup function: only the
+    # open path's own compose up carries the published port.
+    mutated = lib.index('PAPER_PROBE_DB_PORT="$db_port" docker compose')
+    assert armed < mutated, (
+        "the cleanup flag is set BEFORE the compose up, so a partial recreate"
+        " cannot leave the publish open"
+    )
+    # And the wrapper arms the EXIT trap before it calls the bootstrap at all.
+    wrapper = _code_lines(
         (REPO_ROOT / "scripts" / "run_execution_probe_paper.sh").read_text(
             encoding="utf-8"
         )
     )
-
-    armed = code.index("PROBE_PUBLISH_STARTED=1")
-    # The MUTATING call, not the restore inside cleanup(): only the probe's own
-    # compose up carries the published port.
-    mutated = code.index('PAPER_PROBE_DB_PORT="$DB_PORT" docker compose')
-    assert armed < mutated, (
-        "the cleanup flag is set only after a successful compose up, so a"
-        " partial recreate would leave the publish open"
+    assert wrapper.index("trap 'paper_probe_close_db' EXIT") < wrapper.index(
+        "paper_probe_open_db"
     )
-    # And cleanup is reachable from the moment the flag is set.
-    assert code.index("trap cleanup EXIT") < armed
 
 
 # == the wrapper: credentials must be encoded ================================
@@ -837,15 +862,11 @@ def test_the_rendered_url_masks_the_password_by_default() -> None:
 
 def test_the_wrapper_no_longer_interpolates_credentials_into_a_url() -> None:
     """Structural: the string-concatenated DSN is gone."""
-    code = _code_lines(
-        (REPO_ROOT / "scripts" / "run_execution_probe_paper.sh").read_text(
-            encoding="utf-8"
-        )
-    )
+    lib = _bootstrap_code()
 
-    assert "${PAPER_POSTGRES_PASSWORD}@" not in code
-    assert "$PAPER_POSTGRES_PASSWORD@" not in code
-    assert "build_paper_database_url.py" in code
+    assert "${PAPER_POSTGRES_PASSWORD}@" not in lib
+    assert "$PAPER_POSTGRES_PASSWORD@" not in lib
+    assert "build_paper_database_url.py" in lib
 
 
 # == the ONE owner-visible output boundary ===================================
@@ -1103,22 +1124,29 @@ def test_the_preflight_runs_before_the_probe_and_gates_it() -> None:
     image does not reset an existing role's password when the container is
     recreated, so an old volume can expect an older one.
     """
-    code = _code_lines(
+    lib = _bootstrap_code()
+
+    dsn_build = lib.index("build_paper_database_url.py")
+    db_check = lib.index("check_paper_probe_database.py")
+    schema = lib.index("prepare_paper_database.py")
+    assert dsn_build < db_check < schema, (
+        "the authenticated check must use the built URL, before schema prep"
+    )
+    # A failed check returns non-zero (fails closed) and says so, so the caller
+    # never opens a broker socket.
+    guarded = lib[db_check : db_check + 400]
+    assert "return 1" in guarded, "a failed database preflight must abort the run"
+    assert "zero IBKR connections" in guarded
+    # And the wrapper gates the probe on the bootstrap succeeding.
+    wrapper = _code_lines(
         (REPO_ROOT / "scripts" / "run_execution_probe_paper.sh").read_text(
             encoding="utf-8"
         )
     )
-
-    dsn_build = code.index("build_paper_database_url.py")
-    db_check = code.index("check_paper_probe_database.py")
-    probe_run = code.index("python -m trading_execution_agent probe")
-    assert dsn_build < db_check < probe_run, (
-        "the authenticated check must use the built URL and gate the probe"
+    gate = wrapper.index("paper_probe_open_db")
+    assert wrapper.index("|| fail", gate) < wrapper.index(
+        "python -m trading_execution_agent probe"
     )
-    # And it must actually stop the run, not merely report.
-    guarded = code[db_check : db_check + 400]
-    assert "fail " in guarded, "a failed database preflight must abort"
-    assert "zero IBKR connections" in guarded
 
 
 def test_a_failing_database_preflight_invokes_zero_probes(tmp_path: Path) -> None:
@@ -1199,13 +1227,15 @@ def test_the_paper_postgres_compose_contract_is_unchanged() -> None:
     assert "export PAPER_POSTGRES_USER=" in loader
     assert "export PAPER_POSTGRES_PASSWORD=" in loader
 
+    # The shared bootstrap loads them; the wrapper sources it and neither file
+    # REQUIRES them from the caller's environment (the fresh-shell regression).
+    lib = _bootstrap_code()
+    assert "load_paper_environment" in lib
     code = _code_lines(
         (REPO_ROOT / "scripts" / "run_execution_probe_paper.sh").read_text(
             encoding="utf-8"
         )
     )
-    assert "load_paper_environment" in code
-    # And the wrapper no longer REQUIRES them from the caller's environment,
-    # which is exactly the regression the second owner-host run exposed.
-    assert 'PAPER_POSTGRES_USER:?' not in code
-    assert 'PAPER_POSTGRES_PASSWORD:?' not in code
+    assert "paper_probe_bootstrap.sh" in code
+    for forbidden in ("PAPER_POSTGRES_USER:?", "PAPER_POSTGRES_PASSWORD:?"):
+        assert forbidden not in code and forbidden not in lib

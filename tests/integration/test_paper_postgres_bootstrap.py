@@ -48,6 +48,9 @@ WRAPPER = REPO_ROOT / "scripts" / "run_execution_probe_paper.sh"
 BOOTSTRAP_SCRIPT = REPO_ROOT / "scripts" / "bootstrap_paper_postgres.py"
 LOADER_SCRIPT = REPO_ROOT / "scripts" / "load_paper_postgres_env.py"
 PAPER_ENV_LIB = REPO_ROOT / "scripts" / "lib" / "paper_env.sh"
+# The DB/env lifecycle (loopback publish, preflight, schema, cleanup) now lives
+# in the ONE shared bootstrap library both owner wrappers source.
+PAPER_PROBE_BOOTSTRAP = REPO_ROOT / "scripts" / "lib" / "paper_probe_bootstrap.sh"
 LAUNCHER = REPO_ROOT / "scripts" / "run_paper_stack.sh"
 CONFIG_CHECK = REPO_ROOT / "scripts" / "check_paper_compose_config.sh"
 
@@ -489,8 +492,8 @@ def test_no_owner_facing_script_can_remove_the_database(destructive: str) -> Non
 def test_the_wrapper_cleanup_removes_the_publish_and_nothing_else() -> None:
     """Teardown re-applies the paper stack without the probe override. It brings
     the container UP without the published port; it never brings it down."""
-    code = _code_lines(WRAPPER.read_text(encoding="utf-8"))
-    cleanup = code.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
+    lib = _code_lines(PAPER_PROBE_BOOTSTRAP.read_text(encoding="utf-8"))
+    cleanup = lib.split("paper_probe_close_db() {", 1)[1].split("\n}", 1)[0]
 
     assert "up -d --no-deps postgres" in cleanup
     assert "down" not in cleanup
@@ -499,11 +502,11 @@ def test_the_wrapper_cleanup_removes_the_publish_and_nothing_else() -> None:
 
 def test_an_authentication_failure_asks_for_reconciliation_not_deletion() -> None:
     """The message the owner will actually read when an existing volume and the
-    secret set disagree."""
-    text = WRAPPER.read_text(encoding="utf-8")
+    secret set disagree -- now in the shared bootstrap library."""
+    text = PAPER_PROBE_BOOTSTRAP.read_text(encoding="utf-8")
 
     assert "Reconcile" in text
-    assert "Do NOT delete the volume" in text
+    assert "do not delete the volume" in text.lower()
     assert "zero IBKR connections were opened" in text
 
 
@@ -512,13 +515,16 @@ def test_an_authentication_failure_asks_for_reconciliation_not_deletion() -> Non
 
 def test_the_wrapper_loads_the_credentials_before_it_starts_anything() -> None:
     """Order matters: a missing credential must fail before a container exists."""
-    code = _code_lines(WRAPPER.read_text(encoding="utf-8"))
+    lib = _code_lines(PAPER_PROBE_BOOTSTRAP.read_text(encoding="utf-8"))
 
-    load_at = code.index("load_paper_environment")
-    compose_at = code.index('docker compose "${COMPOSE_FILES[@]}" \\')
-    probe_at = code.index("python -m trading_execution_agent probe")
-
-    assert load_at < compose_at < probe_at
+    load_at = lib.index("load_paper_environment")
+    compose_at = lib.index('PAPER_PROBE_DB_PORT="$db_port" docker compose')
+    assert load_at < compose_at, "credentials load before any container starts"
+    # And the wrapper prepares the environment before it ever runs the probe.
+    wrapper = _code_lines(WRAPPER.read_text(encoding="utf-8"))
+    assert wrapper.index("paper_probe_open_db") < wrapper.index(
+        "python -m trading_execution_agent probe"
+    )
 
 
 def test_the_loader_exports_into_its_own_process_only() -> None:
@@ -550,10 +556,19 @@ def test_there_is_exactly_one_credential_loading_implementation() -> None:
     ]
 
     assert callers == [], f"{[c.name for c in callers]} bypass the shared loader"
-    for script in (WRAPPER, LAUNCHER, CONFIG_CHECK):
+    # The launcher and the config check call the loader directly; the probe
+    # wrapper reaches it through the shared bootstrap library it sources (which
+    # is itself the single caller of load_paper_environment for a probe run).
+    for script in (LAUNCHER, CONFIG_CHECK):
         code = _code_lines(script.read_text(encoding="utf-8"))
         assert "lib/paper_env.sh" in code, f"{script.name} does not source the loader"
         assert "load_paper_environment" in code
+    wrapper = _code_lines(WRAPPER.read_text(encoding="utf-8"))
+    assert "lib/paper_env.sh" in wrapper
+    assert "paper_probe_bootstrap.sh" in wrapper
+    assert "load_paper_environment" in _code_lines(
+        PAPER_PROBE_BOOTSTRAP.read_text(encoding="utf-8")
+    )
 
 
 def test_the_loader_satisfies_the_base_compose_interpolation_contract() -> None:
@@ -590,27 +605,28 @@ def test_the_probe_wrapper_never_bootstraps_credentials() -> None:
 def test_the_wrapper_still_publishes_only_on_loopback() -> None:
     """Preserved from the previous round: never 0.0.0.0, never left open."""
     code = _code_lines(WRAPPER.read_text(encoding="utf-8"))
+    lib = _code_lines(PAPER_PROBE_BOOTSTRAP.read_text(encoding="utf-8"))
     override = _code_lines(
         (REPO_ROOT / "deploy" / "compose.paper-probe.yaml").read_text(encoding="utf-8")
     )
 
-    assert "0.0.0.0" not in code
+    assert "0.0.0.0" not in code and "0.0.0.0" not in lib
     assert "0.0.0.0" not in override
     assert "127.0.0.1:" in override
-    assert "trap cleanup EXIT" in code
+    assert "trap 'paper_probe_close_db' EXIT" in code
 
 
 def test_the_first_run_path_creates_the_database_without_asking(tmp_path: Path) -> None:
     """No container, no network, no volume: `compose up` makes all three, and
     PostgreSQL initialises the role from the credentials just loaded."""
     del tmp_path
-    code = _code_lines(WRAPPER.read_text(encoding="utf-8"))
+    code = _code_lines(PAPER_PROBE_BOOTSTRAP.read_text(encoding="utf-8"))
 
     assert "ps -aq postgres" in code, "first run is detected, not assumed"
     assert "first run: creating the paper database" in code
     # It is created by the ordinary paper stack definition, not by a bespoke
     # container, so isolation and persistence come from the reviewed compose
-    # files rather than from this script.
+    # files rather than from this library.
     assert "-f deploy/compose.paper.yaml" in code
 
 

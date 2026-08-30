@@ -47,6 +47,15 @@ CONFIG_CHECK = REPO_ROOT / "scripts" / "check_paper_compose_config.sh"
 PAPER_ENV_LIB = REPO_ROOT / "scripts" / "lib" / "paper_env.sh"
 WRAPPER = REPO_ROOT / "scripts" / "run_execution_probe_paper.sh"
 RECOVERY_HELPER = REPO_ROOT / "scripts" / "close_paper_probe_publish.sh"
+# The DB/env lifecycle -- including the EXIT-trap cleanup -- now lives in the ONE
+# shared bootstrap library both owner wrappers source, so it is read from there.
+BOOTSTRAP = REPO_ROOT / "scripts" / "lib" / "paper_probe_bootstrap.sh"
+
+
+def _close_db_body() -> str:
+    """The body of the shared ``paper_probe_close_db`` function, verbatim."""
+    text = BOOTSTRAP.read_text(encoding="utf-8")
+    return text.split("paper_probe_close_db() {", 1)[1].split("\n}", 1)[0]
 
 #: Everything a fresh owner SSH session does NOT have. Both families.
 CREDENTIAL_VARIABLES = (
@@ -228,8 +237,7 @@ def _cleanup_compose_command() -> str:
     Read out of the wrapper rather than retyped, so the test follows the code
     if the teardown changes.
     """
-    text = WRAPPER.read_text(encoding="utf-8")
-    cleanup = text.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
+    cleanup = _close_db_body()
     for line in _join_continuations(cleanup):
         if line.startswith("if ! docker compose"):
             command = line.removeprefix("if ! ")
@@ -370,8 +378,7 @@ def _cleanup_recovery_instruction() -> str:
     it names must not drift. The wrapper prints it via a second `log` line
     inside the cleanup failure branch.
     """
-    text = WRAPPER.read_text(encoding="utf-8")
-    cleanup = text.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
+    cleanup = _close_db_body()
     warning_seen = False
     for line in _join_continuations(cleanup):
         if "could not close the temporary publish" in line:
@@ -391,9 +398,7 @@ def test_the_cleanup_warning_names_the_canonical_recovery_helper() -> None:
     assert instruction == "bash scripts/close_paper_probe_publish.sh"
     # And the warning does NOT hand the owner a bare `docker compose ... up`,
     # which would require the generic POSTGRES_* a fresh shell lacks.
-    text = WRAPPER.read_text(encoding="utf-8")
-    cleanup = text.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
-    warning_region = cleanup.split("could not close", 1)[1]
+    warning_region = _close_db_body().split("could not close", 1)[1]
     assert "docker compose" not in warning_region, (
         "the recovery instruction must point at the helper, not a bare command"
     )

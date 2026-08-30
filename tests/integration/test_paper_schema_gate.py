@@ -66,29 +66,42 @@ def _wrapper_code() -> str:
     return _code_lines(WRAPPER.read_text(encoding="utf-8"))
 
 
+# The DB/env lifecycle (auth, DATABASE_URL, schema prep) now lives in the ONE
+# shared bootstrap library both owner wrappers source, so those steps are
+# asserted there; the wrapper only orders the bootstrap before the probe.
+BOOTSTRAP = REPO_ROOT / "scripts" / "lib" / "paper_probe_bootstrap.sh"
+
+
+def _bootstrap_code() -> str:
+    return _code_lines(BOOTSTRAP.read_text(encoding="utf-8"))
+
+
 def test_schema_preparation_runs_after_the_database_is_proven() -> None:
     """Migrating before authenticating would report the wrong failure."""
-    code = _wrapper_code()
+    lib = _bootstrap_code()
 
-    auth_at = code.index("check_paper_probe_database.py")
-    prepare_at = code.index("prepare_paper_database.py")
-    probe_at = code.index("python -m trading_execution_agent probe")
-
-    assert auth_at < prepare_at < probe_at
+    auth_at = lib.index("check_paper_probe_database.py")
+    prepare_at = lib.index("prepare_paper_database.py")
+    assert auth_at < prepare_at
+    # And the wrapper runs the probe only after the bootstrap returns.
+    wrapper = _wrapper_code()
+    assert wrapper.index("paper_probe_open_db") < wrapper.index(
+        "python -m trading_execution_agent probe"
+    )
 
 
 def test_schema_preparation_uses_the_url_the_probe_will_use() -> None:
     """The same DATABASE_URL, already built and exported, not a second one."""
-    code = _wrapper_code()
+    lib = _bootstrap_code()
 
-    url_at = code.index("build_paper_database_url.py")
-    export_at = code.index("export DATABASE_URL")
-    prepare_at = code.index("prepare_paper_database.py")
+    url_at = lib.index("build_paper_database_url.py")
+    export_at = lib.index("export DATABASE_URL")
+    prepare_at = lib.index("prepare_paper_database.py")
 
     assert url_at < export_at < prepare_at
     # And the preparation step does not construct its own.
     prepare_line = next(
-        line for line in code.splitlines() if "prepare_paper_database.py" in line
+        line for line in lib.splitlines() if "prepare_paper_database.py" in line
     )
     assert "PAPER_POSTGRES" not in prepare_line
     assert "postgresql" not in prepare_line
@@ -116,12 +129,14 @@ def test_only_upgrade_head_is_ever_offered() -> None:
 
 def test_the_wrapper_never_resets_the_database_on_a_schema_failure() -> None:
     """A migration failure is reported, never "fixed" by destroying data."""
-    text = WRAPPER.read_text(encoding="utf-8")
-    executable = _code_lines(text)
+    wrapper_text = WRAPPER.read_text(encoding="utf-8")
+    lib_text = BOOTSTRAP.read_text(encoding="utf-8")
+    executable = _code_lines(wrapper_text) + "\n" + _code_lines(lib_text)
 
     for destructive in ("down -v", "--volumes", "volume rm", "volume prune"):
         assert destructive not in executable
-    assert "Nothing was reset and no data was removed" in text
+    # The reassurance lives beside the schema step, now in the shared library.
+    assert "Nothing was reset and no data was removed" in lib_text
 
 
 # == the gate actually stops the probe =======================================
@@ -136,27 +151,33 @@ def _run_bash(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
 
 
 def _gate_fragment() -> str:
-    """The wrapper's real schema gate, sliced out of the file.
+    """The wrapper's real bootstrap gate, sliced out of the file.
 
-    Sliced rather than retyped, and asserted non-empty by the callers, so the
-    control flow under test is the shipped one.
+    The DB/schema preparation is one shared function now, so the wrapper's gate
+    is ``paper_probe_open_db ... || fail ...`` before the probe. Sliced rather
+    than retyped, and asserted non-empty, so the control flow under test is the
+    shipped one; the fake ``paper_probe_open_db`` stands in for the whole
+    bootstrap (whose OWN failure-closed behaviour is proven in the library
+    tests).
     """
     text = WRAPPER.read_text(encoding="utf-8")
-    start = text.index("if ! uv run --no-sync python scripts/prepare_paper_database.py")
+    start = text.index("paper_probe_open_db \"$REPO_ROOT\"")
     end = text.index("log \"-- running the probe")
     fragment = text[start:end]
-    assert "fail " in fragment, "the gate must fail, not warn"
+    assert "|| fail" in fragment, "the gate must fail, not warn"
     return fragment
 
 
-def test_a_failing_schema_preparation_invokes_zero_probes(tmp_path: Path) -> None:
-    """The requirement: no migration, no probe, no IBKR session."""
+def test_a_failing_bootstrap_invokes_zero_probes(tmp_path: Path) -> None:
+    """The requirement: no schema prep, no probe, no IBKR session."""
     marker = tmp_path / "probe-was-invoked"
     body = (
         "set -Eeuo pipefail\n"
         'fail() { echo "ERROR: $*" >&2; exit 2; }\n'
         "log() { :; }\n"
-        'uv() { echo "PAPER_DB_SCHEMA_FAILED: OperationalError" >&2; return 1; }\n'
+        'REPO_ROOT="."\n'
+        # The bootstrap fails closed (its own reasons are library-tested).
+        "paper_probe_open_db() { return 1; }\n"
         + _gate_fragment()
         + f'touch "{marker.as_posix()}"\n'
     )
@@ -168,14 +189,15 @@ def test_a_failing_schema_preparation_invokes_zero_probes(tmp_path: Path) -> Non
     assert "zero IBKR connections were opened" in result.stderr
 
 
-def test_a_passing_schema_preparation_allows_the_probe(tmp_path: Path) -> None:
-    """The control: identical control flow, preparation succeeds."""
+def test_a_passing_bootstrap_allows_the_probe(tmp_path: Path) -> None:
+    """The control: identical control flow, the bootstrap succeeds."""
     marker = tmp_path / "probe-was-invoked"
     body = (
         "set -Eeuo pipefail\n"
         'fail() { echo "ERROR: $*" >&2; exit 2; }\n'
         "log() { :; }\n"
-        "uv() { echo 'PAPER_DB_SCHEMA_OK: schema already at head'; return 0; }\n"
+        'REPO_ROOT="."\n'
+        "paper_probe_open_db() { return 0; }\n"
         + _gate_fragment()
         + f'touch "{marker.as_posix()}"\n'
     )
@@ -183,7 +205,7 @@ def test_a_passing_schema_preparation_allows_the_probe(tmp_path: Path) -> None:
     result = _run_bash(tmp_path, body)
 
     assert result.returncode == 0, result.stderr
-    assert marker.exists(), "the probe should run once the schema is proven"
+    assert marker.exists(), "the probe should run once the bootstrap succeeds"
 
 
 # == the CLI is secret-safe ==================================================
