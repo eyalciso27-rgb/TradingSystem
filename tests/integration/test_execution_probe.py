@@ -40,11 +40,36 @@ def test_the_probe_has_no_submission_path_at_all() -> None:
 
 
 def test_the_probe_never_supplies_an_authorization() -> None:
-    """It uses the production authority, which denies. Belt and braces."""
-    source = _source()
+    """The probe's own run passes NO authority, so the service default DENIES.
 
-    assert "authorization=" not in source
-    assert "the production default DENIES" in source
+    ``build_service`` grew an optional ``authorization`` seam that ONLY the
+    owner-safe proof uses; the probe entrypoint must never pass it, so it keeps
+    the production ``DenyAllExecutionAuthorization``. Checked on the actual call
+    in ``main`` via the AST, not a brittle substring — the plumbing legitimately
+    mentions ``authorization`` now.
+    """
+    tree = ast.parse(_source())
+    main_fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    build_calls = [
+        node
+        for node in ast.walk(main_fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "build_service"
+    ]
+    assert build_calls, "the probe main() must call build_service"
+    for call in build_calls:
+        keywords = {kw.arg for kw in call.keywords}
+        assert "authorization" not in keywords, (
+            "the probe must not supply an authorization; the service default"
+            " DenyAllExecutionAuthorization is what makes it non-submitting"
+        )
+    # And the default is documented as DenyAll for the reader.
+    assert "DenyAll" in _source()
 
 
 def test_the_probe_offers_no_live_mode() -> None:
