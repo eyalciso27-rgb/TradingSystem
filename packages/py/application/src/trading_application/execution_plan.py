@@ -94,10 +94,34 @@ class ExecutablePlan:
     time_in_force: str
     limit_price: Decimal | None
     stop_price: Decimal | None
+    #: The protective STOP child's canonical id, when this plan is a protected
+    #: entry (ADR-0019). Its presence means the order is a native bracket: the
+    #: agent establishes the entry and a protective stop at ``stop_price`` as one
+    #: atomic broker action. ``None`` is an ordinary unbracketed order. Part of
+    #: the seal, so the protective structure an authorization is granted over is
+    #: exactly the structure the broker receives — it cannot be added, dropped or
+    #: re-pointed after authorization.
+    protective_stop_client_order_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.quantity <= 0:
             raise ValueError("an executable plan must have a positive quantity")
+        if self.protective_stop_client_order_id is not None:
+            if not self.protective_stop_client_order_id.strip():
+                raise ValueError(
+                    "protective_stop_client_order_id, when present, must be"
+                    " non-empty"
+                )
+            if self.protective_stop_client_order_id == self.client_order_id:
+                raise ValueError(
+                    "the protective stop child id must differ from the entry"
+                    " client_order_id"
+                )
+            if self.stop_price is None or self.stop_price <= 0:
+                raise ValueError(
+                    "a protected entry plan must carry a positive stop_price for"
+                    " its protective child"
+                )
         if not self.client_order_id.strip():
             raise ValueError("client_order_id is mandatory on an executable plan")
         if not self.broker_instrument_ref.strip():

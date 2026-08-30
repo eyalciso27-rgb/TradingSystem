@@ -418,8 +418,12 @@ class ReadinessGuardedBroker:
         intended architecture (ADR-0018, option B).
         """
         # The plan must still carry the protective level -- necessary, and
-        # nowhere near sufficient.
-        has_stop = intent.stop_price is not None and intent.stop_price > 0
+        # nowhere near sufficient. It may sit on the entry itself (a STOP-type
+        # entry) OR on the protective bracket that will establish it atomically
+        # (ADR-0019); either is "the plan carries a protective stop".
+        has_stop = (intent.stop_price is not None and intent.stop_price > 0) or (
+            intent.protective is not None and intent.protective.stop_price > 0
+        )
 
         if self._protection is None:
             return ProtectionState(

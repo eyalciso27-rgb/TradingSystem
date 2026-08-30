@@ -63,6 +63,7 @@ from trading_broker_core.port import (
     CancelOrderRequest,
     OrderIntent,
     OrderSide,
+    ProtectiveBracket,
     TimeInForce,
 )
 from trading_contracts.enums import Environment, OrderType
@@ -396,6 +397,19 @@ class ExecutionAgent:
         # just verified against both the pre-submit result and the token. There
         # is no field here the agent could source from somewhere else.
         plan = request.plan
+        # A protected entry (ADR-0019) is rebuilt from the seal as a native
+        # bracket: the protective stop rides the bracket child, so the parent
+        # stays a clean LIMIT/MARKET and the broker establishes both legs
+        # atomically. The child id and the stop are both sealed, so the bracket
+        # the broker receives is exactly the one that was authorized.
+        protective: ProtectiveBracket | None = None
+        entry_stop_price = plan.stop_price
+        if plan.protective_stop_client_order_id is not None and plan.stop_price is not None:
+            protective = ProtectiveBracket(
+                stop_price=plan.stop_price,
+                stop_client_order_id=plan.protective_stop_client_order_id,
+            )
+            entry_stop_price = None
         intent = OrderIntent(
             client_order_id=plan.client_order_id,
             # The CANONICAL authorization identity, content-addressed over the
@@ -416,8 +430,9 @@ class ExecutionAgent:
             order_type=plan.order_type,
             quantity=plan.quantity,
             limit_price=plan.limit_price,
-            stop_price=plan.stop_price,
+            stop_price=entry_stop_price,
             time_in_force=TimeInForce(plan.time_in_force),
+            protective=protective,
         )
         try:
             receipt = self._broker.submit_order(intent)

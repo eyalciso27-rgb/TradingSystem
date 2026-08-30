@@ -110,6 +110,7 @@ from trading_broker_core.port import (
     InstrumentQuery,
     OrderIntent,
     OrderSide,
+    ProtectiveBracket,
     RecoveredOrder,
     SessionPnlStatus,
     TimeInForce,
@@ -589,6 +590,10 @@ class PlanContext:
     time_in_force: str
     entry_price: Decimal
     stop_price: Decimal | None
+    #: The protective stop child id when this is a protected entry (ADR-0019),
+    #: else None. Decided once, at plan-build time, so the sealed plan and the
+    #: order the agent sends carry the identical protective structure.
+    protective_stop_client_order_id: str | None = None
 
     def sealed_with(self, allocation_ref: str, quantity: Decimal) -> ExecutablePlan:
         """The executable plan these runtime facts make, at this size.
@@ -617,6 +622,7 @@ class PlanContext:
             time_in_force=self.time_in_force,
             limit_price=self.entry_price,
             stop_price=self.stop_price,
+            protective_stop_client_order_id=self.protective_stop_client_order_id,
         )
 
 
@@ -1698,6 +1704,9 @@ class ExecutionService:
             time_in_force=self._config.time_in_force.value,
             entry_price=entry_price,
             stop_price=stop_price,
+            protective_stop_client_order_id=self._protective_child_id(
+                intent.client_order_id, stop_price
+            ),
         )
         try:
             authorization = self._authorization.authorize(
@@ -2359,6 +2368,24 @@ class ExecutionService:
         stop_price: Decimal | None,
         broker_instrument_ref: str,
     ) -> OrderIntent:
+        # A protected entry is a native bracket (ADR-0019): the protective stop
+        # rides the bracket, so the parent stays a clean LIMIT/MARKET and the
+        # broker establishes the entry and its stop as one atomic action. The
+        # child id is derived deterministically from the entry id, so the eval
+        # path and the sealed-plan submission build the SAME bracket -- which is
+        # what keeps the seal intact. When protection is not required, or the
+        # parent is a STOP-type entry, or there is no stop, this is an ordinary
+        # unbracketed order exactly as before.
+        protective: ProtectiveBracket | None = None
+        entry_stop_price = stop_price
+        child_id = self._protective_child_id(intent.client_order_id, stop_price)
+        if child_id is not None and stop_price is not None:
+            protective = ProtectiveBracket(
+                stop_price=stop_price,
+                stop_client_order_id=child_id,
+            )
+            # The stop is the bracket child's, not the parent's aux price.
+            entry_stop_price = None
         return OrderIntent(
             client_order_id=intent.client_order_id,
             # Provisional: the real one is minted by the pre-submit check and
@@ -2373,9 +2400,29 @@ class ExecutionService:
             order_type=self._config.order_type,
             quantity=quantity,
             limit_price=entry_price,
-            stop_price=stop_price,
+            stop_price=entry_stop_price,
             time_in_force=self._config.time_in_force,
+            protective=protective,
         )
+
+    def _protective_child_id(
+        self, client_order_id: str, stop_price: Decimal | None
+    ) -> str | None:
+        """The protective stop child's id when this entry must be bracketed.
+
+        ONE decision, used both to build the eval order and to seal the plan, so
+        the order the guard evaluates and the order the agent sends carry the
+        identical protective structure. ``None`` means no bracket: protection is
+        not required, there is no stop, or the parent is a STOP-type entry that
+        cannot host a protective child.
+        """
+        if (
+            self._config.protection_required
+            and stop_price is not None
+            and self._config.order_type in (OrderType.LIMIT, OrderType.MARKET)
+        ):
+            return f"{client_order_id}:stop"
+        return None
 
     def _stop_price(self, intent: ExecutionIntent, entry: Decimal) -> Decimal | None:
         """Protection derived from configuration, never improvised per call."""

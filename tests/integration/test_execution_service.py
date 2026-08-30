@@ -115,6 +115,7 @@ from trading_execution_agent.execution_service import (
     ExecutionStage,
     PlanContext,
 )
+from trading_execution_agent.protected_entry import IbkrProtectedEntryLifecycle
 from trading_execution_agent.reconciliation_latch import ALWAYS_PERMIT
 from trading_market_data_core.sp500_current_universe import Constituent, ConstituentSnapshot
 from trading_market_data_core.trading_readiness import (
@@ -510,6 +511,7 @@ def _real_authorization(
             broker_instrument_ref=facts.instrument.broker_instrument_ref,
             broker_exchange=facts.instrument.exchange,
             broker_currency=facts.instrument.currency,
+            protective_stop_client_order_id=facts.protective_stop_client_order_id,
         ),
         RefreshedMarket(price=entry, observed_at=NOW),
         RefreshedAccount(risk_budget_equity=Decimal("50000"), observed_at=NOW),
@@ -988,6 +990,43 @@ def test_an_authorized_ready_decision_reaches_the_broker_exactly_once() -> None:
     assert evaluation.outcome is not None
     assert evaluation.outcome.status is ExecutionStatus.SUBMITTED
     assert len(_submits(transport)) == 1, "exactly one order reached the broker"
+
+
+def test_a_wired_lifecycle_reaches_native_protected_submission_end_to_end() -> None:
+    """ADR-0019 end to end: the canonical decision path establishes protection.
+
+    With the production ``IbkrProtectedEntryLifecycle`` wired and a test
+    authorization, a protection-REQUIRED decision passes the protection gate
+    (which used to refuse at PROTECTION_UNAVAILABLE) and the broker receives ONE
+    atomic native bracket — carrying the EXACT conId and both legs resting — not
+    a lone entry. This is the whole milestone joined up.
+    """
+    transport = PnlAwareTransport()
+    adapter = _adapter(transport)
+    service, fake, _ = _service(
+        transport=transport,
+        adapter=adapter,
+        protection=IbkrProtectedEntryLifecycle(adapter),
+        protection_required=True,
+        authorization=_TestOnlyAuthorization(),
+    )
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED, evaluation.reasons
+    # A native BRACKET reached the broker, never a lone unbracketed entry.
+    bracket_calls = [c for c in fake.calls if c.startswith("submit_bracket:")]
+    assert len(bracket_calls) == 1, fake.calls
+    assert not any(c.startswith("submit:") for c in fake.calls)
+    # The exact resolved security is preserved end to end onto the bracket.
+    submitted = fake.submitted_intents[-1]
+    assert submitted.broker_instrument_ref == "conid:265598"
+    assert submitted.protective is not None
+    assert submitted.stop_price is None, "the stop rides the bracket, not the parent aux"
+    # Both legs actually rest at the broker: the entry is born protected.
+    legs = {o.client_order_id for o in adapter.get_open_orders("paper-main")}
+    assert submitted.client_order_id in legs
+    assert submitted.protective.stop_client_order_id in legs
 
 
 def test_the_pre_submit_record_is_written_before_the_broker_sees_anything() -> None:

@@ -68,6 +68,7 @@ from trading_execution_agent.execution_service import (
     ExecutionService,
     ExecutionStage,
 )
+from trading_execution_agent.protected_entry import IbkrProtectedEntryLifecycle
 from trading_execution_agent.safe_logging import (
     install_owner_output_protection,
     owner_print,
@@ -503,6 +504,10 @@ def _build(
         # there is no wiring in which the latched gate and the gate the agent
         # consults could be different.
         entry_gate=latch,
+        # The production protected-entry authority (ADR-0019): it PROVES a
+        # native bracket will protect the entry and never submits. Without it a
+        # protection-required entry is refused (no lifecycle => no evidence).
+        protection=IbkrProtectedEntryLifecycle(adapter),  # type: ignore[arg-type]
         # No authorization argument: the production default DENIES.
     )
 

@@ -200,6 +200,11 @@ class PreSubmitRequest:
     broker_instrument_ref: str
     broker_exchange: str
     broker_currency: str
+    #: The protective STOP child id when this candidate is a protected entry
+    #: (ADR-0019), else None. Part of the order, so it is checked and sealed into
+    #: the plan: an authorization for a bracketed entry authorizes THAT protective
+    #: structure, and a later component cannot add, drop or re-point it.
+    protective_stop_client_order_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.client_order_id.strip():
@@ -386,6 +391,7 @@ class FinalPreSubmitCheck:
                 time_in_force=request.time_in_force,
                 limit_price=request.planned_entry_price,
                 stop_price=request.planned_stop_price,
+                protective_stop_client_order_id=request.protective_stop_client_order_id,
             )
             sealed = plan_identity(plan)
             return replace(
