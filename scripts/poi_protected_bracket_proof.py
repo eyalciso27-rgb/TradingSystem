@@ -371,16 +371,22 @@ def _cleanup(resources: object, account_alias: str, client_order_id: str) -> int
         return EXIT_ERROR
     broker = service.guarded_broker
     owner_print("=== CLEANUP: cancel + reconcile ===")
-    try:
-        broker.cancel_order(
-            CancelOrderRequest(
-                client_order_id=client_order_id, correlation_id=client_order_id
+    # Cancel BOTH known legs explicitly rather than trusting a parentId/OCA side
+    # effect: the entry and the derived protective stop id. Cancelling the parent
+    # SHOULD take the attached child down, but a proof does not rely on "should"
+    # -- it cancels each id it created, then proves via reconcile that no leg
+    # remains working.
+    stop_client_order_id = f"{client_order_id}:stop"
+    for leg in (client_order_id, stop_client_order_id):
+        try:
+            broker.cancel_order(
+                CancelOrderRequest(client_order_id=leg, correlation_id=client_order_id)
             )
-        )
-        owner_print("cancel requested for the bracket (OCA cancels every leg)")
-    except Exception as error:  # noqa: BLE001 - type/code only
-        owner_print(safe_failure("cancel failed; RECONCILE MANUALLY", error))
-        return EXIT_ERROR
+            owner_print(f"cancel requested for {leg!r}")
+        except Exception as error:  # noqa: BLE001 - type/code only
+            # A leg the broker no longer holds (already cancelled with its
+            # parent) is fine; other failures are surfaced by the reconcile.
+            owner_print(safe_failure(f"cancel for {leg!r} not confirmed", error))
     try:
         result = broker.reconcile(account_alias)
     except Exception as error:  # noqa: BLE001

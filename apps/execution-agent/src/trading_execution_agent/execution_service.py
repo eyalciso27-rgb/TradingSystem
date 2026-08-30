@@ -807,6 +807,9 @@ class ExecutionFingerprint:
     bracket_mechanism: str = ""
     protective_order_refs: str = ""
     protective_quantity: str = ""
+    #: The protective STOP LEVEL that was prepared. A recovered stop at the wrong
+    #: price protects the wrong exposure, so it is sealed and compared exactly.
+    protective_stop_price: str = ""
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -830,6 +833,7 @@ class ExecutionFingerprint:
             "bracket_mechanism": self.bracket_mechanism,
             "protective_order_refs": self.protective_order_refs,
             "protective_quantity": self.protective_quantity,
+            "protective_stop_price": self.protective_stop_price,
         }
 
     #: The fields that say WHICH execution this is, and what the caller ASKED
@@ -895,6 +899,7 @@ class ExecutionFingerprint:
                 bracket_mechanism=str(raw.get("bracket_mechanism", "")),
                 protective_order_refs=str(raw.get("protective_order_refs", "")),
                 protective_quantity=str(raw.get("protective_quantity", "")),
+                protective_stop_price=str(raw.get("protective_stop_price", "")),
             )
         except KeyError:
             return None
@@ -1827,6 +1832,11 @@ class ExecutionService:
             protective_quantity=(
                 _normal(order.quantity) if order and order.protective else ""
             ),
+            protective_stop_price=(
+                _normal(order.protective.stop_price)
+                if order and order.protective
+                else ""
+            ),
         )
 
     def _durable_verdict(self, intent: ExecutionIntent) -> ExecutionEvaluation | None:
@@ -2125,6 +2135,24 @@ class ExecutionService:
                 f" not the protected {prepared.protective_quantity}; the exposure"
                 " is not fully covered"
             )
+        # THE stop level. A stop of the right shape at the wrong price protects
+        # the wrong exposure -- a long entry authorized to stop at 95 that comes
+        # back stopping at 80 is exposed 15 points further than authorized. A
+        # protected entry MUST carry a prepared stop price, and the broker MUST
+        # report one; a missing or differing level fails closed.
+        if prepared.protective_stop_price:
+            if child.stop_price is None:
+                return (
+                    f"the protective child {child_id!r} reports no stop price;"
+                    " protection at an unknown level cannot be proven"
+                )
+            if _normal(child.stop_price) != prepared.protective_stop_price:
+                return (
+                    f"the protective child {child_id!r} stops at"
+                    f" {_normal(child.stop_price)}, not the authorized"
+                    f" {prepared.protective_stop_price}; a stop at the wrong"
+                    " price protects the wrong exposure"
+                )
         # When the broker states the child's security, it must be the SAME one
         # the entry named. A stop on a different security is not protection.
         if (

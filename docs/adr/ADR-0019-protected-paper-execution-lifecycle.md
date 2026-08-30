@@ -211,3 +211,39 @@ the risk engine, or if the default-to-deny / submit-through-the-agent /
 audit-before-submit invariants are edited out. This ADR adds one guardrail: a
 protective child order may be constructed only inside the IBKR adapter, so no
 bracket/OCA/parentId/transmit wiring can leak outside `trading_broker_ibkr`.
+
+## Amendments after review (Increment-2 hardening)
+
+**The protective STOP PRICE is sealed and verified.** `protective_stop_price`
+joins `PROTECTIVE_ORDER_FIELDS`, so it is written at SUBMIT_PREPARED, carried
+into the terminal record, required by the durable reader whenever a bracket is
+declared, and compared by `require_consistent_lifecycle`. Restart recovery
+compares the broker-reported `child.stop_price` against it: a stop of the right
+shape at the WRONG price — or a broker that reports no price — protects the wrong
+exposure and fails closed to `NEEDS_RECONCILIATION`. A right-shaped stop at the
+wrong level is not protection.
+
+**Bracket acceptance is an explicit coherence matrix.** Statuses are mapped
+WITHOUT raising, then: both legs working-or-better → PROTECTED; both legs
+definitely-not-live → a clean rejection (nothing live); **every** other pair —
+one leg live while the other is not proven, or EITHER leg UNKNOWN — cancels BOTH
+broker ids best-effort, marks the order unresolved, and refuses. No status
+combination may leave one unexplained working leg. "IBKR would never do this" is
+not a safety argument.
+
+**MVP partial-fill safety: a protected Paper entry is one whole share.** IBKR
+holds an attached protective child until the PARENT is *completely* filled, so a
+parent larger than one share can rest PARTIALLY_FILLED with its stop not yet
+active — an unprotected window. Until live partial-fill protection is built
+(deferred), a protected entry is exactly one whole share, refused otherwise at
+the adapter boundary every `OrderIntent` crosses (fractional is disabled, so a
+one-share order fills fully or not at all). The authority may reduce a larger
+risk approval to one; it may never increase risk. This is an explicit,
+documented MVP limitation, not the target.
+
+**Cleanup proves no child remains.** The fake transport models the REAL
+structure — `parentId` binds the child to the parent, the OCA group is between
+children — rather than a convenient parent-in-OCA side effect, so a test cannot
+prove a cleanup property the real broker does not guarantee. The proof cancels
+BOTH known ids explicitly (entry and derived stop) and then reconciles to prove
+no leg remains working, reporting any residual position for a manual flatten.

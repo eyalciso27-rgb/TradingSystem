@@ -77,6 +77,11 @@ PROTECTIVE_ORDER_FIELDS: tuple[str, ...] = (
     "bracket_mechanism",
     "protective_order_refs",
     "protective_quantity",
+    # The protective STOP LEVEL. A recovered stop of the right shape at the
+    # WRONG price is not protection: a long entry whose stop dropped from 95 to
+    # 80 is exposed far below where it was authorized to be. So the price is
+    # sealed and compared exactly like the rest of the protective structure.
+    "protective_stop_price",
 )
 
 #: The single field whose presence marks a record as a protected entry and thus

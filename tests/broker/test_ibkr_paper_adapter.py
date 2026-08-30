@@ -91,9 +91,10 @@ class FakePaperTransport:
         # tracked live orders: broker_order_id -> RawOpenOrder (for the
         # read-only reqAllOpenOrders snapshot)
         self._live: dict[int, RawOpenOrder] = {}
-        #: broker_order_id -> OCA group, so cancelling one bracket leg cancels
-        #: the whole group like a real native bracket.
+        #: child broker_order_id -> OCA group (children only, like real IBKR).
         self._oca_groups: dict[int, str] = {}
+        #: parent broker_order_id -> attached child ids (the parentId relation).
+        self._children_of: dict[int, list[int]] = {}
         #: injected snapshot rows (for restart / foreign / malformed drills)
         self.snapshot_override: tuple[RawOpenOrder, ...] | None = None
         self.snapshot_error: Exception | None = None
@@ -225,7 +226,13 @@ class FakePaperTransport:
             limit_price=None,
             aux_price=bracket.stop_price,
         )
-        self._oca_groups[parent_order_id] = oca
+        # REAL IBKR semantics, not a convenient fiction: the child is bound to
+        # the parent by parentId (cancelling the parent cancels its attached
+        # children), and the OCA group is between the CHILDREN (the stop and,
+        # later, a take-profit) -- the parent is NOT in it. Modelling it the
+        # real way is what stops a FakeBroker OCA side effect from "proving" a
+        # cleanup property the real structure does not guarantee.
+        self._children_of.setdefault(parent_order_id, []).append(stop_order_id)
         self._oca_groups[stop_order_id] = oca
         return BracketSubmission(
             parent_broker_order_id=parent_order_id,
@@ -234,20 +241,24 @@ class FakePaperTransport:
             stop_status=self._bracket_stop_status,
         )
 
+    def _do_cancel(self, broker_order_id: int) -> None:
+        existing = self._live.get(broker_order_id)
+        if existing is None or existing.status == self._cancel_status:
+            return
+        self._live[broker_order_id] = replace(existing, status=self._cancel_status)
+        # Cancelling a parent cancels its attached children (parentId).
+        for child_id in self._children_of.get(broker_order_id, []):
+            self._do_cancel(child_id)
+        # Cancelling any OCA member cancels its siblings.
+        group = self._oca_groups.get(broker_order_id)
+        if group is not None:
+            for other_id, other_group in list(self._oca_groups.items()):
+                if other_group == group and other_id != broker_order_id:
+                    self._do_cancel(other_id)
+
     def cancel(self, broker_order_id: int) -> str:
         self.calls.append(f"cancel:{broker_order_id}")
-        existing = self._live.get(broker_order_id)
-        if existing is not None:
-            self._live[broker_order_id] = replace(existing, status=self._cancel_status)
-            # Cancelling any leg of an OCA group cancels the whole group, exactly
-            # as a native bracket behaves.
-            group = self._oca_groups.get(broker_order_id)
-            if group is not None:
-                for other_id, other_group in self._oca_groups.items():
-                    if other_group == group and other_id in self._live:
-                        self._live[other_id] = replace(
-                            self._live[other_id], status=self._cancel_status
-                        )
+        self._do_cancel(broker_order_id)
         return self._cancel_status
 
     def open_order_snapshot(self, account_id: str) -> tuple[RawOpenOrder, ...]:
@@ -1004,10 +1015,14 @@ def _bracket_intent(
     *,
     stop_price: Decimal = Decimal("9"),
     stop_ref: str | None = None,
+    quantity: Decimal = Decimal("1"),
     **overrides: Any,
 ) -> OrderIntent:
+    # A protected Paper entry is 1 whole share in the MVP (partial-fill safety),
+    # enforced at the adapter boundary, so the bracket helpers default to 1.
     return make_intent(
         client_order_id,
+        quantity=quantity,
         protective=ProtectiveBracket(
             stop_price=stop_price,
             stop_client_order_id=stop_ref or f"{client_order_id}:stop",
@@ -1092,6 +1107,7 @@ def test_take_profit_leg_is_refused_for_this_milestone() -> None:
     adapter.connect()
     intent = make_intent(
         "brk-3",
+        quantity=Decimal("1"),
         protective=ProtectiveBracket(
             stop_price=Decimal("9"),
             stop_client_order_id="brk-3:stop",
@@ -1155,3 +1171,75 @@ def test_a_synchronous_bracket_failure_cancels_both_legs_and_reconciles() -> Non
     # And it is surfaced for reconciliation, never dropped.
     result = adapter.reconcile("paper-main")
     assert "brk-boom" in result.unresolved_client_order_ids
+
+
+# -- ADR-0019 Increment-2 blockers: coherence matrix + qty gate --------------
+
+
+@pytest.mark.parametrize(
+    ("parent_status", "stop_status", "expect"),
+    [
+        ("Submitted", "Submitted", "protected"),   # both working
+        ("Submitted", "Inactive", "fail"),         # parent live, stop rejected
+        ("Inactive", "Submitted", "fail"),         # stop live, parent rejected
+        ("WeirdParent", "Submitted", "fail"),      # parent UNKNOWN, stop live
+        ("Submitted", "WeirdStop", "fail"),        # parent live, stop UNKNOWN
+        ("Inactive", "Inactive", "reject"),        # both definitely not live
+        ("Cancelled", "Cancelled", "reject"),      # both definitely not live
+    ],
+)
+def test_bracket_acceptance_matrix(
+    parent_status: str, stop_status: str, expect: str
+) -> None:
+    transport = FakePaperTransport(
+        submit_status=parent_status, bracket_stop_status=stop_status
+    )
+    adapter = make_adapter(transport)
+    adapter.connect()
+
+    if expect == "protected":
+        receipt = adapter.submit_order(_bracket_intent("m"))
+        assert receipt.state is OrderState.ACKNOWLEDGED
+        refs = {o.client_order_id for o in adapter.get_open_orders("paper-main")}
+        assert refs == {"m", "m:stop"}
+    elif expect == "reject":
+        # A clean rejection with NOTHING live: returned as the parent receipt,
+        # no exception, and no cancel was needed.
+        receipt = adapter.submit_order(_bracket_intent("m"))
+        assert receipt.state in (OrderState.REJECTED, OrderState.CANCELLED)
+        assert not any(c.startswith("cancel:") for c in transport.calls)
+    else:  # fail: incoherent -> BOTH legs cancelled best-effort + unresolved
+        with pytest.raises(BrokerPortError):
+            adapter.submit_order(_bracket_intent("m"))
+        assert any(c == "cancel:1001" for c in transport.calls), transport.calls
+        assert any(c == "cancel:1002" for c in transport.calls), transport.calls
+        result = adapter.reconcile("paper-main")
+        assert "m" in result.unresolved_client_order_ids
+
+
+def test_a_protected_entry_over_one_share_is_refused_at_the_boundary() -> None:
+    # MVP partial-fill safety: a protected entry is exactly 1 whole share, and
+    # the refusal is at the adapter boundary every OrderIntent crosses, so it
+    # cannot be bypassed by constructing a different intent.
+    transport = FakePaperTransport()
+    adapter = make_adapter(transport)
+    adapter.connect()
+    with pytest.raises(BrokerPortError) as error:
+        adapter.submit_order(_bracket_intent("big", quantity=Decimal("2")))
+    assert error.value.code is BrokerErrorCode.VALIDATION_FAILED
+    # Nothing was sent.
+    assert not any(c.startswith("submit_bracket:") for c in transport.calls)
+
+
+def test_cancelling_the_parent_cancels_the_attached_stop_child() -> None:
+    # Real IBKR parentId semantics (modelled in the fake): cancelling the parent
+    # takes its attached protective child with it -- no orphan stop.
+    transport = FakePaperTransport()
+    adapter = make_adapter(transport)
+    adapter.connect()
+    adapter.submit_order(_bracket_intent("p"))
+
+    adapter.cancel_order(
+        CancelOrderRequest(client_order_id="p", correlation_id="corr-p")
+    )
+    assert adapter.get_open_orders("paper-main") == ()

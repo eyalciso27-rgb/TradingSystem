@@ -3844,6 +3844,7 @@ def _protected_lifecycle(**outcome: str) -> tuple[ExecutionHistoryRecord, ...]:
         "bracket_mechanism": "native-bracket",
         "protective_order_refs": "ord-1:stop",
         "protective_quantity": "10",
+        "protective_stop_price": "95",
         # A bracketed entry's stop rides the child, so the parent's own aux is
         # empty -- matching how the service writes it.
         "stop_price": "",
@@ -3863,6 +3864,7 @@ def test_a_matching_protected_lifecycle_reads_normally() -> None:
     [
         ("stop moved to another ref", {"protective_order_refs": "ord-1:other"}),
         ("protected quantity shrank", {"protective_quantity": "5"}),
+        ("stop price moved", {"protective_stop_price": "80"}),
         ("protection vanished", {"bracket_mechanism": ""}),
     ],
 )
@@ -3876,18 +3878,21 @@ def test_an_outcome_resolving_a_different_protective_structure_is_unreadable(
 
 
 @pytest.mark.parametrize(
-    "missing", ["protective_order_refs", "protective_quantity"]
+    "missing",
+    ["protective_order_refs", "protective_quantity", "protective_stop_price"],
 )
 def test_a_bracket_record_missing_its_protective_fields_is_unreadable(
     missing: str,
 ) -> None:
-    """A record that DECLARES a bracket must name the protective order and its
-    quantity, or its claim of protection cannot be compared to a replay."""
+    """A record that DECLARES a bracket must name the protective order, its
+    quantity AND its stop level, or its claim of protection cannot be compared
+    to a replay."""
     payload = _prepared_payload(
         broker_instrument_ref="conid:265598",
         bracket_mechanism="native-bracket",
         protective_order_refs="ord-1:stop",
         protective_quantity="10",
+        protective_stop_price="95",
     )
     fingerprint = payload["execution_fingerprint"]
     assert isinstance(fingerprint, dict)

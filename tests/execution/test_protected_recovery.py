@@ -41,6 +41,7 @@ def _prepared() -> ExecutionFingerprint:
         bracket_mechanism="native-bracket",
         protective_order_refs="brk-1:stop",
         protective_quantity="1",
+        protective_stop_price="9",
     )
 
 
@@ -50,6 +51,7 @@ def _child(
     order_type: OrderType = OrderType.STOP,
     quantity: Decimal = Decimal("1"),
     conid: str = CONID,
+    stop_price: Decimal | None = Decimal("9"),
 ) -> RecoveredOrder:
     return RecoveredOrder(
         client_order_id="brk-1:stop",
@@ -62,7 +64,7 @@ def _child(
         quantity=quantity,
         order_type=order_type,
         limit_price=None,
-        stop_price=Decimal("9"),
+        stop_price=stop_price,
         observed_at=NOW,
     )
 
@@ -116,3 +118,20 @@ def test_wrong_security_child_does_not_protect_this_entry() -> None:
     problem = _problem(_prepared(), (_parent(), _child(conid="conid:999999")))
     assert problem is not None
     assert "different security" in problem
+
+
+def test_exact_stop_price_is_accepted() -> None:
+    # The control for the stop-price checks: the right level passes.
+    assert _problem(_prepared(), (_parent(), _child(stop_price=Decimal("9")))) is None
+
+
+def test_wrong_stop_price_protects_the_wrong_exposure() -> None:
+    problem = _problem(_prepared(), (_parent(), _child(stop_price=Decimal("8"))))
+    assert problem is not None
+    assert "wrong price" in problem
+
+
+def test_missing_broker_stop_price_cannot_prove_protection() -> None:
+    problem = _problem(_prepared(), (_parent(), _child(stop_price=None)))
+    assert problem is not None
+    assert "no stop price" in problem

@@ -182,6 +182,18 @@ WORKING_OR_BETTER_STATES: frozenset[OrderState] = frozenset(
     }
 )
 
+#: Order states in which a leg is DEFINITELY not live at the broker. Everything
+#: outside WORKING_OR_BETTER and outside this set (an unmapped status ->
+#: ``UNKNOWN``, say) is uncertain — it MAY be live — and is treated as such.
+NOT_LIVE_STATES: frozenset[OrderState] = frozenset(
+    {
+        OrderState.REJECTED,
+        OrderState.CANCELLED,
+        OrderState.CANCELLED_BY_POLICY,
+        OrderState.EXPIRED,
+    }
+)
+
 #: IBKR order-status strings -> canonical OrderState (Decision_Contract
 #: 12.5). Anything absent here is UNKNOWN and fails closed.
 IBKR_STATUS_MAP: Mapping[str, OrderState] = {
@@ -1211,43 +1223,43 @@ class IbkrPaperAdapter:
             # separate placeOrder calls, so a synchronous failure PART-WAY
             # through can leave the parent live and unprotected while the stop
             # never arrived. Once an outbound placeOrder has been ATTEMPTED it
-            # MAY have reached the gateway, so both ids are cancelled
-            # best-effort, and the order is marked unresolved for reconciliation
-            # rather than left as a silent orphan.
-            self._unresolved.add(intent.client_order_id)
-            for orphan_id in (parent_order_id, stop_order_id):
-                # Invoked immediately in the loop body, so the closure sees the
-                # current id (no late-binding surprise).
-                try:
-                    self._guarded(lambda: transport.cancel(orphan_id))  # noqa: B023
-                except BrokerPortError:
-                    pass
+            # MAY have reached the gateway, so both ids are cancelled best-effort
+            # and the order is marked unresolved rather than left an orphan.
+            self._cleanup_bracket_best_effort(
+                transport, intent.client_order_id, parent_order_id, stop_order_id
+            )
             raise
         received_at = self._now()
-        parent_state = self._map_status(
-            result.parent_status, intent.client_order_id, intent.correlation_id
+        # Map WITHOUT raising: an unmapped status is UNKNOWN, and an UNKNOWN leg
+        # is uncertain (it may be live), which the coherence matrix must see
+        # rather than have _map_status raise past it before either leg is
+        # cleaned up.
+        parent_state = IBKR_STATUS_MAP.get(result.parent_status, OrderState.UNKNOWN)
+        stop_state = IBKR_STATUS_MAP.get(result.stop_status, OrderState.UNKNOWN)
+        # The EXPLICIT bracket-outcome matrix. Only two shapes are coherent:
+        #   * both legs working-or-better  -> PROTECTED, proceed;
+        #   * both legs definitely-not-live -> a clean rejection with nothing
+        #     live at the broker, returned as the (rejected) parent receipt.
+        # EVERY other pair -- one live while the other is not coherent, or
+        # EITHER leg UNKNOWN -- may leave a working, unexplained leg (an
+        # unprotected entry, or an orphan stop). Those fail closed: cancel BOTH
+        # ids best-effort, mark unresolved, and refuse. "IBKR would never do
+        # this" is not a safety argument.
+        parent_live = parent_state in WORKING_OR_BETTER_STATES
+        stop_live = stop_state in WORKING_OR_BETTER_STATES
+        both_not_live = (
+            parent_state in NOT_LIVE_STATES and stop_state in NOT_LIVE_STATES
         )
-        stop_state = self._map_status(
-            result.stop_status, bracket.stop_client_order_id, intent.correlation_id
-        )
-        # The safety gate: a working entry whose protective stop is NOT
-        # working-or-better is an unprotected position. Refuse it, and take the
-        # parent back down — best effort, because it may already be live.
-        if (
-            parent_state in WORKING_OR_BETTER_STATES
-            and stop_state not in WORKING_OR_BETTER_STATES
-        ):
-            self._unresolved.add(intent.client_order_id)
-            try:
-                self._guarded(lambda: transport.cancel(parent_order_id))
-            except BrokerPortError:
-                # The cancel itself is uncertain now; reconciliation owns it.
-                pass
+        if not (parent_live and stop_live) and not both_not_live:
+            self._cleanup_bracket_best_effort(
+                transport, intent.client_order_id, parent_order_id, stop_order_id
+            )
             raise BrokerPortError(
                 BrokerErrorCode.BROKER_REJECTED,
-                "protective stop was not accepted alongside the entry; the entry"
-                " would rest unprotected, so it was cancelled and the bracket"
-                " refused (reconcile to confirm)",
+                "incoherent bracket acceptance"
+                f" (parent {parent_state.value}, stop {stop_state.value}): one"
+                " leg may be live while the other is not proven, so both were"
+                " cancelled best-effort and the bracket refused. Reconcile.",
                 correlation_id=intent.correlation_id,
             )
         parent_receipt = BrokerOrderReceipt(
@@ -1275,10 +1287,49 @@ class IbkrPaperAdapter:
         self._append_event(stop_receipt)
         return parent_receipt
 
+    def _cleanup_bracket_best_effort(
+        self,
+        transport: PaperTransport,
+        client_order_id: str,
+        *broker_order_ids: int,
+    ) -> None:
+        """Cancel every reserved bracket id best-effort and mark it unresolved.
+
+        The cleanup-ownership rule for a multi-leg order: once ANY leg's
+        placeOrder was attempted, EITHER leg may be live at the broker, so both
+        are cancelled and the order is surfaced for reconciliation rather than
+        left as an unexplained working order. A cancel that itself fails leaves
+        the state uncertain, which is exactly why it is also marked unresolved.
+        """
+        self._unresolved.add(client_order_id)
+        for broker_order_id in broker_order_ids:
+            try:
+                self._guarded(lambda: transport.cancel(broker_order_id))  # noqa: B023
+            except BrokerPortError:
+                pass
+
     def _validate_protective(
         self, intent: OrderIntent, bracket: ProtectiveBracket
     ) -> None:
         """The protective structure must be one the adapter can build natively."""
+        # MVP partial-fill safety (ADR-0019, Option A). IBKR holds an attached
+        # protective child until the PARENT is completely filled, so a parent of
+        # more than one share can sit PARTIALLY_FILLED with its stop not yet
+        # active -- an unprotected window. Until live partial-fill protection is
+        # built, a protected Paper entry is exactly ONE whole share, enforced
+        # HERE at the final boundary every order crosses. Fractional is disabled,
+        # so a one-share order fills fully or not at all: no partial window. The
+        # authority may reduce a larger risk approval to one (never increase it);
+        # this refusal is the floor that cannot be bypassed by constructing a
+        # different OrderIntent, because every OrderIntent crosses this method.
+        if intent.quantity != Decimal(1):
+            raise BrokerPortError(
+                BrokerErrorCode.VALIDATION_FAILED,
+                "a protected Paper entry is limited to 1 whole share in the MVP"
+                " (partial-fill protection is not yet built); refusing a"
+                f" protected quantity of {intent.quantity}",
+                correlation_id=intent.correlation_id,
+            )
         if IBKR_PAPER_CAPABILITIES.bracket is not BrokerCapabilityMode.NATIVE:
             raise BrokerPortError(
                 BrokerErrorCode.CAPABILITY_UNSUPPORTED,
