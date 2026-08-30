@@ -3836,6 +3836,68 @@ def test_an_outcome_resolving_a_different_order_is_unreadable(
         require_consistent_lifecycle(_lifecycle(**mutation))
 
 
+# == PREPARED and OUTCOME must agree about the PROTECTIVE structure (ADR-0019) =
+
+
+def _protected_lifecycle(**outcome: str) -> tuple[ExecutionHistoryRecord, ...]:
+    base = {
+        "bracket_mechanism": "native-bracket",
+        "protective_order_refs": "ord-1:stop",
+        "protective_quantity": "10",
+        # A bracketed entry's stop rides the child, so the parent's own aux is
+        # empty -- matching how the service writes it.
+        "stop_price": "",
+    }
+    prepared = _history_record("EXECUTION_SUBMIT_PREPARED", _prepared_payload(**base))
+    terminal_payload = _prepared_payload(**{**base, **outcome})
+    terminal_payload["submission_outcome"] = "SUBMITTED"
+    return (prepared, _history_record("EXECUTION_OUTCOME", terminal_payload))
+
+
+def test_a_matching_protected_lifecycle_reads_normally() -> None:
+    require_consistent_lifecycle(_protected_lifecycle())
+
+
+@pytest.mark.parametrize(
+    ("name", "mutation"),
+    [
+        ("stop moved to another ref", {"protective_order_refs": "ord-1:other"}),
+        ("protected quantity shrank", {"protective_quantity": "5"}),
+        ("protection vanished", {"bracket_mechanism": ""}),
+    ],
+)
+def test_an_outcome_resolving_a_different_protective_structure_is_unreadable(
+    name: str, mutation: dict[str, str]
+) -> None:
+    """A stop that moved, resized or vanished between PREPARED and OUTCOME is
+    the safety property; it must reconcile, never replay."""
+    with pytest.raises(ExecutionHistoryUnreadableError, match="DIFFERENT order"):
+        require_consistent_lifecycle(_protected_lifecycle(**mutation))
+
+
+@pytest.mark.parametrize(
+    "missing", ["protective_order_refs", "protective_quantity"]
+)
+def test_a_bracket_record_missing_its_protective_fields_is_unreadable(
+    missing: str,
+) -> None:
+    """A record that DECLARES a bracket must name the protective order and its
+    quantity, or its claim of protection cannot be compared to a replay."""
+    payload = _prepared_payload(
+        broker_instrument_ref="conid:265598",
+        bracket_mechanism="native-bracket",
+        protective_order_refs="ord-1:stop",
+        protective_quantity="10",
+    )
+    fingerprint = payload["execution_fingerprint"]
+    assert isinstance(fingerprint, dict)
+    fingerprint[missing] = ""
+    payload["submission_outcome"] = "SUBMITTED"
+
+    with pytest.raises(ExecutionHistoryUnreadableError, match="protective"):
+        _require_readable("EXECUTION_OUTCOME", "sha256:x", payload)
+
+
 @pytest.mark.parametrize(
     ("name", "missing"),
     [

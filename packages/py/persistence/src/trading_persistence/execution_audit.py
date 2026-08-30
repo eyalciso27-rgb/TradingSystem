@@ -55,6 +55,8 @@ from trading_contracts.enums import Environment
 from trading_contracts.execution_fingerprint import (
     MANDATORY_PREPARED_FIELDS,
     PREPARED_ORDER_FIELDS,
+    PROTECTIVE_DISCRIMINATOR_FIELD,
+    PROTECTIVE_ORDER_FIELDS,
     REQUEST_IDENTITY_FIELDS,
 )
 
@@ -482,6 +484,23 @@ def _require_readable(
                     f" order (missing {missing_order}); the prepared execution"
                     " cannot be compared to a replay"
                 )
+            # A record that declares a protective mechanism (ADR-0019) MUST name
+            # the protective order and its quantity, or its claim of protection
+            # cannot be compared to a replay -- and a bracket that cannot be
+            # verified is exactly the one that must be reconciled, not replayed.
+            if str(fingerprint.get(PROTECTIVE_DISCRIMINATOR_FIELD, "")).strip():
+                missing_protective = [
+                    field
+                    for field in PROTECTIVE_ORDER_FIELDS
+                    if not str(fingerprint.get(field, "")).strip()
+                ]
+                if missing_protective:
+                    raise ExecutionHistoryUnreadableError(
+                        f"{action} record {chain_hash} declares a protective"
+                        f" mechanism but is missing {missing_protective}; a"
+                        " protected entry whose structure cannot be identified"
+                        " must be reconciled, never replayed"
+                    )
     if action in TERMINAL_ACTIONS and not payload.get("submission_outcome"):
         raise ExecutionHistoryUnreadableError(
             f"terminal record {chain_hash} carries no submission outcome; it"
@@ -502,11 +521,18 @@ def _describes_a_submission(payload: Mapping[str, object]) -> bool:
     return outcome in _ATTEMPTED_OUTCOMES
 
 
+#: The frozen order AND its protective structure: both are sealed at
+#: SUBMIT_PREPARED, and a terminal record that resolves either differently than
+#: was prepared is corruption. A protective stop that moved, resized or vanished
+#: between prepared and terminal is the safety property this exists to catch.
+_SEALED_ORDER_FIELDS: tuple[str, ...] = (*PREPARED_ORDER_FIELDS, *PROTECTIVE_ORDER_FIELDS)
+
+
 def _prepared_order(fingerprint: Mapping[str, object]) -> dict[str, str]:
-    """The frozen-order half of a fingerprint, as plain strings."""
+    """The frozen-order half of a fingerprint (order + protection), as strings."""
     return {
         field: str(fingerprint.get(field, "")).strip()
-        for field in PREPARED_ORDER_FIELDS
+        for field in _SEALED_ORDER_FIELDS
     }
 
 
@@ -544,7 +570,7 @@ def require_consistent_lifecycle(
         terminal = _prepared_order(fingerprint)
         differing = [
             field
-            for field in PREPARED_ORDER_FIELDS
+            for field in _SEALED_ORDER_FIELDS
             if prepared[field] != terminal[field]
         ]
         if differing:

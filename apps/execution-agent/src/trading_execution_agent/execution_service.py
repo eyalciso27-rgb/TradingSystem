@@ -118,6 +118,7 @@ from trading_broker_core.port import (
 from trading_contracts.enums import Environment, OrderType, RiskDecisionOutcome
 from trading_contracts.execution_fingerprint import (
     PREPARED_ORDER_FIELDS,
+    PROTECTIVE_ORDER_FIELDS,
     REQUEST_IDENTITY_FIELDS,
 )
 from trading_market_data_core.sp500_current_universe import ConstituentSnapshot
@@ -130,6 +131,7 @@ from trading_market_data_core.trading_readiness import (
 )
 
 from trading_execution_agent.agent import ExecutionAgent, ExecutionOutcome, ExecutionRequest
+from trading_execution_agent.protected_entry import NATIVE_BRACKET_MECHANISM
 
 #: Chain action names, mirrored so the application layer can read its own
 #: history without importing the persistence package.
@@ -796,6 +798,15 @@ class ExecutionFingerprint:
     #: identity -- but it is compared exactly as strictly, because a replay
     #: that agrees on ticker and disagrees on security is not a replay.
     broker_instrument_ref: str = ""
+    #: The PROTECTIVE structure that was prepared (ADR-0019). Present only for a
+    #: protected entry: ``bracket_mechanism`` is the discriminator, and when it
+    #: is set the protective child ref and the protected quantity are too. A
+    #: replay that resolves a different protective structure than was prepared is
+    #: not the same execution -- a stop that moved, resized or vanished is the
+    #: whole safety property, so it is compared as strictly as the order.
+    bracket_mechanism: str = ""
+    protective_order_refs: str = ""
+    protective_quantity: str = ""
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -816,6 +827,9 @@ class ExecutionFingerprint:
             "stop_price": self.stop_price,
             "time_in_force": self.time_in_force,
             "broker_instrument_ref": self.broker_instrument_ref,
+            "bracket_mechanism": self.bracket_mechanism,
+            "protective_order_refs": self.protective_order_refs,
+            "protective_quantity": self.protective_quantity,
         }
 
     #: The fields that say WHICH execution this is, and what the caller ASKED
@@ -831,6 +845,10 @@ class ExecutionFingerprint:
     #: BOTH sides have it -- a replay has not planned its order yet when the
     #: identity check runs.
     ORDER_FIELDS = PREPARED_ORDER_FIELDS
+    #: The frozen PROTECTIVE structure. Compared with the same both-present rule:
+    #: a replay that planned no bracket cannot conflict with a prepared one on a
+    #: field it never had, but two brackets that disagree do.
+    PROTECTIVE_FIELDS = PROTECTIVE_ORDER_FIELDS
 
     def differences(self, other: ExecutionFingerprint) -> tuple[str, ...]:
         """Fields where these two describe different executions."""
@@ -840,7 +858,7 @@ class ExecutionFingerprint:
         ]
         differing.extend(
             field
-            for field in self.ORDER_FIELDS
+            for field in (*self.ORDER_FIELDS, *self.PROTECTIVE_FIELDS)
             if mine[field] and theirs[field] and mine[field] != theirs[field]
         )
         return tuple(differing)
@@ -874,6 +892,9 @@ class ExecutionFingerprint:
                 stop_price=str(raw.get("stop_price", "")),
                 time_in_force=str(raw.get("time_in_force", "")),
                 broker_instrument_ref=str(raw.get("broker_instrument_ref", "")),
+                bracket_mechanism=str(raw.get("bracket_mechanism", "")),
+                protective_order_refs=str(raw.get("protective_order_refs", "")),
+                protective_quantity=str(raw.get("protective_quantity", "")),
             )
         except KeyError:
             return None
@@ -1793,6 +1814,19 @@ class ExecutionService:
             stop_price=_normal(order.stop_price) if order else "",
             time_in_force=order.time_in_force.value if order else "",
             broker_instrument_ref=order.broker_instrument_ref if order else "",
+            bracket_mechanism=(
+                NATIVE_BRACKET_MECHANISM if order and order.protective else ""
+            ),
+            protective_order_refs=(
+                order.protective.stop_client_order_id
+                if order and order.protective
+                else ""
+            ),
+            # The whole entry quantity is protected: the stop child matches the
+            # parent size, so proven coverage == quantity for a fresh bracket.
+            protective_quantity=(
+                _normal(order.quantity) if order and order.protective else ""
+            ),
         )
 
     def _durable_verdict(self, intent: ExecutionIntent) -> ExecutionEvaluation | None:
@@ -2011,6 +2045,23 @@ class ExecutionService:
                         " claimed",
                     ),
                 )
+            # A protected entry is recovered only when its PROTECTIVE stop is
+            # also proven at the broker. A matched parent whose stop is missing,
+            # or wrong in side/type/quantity/security, is an UNPROTECTED position
+            # wearing a recovered name -- exactly the state that must fail closed
+            # to reconciliation rather than be claimed as fine (ADR-0019).
+            if prepared.bracket_mechanism:
+                problem = self._protective_child_problem(prepared, working)
+                if problem is not None:
+                    LOGGER.warning(
+                        "a recovered entry's protective stop is not proven",
+                        extra=self._context(
+                            intent, stage="RECOVERY_PROTECTION_MISMATCH"
+                        ),
+                    )
+                    return self._bare(
+                        intent, ExecutionStage.NEEDS_RECONCILIATION, (problem,)
+                    )
             LOGGER.info(
                 "the broker still holds this order; recovered without resubmitting",
                 extra=self._context(intent, stage="RECOVERED"),
@@ -2020,13 +2071,73 @@ class ExecutionService:
                 ExecutionStage.SUBMITTED,
                 (
                     "the broker already holds a working order matching the"
-                    " prepared execution; recovered rather than duplicated",
+                    " prepared execution, with its protective stop proven;"
+                    " recovered rather than duplicated",
                 ),
             )
         LOGGER.info(
             "the broker holds no working order with this identity",
             extra=self._context(intent, stage="RECOVERY_NO_MATCH"),
         )
+        return None
+
+    @staticmethod
+    def _protective_child_problem(
+        prepared: ExecutionFingerprint, working: Sequence[RecoveredOrder]
+    ) -> str | None:
+        """Why the prepared bracket's protective stop is NOT proven, or None.
+
+        Only facts the broker actually returns are compared. The child is looked
+        up by OUR canonical id (its ``orderRef``), which the recovery feed does
+        preserve, and then its shape is checked against what a protective stop
+        for this entry must be: opposite side, STOP type, the protected quantity,
+        and — when the broker states it — the SAME security as the entry. Any
+        gap means the entry may be resting unprotected.
+        """
+        child_id = prepared.protective_order_refs
+        child = next(
+            (c for c in working if c.client_order_id == child_id), None
+        )
+        if child is None:
+            return (
+                f"the protective stop child {child_id!r} is not working at the"
+                " broker; a recovered entry with no proven stop is unprotected"
+            )
+        if child.order_type is not OrderType.STOP:
+            return (
+                f"the protective child {child_id!r} is a"
+                f" {child.order_type.value}, not a STOP; protection is not proven"
+            )
+        # The stop must be on the OPPOSITE side of the entry to reduce exposure.
+        expected_side = (
+            OrderSide.SELL if prepared.side == OrderSide.BUY.value else OrderSide.BUY
+        )
+        if child.side is not expected_side:
+            return (
+                f"the protective child {child_id!r} is {child.side.value}, not"
+                f" {expected_side.value}; a same-side stop protects nothing"
+            )
+        if prepared.protective_quantity and _normal(child.quantity) != (
+            prepared.protective_quantity
+        ):
+            return (
+                f"the protective child {child_id!r} covers {_normal(child.quantity)},"
+                f" not the protected {prepared.protective_quantity}; the exposure"
+                " is not fully covered"
+            )
+        # When the broker states the child's security, it must be the SAME one
+        # the entry named. A stop on a different security is not protection.
+        if (
+            child.broker_instrument_ref
+            and prepared.broker_instrument_ref
+            and child.broker_instrument_ref != prepared.broker_instrument_ref
+        ):
+            return (
+                f"the protective child {child_id!r} is on a different security"
+                f" ({child.broker_instrument_ref!r} !="
+                f" {prepared.broker_instrument_ref!r}); it does not protect this"
+                " entry"
+            )
         return None
 
     @staticmethod
