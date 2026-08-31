@@ -20,6 +20,7 @@ from decimal import Decimal
 from trading_contracts.enums import AssessmentStatus
 
 from trading_application.baseline_strategy import (
+    BASE_SELECTION_LARGEST,
     BaselineTrendBreakoutPolicy,
 )
 from trading_application.strategy_manifest import (
@@ -27,6 +28,7 @@ from trading_application.strategy_manifest import (
     ManifestRole,
     StrategyManifest,
 )
+from trading_application.universe_eligibility import UniverseEligibilityPolicy
 
 #: Identity of the frozen strategy record this configuration realizes.
 BASELINE_STRATEGY_ID = "baseline-trend-breakout-v1"
@@ -42,6 +44,11 @@ BASELINE_STRATEGY_VERSION = "1.0.0"
 BASELINE_FROZEN_FINGERPRINT = (
     "sha256:75f299b89e408ef332cd39a46f92d417ef637b3c5a5c1712801774c9e84dfed0"
 )
+#: Owner ratification of the base-length selection ambiguity (the frozen record
+#: says "10-20 trading days" but not which valid length to pick). This does NOT
+#: change the frozen record or its fingerprint — it is a separate, dated
+#: clarification recorded here and in the execution-params file.
+BASELINE_BASE_SELECTION_APPROVAL_REF = "OWNER-EYAL-2026-08-31-BASELINE-BASE-SELECTION-LARGEST"
 
 
 def baseline_trend_breakout_v1_policy() -> BaselineTrendBreakoutPolicy:
@@ -76,6 +83,8 @@ def baseline_trend_breakout_v1_policy() -> BaselineTrendBreakoutPolicy:
         entry_atr_multiple=Decimal("0.25"),
         stop_atr_multiple=Decimal("0.25"),
         max_risk_atr_multiple=Decimal("2.5"),
+        # Owner-ratified 2026-08-31 (BASELINE_BASE_SELECTION_APPROVAL_REF).
+        base_selection_rule=BASE_SELECTION_LARGEST,
     )
 
 
@@ -103,11 +112,34 @@ def baseline_trend_breakout_v1_manifest() -> StrategyManifest:
     )
 
 
+def baseline_universe_eligibility_policy() -> UniverseEligibilityPolicy:
+    """Owner-frozen universe/liquidity/price/spread thresholds.
+
+    Provenance (baseline-trend-breakout-v1):
+
+    * ``universe.min_liquidity`` "20-day Average Dollar Volume >= USD 50,000,000"
+      -> ``min_adv20_usd``.
+    * ``universe.min_price`` "Price >= USD 10" -> ``min_price``.
+    * ``universe.max_spread`` "Spread <= 10 bps / 0.10%" -> ``max_spread_bps``.
+    * ``universe.definition`` "Historical membership MUST be Point-in-Time" ->
+      ``require_point_in_time_membership``.
+    """
+    return UniverseEligibilityPolicy(
+        policy_version=BASELINE_STRATEGY_VERSION,
+        min_adv20_usd=Decimal("50000000"),
+        min_price=Decimal("10"),
+        max_spread_bps=Decimal("10"),
+        require_point_in_time_membership=True,
+    )
+
+
 __all__ = [
+    "BASELINE_BASE_SELECTION_APPROVAL_REF",
     "BASELINE_FROZEN_FINGERPRINT",
     "BASELINE_STRATEGY_ID",
     "BASELINE_STRATEGY_VERSION",
     "BASELINE_VERSION_ID",
     "baseline_trend_breakout_v1_manifest",
     "baseline_trend_breakout_v1_policy",
+    "baseline_universe_eligibility_policy",
 ]

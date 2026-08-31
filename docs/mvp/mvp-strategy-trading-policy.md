@@ -68,8 +68,15 @@ of them change the strategy or risk semantics:
    store into `SystemPositionRecord`. The classifier itself is unchanged.
 2. **Account snapshot → `MvpAccountSnapshot`.** The broker-core `AccountSnapshot`
    already carries `session_pnl` + `SessionPnlStatus`; map NLV, the configured
-   simulation-equity cap and the P&L observation into `MvpAccountSnapshot`. The
-   unknown-state gate already fails closed on anything but a fresh `OK` P&L.
+   simulation-equity cap, the P&L observation and the authoritative **Start-of-Day
+   equity** into `MvpAccountSnapshot`. The unknown-state gate fails closed on
+   anything but a fresh `OK` P&L and a present SOD equity.
+2b. **Universe facts + calendar.** Populate `UniverseFacts` from the canonical
+   sources — S&P membership snapshots (`trading_market_data_core` universe;
+   `sector_of` gives the authoritative GICS sector) and the feature engine's
+   `adv_dollar` / `spread` — and pass the instrument's `TradingCalendar`. Every
+   fact is nullable and UNKNOWN blocks, so the policy boundary is safe even if
+   the runtime does not pre-filter.
 3. **`ExecutablePlan` → execution runtime.** The sealed `ExecutablePlan` (and the
    single-use `SubmitAuthorization` the pre-submit check mints) are the hand-off
    point. The execution agent / protected-lifecycle work consumes them; this
@@ -79,6 +86,49 @@ of them change the strategy or risk semantics:
    layer here already supports an execution authority reducing an approved
    quantity `N` down to `1` (reducing risk is always permitted; increasing it is
    never permitted), so no change is required on this side to remain compatible.
+
+## Base-length selection — owner decision (2026-08-31)
+
+The frozen record says the contracting base is "10-20 trading days" but does not
+state which valid length to use when several qualify — a strategy semantic the
+frozen record left open. The owner resolved it on 2026-08-31
+(`OWNER-EYAL-2026-08-31-BASELINE-BASE-SELECTION-LARGEST`): **use the LARGEST
+valid window** (search 20 → 10). This is recorded as an explicit
+`base_selection_rule` policy field and in the execution-params file; it does NOT
+change the frozen record or its fingerprint.
+
+## Frozen-rule coverage (every rule that gates a new entry)
+
+| Frozen rule | Owner | Enforced by | Test |
+|---|---|---|---|
+| S&P 500 membership (PIT for history) | universe.definition | `universe_eligibility` (UNIVERSE) | `test_mvp_trading_policy::test_non_sp500_member_blocks`, `test_membership_not_point_in_time_blocks` |
+| ADV20 ≥ $50M | universe.min_liquidity | `universe_eligibility` | `test_universe_eligibility`, `test_adv20_below_min_blocks` |
+| Price ≥ $10 | universe.min_price | `universe_eligibility` | `test_price_below_min_blocks` |
+| Spread ≤ 10 bps | universe.max_spread | `universe_eligibility` | `test_spread_too_wide_blocks` |
+| Completed RTH daily bars / signal in RTH | sessions.allowed | `baseline_strategy` session gate (BLOCKED on unknown) | `test_baseline_strategy::test_unknown_session_blocks`, `test_non_rth_session_blocks` |
+| New entry in the NEXT RTH session | entry.rule / sessions.allowed | `mvp_safety_gates.entry_timing_eligible` (canonical calendar) | `test_mvp_safety_gates` (same/next/weekend/holiday), `test_two_sessions_later_is_blocked` |
+| Trend (Close>SMA150 & rising) | setup.definition | `baseline_strategy` | `test_declining_trend_blocks`, `test_close_below_sma_blocks` |
+| Contracting base + largest-window selection | setup.definition + owner 2026-08-31 | `baseline_strategy` | `test_no_contracting_base_blocks`, `test_base_selection_is_owner_ratified_and_explicit` |
+| Breakout trigger | trigger.definition | `baseline_strategy` | `test_no_breakout_blocks` |
+| Entry cap (BreakoutClose+0.25·ATR20), no chase | entry.rule | `baseline_strategy` cap + pre-submit slippage (CANCEL) | `test_do_not_chase_price_slippage_cancels` |
+| Structural STOP (BaseLow−0.25·ATR20) | exit.stop_rule | `baseline_strategy` + risk protective-stop gate | `test_valid_complete_setup_triggers` |
+| Skip if risk > 2.5·ATR20 | exit.stop_rule | `baseline_strategy` | `test_risk_per_share_over_cap_blocks` |
+| 0.25% risk per trade (fixed-fractional) | sizing.method / risk.per_trade | orchestrator sizing + RiskEngine (reduce-only) | `test_risk_reduces_but_never_increases_quantity`, `test_insufficient_risk_budget_blocks` |
+| Max 8 concurrent positions | risk.max_concurrent_positions | RiskEngine | `test_max_concurrent_positions_vetoes` |
+| Max 3 positions per GICS sector | risk.max_concurrent_positions | `mvp_safety_gates.sector_within_caps` (SECTOR) | `test_three_same_sector_positions_block` |
+| Max 0.75% planned risk per GICS sector | risk.max_concurrent_positions | `mvp_safety_gates.sector_within_caps` | `test_sector_planned_risk_cap_blocks` |
+| 75% gross exposure ceiling | risk.max_portfolio_exposure | RiskEngine notional caps + allocator | RiskEngine/allocator suites |
+| 1.5% daily loss vs Start-of-Day equity | risk.daily_loss_limit | `mvp_safety_gates.daily_loss_within_limit` (DAILY_LOSS) | `test_daily_loss_uses_sod_equity_not_current_nlv`, `test_changing_current_nlv_does_not_move_sod_threshold` |
+| One position per symbol / no averaging down | risk.action_on_breach / 3.1 | RiskEngine | `test_same_symbol_existing_position_vetoes` |
+| conId position ownership; unknown blocks | (mission §6) | `position_attribution` | `test_position_attribution`, `test_unattributable_position_blocks_entry` |
+| Usable account/P&L only when authoritative | data.staleness / broker P&L status | orchestrator account gate (PNL_OK required, SOD present) | `test_finite_pnl_without_status_blocks`, `test_unknown_*_blocks` |
+| Point-in-time inputs (no look-ahead) | data.point_in_time_requirement | every engine's `as_of` guard | lookahead tests across suites |
+| Strategy exits (failed breakout / time / trailing) | exit.* | `baseline_exit` → PositionCoordinator | `test_baseline_exit` |
+
+Everything above is enforced **in this policy path** or by a canonical gate the
+runtime cannot bypass; there is no silent "assumed upstream". An authoritative
+fact that is not yet available resolves to NO NEW ENTRY (fail closed), never to a
+pass.
 
 ## Residual blockers to an autonomous Paper MVP (out of scope here)
 

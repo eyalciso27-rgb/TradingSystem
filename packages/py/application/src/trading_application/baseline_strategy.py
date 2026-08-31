@@ -75,6 +75,14 @@ _UNUSABLE_FRESHNESS: tuple[FreshnessClass, ...] = (
     FreshnessClass.UNKNOWN,
 )
 
+#: The owner-ratified base-length selection rule. The frozen record states
+#: "base duration 10-20 trading days" but does not state which valid length to
+#: use when several qualify; the owner resolved this ambiguity on 2026-08-31
+#: (OWNER-EYAL-2026-08-31-BASELINE-BASE-SELECTION-LARGEST) as: use the LARGEST
+#: valid window (search 20 down to 10). It is an explicit, attributed rule here,
+#: never a silently-chosen implementation detail. Any other value fails closed.
+BASE_SELECTION_LARGEST = "LARGEST_VALID_WINDOW"
+
 
 class BaselineStrategyError(Exception):
     """Fail-closed strategy failure (bad inputs, lookahead, mismatch)."""
@@ -104,12 +112,21 @@ class BaselineTrendBreakoutPolicy:
     entry_atr_multiple: Decimal  # MaxEntryPrice = Close + 0.25 * ATR20
     stop_atr_multiple: Decimal  # StructuralStop = BaseLow - 0.25 * ATR20
     max_risk_atr_multiple: Decimal  # SKIP if EntryPrice - Stop > 2.5 * ATR20
+    #: Owner-ratified base-length selection rule (see BASE_SELECTION_LARGEST).
+    #: Explicit config, not a silent default: only the ratified value is
+    #: accepted; anything else fails closed.
+    base_selection_rule: str
 
     def __post_init__(self) -> None:
         if not self.strategy_id.strip() or not self.version_id.strip():
             raise BaselineStrategyError("strategy_id and version_id are mandatory")
         if not self.frozen_fingerprint.startswith("sha256:"):
             raise BaselineStrategyError("frozen_fingerprint must be a sha256 reference")
+        if self.base_selection_rule != BASE_SELECTION_LARGEST:
+            raise BaselineStrategyError(
+                "base_selection_rule must be the owner-ratified"
+                f" {BASE_SELECTION_LARGEST!r}; no other rule is supported"
+            )
         periods = (
             self.sma_trend_period,
             self.sma_trend_rising_lookback,
@@ -269,11 +286,16 @@ class BaselineTrendBreakoutStrategy:
         reasons: list[str] = []
         no_trade: list[str] = []
 
-        # -- session eligibility: new entries RTH only ------------------------
-        session_ok = session is None or session is MarketSessionStatus.REGULAR
+        # -- session eligibility: new entries RTH only, fail closed on unknown
+        # An authoritative REGULAR session is REQUIRED. A missing/unknown session
+        # (None) is never eligible — signals come from completed RTH bars only and
+        # extended-hours entries are forbidden, so unknown must fail closed.
+        session_ok = session is MarketSessionStatus.REGULAR
         if not session_ok:
-            assert session is not None
-            no_trade.append(f"SESSION_NOT_RTH_{session.value}")
+            no_trade.append(
+                f"SESSION_NOT_RTH_{session.value}" if session is not None
+                else "SESSION_UNKNOWN"
+            )
 
         # -- data freshness: STALE/UNKNOWN never signals ----------------------
         data_fresh = bool(ordered) and ordered[-1].freshness not in _UNUSABLE_FRESHNESS
@@ -428,6 +450,13 @@ class BaselineTrendBreakoutStrategy:
     ) -> tuple[Bar, ...] | None:
         """Largest valid contracting base ending just before the breakout bar.
 
+        Selection rule: OWNER-RATIFIED ``BASE_SELECTION_LARGEST``
+        (OWNER-EYAL-2026-08-31-BASELINE-BASE-SELECTION-LARGEST) — when several
+        lengths in the owner's [min, max] range each satisfy the contraction
+        predicates, use the LARGEST. The frozen record left this ambiguous; the
+        owner resolved it explicitly, and ``policy.base_selection_rule`` records
+        the ratified value rather than the code choosing silently.
+
         Deterministic search from ``base_max_bars`` down to ``base_min_bars``
         (largest first): the base is the window of ``base_len`` completed bars
         immediately preceding the breakout bar that satisfies every owner
@@ -518,6 +547,7 @@ class BaselineTrendBreakoutStrategy:
 
 
 __all__ = [
+    "BASE_SELECTION_LARGEST",
     "STRATEGY_ENGINE_VERSION",
     "STRATEGY_MODEL_ID",
     "STRATEGY_MODEL_VERSION",

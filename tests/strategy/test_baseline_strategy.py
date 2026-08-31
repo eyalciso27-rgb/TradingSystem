@@ -188,6 +188,17 @@ def test_unknown_freshness_blocks(
     assert result.assessment.status is AssessmentStatus.BLOCKED
 
 
+def test_unknown_session_blocks(
+    triggered_series: BarSeries, instrument_id: uuid.UUID, as_of_after: AsOf
+) -> None:
+    # An unknown/missing session (None) must NOT be treated as eligible.
+    result = _evaluate(triggered_series, instrument_id, as_of_after, session=None)
+    assert not result.is_trade
+    assert result.signal is None
+    assert result.assessment.status is AssessmentStatus.BLOCKED
+    assert "SESSION_UNKNOWN" in result.no_trade_reasons
+
+
 @pytest.mark.parametrize(
     "session",
     [MarketSessionStatus.PRE_MARKET, MarketSessionStatus.AFTER_HOURS, MarketSessionStatus.HALTED],

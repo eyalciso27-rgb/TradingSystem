@@ -13,10 +13,13 @@ from decimal import Decimal
 from pathlib import Path
 
 import yaml
+from trading_application.baseline_strategy import BASE_SELECTION_LARGEST
 from trading_application.baseline_strategy_config import (
+    BASELINE_BASE_SELECTION_APPROVAL_REF,
     BASELINE_FROZEN_FINGERPRINT,
     baseline_trend_breakout_v1_manifest,
     baseline_trend_breakout_v1_policy,
+    baseline_universe_eligibility_policy,
 )
 from trading_application.strategy_freeze_cli import load_freeze_record
 
@@ -66,3 +69,29 @@ def test_every_execution_param_cites_a_frozen_owner_key() -> None:
     data = yaml.safe_load(EXEC_PARAMS.read_text(encoding="utf-8"))
     for name, spec in data["parameters"].items():
         assert spec["source_key"] in owner_keys, f"{name} cites unknown owner key"
+
+
+def test_base_selection_is_owner_ratified_and_explicit() -> None:
+    policy = baseline_trend_breakout_v1_policy()
+    assert policy.base_selection_rule == BASE_SELECTION_LARGEST
+    data = yaml.safe_load(EXEC_PARAMS.read_text(encoding="utf-8"))
+    assert data["base_selection"]["rule"] == BASE_SELECTION_LARGEST
+    assert data["base_selection"]["approval_ref"] == BASELINE_BASE_SELECTION_APPROVAL_REF
+    # The clarification cites a real frozen owner key and does NOT change the
+    # frozen fingerprint.
+    record = load_freeze_record(FROZEN_MANIFEST)
+    assert data["base_selection"]["source_key"] in record.parameter_keys()
+    assert record.fingerprint() == BASELINE_FROZEN_FINGERPRINT
+
+
+def test_universe_eligibility_policy_matches_frozen_thresholds() -> None:
+    policy = baseline_universe_eligibility_policy()
+    data = yaml.safe_load(EXEC_PARAMS.read_text(encoding="utf-8"))["universe"]
+    assert policy.min_adv20_usd == Decimal(data["min_adv20_usd"]["value"])
+    assert policy.min_price == Decimal(data["min_price"]["value"])
+    assert policy.max_spread_bps == Decimal(data["max_spread_bps"]["value"])
+    assert policy.require_point_in_time_membership is True
+    # Owner provenance for every universe threshold.
+    record = load_freeze_record(FROZEN_MANIFEST)
+    for spec in data.values():
+        assert spec["source_key"] in record.parameter_keys()

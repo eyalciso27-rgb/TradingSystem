@@ -28,6 +28,7 @@ from trading_application.baseline_strategy import BaselineTrendBreakoutPolicy
 from trading_application.baseline_strategy_config import (
     baseline_trend_breakout_v1_manifest,
     baseline_trend_breakout_v1_policy,
+    baseline_universe_eligibility_policy,
 )
 from trading_application.decision_engine import DecisionPolicy
 from trading_application.portfolio_allocator import PortfolioAllocationPolicy
@@ -35,8 +36,46 @@ from trading_application.pre_submit_check import ChangeAction, PreSubmitPolicy, 
 from trading_application.risk_engine import RiskPolicy
 from trading_application.signal_fusion import FusionPolicy
 from trading_application.strategy_manifest import StrategyManifest
+from trading_application.universe_eligibility import UniverseEligibilityPolicy
 
 MVP_POLICY_VERSION = "1.0.0"
+
+
+@dataclass(frozen=True, slots=True)
+class MvpSafetyPolicy:
+    """Owner-frozen safety limits the generic engines do not express directly.
+
+    Provenance (baseline-trend-breakout-v1):
+
+    * ``risk.daily_loss_limit`` "1.5% of Start-of-Day Equity" ->
+      ``daily_loss_limit_pct`` (evaluated against SOD equity, B6).
+    * ``risk.max_concurrent_positions`` "maximum 3 open positions in the same
+      GICS sector" -> ``max_positions_per_sector`` (B4).
+    * ``risk.max_concurrent_positions`` "maximum initial planned risk in one GICS
+      sector = 0.75% of equity" -> ``max_sector_planned_risk_pct`` (B5), measured
+      on the AUTHORITATIVE GICS sector, not the correlation cluster.
+    """
+
+    policy_version: str
+    daily_loss_limit_pct: Decimal
+    max_positions_per_sector: int
+    max_sector_planned_risk_pct: Decimal
+
+    def __post_init__(self) -> None:
+        if self.daily_loss_limit_pct <= 0 or self.max_sector_planned_risk_pct <= 0:
+            raise ValueError("safety fractions must be positive")
+        if self.max_positions_per_sector < 1:
+            raise ValueError("max_positions_per_sector must be >= 1")
+
+
+def mvp_safety_policy() -> MvpSafetyPolicy:
+    """The owner-frozen daily-loss (SOD) and GICS-sector caps."""
+    return MvpSafetyPolicy(
+        policy_version=MVP_POLICY_VERSION,
+        daily_loss_limit_pct=Decimal("0.015"),
+        max_positions_per_sector=3,
+        max_sector_planned_risk_pct=Decimal("0.0075"),
+    )
 
 
 def mvp_fusion_policy() -> FusionPolicy:
@@ -90,10 +129,10 @@ def mvp_risk_policy() -> RiskPolicy:
       the hard branch fires).
     * ``risk.max_portfolio_exposure`` 75% gross -> the notional caps (no single
       name / order / sector may exceed the gross ceiling).
-    * ``risk.max_concurrent_positions`` GICS-sector risk cap 0.75% of equity ->
-      ``max_correlated_cluster_pct`` = 0.375 (0.75% expressed as a share of the
-      2% open-risk envelope). MVP: the correlated cluster stands in for the
-      owner's GICS sector risk cap.
+    * ``max_correlated_cluster_pct`` = 0.375 is a genuine correlation-cluster
+      limit ONLY (0.75% of the 2% open-risk envelope). It is NOT a substitute for
+      the owner's GICS-sector risk cap — that cap is enforced authoritatively, by
+      GICS sector, in ``mvp_safety_gates.sector_within_caps`` (see MvpSafetyPolicy).
     * No owner per-source cap for the single MVP strategy ->
       ``max_source_open_risk_share`` = 1 (non-binding).
     """
@@ -156,6 +195,8 @@ class MvpPolicyConfig:
     risk_policy: RiskPolicy
     allocation_policy: PortfolioAllocationPolicy
     pre_submit_policy: PreSubmitPolicy
+    universe_policy: UniverseEligibilityPolicy
+    safety_policy: MvpSafetyPolicy
 
 
 def default_mvp_policy_config() -> MvpPolicyConfig:
@@ -168,16 +209,20 @@ def default_mvp_policy_config() -> MvpPolicyConfig:
         risk_policy=mvp_risk_policy(),
         allocation_policy=mvp_allocation_policy(),
         pre_submit_policy=mvp_pre_submit_policy(),
+        universe_policy=baseline_universe_eligibility_policy(),
+        safety_policy=mvp_safety_policy(),
     )
 
 
 __all__ = [
     "MVP_POLICY_VERSION",
     "MvpPolicyConfig",
+    "MvpSafetyPolicy",
     "default_mvp_policy_config",
     "mvp_allocation_policy",
     "mvp_decision_policy",
     "mvp_fusion_policy",
     "mvp_pre_submit_policy",
     "mvp_risk_policy",
+    "mvp_safety_policy",
 ]

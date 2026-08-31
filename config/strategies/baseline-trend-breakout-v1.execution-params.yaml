@@ -56,6 +56,36 @@ parameters:
     source_key: exit.stop_rule
     owner_text: "If EntryPrice - StructuralStop > 2.5 * ATR20 then SKIP TRADE."
 
+# Owner clarification 2026-08-31 (OWNER-EYAL-2026-08-31-BASELINE-BASE-SELECTION-LARGEST).
+# The frozen record says the base is "10-20 trading days" but does not state which
+# valid length to use when several qualify. The owner resolved the ambiguity: use
+# the LARGEST valid window (search 20 down to 10). This does NOT change the frozen
+# record or its fingerprint; it is a separate, dated clarification.
+base_selection:
+  rule: LARGEST_VALID_WINDOW
+  approval_ref: OWNER-EYAL-2026-08-31-BASELINE-BASE-SELECTION-LARGEST
+  source_key: setup.definition
+  owner_text: "Contracting Base: base duration 10-20 trading days."
+
+# Universe / liquidity / price / spread eligibility thresholds (owner-frozen).
+universe:
+  min_adv20_usd:
+    value: "50000000"
+    source_key: universe.min_liquidity
+    owner_text: "20-day Average Dollar Volume >= USD 50,000,000."
+  min_price:
+    value: "10"
+    source_key: universe.min_price
+    owner_text: "Price >= USD 10."
+  max_spread_bps:
+    value: "10"
+    source_key: universe.max_spread
+    owner_text: "Spread <= 10 bps / 0.10%."
+  require_point_in_time_membership:
+    value: true
+    source_key: universe.definition
+    owner_text: "Historical membership MUST be Point-in-Time."
+
 # The fusion manifest is the owner-approved structural representation of the
 # breakout trigger: a single REQUIRED technical.breakout that must be TRIGGERED.
 fusion_manifest:
