@@ -262,12 +262,25 @@ class ReadinessGuardedBroker:
             snapshot: AccountSnapshot = self._broker.get_account_snapshot(
                 self._config.account_alias
             )
+        except BrokerPortError as error:
+            # The broker refused or could not answer. That is NOT "the broker
+            # reports an unknown environment" -- it is "we have no observation" --
+            # and the gate must be able to say which, or an owner-host failure
+            # reads as a wiring problem that does not exist. Canonical CODE only.
+            return BrokerSessionState(
+                connected=True, account_alias=self._config.account_alias,
+                session_mode=None, observed_at=health.checked_at,
+                health_ok=health.healthy,
+                detail=f"account snapshot refused: {error.code.value}",
+                account_observation_error=error.code.value,
+            )
         except Exception as error:  # noqa: BLE001
             return BrokerSessionState(
                 connected=True, account_alias=self._config.account_alias,
                 session_mode=None, observed_at=health.checked_at,
                 health_ok=health.healthy,
                 detail=f"account snapshot raised {type(error).__name__}",
+                account_observation_error=type(error).__name__,
             )
         # An environment outside the trading axis (RESEARCH) maps to None, which
         # blocks: it is neither paper nor live, so it cannot satisfy either.

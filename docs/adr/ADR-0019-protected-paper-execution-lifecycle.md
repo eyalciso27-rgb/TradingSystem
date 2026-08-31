@@ -247,3 +247,44 @@ children — rather than a convenient parent-in-OCA side effect, so a test canno
 prove a cleanup property the real broker does not guarantee. The proof cancels
 BOTH known ids explicitly (entry and derived stop) and then reconciles to prove
 no leg remains working, reporting any residual position for a manual flatten.
+
+## Amendment: one account observation per decision (owner-host round 4)
+
+**The defect.** An owner-host run reported `[OK] account: alias paper-poi
+environment PAPER` in its own evidence and then failed readiness with
+`account_mode_safety: session environment or account alias is unknown`.
+`IbkrPaperAdapter.get_account_snapshot` hard-codes `environment=PAPER`, so an
+"unknown environment" can only mean the snapshot RAISED — the gate was
+reporting the wrong fact.
+
+**The lifecycle cause.** `reqAccountSummary` is a SUBSCRIPTION and
+`cancelAccountSummary` is asynchronous and unacknowledged. ONE execution
+decision observes the account **six times** (independent evidence, risk
+evaluation, readiness, and readiness again at the submission boundary), so the
+adapter issued six subscribe/cancel cycles for the same group within a second,
+each racing the previous cancel. A gateway may legitimately refuse such a
+duplicate, and that refusal propagated as a bare "unknown environment" block.
+
+**The fix.** The transport serves ONE account observation for a bounded window
+(`ACCOUNT_SUMMARY_FRESHNESS_SECONDS`, default 5s) and issues a genuinely fresh
+request for any read beyond it. Six port-level observations become one gateway
+round trip; the whole read-or-request path is under one lock, so two threads can
+never hold overlapping account-summary subscriptions on a connection either. A
+failed observation is never committed, the observation is never shared across
+accounts, and `disconnect` detaches it (a reconnect is a new transport anyway).
+
+This is a de-duplication of observations that are milliseconds apart and
+describe the same account state — not a relaxation of any gate. Accepted
+trade-off, stated plainly: within the window the account values may be up to
+that window old, while `AccountSnapshot.observed_at` remains the snapshot BUILD
+time, so it is accurate to within the window. Nothing else changed: the quote is
+still fetched fresh at the submission boundary, session P&L remains a separate
+persistent subscription with its own freshness window, and UNKNOWN in any form
+still fails closed.
+
+**The diagnostic.** `BrokerSessionState` gained `account_observation_error`, so
+`account_mode_safety` distinguishes *"account snapshot unavailable (CODE)"* from
+*"the broker reported no usable account environment or alias"*. The verdict is
+BLOCKED either way; only the reported fact differs. It carries a canonical error
+code or an exception type — never an account number, raw broker text, a DSN or a
+secret.

@@ -142,6 +142,23 @@ SESSION_PNL_TIMEOUT_SECONDS = 15.0
 #: if it were current. Generous enough to tolerate a gateway hiccup, tight
 #: enough to catch a dead subscription; bounded, never an unbounded wait.
 SESSION_PNL_FRESHNESS_SECONDS = 30.0
+
+#: How long ONE account-summary observation is shared by the gates of a single
+#: decision before a genuinely fresh request is issued.
+#:
+#: ``reqAccountSummary`` is a SUBSCRIPTION, and cancelling it is asynchronous
+#: and unacknowledged. One execution decision observes the account SIX times
+#: (evidence, risk, readiness -- then readiness again at the submission
+#: boundary), so the previous shape issued six subscribe/cancel cycles for the
+#: same group within a second, each one racing the previous cancel. A gateway is
+#: entitled to refuse the duplicate, and that refusal surfaced as a bare
+#: "unknown environment" readiness block on the owner host.
+#:
+#: This is NOT a freshness relaxation of any gate: it de-duplicates observations
+#: that are milliseconds apart and describe the same account state. An
+#: observation older than this window is not reused -- a real request is issued --
+#: so a genuinely later read is still a genuinely fresh read.
+ACCOUNT_SUMMARY_FRESHNESS_SECONDS = 5.0
 DEFAULT_CLIENT_ID = 1
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
@@ -1628,6 +1645,7 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
     *,
     session_pnl_timeout_seconds: float = SESSION_PNL_TIMEOUT_SECONDS,
     session_pnl_freshness_seconds: float = SESSION_PNL_FRESHNESS_SECONDS,
+    account_summary_freshness_seconds: float = ACCOUNT_SUMMARY_FRESHNESS_SECONDS,
     monotonic_clock: Callable[[], float] | None = None,
 ) -> PaperTransport:
     """Build the real SDK-backed paper transport (gateway host only).
@@ -1938,6 +1956,16 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             # callers must not each start a reqPnL, and disconnect must not race
             # an in-progress init and leave an orphan broker subscription.
             self._pnl_init_lock = threading.Lock()
+            # ONE account-summary observation, shared by the gates of a single
+            # decision. reqAccountSummary is a subscription whose cancel is
+            # asynchronous, so issuing one per gate raced the previous cancel;
+            # the lock also means two threads can never have overlapping
+            # account-summary subscriptions on this connection.
+            self._summary_lock = threading.Lock()
+            self._summary_freshness = account_summary_freshness_seconds
+            self._summary_values: dict[str, Decimal] | None = None
+            self._summary_account: str | None = None
+            self._summary_observed_monotonic: float | None = None
             # Serialises the ENTIRE open-order snapshot lifecycle so two
             # snapshots can never be ACTIVE at once (their id-less callbacks
             # would otherwise cross generations). One-request-at-a-time.
@@ -1992,6 +2020,12 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
                     self._app.stop_session_pnl()
                     self._pnl_req_id = None
                     self._pnl_account = None
+            # Detach the shared account observation too: a value observed on
+            # THIS connection must never be served after it is gone.
+            with self._summary_lock:
+                self._summary_values = None
+                self._summary_account = None
+                self._summary_observed_monotonic = None
             try:
                 if self._app.isConnected():
                     self._app.disconnect()
@@ -2059,10 +2093,46 @@ def _build_ibapi_paper_transport(  # pragma: no cover - host-only, gated by POI-
             return _resolve_one_contract(details, query, contract)
 
         def account_summary(self, account_id: str) -> Mapping[str, Decimal]:
-            # reqAccountSummary is a SUBSCRIPTION: cancel it in a finally, so a
-            # _collect timeout or error cannot orphan it at the gateway. The old
-            # shape cancelled only after a successful collect, so an incomplete
-            # observation left a live subscription behind.
+            """ONE account observation per decision, not one per gate.
+
+            ``reqAccountSummary`` is a SUBSCRIPTION and ``cancelAccountSummary``
+            is asynchronous and unacknowledged. A single execution decision
+            observes the account six times (evidence, risk, readiness, and
+            readiness again at the submission boundary), so issuing a fresh
+            subscribe/cancel cycle per gate meant six cycles for the same group
+            within a second, each racing the previous cancel. A gateway may
+            legitimately refuse such a duplicate, and on the owner host that
+            refusal reached readiness as a bare "unknown environment" block.
+
+            So one observation is shared for a bounded window and a genuinely
+            later read still issues a genuinely fresh request. The whole
+            request/serve path is under one lock, so two threads can never hold
+            overlapping account-summary subscriptions on this connection either.
+            """
+            with self._summary_lock:
+                cached = self._summary_values
+                observed = self._summary_observed_monotonic
+                if (
+                    cached is not None
+                    and observed is not None
+                    and self._summary_account == account_id
+                    and (_monotonic() - observed) < self._summary_freshness
+                ):
+                    return dict(cached)
+                values = self._request_account_summary(account_id)
+                # Committed only on success: a failed observation must never
+                # leave a half-built one behind for the next gate to reuse.
+                self._summary_values = values
+                self._summary_account = account_id
+                self._summary_observed_monotonic = _monotonic()
+                return dict(values)
+
+        def _request_account_summary(self, account_id: str) -> dict[str, Decimal]:
+            """One real reqAccountSummary round trip. Always unsubscribes.
+
+            Cancelled in a finally, so a ``_collect`` timeout or error cannot
+            orphan the subscription at the gateway.
+            """
             req_id = self._next_request_id()
             stream = request_stream(req_id)
             try:

@@ -87,6 +87,20 @@ class BrokerSessionState:
     #: The canonical BrokerPort.health_check() verdict.
     health_ok: bool = True
     detail: str = ""
+    #: WHY ``session_mode`` is unknown, when the ACCOUNT OBSERVATION ITSELF
+    #: failed. ``None`` means no observation error: the broker answered, and a
+    #: ``session_mode`` of ``None`` then genuinely means the broker reported an
+    #: environment this system does not treat as a trading mode.
+    #:
+    #: The distinction is load-bearing for diagnosis, never for the verdict:
+    #: both cases BLOCK. An owner-host run that failed because a repeated
+    #: account snapshot raised used to be indistinguishable from a broker that
+    #: reported an unknown environment, which sent the investigation the wrong
+    #: way entirely.
+    #:
+    #: Safe by construction: this carries a canonical error CODE or an exception
+    #: TYPE only -- never an account number, raw broker text, a DSN or a secret.
+    account_observation_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,7 +374,20 @@ def _gate_account_mode(inputs: RuntimeInputs) -> GateOutcome:
     broker = inputs.broker
     name = "account_mode_safety"
     if broker.session_mode is None or not broker.account_alias:
-        return GateOutcome(name, False, "session environment or account alias is unknown")
+        # Same BLOCKED verdict either way; different fact, so say which.
+        if broker.account_observation_error:
+            return GateOutcome(
+                name,
+                False,
+                "account snapshot unavailable"
+                f" ({broker.account_observation_error}); the session environment"
+                " could not be observed, so it is not proven",
+            )
+        return GateOutcome(
+            name,
+            False,
+            "the broker reported no usable account environment or alias",
+        )
     if broker.session_mode is not inputs.mode:
         # The port's own environment disagreeing with the requested mode is a
         # wiring error, and the port's word wins.

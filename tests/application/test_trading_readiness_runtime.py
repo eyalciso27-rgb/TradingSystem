@@ -200,6 +200,60 @@ def test_an_environment_the_broker_cannot_state_blocks() -> None:
     assert any("account_mode_safety" in b for b in report.blockers)
 
 
+def test_paper_environment_passes_account_mode_safety() -> None:
+    """The control: a broker that states PAPER satisfies the gate."""
+    report = evaluate_runtime_readiness(
+        _inputs(broker=BrokerSessionState(True, "paper-poi", TradingMode.PAPER, NOW))
+    )
+    gate = next(g for g in report.gates if g.name == "account_mode_safety")
+    assert gate.satisfied is True
+    assert "PAPER" in gate.detail
+    assert not any("account_mode_safety" in b for b in report.blockers)
+
+
+def test_an_account_snapshot_failure_is_reported_as_such_not_as_unknown() -> None:
+    """The owner-host diagnostic defect.
+
+    A repeated account snapshot that RAISED used to be indistinguishable from a
+    broker that reported an unknown environment -- both said "session
+    environment or account alias is unknown", which sent the investigation
+    entirely the wrong way. The verdict is BLOCKED either way; the FACT must
+    differ, and must carry a canonical code rather than raw broker text.
+    """
+    report = evaluate_runtime_readiness(
+        _inputs(
+            broker=BrokerSessionState(
+                True,
+                "paper-poi",
+                None,
+                NOW,
+                account_observation_error="BROKER_REJECTED",
+            )
+        )
+    )
+    gate = next(g for g in report.gates if g.name == "account_mode_safety")
+
+    assert report.readiness is TradingReadiness.BLOCKED
+    assert gate.satisfied is False
+    assert "account snapshot unavailable" in gate.detail
+    assert "BROKER_REJECTED" in gate.detail
+    # And it no longer claims the broker reported an unknown environment.
+    assert "reported no usable account environment" not in gate.detail
+
+
+def test_a_genuinely_unknown_environment_still_fails_closed_and_says_so() -> None:
+    """No observation error: the broker really did not state an environment."""
+    report = evaluate_runtime_readiness(
+        _inputs(broker=BrokerSessionState(True, "paper-poi", None, NOW))
+    )
+    gate = next(g for g in report.gates if g.name == "account_mode_safety")
+
+    assert report.readiness is TradingReadiness.BLOCKED
+    assert gate.satisfied is False
+    assert "reported no usable account environment" in gate.detail
+    assert "account snapshot unavailable" not in gate.detail
+
+
 def test_a_session_in_the_wrong_mode_blocks() -> None:
     report = evaluate_runtime_readiness(
         _inputs(
