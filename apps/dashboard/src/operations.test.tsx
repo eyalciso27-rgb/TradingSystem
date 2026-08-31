@@ -44,6 +44,16 @@ describe("fail-closed operations rendering", () => {
     for (const stage of EXECUTION_LIFECYCLE) { const next = execution.indexOf(`>${stage}</b>`, cursor + 1); expect(next).toBeGreaterThan(cursor); cursor = next; }
   });
 
+  it("keeps scoped proof authorization distinct from disabled autonomous Paper Auto", () => {
+    expect(MOCK_OPERATIONS_SNAPSHOT.runtime.authorizationMode).toBe("PAPER_AUTO_DISABLED");
+    const protectedProof = MOCK_OPERATIONS_SNAPSHOT.executions.find((execution) => execution.executionId === "exec-msft-088");
+    expect(protectedProof?.quantity).toBe("1");
+    expect(protectedProof?.authorizationOutcome).toBe("SCOPED_PAPER_PROOF_AUTHORIZATION");
+    expect(protectedProof?.authorizationOutcome).not.toContain("PAPER_AUTO");
+    const html = renderToStaticMarkup(<ExecutionHistoryScreen {...props} />);
+    expect(html).toContain("Scoped/manual proof authorization is distinct from autonomous PAPER_AUTO authorization");
+  });
+
   it("shows explicit loading and error states", () => {
     expect(renderToStaticMarkup(<OperationsLoadState state={{ status: "loading" }} />)).toContain("Loading operations state");
     const error = renderToStaticMarkup(<OperationsLoadState state={{ status: "error", message: "fixture failure" }} />);

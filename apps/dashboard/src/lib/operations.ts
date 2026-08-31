@@ -198,9 +198,9 @@ export const MOCK_OPERATIONS_SNAPSHOT: OperationsSnapshot = {
     {
       executionId: "exec-msft-088", decisionId: "dec-msft-088", clientOrderId: "paper-entry-088",
       correlationId: "corr-088", strategyId: "mvp-breakout", strategyVersion: "1.0.0",
-      symbol: "MSFT", conId: 272093, side: "BUY", quantity: "10", orderType: "LIMIT",
+      symbol: "MSFT", conId: 272093, side: "BUY", quantity: "1", orderType: "LIMIT",
       entryPrice: "400.00", protectiveStopPrice: "392.00", riskOutcome: "ALLOWED",
-      authorizationOutcome: "PAPER_AUTHORIZATION_GRANTED", brokerOrderReferences: ["paper-order-ref-088"],
+      authorizationOutcome: "SCOPED_PAPER_PROOF_AUTHORIZATION", brokerOrderReferences: ["paper-order-ref-088"],
       lifecycleState: "NEEDS_RECONCILIATION",
       reachedStages: ["STRATEGY", "DECISION", "RISK", "READINESS", "AUTHORIZATION", "SUBMIT_PREPARED", "BROKER_SUBMIT", "ACKNOWLEDGED", "FILLED", "NEEDS_RECONCILIATION"],
       timestamps: { STRATEGY: "2026-08-31T09:10:00.000Z", DECISION: "2026-08-31T09:10:01.000Z", RISK: "2026-08-31T09:10:02.000Z", READINESS: "2026-08-31T09:10:03.000Z", AUTHORIZATION: "2026-08-31T09:10:04.000Z", SUBMIT_PREPARED: "2026-08-31T09:10:05.000Z", BROKER_SUBMIT: "2026-08-31T09:10:06.000Z", ACKNOWLEDGED: "2026-08-31T09:10:07.000Z", FILLED: "2026-08-31T09:10:12.000Z", NEEDS_RECONCILIATION: "2026-08-31T09:40:00.000Z" },
