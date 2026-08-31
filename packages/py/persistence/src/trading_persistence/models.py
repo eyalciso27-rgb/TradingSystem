@@ -702,6 +702,106 @@ class Position(Base):
     )
 
 
+# Durable broker-observation ledger (IMP autonomous-paper-runtime, Phase A/A5).
+# The kinds of raw broker callback the runtime consumer lands durably before it
+# is projected into the normalized broker_orders/fills/positions graph. Kept as
+# an explicit value list, not a cross-service contract enum: it names landing
+# records, not a domain state machine.
+BROKER_OBSERVATION_KINDS = ("ORDER_STATUS", "FILL", "POSITION")
+# Canonical order sides. Broker-neutral; the adapter maps its own vocabulary to
+# these before anything is landed.
+BROKER_OBSERVATION_SIDES = ("BUY", "SELL")
+
+
+class BrokerObservation(Base):
+    """Durable, append-only landing record for ONE broker callback (runtime A5).
+
+    Authority: Integration_Specification_v0.6 section 9.4 (broker events are
+    append-only and processed idempotently) and 9.5 (reconciliation reads the
+    durable record of what the broker reported). This is the runtime consumer's
+    durable boundary: a raw order-status update, execution/fill or position
+    observation is landed here idempotently, keyed on stable broker identities,
+    and later projected into the normalized broker_orders/fills/positions graph
+    within the domain transaction (that projector is deferred to the runtime's
+    Phase B, when the submission pipeline that creates those parent rows lands).
+
+    Idempotency is structural, not conventional: ``(environment, dedup_key)`` is
+    UNIQUE and the repository appends with ON CONFLICT DO NOTHING, so a broker
+    that redelivers the same callback -- or two callbacks carrying the same
+    execution id -- can never create two economic events. ``dedup_key`` is
+    derived by the repository from the stable identity of the observation (the
+    execution ref for a fill; the order ref + state + filled quantity for a
+    status update; the instrument ref + quantity + price for a position), so a
+    genuine progression appends a new row while an exact duplicate does not.
+
+    Broker-neutral by construction (Data_Model section 4): identities are stored
+    as ``external_order_ref`` / ``external_execution_ref`` / ``instrument_ref``
+    (the adapter maps its own order id, execution id and contract id onto these
+    neutral refs), never as a broker-specific column. Quantities and money are the
+    canonical NUMERIC types and never FLOAT. A count that was never observed is
+    absent, never zero -- ``open_positions`` reconstructs exposure only from
+    observations that exist, so an unknown position stays unknown.
+    """
+
+    __tablename__ = "broker_observations"
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    environment: Mapped[str] = mapped_column(Text, nullable=False)
+    account_alias: Mapped[str] = mapped_column(Text, nullable=False)
+    observation_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Stable idempotency identity, derived by the repository. UNIQUE per env.
+    dedup_key: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Broker order identity (the adapter maps its order id / authoritative
+    #: permId onto this neutral ref). Present on ORDER_STATUS and FILL.
+    external_order_ref: Mapped[str | None] = mapped_column(Text)
+    #: Broker execution identity (execId), the natural key for a fill.
+    external_execution_ref: Mapped[str | None] = mapped_column(Text)
+    #: Neutral instrument reference (the adapter maps its contract id onto this).
+    instrument_ref: Mapped[str | None] = mapped_column(Text)
+    #: Our own client/correlation id, when the callback can be attributed to one.
+    correlation_ref: Mapped[str | None] = mapped_column(Text)
+    symbol: Mapped[str | None] = mapped_column(Text)
+    side: Mapped[str | None] = mapped_column(Text)
+    order_state: Mapped[str | None] = mapped_column(Text)
+    filled_quantity: Mapped[object | None] = mapped_column(Numeric(28, 10))
+    remaining_quantity: Mapped[object | None] = mapped_column(Numeric(28, 10))
+    last_fill_quantity: Mapped[object | None] = mapped_column(Numeric(28, 10))
+    price: Mapped[object | None] = mapped_column(Numeric(20, 8))
+    commission: Mapped[object | None] = mapped_column(Numeric(20, 8))
+    currency: Mapped[str | None] = mapped_column(CHAR(3))
+    position_quantity: Mapped[object | None] = mapped_column(Numeric(28, 10))
+    average_price: Mapped[object | None] = mapped_column(Numeric(20, 8))
+    raw_payload_ref: Mapped[str | None] = mapped_column(Text)
+    observed_at: Mapped[datetime] = _ts(nullable=False)
+    created_at: Mapped[datetime] = _ts(nullable=False)
+
+    __table_args__ = (
+        enum_check("environment", Environment, "broker_observations_environment"),
+        values_check(
+            "observation_kind", BROKER_OBSERVATION_KINDS, "broker_observations_kind"
+        ),
+        # side / order_state are nullable: a NULL passes the CHECK (SQL treats an
+        # unknown result as satisfied), so only a present value is constrained.
+        raw_check(
+            "side IS NULL OR side IN ('BUY', 'SELL')", "broker_observations_side"
+        ),
+        raw_check(
+            "order_state IS NULL OR order_state IN ("
+            "'CREATED', 'VALIDATED', 'QUEUED', 'SUBMITTING', 'ACKNOWLEDGED',"
+            " 'PARTIALLY_FILLED', 'FILLED', 'CANCEL_PENDING', 'CANCELLED',"
+            " 'CANCELLED_BY_POLICY', 'REJECTED', 'EXPIRED', 'UNKNOWN')",
+            "broker_observations_order_state",
+        ),
+        UniqueConstraint("environment", "dedup_key"),
+        Index("ix_broker_observations_external_order_ref", "external_order_ref"),
+        Index(
+            "ix_broker_observations_observation_kind_observed_at",
+            "observation_kind",
+            "observed_at",
+        ),
+    )
+
+
 class OutboxMessage(Base):
     """Transactional outbox row (IMP-0203, Data_Model v0.6 section 24.3).
 

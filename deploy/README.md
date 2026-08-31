@@ -216,3 +216,35 @@ PAPER uses its own `PAPER_*` variables, network (`trading-paper`) and volumes,
 sharing nothing with dev/test; PostgreSQL is never exposed beyond localhost
 (dev) or the internal network (paper/test); LIVE remains disabled — no live
 stack exists by design.
+
+## Autonomous-Paper runtime (Phase A foundation)
+
+The autonomous-Paper runtime is the supervised orchestration loop that will,
+once the strategy and protected-execution branches land, drive the existing
+canonical execution path by itself. Phase A ships the foundation only; the
+loop runs on the DenyAll authority and submits nothing.
+
+Single-instance ownership is enforced **at runtime** by a session-level
+PostgreSQL advisory lock (`trading:autonomous-paper-runtime:PAPER`): a second
+instance cannot acquire the lock and refuses to start, and a dropped database
+session releases the lock automatically, so exactly one process ever owns
+execution. The deployment therefore runs **one** runtime instance; there is no
+horizontal scaling of the execution loop by design.
+
+Operators control a running runtime through the durable emergency store — not a
+socket into the process — with the `paper-runtime` CLI (in the execution-agent
+image):
+
+```sh
+paper-runtime halt   --reason "operator kill switch"   # blocks the next entry
+paper-runtime status                                    # durable runtime facts (JSON)
+paper-runtime resume --reason "recovered and reconciled"  # fails closed unless reconciled
+```
+
+`halt` writes an append-only `ACTIVATE_HALT` command that the running loop reads
+on its next tick, so the next automatic entry is blocked deterministically;
+protective and exposure-reducing paths are never blocked by an entry halt.
+`resume` refuses unless the reconciliation latch proves the current broker
+session is CLEAN. `paper-runtime run` (the loop itself) and its compose service
+are wired in Phase B, when the loop is connected to an owned IBKR session,
+market data and the real strategy.
