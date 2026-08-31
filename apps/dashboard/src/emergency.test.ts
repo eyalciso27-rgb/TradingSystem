@@ -139,8 +139,9 @@ describe("hygiene: no real action path, no secrets", () => {
     }
   });
 
-  it("the flatten execute button is disabled by the FLATTEN_ENABLED constant", () => {
+  it("the emergency screen exposes no action button at all", () => {
     const source = readFileSync(join(HERE, "components", "emergency-controls.tsx"), "utf-8");
-    expect(source).toContain("disabled={!FLATTEN_ENABLED}");
+    expect(source).not.toContain("<button");
+    expect(source).not.toContain("FLATTEN_ENABLED");
   });
 });

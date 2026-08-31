@@ -3,13 +3,16 @@
  * client interactivity, no actions) with the current section highlighted so
  * an operator always knows where they are and how to move between screens.
  */
+import * as React from "react";
 
 export type ConsoleSection =
   | "dashboard"
   | "sources"
   | "candidates"
   | "approvals"
+  | "executions"
   | "positions"
+  | "health"
   | "emergency"
   | "research";
 
@@ -18,7 +21,9 @@ const SECTIONS: readonly { readonly id: ConsoleSection; readonly label: string; 
   { id: "sources", label: "Sources", href: "/sources" },
   { id: "candidates", label: "Candidates", href: "/candidates" },
   { id: "approvals", label: "Approvals", href: "/approvals" },
+  { id: "executions", label: "Executions", href: "/executions" },
   { id: "positions", label: "Positions", href: "/positions" },
+  { id: "health", label: "Health", href: "/health" },
   { id: "emergency", label: "Emergency", href: "/emergency" },
   { id: "research", label: "Research", href: "/research" },
 ];
