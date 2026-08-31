@@ -22,6 +22,7 @@ ATR_WILDER_V1 = "atr-wilder-v1"
 ADV_DOLLAR_V1 = "adv-dollar-v1"
 SPREAD_QUOTE_V1 = "spread-quote-v1"
 RELATIVE_VOLUME_V1 = "relative-volume-v1"
+SMA_CLOSE_V1 = "sma-close-v1"
 
 
 class FeatureComputationError(Exception):
@@ -61,6 +62,21 @@ def atr(bars: tuple[Bar, ...], *, period: int) -> Decimal:
     for true_range in window[1:]:
         value = (value * (period - 1) + true_range) / period
     return value
+
+
+def sma_close(bars: tuple[Bar, ...], *, period: int) -> Decimal:
+    """Simple moving average of the CLOSE over the last ``period`` bars.
+
+    Formula version: ``SMA_CLOSE_V1`` (the baseline trend filter uses
+    period=150). Pure Decimal mean of the final ``period`` closes — the same
+    frozen bars always produce the same value.
+    """
+    if period < 1:
+        raise FeatureComputationError("sma_close: period must be >= 1")
+    _require_bars(bars, period, "sma_close")
+    window = bars[-period:]
+    total = sum((bar.close for bar in window), Decimal(0))
+    return total / period
 
 
 def adv_dollar(bars: tuple[Bar, ...], *, period: int) -> Decimal:
