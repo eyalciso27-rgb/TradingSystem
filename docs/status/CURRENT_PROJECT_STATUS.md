@@ -49,7 +49,7 @@
 | Current stage | **Evidence Delivery** (feature delivery paused after PHASE-13/IMP-1301) |
 | Paper Auto / Live | **DISABLED / DISABLED** |
 | Next broker-changing action | **DEF-18** post-fix cancellation, any permitted non-closed session (§9) |
-| Next non-broker action | **freeze `baseline-trend-breakout-v1`** — needs no broker (§9) |
+| Next non-broker action | **build the point-in-time research dataset** for the now-FROZEN `baseline-trend-breakout-v1` — needs no broker (§9) |
 
 ## 3. What is completed in code (`IMPLEMENTED`)
 
@@ -144,11 +144,14 @@ from a dry run of identical parameters, and it is `TESTED_WITH_FAKES` only.
    Evidence produced **before** the D-CLOCK-01 fix carries fabricated
    timestamps and **must be regenerated, not trusted**.
 5. IMP-1302 gated on POI-IBKR-001 PASS.
-6. Strategy profitability: **PROFITABILITY_NOT_PROVEN** for every strategy —
-   no hypothesis freeze, no point-in-time dataset, no out-of-sample, no
-   shadow evidence exists yet. **No strategy is eligible for any automated
-   mode**, and eligibility requires BOTH `OUT_OF_SAMPLE_PASS` AND
-   `SHADOW_PASS` plus a formal owner Go.
+6. Strategy profitability: **PROFITABILITY_NOT_PROVEN** for every strategy.
+   `baseline-trend-breakout-v1` is now **FROZEN** and owner-approved (v1,
+   `OWNER-EYAL-2026-08-13-BASELINE-TREND-BREAKOUT-V1`,
+   `docs/strategies/baseline-trend-breakout-v1.yaml`, immutable — a material
+   change requires a NEW `version_id`, never an edit to v1), but there is
+   still no point-in-time dataset, no out-of-sample, and no shadow evidence.
+   **No strategy is eligible for any automated mode**, and eligibility
+   requires BOTH `OUT_OF_SAMPLE_PASS` AND `SHADOW_PASS` plus a formal owner Go.
 7. Social, AI, news, InvestingPro and TradingView PoIs all remain
    **BLOCKED** on owner-supplied accounts/hosts (ADR-0014, ADR-0013).
 8. The **AI Review Committee is designed but not implemented** as an active
@@ -202,12 +205,14 @@ cancelled.
 > or an unconfirmed cancellation. **DEF-20 remains NOT_RUN afterwards**, and
 > runs in its own window — broker-mutating owner-runs are never concurrent.
 >
-> **2 — Strategy (needs no broker at all).** Freeze
-> **`baseline-trend-breakout-v1`** using
-> [`STRATEGY_FREEZE_TEMPLATE.md`](../strategies/STRATEGY_FREEZE_TEMPLATE.md).
-> It requires no social and no AI input, so it is unblocked today and it
-> creates the baseline every later claim must beat. The freeze must happen
-> **before** any evaluation result is inspected.
+> **2 — Strategy (needs no broker at all).** **`baseline-trend-breakout-v1`
+> is FROZEN** (owner-approved 2026-08-13, immutable v1 —
+> [`docs/strategies/baseline-trend-breakout-v1.yaml`](../strategies/baseline-trend-breakout-v1.yaml),
+> pinned by `tests/strategy/test_frozen_baseline_manifest.py`). It requires no
+> social and no AI input, so it is the baseline every later claim must beat.
+> The next step is building the point-in-time research dataset, which must
+> happen **before** any evaluation result is inspected against the frozen
+> manifest.
 >
 > Only the owner may run either; only the owner may mark a PoI. Everything
 > downstream (IMP-1302 → 1303 → 1304, then PHASE-14) stays gated, and
