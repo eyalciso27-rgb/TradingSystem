@@ -290,11 +290,14 @@ class BrokerObservationLedger:
             .on_conflict_do_nothing(
                 index_elements=["environment", "dedup_key"]
             )
+            .returning(BrokerObservation.id)
         )
         result = connection.execute(statement)
-        # rowcount is 1 when the row was inserted, 0 when the conflict clause
-        # swallowed a duplicate. That is the economic-event/redelivery signal.
-        return result.rowcount == 1
+        # PostgreSQL returns one id when the row was inserted and no row when
+        # the conflict clause swallowed a duplicate. This is the
+        # economic-event/redelivery signal; it avoids relying on driver-specific
+        # rowcount behaviour for INSERT .. ON CONFLICT DO NOTHING.
+        return result.scalar_one_or_none() is not None
 
     # -- reconstruct reads ---------------------------------------------------
 
