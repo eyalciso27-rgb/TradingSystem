@@ -15,8 +15,11 @@ already in this repository satisfies the A-WP2 acceptance shape end to end:
 * each reference capability is classified into exactly one of three states —
   ``EMPIRICALLY_VERIFIED`` (task vocabulary: COMPLETE),
   ``CONTRACT_READY`` (PARTIAL — fixture proves the machinery only, never
-  empirical evidence), and ``BLOCKED_EXTERNAL`` (EXTERNAL_BLOCKED) —
-  never fabricated (``trading_market_data_core.dataset_v1_ingestion``);
+  empirical evidence), and ``BLOCKED_EXTERNAL`` (EXTERNAL_BLOCKED). The
+  COMPLETE state is reached only through the qualification harness's OWN
+  checksum verification over real fixture bytes on disk — never a
+  hard-coded/decorative digest (``trading_market_data_core.dataset_v1_qualification``,
+  ``trading_market_data_core.dataset_v1_ingestion``);
 * a look-ahead violation is rejected, both as an explicit fail-closed audit
   (``NoLookaheadAuditor``) and structurally, by excluding any record that was
   not yet knowable at the evaluated ``as_of`` / ``known_as_of`` cutoff from a
@@ -70,6 +73,20 @@ from trading_market_data_core.dataset_v1_ingestion import (
     SourceKind,
     assess_reference_capability,
 )
+from trading_market_data_core.dataset_v1_qualification import (
+    CoverageWindow,
+    DataQualityMetrics,
+    IdentityResolutionReport,
+    IdentitySemantics,
+    QualificationError,
+    QualificationResult,
+    SourceDescriptor,
+    TemporalSemantics,
+    load_and_verify_evidence,
+    promote_capability,
+    qualify_source,
+)
+from trading_market_data_core.dataset_v1_qualification import SourceKind as EvidenceSourceKind
 from trading_market_data_core.dataset_v1_run import (
     RunArtifact,
     RunManifest,
@@ -375,10 +392,68 @@ def test_run_manifest_binds_immutable_artifact_sha256_and_detects_tamper(
 # -- 4. classifies capabilities as COMPLETE / PARTIAL / EXTERNAL_BLOCKED -----
 
 
-def test_capability_classification_complete_partial_external_blocked() -> None:
-    """Task vocabulary <-> implementation mapping, proven from fixtures alone:
+def test_complete_capability_requires_content_verified_evidence_not_a_label(
+    tmp_path: Path,
+) -> None:
+    """COMPLETE (``CapabilityState.EMPIRICALLY_VERIFIED``) is reached ONLY
+    through the qualification harness's OWN checksum verification over real
+    bytes on disk — never a hard-coded/decorative digest.
 
-    * COMPLETE        -> ``CapabilityState.EMPIRICALLY_VERIFIED``
+    The evidence artifact is written to ``tmp_path`` and then RELOADED, which
+    recomputes and compares its checksum against the actual file bytes before
+    ``promote_capability`` is even called; a tampered artifact is proven to
+    fail closed. This demonstrates the DECISION PATH accepts well-formed,
+    content-verified evidence — it is NOT a claim that any external network
+    source was contacted. The repository's real capabilities stay blocked
+    until wired to genuine external evidence (see ``docs/data/DATASET-V1-*``).
+    """
+    raw_artifact = tmp_path / "raw-source-fixture.txt"
+    raw_artifact.write_text(
+        "fixture raw source bytes for the A-WP2 closure proof", encoding="utf-8"
+    )
+    # The checksum authenticates THESE bytes — not an arbitrary string.
+    raw_checksum = "sha256:" + hashlib.sha256(raw_artifact.read_bytes()).hexdigest()
+
+    evidence = qualify_source(
+        "pit_sp500_membership",
+        source=SourceDescriptor(
+            source_id="fixture-source", name="Fixture Source", version="v1",
+            kind=EvidenceSourceKind.REAL, raw_checksum=raw_checksum,
+            raw_artifact=str(raw_artifact),
+        ),
+        coverage=CoverageWindow(date(2010, 1, 1), date(2021, 6, 30)),
+        temporal=TemporalSemantics(
+            provides_effective_dates=True, provides_known_at=True, revision_safe=True
+        ),
+        identity=IdentitySemantics(provides_stable_identifier=True, identifier_kinds=("cik",)),
+        metrics=DataQualityMetrics(total_rows=10, accepted=10, historical_changes=2),
+        resolution=IdentityResolutionReport(resolved=10),
+        proofs=("historical_addition", "historical_removal"),
+        observed_at=KNOWN_AS_OF,
+    )
+    assert evidence.result is QualificationResult.PASS
+    evidence_path = tmp_path / "pit_sp500_membership.json"
+    evidence.write(evidence_path)
+
+    # RELOAD from disk: this recomputes the checksum from the actual file
+    # bytes and compares it, so a decorative or stale digest cannot pass here.
+    reloaded_evidence = load_and_verify_evidence(evidence_path)
+    complete_state = promote_capability(reloaded_evidence)
+    assert complete_state is CapabilityState.EMPIRICALLY_VERIFIED  # COMPLETE
+
+    # A tampered evidence file must never promote — proves the checksum is
+    # load-bearing, not decorative.
+    tampered = evidence_path.read_text(encoding="utf-8").replace('"PASS"', '"FAIL"')
+    assert tampered != evidence_path.read_text(encoding="utf-8")
+    evidence_path.write_text(tampered, encoding="utf-8")
+    with pytest.raises(QualificationError, match="checksum mismatch"):
+        load_and_verify_evidence(evidence_path)
+
+
+def test_partial_and_external_blocked_capability_classification() -> None:
+    """Task vocabulary <-> implementation mapping for the two states that must
+    never reach COMPLETE from fixtures alone:
+
     * PARTIAL          -> ``CapabilityState.CONTRACT_READY``
       (a clean FIXTURE source proves the machinery only; it can never be
       promoted to COMPLETE, however clean its metrics look)
@@ -387,14 +462,6 @@ def test_capability_classification_complete_partial_external_blocked() -> None:
     full_caps = SourceCapabilities(
         provides_effective_dates=True, provides_known_at=True, provides_stable_identity=True
     )
-
-    complete = assess_reference_capability(
-        "pit_sp500_membership", source_kind=SourceKind.REAL, capabilities=full_caps,
-        validation_errors=(), historical_change_count=3,
-        real_evidence_checksum="sha256:" + "1" * 64,
-    )
-    assert complete.state is CapabilityState.EMPIRICALLY_VERIFIED
-    assert complete.promotable
 
     partial = assess_reference_capability(
         "asof_gics", source_kind=SourceKind.FIXTURE, capabilities=full_caps,
