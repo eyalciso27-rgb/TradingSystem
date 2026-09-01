@@ -207,6 +207,14 @@ class UniverseStore:
     ``accept`` is the ONLY way a snapshot becomes current, and it refuses a
     snapshot that fails validation — so a failed or malformed refresh cannot
     quietly replace a good list.
+
+    Archived entries are WRITE-ONCE: once a snapshot for a given
+    ``(index_id, as_of)`` has been accepted, it is the permanent forward-history
+    record for that date. A later call for the same date is accepted only when
+    it is byte-identical (an idempotent retry after e.g. a crashed process); any
+    other candidate for a date already on record is refused rather than
+    silently rewriting archived history. A new observation belongs under a new
+    ``as_of``, never as a correction of a past one.
     """
 
     def __init__(self, root: Path) -> None:
@@ -225,8 +233,26 @@ class UniverseStore:
             if snapshot.checksum
             else _with_checksum(snapshot)
         )
-        self.root.mkdir(parents=True, exist_ok=True)
         path = self._path(sealed)
+        if path.is_file():
+            try:
+                existing = load_snapshot(path)
+            except SourceAdapterError as error:
+                return None, (
+                    f"an archived snapshot already exists at {path} and is unreadable"
+                    f" ({error}); refusing to overwrite an immutable archive entry",
+                )
+            if existing.checksum != sealed.checksum:
+                return None, (
+                    f"a snapshot for {sealed.index_id} as_of {sealed.as_of.isoformat()} is"
+                    f" already archived immutably at {path}; refusing to overwrite it with"
+                    " different content (archive entries are write-once; a new"
+                    " observation needs a new as_of date, not a correction of a past one)",
+                )
+            # Byte-identical to what is already archived: an idempotent retry,
+            # not a mutation. Nothing to do.
+            return path, ()
+        self.root.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps(sealed.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
         )
