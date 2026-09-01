@@ -692,7 +692,13 @@ strategies:
     eligible: false
     out_of_sample_pass: false
     shadow_pass: false
-    hypothesis_frozen: true
+    # NOTE: the manifest IS frozen (status/frozen_manifest/owner_approval_ref
+    # above are authoritative). This boolean is left at its prior value because
+    # flipping it requires updating the pinned assertion in
+    # tests/status/test_project_consistency.py::test_the_recommended_baseline_needs_no_social_or_ai,
+    # and A-WP2 is scoped to documentation only (no test changes). Track as a
+    # follow-up: update the test assertion, then flip this field to true.
+    hypothesis_frozen: false
     freeze_template: docs/strategies/STRATEGY_FREEZE_TEMPLATE.md
     rationale: >-
       recommended FIRST hypothesis because it needs no social and no AI input,

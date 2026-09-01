@@ -143,9 +143,12 @@ real-account PoIs remain **BLOCKED**.
 > readiness packages were added. **Track A** (strategy freeze, point-in-time
 > dataset foundation, backtest readiness, real-data ingestion readiness) makes
 > the research pipeline production-ready **without inventing any trading
-> parameter**: `DatasetStatus` stays `REAL_DATASET_NOT_BUILT` and every run is
-> `PROFITABILITY_NOT_PROVEN` until the owner freezes a strategy and real data
-> exists. **Track C** takes the four merged adapters to
+> parameter**: `DatasetStatus` stays `REAL_DATASET_NOT_BUILT` and every run
+> remains `PROFITABILITY_NOT_PROVEN` — freezing a strategy alone is not
+> evidence; a point-in-time dataset, a walk-forward/Final-OOS pass and a
+> shadow-evidence pass are all still required (see the A-WP1 entry below: the
+> baseline was frozen the same day). **Track C** takes the four merged
+> adapters to
 > `ACTIVATION_READY` — production secret-store integration, read-only preflight,
 > sanitized PoI evidence artifacts, and per-source owner runbooks
 > (`docs/status/PHASE6_SOURCE_ACTIVATION.md`) — while their real-account PoIs

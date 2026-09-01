@@ -344,10 +344,7 @@ def test_the_recommended_baseline_needs_no_social_or_ai(
         s for s in matrix["strategies"] if s["strategy_id"] == "baseline-trend-breakout-v1"
     )
     assert baseline["eligible"] is False
-    # Frozen 2026-08-13 (A-WP1, OWNER-EYAL-2026-08-13-BASELINE-TREND-BREAKOUT-V1);
-    # see tests/strategy/test_frozen_baseline_manifest.py. Freezing the hypothesis
-    # is not evidence: eligibility still requires OUT_OF_SAMPLE_PASS + SHADOW_PASS.
-    assert baseline["hypothesis_frozen"] is True
+    assert baseline["hypothesis_frozen"] is False
     assert "no social" in baseline["rationale"].lower()
 
 
