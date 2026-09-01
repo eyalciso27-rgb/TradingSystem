@@ -24,7 +24,7 @@
 | Is the system built? | **Mostly in code** — **69 of 82** canonical tasks are `IMPLEMENTED`. Four PHASE-6 source adapters with an official/ToS-permitted path (Telegram-user/TDLib, Telegram-bot, News/filings, TradingView) are now built (code, fakes-tested; real PoIs BLOCKED). Three (WhatsApp-user, Discord-user, InvestingPro) remain **NOT built** — no ToS-permitted access path. |
 | Is it integrated with the real world? | **Almost nowhere.** 2 of 15 PoIs PASS. |
 | Can it trade? | **No.** Paper Manual is blocked; Paper Auto and Live are **DISABLED**. |
-| Is any strategy profitable? | **Unknown — `PROFITABILITY_NOT_PROVEN`.** No hypothesis is even frozen. |
+| Is any strategy profitable? | **Unknown — `PROFITABILITY_NOT_PROVEN`.** The baseline hypothesis `baseline-trend-breakout-v1` is now FROZEN and owner-approved; no point-in-time dataset, OOS or shadow evidence exists yet. |
 | What is the single biggest gap? | **Evidence, not code.** |
 
 The project's centre of gravity has moved from *building* to *proving*. Nearly
@@ -143,15 +143,31 @@ real-account PoIs remain **BLOCKED**.
 > readiness packages were added. **Track A** (strategy freeze, point-in-time
 > dataset foundation, backtest readiness, real-data ingestion readiness) makes
 > the research pipeline production-ready **without inventing any trading
-> parameter**: `DatasetStatus` stays `REAL_DATASET_NOT_BUILT` and every run is
-> `PROFITABILITY_NOT_PROVEN` until the owner freezes a strategy and real data
-> exists. **Track C** takes the four merged adapters to
+> parameter**: `DatasetStatus` stays `REAL_DATASET_NOT_BUILT` and every run
+> remains `PROFITABILITY_NOT_PROVEN` — freezing a strategy alone is not
+> evidence; a point-in-time dataset, a walk-forward/Final-OOS pass and a
+> shadow-evidence pass are all still required (see the A-WP1 entry below: the
+> baseline was frozen the same day). **Track C** takes the four merged
+> adapters to
 > `ACTIVATION_READY` — production secret-store integration, read-only preflight,
 > sanitized PoI evidence artifacts, and per-source owner runbooks
 > (`docs/status/PHASE6_SOURCE_ACTIVATION.md`) — while their real-account PoIs
 > stay **BLOCKED** and a FAKE probe can only ever be `NOT_EVIDENCE`, never PASS.
 > **These are readiness machinery for existing tasks; the canonical IMPLEMENTED
 > count is unchanged at 69.**
+
+> **A-WP1 — baseline hypothesis FROZEN (2026-08-13).** The owner completed
+> `STRATEGY_FREEZE_TEMPLATE.md` for `baseline-trend-breakout-v1` and it
+> transitioned DRAFT → FROZEN: 34/34 mandatory owner parameters recorded with
+> provenance, the structural fusion manifest (`technical.breakout` /
+> `REQUIRED` / `TRIGGERED`, no invented thresholds), owner_approval_ref
+> `OWNER-EYAL-2026-08-13-BASELINE-TREND-BREAKOUT-V1`, and an immutable
+> fingerprint pinned by `tests/strategy/test_frozen_baseline_manifest.py`
+> (`docs/strategies/baseline-trend-breakout-v1.yaml`). No evaluation result was
+> inspected before the freeze; no parameter is invented. This resolves the
+> freeze step only — `DatasetStatus` stays `REAL_DATASET_NOT_BUILT`, no
+> backtest has run, and the strategy remains `PROFITABILITY_NOT_PROVEN` with
+> no `OUT_OF_SAMPLE_PASS` or `SHADOW_PASS` evidence.
 
 > **PHASE-5 caveat.** `IMP-0501…0503` are implementation-complete (registry,
 > evidence structure, drills, provider catalog) but the **exit gate is not
@@ -258,7 +274,7 @@ Summary:
 | External provider | external-market-data-provider | **NOT_IMPLEMENTED**; no provider selected |
 | AI | ai-provider, ai-analysis-engines | Implemented; provider PoI BLOCKED; engines fakes-only |
 | AI Review Committee | ai-review-committee | **NOT_IMPLEMENTED — designed only** |
-| Decision pipeline | strategy-manifests, fusion, decision, risk, allocation, pre-submit | Implemented; fakes only; **no frozen manifest exists** |
+| Decision pipeline | strategy-manifests, fusion, decision, risk, allocation, pre-submit | Implemented; fakes only; **`baseline-trend-breakout-v1` manifest is FROZEN (A-WP1)** but not yet evaluated on real data |
 | Broker stack | ibkr-adapter, execution, protection, reconciliation | Implemented; partial real evidence; DEF-18/20 outstanding |
 | Operations | dashboard, ibc, watchdog | Implemented/partial; host evidence missing (B-03/B-04) |
 | Event bus | event-bus-nats | **SKELETON** — N-01, needs an ADR |
@@ -283,14 +299,17 @@ I/O contract and no replayable orchestration.
 ## 6. Strategy state
 
 **There is no frozen, owner-approved, evidence-qualified or
-production-eligible strategy.** That is a precise claim, and the distinction
-matters — what is missing is *evidence and an owner decision*, not machinery:
+production-eligible strategy** cleared for automated trading. That is a
+precise claim, and the distinction matters — what is missing now is
+*evidence*, not machinery, and not a frozen hypothesis: the baseline
+hypothesis itself is already frozen and owner-approved; it is the evidence
+(dataset, OOS, shadow) and the formal owner Go that remain outstanding:
 
 | | State |
 |---|---|
 | Strategy **infrastructure** | ✅ **exists** — manifest evaluator, fusion, decision, risk, allocator, pre-submit, replay, backtest, funnel, champion/challenger (all `TESTED_WITH_FAKES`) |
 | Proposed **hypotheses** | ✅ **exist** — e.g. `baseline-trend-breakout-v1`, and the WhatsApp measurement/experiment ideas in the evidence roadmap |
-| A **frozen** hypothesis | ❌ none — no manifest data is committed, no owner freeze record exists |
+| A **frozen** hypothesis | ✅ **yes** — `baseline-trend-breakout-v1` v1, status `FROZEN`, owner_approval_ref `OWNER-EYAL-2026-08-13-BASELINE-TREND-BREAKOUT-V1`, frozen 2026-08-13, immutable fingerprint `sha256:75f299b8…`, pinned by `tests/strategy/test_frozen_baseline_manifest.py` (see `docs/strategies/baseline-trend-breakout-v1.yaml`) |
 | Point-in-time **dataset** | ❌ none |
 | `HISTORICALLY_TESTED` | ❌ none |
 | `OUT_OF_SAMPLE_PASS` | ❌ none |
@@ -303,10 +322,15 @@ The recommended first hypothesis is **`baseline-trend-breakout-v1`**, because
 it requires **no social and no AI input**. That makes it a clean baseline: any
 later claim that a social source or the AI committee adds value must beat it.
 
-The owner must complete
+The owner has completed
 [`docs/strategies/STRATEGY_FREEZE_TEMPLATE.md`](../strategies/STRATEGY_FREEZE_TEMPLATE.md)
-**before any evaluation result is inspected**. No trading parameter is invented
-anywhere in this repository, and none may be.
+for `baseline-trend-breakout-v1` and the manifest is now **FROZEN and
+immutable** — any material change requires a NEW `version_id` (supersede),
+never an edit to v1. The freeze happened **before** any evaluation result was
+inspected, per the required ordering. No trading parameter is invented
+anywhere in this repository, and none may be. The next step is building the
+point-in-time research dataset (Track A) so the frozen manifest can be
+evaluated.
 
 ---
 
@@ -339,7 +363,7 @@ patches not upstreamed, no transcript), **B-04** (watchdog deep probe off).
 | N-01 | NATS JetStream adapter absent | Owner decision + ADR |
 | N-02 | External market-data provider not selected | Owner decision |
 | N-03 | POI-MD-001 aggregate BLOCKED | Owner decision (provider) |
-| STRAT-01 | No frozen hypothesis, dataset, OOS or shadow evidence | Owner decision |
+| STRAT-01 | `baseline-trend-breakout-v1` is FROZEN; still no dataset, OOS or shadow evidence | Owner decision |
 | SOC-01 | All social/news/InvestingPro/TradingView/AI PoIs BLOCKED | Owner accounts |
 
 **Owner-dependency summary:** almost every remaining blocker needs an owner
@@ -362,7 +386,7 @@ is waiting on code.
       IMP-1302 Paper Manual ──▶ IMP-1303 chaos drills ──▶ IMP-1304 defects
                                         │
  Strategy track (independent, can run in parallel):
-   freeze hypothesis ─▶ point-in-time dataset ─▶ replay/backtest
+   freeze hypothesis ✅ FROZEN ─▶ point-in-time dataset ❌ NOT_RUN ─▶ replay/backtest
         └─▶ walk-forward / OOS ─▶ live shadow ─▶ formal Go/No-Go
                                         │
           ┌─────────────────────────────┴─────────────────────────────┐
@@ -426,8 +450,9 @@ run, only a **closed** session is refused — per
 [`POI_IBKR_001_OWNER_RUN.md`](../runbooks/POI_IBKR_001_OWNER_RUN.md).
 Broker-mutating owner-runs are **serialized**: DEF-18, the fill path, DEF-20,
 Gateway restarts and destructive drills never overlap on one account.
-The single next strategy action is **freezing `baseline-trend-breakout-v1`**,
-which needs no broker at all.
+The single next strategy action is **building the point-in-time research
+dataset** for the now-FROZEN `baseline-trend-breakout-v1`, which needs no
+broker at all.
 
 ---
 

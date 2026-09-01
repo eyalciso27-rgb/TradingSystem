@@ -420,13 +420,20 @@ components:
     real_integration_status: NONE
     strategy_dependency: REQUIRED
     current_blocker: >-
-      the evaluator exists but NO frozen strategy manifest exists; no hypothesis
-      has been frozen
-    owner_dependency: OWNER_DECISION
+      the evaluator exists and a frozen, owner-approved manifest now exists
+      (docs/strategies/baseline-trend-breakout-v1.yaml, v1, status FROZEN,
+      owner_approval_ref OWNER-EYAL-2026-08-13-BASELINE-TREND-BREAKOUT-V1,
+      pinned by tests/strategy/test_frozen_baseline_manifest.py); it has not
+      been evaluated against any dataset — no point-in-time research dataset
+      exists to run it against, so nothing is HISTORICALLY_TESTED yet
+    owner_dependency: NONE
     next_action: >-
-      owner completes docs/strategies/STRATEGY_FREEZE_TEMPLATE.md for
-      baseline-trend-breakout-v1 BEFORE inspecting any evaluation result
-    exit_criterion: a frozen, owner-approved manifest registered before data inspection
+      build the point-in-time research dataset (Track A, EVD-0004), then
+      evaluate the frozen v1 manifest in-sample only; no parameter may be
+      inspected or changed on v1 without a new version_id (supersede)
+    exit_criterion: >-
+      the frozen, owner-approved manifest evaluated on a real point-in-time
+      dataset (HISTORICALLY_TESTED)
 
   - component_id: fusion
     name: Signal fusion
@@ -646,10 +653,13 @@ components:
     real_integration_status: NONE
     strategy_dependency: REQUIRED
     current_blocker: >-
-      no real dataset, no frozen hypothesis, no cost/slippage assumptions
-      approved
-    owner_dependency: OWNER_DECISION
-    next_action: freeze baseline-trend-breakout-v1, then backtest in-sample only
+      baseline-trend-breakout-v1 is FROZEN with owner-approved cost/slippage/
+      spread assumptions (docs/strategies/baseline-trend-breakout-v1.yaml); no
+      real point-in-time dataset exists yet to backtest it against
+    owner_dependency: NONE
+    next_action: >-
+      build the point-in-time dataset (Track A), then backtest the frozen v1
+      manifest in-sample only
     exit_criterion: HISTORICALLY_TESTED, then OUT_OF_SAMPLE_PASS via walk-forward
 
   - component_id: shadow
@@ -672,21 +682,37 @@ components:
 # OUT_OF_SAMPLE_PASS and SHADOW_PASS evidence, plus a formal owner Go decision.
 strategies:
   - strategy_id: baseline-trend-breakout-v1
-    status: NOT_FROZEN
+    status: FROZEN
+    version_id: v1
+    frozen_manifest: docs/strategies/baseline-trend-breakout-v1.yaml
+    owner_approval_ref: "OWNER-EYAL-2026-08-13-BASELINE-TREND-BREAKOUT-V1"
+    frozen_at: "2026-08-13T19:45:00+00:00"
+    fingerprint: "sha256:75f299b89e408ef332cd39a46f92d417ef637b3c5a5c1712801774c9e84dfed0"
     evidence_class: PROFITABILITY_NOT_PROVEN
     eligible: false
     out_of_sample_pass: false
     shadow_pass: false
-    hypothesis_frozen: false
+    # The manifest is FROZEN (status/frozen_manifest/owner_approval_ref above
+    # are authoritative); this boolean must agree. Freezing the hypothesis is
+    # not evidence: eligible/out_of_sample_pass/shadow_pass all stay false.
+    # Pinned by tests/status/test_project_consistency.py::
+    # test_the_recommended_baseline_needs_no_social_or_ai.
+    hypothesis_frozen: true
     freeze_template: docs/strategies/STRATEGY_FREEZE_TEMPLATE.md
     rationale: >-
       recommended FIRST hypothesis because it needs no social and no AI input,
       so it establishes a clean baseline against which any social or committee
       contribution can later be measured
     blocker: >-
-      the owner has not frozen the hypothesis; no parameter is defined anywhere
-      in this repository and none may be invented
-    next_action: owner completes the freeze template before any data inspection
+      the hypothesis is FROZEN and owner-approved (v1, immutable; a material
+      change requires a NEW version_id, never an edit to v1); no real
+      point-in-time research dataset has been built, so no backtest,
+      OUT_OF_SAMPLE_PASS or SHADOW_PASS evidence exists yet and no strategy is
+      eligible for any automated mode
+    next_action: >-
+      build the point-in-time research dataset (Track A), then evaluate the
+      frozen v1 manifest in-sample only, walk-forward, and Final OOS before any
+      Go/No-Go
 
 # -- open blockers (mirrors the defect register and PoI registry) -----------
 blockers:
@@ -712,7 +738,9 @@ blockers:
     summary: POI-MD-001 aggregate BLOCKED (provider-gated)
     owner_dependency: OWNER_DECISION
   - id: STRAT-01
-    summary: no frozen hypothesis, no point-in-time dataset, no OOS, no shadow
+    summary: >-
+      baseline-trend-breakout-v1 is FROZEN and owner-approved (v1); no
+      point-in-time dataset, no OOS and no shadow evidence exists yet
     owner_dependency: OWNER_DECISION
 
 # -- deferred owner-run states (must match the Phase-13 ledger exactly) ------
