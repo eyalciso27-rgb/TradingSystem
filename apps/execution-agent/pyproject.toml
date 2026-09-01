@@ -16,6 +16,9 @@ dependencies = [
 [project.scripts]
 # The owner-safe probe. It has no submission path.
 trading-execution-probe = "trading_execution_agent.__main__:main"
+# The autonomous-Paper runtime operator CLI (halt / resume / status). The
+# supervised loop itself submits nothing; `run` is Phase B.
+paper-runtime = "trading_execution_agent.runtime.cli:main"
 
 [tool.uv.sources]
 trading-application = { workspace = true }

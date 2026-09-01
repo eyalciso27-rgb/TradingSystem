@@ -53,6 +53,7 @@ EXPECTED_TABLES = {
     "audit_events",
     "emergency_commands",
     "notification_events",
+    "broker_observations",
 }
 
 FORBIDDEN_BROKER_TOKENS = [
@@ -224,6 +225,22 @@ def test_corporate_actions_migration_exists_and_is_frozen() -> None:
     assert "corporate_actions" in text
     assert "ck_corporate_actions_corporate_actions_ratio_pair" in text
     assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
+
+
+def test_broker_observations_migration_exists_and_is_frozen() -> None:
+    obs = MIGRATION.parent / "0010_broker_observations.py"
+    text = obs.read_text(encoding="utf-8")
+    assert 'down_revision: str | None = "0009_corporate_actions"' in text
+    assert "broker_observations" in text
+    assert "uq_broker_observations_environment_dedup_key" in text
+    assert "trading_persistence.models" not in text  # frozen DDL, no live metadata
+
+
+def test_broker_observations_migration_is_broker_neutral() -> None:
+    obs = MIGRATION.parent / "0010_broker_observations.py"
+    text = obs.read_text(encoding="utf-8").lower()
+    for token in FORBIDDEN_BROKER_TOKENS:
+        assert token not in text, token
 
 
 def test_point_in_time_migration_exists() -> None:
