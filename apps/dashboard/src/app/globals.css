@@ -147,6 +147,50 @@ a {
   border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
 }
 
+.mock-banner {
+  margin: 0 0 1rem;
+  padding: 0.45rem 0.7rem;
+  border: 1px dashed var(--warn);
+  border-radius: var(--radius-sm);
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 0.78rem;
+  letter-spacing: 0.02em;
+}
+
+.mock-banner strong { margin-right: 0.5rem; }
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10.5rem, 1fr));
+  gap: 0.65rem;
+  margin-bottom: 1rem;
+}
+
+.status-card {
+  min-width: 0;
+  padding: 0.7rem;
+  border: 1px solid var(--border);
+  border-top: 3px solid var(--muted);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.status-card-danger { border-top-color: var(--danger); background: var(--danger-bg); }
+.unknown-value { color: var(--danger); font-weight: 800; letter-spacing: 0.02em; }
+.unknown-row { background: var(--danger-bg) !important; outline: 2px solid var(--danger); outline-offset: -2px; }
+.reason-code { display: inline-block; margin: 0 0.35rem 0.25rem 0; padding: 0.15rem 0.35rem; background: var(--surface-2); border-radius: 0.25rem; }
+.decision-card { border-left: 4px solid var(--warn); }
+.execution-list, .health-grid { display: grid; gap: 1rem; }
+.health-grid { grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); }
+.lifecycle { display: flex; gap: 0.3rem; overflow-x: auto; padding: 0.65rem 0; }
+.lifecycle-stage { min-width: 8.5rem; padding: 0.45rem; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 0.68rem; position: relative; }
+.lifecycle-stage:not(:last-child)::after { content: "→"; position: absolute; right: -0.35rem; top: 0.55rem; z-index: 1; }
+.lifecycle-stage small { display: block; margin-top: 0.2rem; color: var(--muted); overflow-wrap: anywhere; }
+.lifecycle-stage.reached { border-color: var(--info); background: var(--info-bg); }
+.lifecycle-stage.not-reached { opacity: 0.58; }
+.execution-detail { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: 1rem; margin-top: 0.75rem; }
+
 /* -- page shell -------------------------------------------------------------- */
 
 .console {
