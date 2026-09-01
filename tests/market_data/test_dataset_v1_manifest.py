@@ -15,10 +15,12 @@ already in this repository satisfies the A-WP2 acceptance shape end to end:
 * each reference capability is classified into exactly one of three states —
   ``EMPIRICALLY_VERIFIED`` (task vocabulary: COMPLETE),
   ``CONTRACT_READY`` (PARTIAL — fixture proves the machinery only, never
-  empirical evidence), and ``BLOCKED_EXTERNAL`` (EXTERNAL_BLOCKED). The
-  COMPLETE state is reached only through the qualification harness's OWN
-  checksum verification over real fixture bytes on disk — never a
-  hard-coded/decorative digest (``trading_market_data_core.dataset_v1_qualification``,
+  empirical evidence), and ``BLOCKED_EXTERNAL`` (EXTERNAL_BLOCKED). COMPLETE
+  is proven UNREACHABLE from anything this file constructs: a matching
+  SHA-256 establishes byte integrity only, never that the bytes came from a
+  real external source, so evidence built here is always honestly labelled
+  ``FIXTURE`` and the promotion gate refuses it however clean its checksum,
+  coverage or metrics look (``trading_market_data_core.dataset_v1_qualification``,
   ``trading_market_data_core.dataset_v1_ingestion``);
 * a look-ahead violation is rejected, both as an explicit fail-closed audit
   (``NoLookaheadAuditor``) and structurally, by excluding any record that was
@@ -27,8 +29,11 @@ already in this repository satisfies the A-WP2 acceptance shape end to end:
 
 Everything here uses in-memory or ``tmp_path`` fixtures only. No network call,
 no broker/SEC/S&P access, no strategy parameter is touched, and nothing here
-claims real integration evidence: capabilities that are proven only from a
-``FIXTURE`` source stay ``CONTRACT_READY`` at best, never ``EMPIRICALLY_VERIFIED``.
+claims real integration evidence: no evidence built in this file is ever
+labelled ``EvidenceSourceKind.REAL``/``SourceKind.REAL``, so no capability
+proven only from what this file constructs can ever reach
+``EMPIRICALLY_VERIFIED`` — it stays ``CONTRACT_READY`` or ``BLOCKED_EXTERNAL``
+depending on which harness is exercised, but never COMPLETE.
 """
 
 from __future__ import annotations
@@ -392,33 +397,44 @@ def test_run_manifest_binds_immutable_artifact_sha256_and_detects_tamper(
 # -- 4. classifies capabilities as COMPLETE / PARTIAL / EXTERNAL_BLOCKED -----
 
 
-def test_complete_capability_requires_content_verified_evidence_not_a_label(
+def test_complete_capability_is_unreachable_from_a_self_declared_fixture(
     tmp_path: Path,
 ) -> None:
-    """COMPLETE (``CapabilityState.EMPIRICALLY_VERIFIED``) is reached ONLY
-    through the qualification harness's OWN checksum verification over real
-    bytes on disk — never a hard-coded/decorative digest.
+    """COMPLETE (``CapabilityState.EMPIRICALLY_VERIFIED``) can NEVER be reached
+    by anything this fixture-only file constructs, however clean it looks.
+
+    A matching SHA-256 establishes byte INTEGRITY only — it proves the evidence
+    was not altered after it was written, never that the bytes came from a real
+    external source. That provenance judgement is exactly ``source.kind``, and
+    it must be supplied by something OUTSIDE this test's control (a genuine
+    external retrieval, attested upstream) — never self-declared here. So this
+    evidence is honestly labelled ``EvidenceSourceKind.FIXTURE``, and even with
+    a real, content-verified checksum over real bytes on disk, full coverage,
+    full temporal/identity semantics, clean metrics and every required proof
+    present, the gate refuses to promote it: it stays capped BELOW COMPLETE.
 
     The evidence artifact is written to ``tmp_path`` and then RELOADED, which
     recomputes and compares its checksum against the actual file bytes before
     ``promote_capability`` is even called; a tampered artifact is proven to
-    fail closed. This demonstrates the DECISION PATH accepts well-formed,
-    content-verified evidence — it is NOT a claim that any external network
-    source was contacted. The repository's real capabilities stay blocked
-    until wired to genuine external evidence (see ``docs/data/DATASET-V1-*``).
+    fail closed independently of the FIXTURE/REAL distinction. This is NOT a
+    claim that any external network source was contacted, and it never
+    fabricates ``EvidenceSourceKind.REAL`` for synthetic bytes. The
+    repository's real capabilities stay blocked until wired to genuine
+    external evidence (see ``docs/data/DATASET-V1-*``).
     """
     raw_artifact = tmp_path / "raw-source-fixture.txt"
     raw_artifact.write_text(
         "fixture raw source bytes for the A-WP2 closure proof", encoding="utf-8"
     )
-    # The checksum authenticates THESE bytes — not an arbitrary string.
+    # The checksum authenticates THESE bytes — not an arbitrary string. Byte
+    # integrity alone, though, is never treated as proof of a real source.
     raw_checksum = "sha256:" + hashlib.sha256(raw_artifact.read_bytes()).hexdigest()
 
     evidence = qualify_source(
         "pit_sp500_membership",
         source=SourceDescriptor(
             source_id="fixture-source", name="Fixture Source", version="v1",
-            kind=EvidenceSourceKind.REAL, raw_checksum=raw_checksum,
+            kind=EvidenceSourceKind.FIXTURE, raw_checksum=raw_checksum,
             raw_artifact=str(raw_artifact),
         ),
         coverage=CoverageWindow(date(2010, 1, 1), date(2021, 6, 30)),
@@ -431,19 +447,24 @@ def test_complete_capability_requires_content_verified_evidence_not_a_label(
         proofs=("historical_addition", "historical_removal"),
         observed_at=KNOWN_AS_OF,
     )
-    assert evidence.result is QualificationResult.PASS
+    # A FIXTURE can never PASS, regardless of how clean everything else is.
+    assert evidence.result is not QualificationResult.PASS
+    assert not evidence.promotion_eligible
+    assert any("FIXTURE" in reason for reason in evidence.blocked_reasons)
     evidence_path = tmp_path / "pit_sp500_membership.json"
     evidence.write(evidence_path)
 
     # RELOAD from disk: this recomputes the checksum from the actual file
-    # bytes and compares it, so a decorative or stale digest cannot pass here.
+    # bytes and compares it, so a decorative or stale digest cannot pass here
+    # either — the fail-closed checksum check is independent of source kind.
     reloaded_evidence = load_and_verify_evidence(evidence_path)
-    complete_state = promote_capability(reloaded_evidence)
-    assert complete_state is CapabilityState.EMPIRICALLY_VERIFIED  # COMPLETE
+    state = promote_capability(reloaded_evidence)
+    assert state is not CapabilityState.EMPIRICALLY_VERIFIED  # never COMPLETE
+    assert state is CapabilityState.BLOCKED_EXTERNAL
 
-    # A tampered evidence file must never promote — proves the checksum is
-    # load-bearing, not decorative.
-    tampered = evidence_path.read_text(encoding="utf-8").replace('"PASS"', '"FAIL"')
+    # A tampered evidence file must never verify — proves the checksum is
+    # load-bearing, not decorative, on top of the FIXTURE/REAL distinction.
+    tampered = evidence_path.read_text(encoding="utf-8").replace('"FAIL"', '"PASS"')
     assert tampered != evidence_path.read_text(encoding="utf-8")
     evidence_path.write_text(tampered, encoding="utf-8")
     with pytest.raises(QualificationError, match="checksum mismatch"):
