@@ -29,7 +29,11 @@ from trading_broker_core.port import (
     OrderIntent,
     SessionPnlObservation,
 )
-from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter, RawOpenOrder
+from trading_broker_ibkr.paper_adapter import (
+    BracketSubmission,
+    IbkrPaperAdapter,
+    RawOpenOrder,
+)
 
 from tests.broker.test_ibkr_paper_adapter import (
     ALIASES,
@@ -85,6 +89,16 @@ class ExplodingTransport:
 
     def submit(self, broker_order_id: int, account_id: str, intent: OrderIntent) -> str:
         raise Boom("placeOrder exploded")
+
+    def submit_bracket(
+        self,
+        *,
+        parent_order_id: int,
+        stop_order_id: int,
+        account_id: str,
+        intent: OrderIntent,
+    ) -> BracketSubmission:
+        raise Boom("bracket placeOrder exploded")
 
     def cancel(self, broker_order_id: int) -> str:
         raise Boom("cancelOrder exploded")

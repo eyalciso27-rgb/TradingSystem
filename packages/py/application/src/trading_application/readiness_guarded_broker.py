@@ -262,12 +262,25 @@ class ReadinessGuardedBroker:
             snapshot: AccountSnapshot = self._broker.get_account_snapshot(
                 self._config.account_alias
             )
+        except BrokerPortError as error:
+            # The broker refused or could not answer. That is NOT "the broker
+            # reports an unknown environment" -- it is "we have no observation" --
+            # and the gate must be able to say which, or an owner-host failure
+            # reads as a wiring problem that does not exist. Canonical CODE only.
+            return BrokerSessionState(
+                connected=True, account_alias=self._config.account_alias,
+                session_mode=None, observed_at=health.checked_at,
+                health_ok=health.healthy,
+                detail=f"account snapshot refused: {error.code.value}",
+                account_observation_error=error.code.value,
+            )
         except Exception as error:  # noqa: BLE001
             return BrokerSessionState(
                 connected=True, account_alias=self._config.account_alias,
                 session_mode=None, observed_at=health.checked_at,
                 health_ok=health.healthy,
                 detail=f"account snapshot raised {type(error).__name__}",
+                account_observation_error=type(error).__name__,
             )
         # An environment outside the trading axis (RESEARCH) maps to None, which
         # blocks: it is neither paper nor live, so it cannot satisfy either.
@@ -418,8 +431,12 @@ class ReadinessGuardedBroker:
         intended architecture (ADR-0018, option B).
         """
         # The plan must still carry the protective level -- necessary, and
-        # nowhere near sufficient.
-        has_stop = intent.stop_price is not None and intent.stop_price > 0
+        # nowhere near sufficient. It may sit on the entry itself (a STOP-type
+        # entry) OR on the protective bracket that will establish it atomically
+        # (ADR-0019); either is "the plan carries a protective stop".
+        has_stop = (intent.stop_price is not None and intent.stop_price > 0) or (
+            intent.protective is not None and intent.protective.stop_price > 0
+        )
 
         if self._protection is None:
             return ProtectionState(

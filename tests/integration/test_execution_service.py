@@ -84,6 +84,7 @@ from trading_broker_core.port import (
     InstrumentQuery,
     OrderIntent,
     OrderSide,
+    ProtectiveBracket,
     SessionPnlStatus,
 )
 from trading_broker_ibkr.paper_adapter import IbkrPaperAdapter, decode_instrument_ref
@@ -114,6 +115,7 @@ from trading_execution_agent.execution_service import (
     ExecutionStage,
     PlanContext,
 )
+from trading_execution_agent.protected_entry import IbkrProtectedEntryLifecycle
 from trading_execution_agent.reconciliation_latch import ALWAYS_PERMIT
 from trading_market_data_core.sp500_current_universe import Constituent, ConstituentSnapshot
 from trading_market_data_core.trading_readiness import (
@@ -509,6 +511,7 @@ def _real_authorization(
             broker_instrument_ref=facts.instrument.broker_instrument_ref,
             broker_exchange=facts.instrument.exchange,
             broker_currency=facts.instrument.currency,
+            protective_stop_client_order_id=facts.protective_stop_client_order_id,
         ),
         RefreshedMarket(price=entry, observed_at=NOW),
         RefreshedAccount(risk_budget_equity=Decimal("50000"), observed_at=NOW),
@@ -987,6 +990,43 @@ def test_an_authorized_ready_decision_reaches_the_broker_exactly_once() -> None:
     assert evaluation.outcome is not None
     assert evaluation.outcome.status is ExecutionStatus.SUBMITTED
     assert len(_submits(transport)) == 1, "exactly one order reached the broker"
+
+
+def test_a_wired_lifecycle_reaches_native_protected_submission_end_to_end() -> None:
+    """ADR-0019 end to end: the canonical decision path establishes protection.
+
+    With the production ``IbkrProtectedEntryLifecycle`` wired and a test
+    authorization, a protection-REQUIRED decision passes the protection gate
+    (which used to refuse at PROTECTION_UNAVAILABLE) and the broker receives ONE
+    atomic native bracket — carrying the EXACT conId and both legs resting — not
+    a lone entry. This is the whole milestone joined up.
+    """
+    transport = PnlAwareTransport()
+    adapter = _adapter(transport)
+    service, fake, _ = _service(
+        transport=transport,
+        adapter=adapter,
+        protection=IbkrProtectedEntryLifecycle(adapter),
+        protection_required=True,
+        authorization=_TestOnlyAuthorization(),
+    )
+
+    evaluation = service.execute(_intent())
+
+    assert evaluation.stage is ExecutionStage.SUBMITTED, evaluation.reasons
+    # A native BRACKET reached the broker, never a lone unbracketed entry.
+    bracket_calls = [c for c in fake.calls if c.startswith("submit_bracket:")]
+    assert len(bracket_calls) == 1, fake.calls
+    assert not any(c.startswith("submit:") for c in fake.calls)
+    # The exact resolved security is preserved end to end onto the bracket.
+    submitted = fake.submitted_intents[-1]
+    assert submitted.broker_instrument_ref == "conid:265598"
+    assert submitted.protective is not None
+    assert submitted.stop_price is None, "the stop rides the bracket, not the parent aux"
+    # Both legs actually rest at the broker: the entry is born protected.
+    legs = {o.client_order_id for o in adapter.get_open_orders("paper-main")}
+    assert submitted.client_order_id in legs
+    assert submitted.protective.stop_client_order_id in legs
 
 
 def test_the_pre_submit_record_is_written_before_the_broker_sees_anything() -> None:
@@ -1535,15 +1575,42 @@ def test_a_real_protection_lifecycle_satisfies_both_layers_identically() -> None
     assert guard_state.protective_order_supported is True
 
 
-def test_the_real_adapter_cannot_currently_hold_atomic_protection() -> None:
-    """Pinned so flipping a capability flag without wiring it is caught."""
-    capabilities = _adapter().capabilities()
+def test_the_real_adapter_now_holds_atomic_protection_and_it_is_wired() -> None:
+    """ADR-0019: bracket/oco are NATIVE AND backed by real wiring.
 
-    assert capabilities.bracket is BrokerCapabilityMode.UNSUPPORTED
-    assert capabilities.oco is BrokerCapabilityMode.UNSUPPORTED
-    assert capabilities.order_types[OrderType.STOP] is BrokerCapabilityMode.NATIVE, (
-        "a supported STOP order type is exactly the thing that must NOT be"
-        " mistaken for broker-side protection"
+    The inverse of the old option-B guard: pinned so the flag can never be
+    NATIVE without ``submit_order`` actually establishing BOTH legs atomically. A
+    bare flag flip with no wiring would leave only one leg here and fail.
+    """
+    adapter = _adapter()
+    capabilities = adapter.capabilities()
+    assert capabilities.bracket is BrokerCapabilityMode.NATIVE
+    assert capabilities.oco is BrokerCapabilityMode.NATIVE
+    assert capabilities.order_types[OrderType.STOP] is BrokerCapabilityMode.NATIVE
+
+    alias = next(iter(ALIASES))
+    receipt = adapter.submit_order(
+        OrderIntent(
+            client_order_id="brk-real",
+            authorization_ref="submit-auth:brk-real",
+            correlation_id="corr-brk-real",
+            environment=Environment.PAPER,
+            account_alias=alias,
+            symbol="AAPL",
+            broker_instrument_ref="conid:265598",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=Decimal("1"),
+            limit_price=Decimal("190"),
+            protective=ProtectiveBracket(
+                stop_price=Decimal("180"), stop_client_order_id="brk-real:stop"
+            ),
+        )
+    )
+    assert receipt.client_order_id == "brk-real"
+    legs = {o.client_order_id for o in adapter.get_open_orders(alias)}
+    assert legs == {"brk-real", "brk-real:stop"}, (
+        "a NATIVE bracket flag must be backed by BOTH legs actually resting"
     )
 
 
@@ -1630,17 +1697,18 @@ def test_protection_evidence_without_a_broker_reference_is_not_protection() -> N
     assert state.protective_order_supported is False
 
 
-def test_the_real_adapter_has_no_protected_entry_lifecycle_so_entries_block() -> None:
-    """Option B, end to end, against the real adapter and the real guard.
+def test_without_a_wired_protected_entry_lifecycle_entries_still_block() -> None:
+    """Defence in depth: a NATIVE bracket capability is NOT enough on its own.
 
-    STOP order type may be NATIVE; bracket and OCO are not; there is no atomic
-    protected-entry implementation; the final readiness gate blocks; and the
-    broker's transport sees ZERO submits.
+    The adapter can now hold a bracket, but the execution service is constructed
+    here WITHOUT a ``ProtectedEntryLifecycle`` wired in. Protection is proven by
+    a lifecycle, never inferred from a capability flag, so the final readiness
+    gate still blocks and the broker's transport sees ZERO submits. Wiring the
+    lifecycle is a separate, explicit step.
     """
     capabilities = _adapter().capabilities()
     assert capabilities.order_types[OrderType.STOP] is BrokerCapabilityMode.NATIVE
-    assert capabilities.bracket is BrokerCapabilityMode.UNSUPPORTED
-    assert capabilities.oco is BrokerCapabilityMode.UNSUPPORTED
+    assert capabilities.bracket is BrokerCapabilityMode.NATIVE
 
     service, transport, _ = _service(
         protection_required=True, authorization=_TestOnlyAuthorization()
@@ -3766,6 +3834,73 @@ def test_an_outcome_resolving_a_different_order_is_unreadable(
     """PREPARED says one order, OUTCOME says another. Reconcile, never replay."""
     with pytest.raises(ExecutionHistoryUnreadableError, match="DIFFERENT order"):
         require_consistent_lifecycle(_lifecycle(**mutation))
+
+
+# == PREPARED and OUTCOME must agree about the PROTECTIVE structure (ADR-0019) =
+
+
+def _protected_lifecycle(**outcome: str) -> tuple[ExecutionHistoryRecord, ...]:
+    base = {
+        "bracket_mechanism": "native-bracket",
+        "protective_order_refs": "ord-1:stop",
+        "protective_quantity": "10",
+        "protective_stop_price": "95",
+        # A bracketed entry's stop rides the child, so the parent's own aux is
+        # empty -- matching how the service writes it.
+        "stop_price": "",
+    }
+    prepared = _history_record("EXECUTION_SUBMIT_PREPARED", _prepared_payload(**base))
+    terminal_payload = _prepared_payload(**{**base, **outcome})
+    terminal_payload["submission_outcome"] = "SUBMITTED"
+    return (prepared, _history_record("EXECUTION_OUTCOME", terminal_payload))
+
+
+def test_a_matching_protected_lifecycle_reads_normally() -> None:
+    require_consistent_lifecycle(_protected_lifecycle())
+
+
+@pytest.mark.parametrize(
+    ("name", "mutation"),
+    [
+        ("stop moved to another ref", {"protective_order_refs": "ord-1:other"}),
+        ("protected quantity shrank", {"protective_quantity": "5"}),
+        ("stop price moved", {"protective_stop_price": "80"}),
+        ("protection vanished", {"bracket_mechanism": ""}),
+    ],
+)
+def test_an_outcome_resolving_a_different_protective_structure_is_unreadable(
+    name: str, mutation: dict[str, str]
+) -> None:
+    """A stop that moved, resized or vanished between PREPARED and OUTCOME is
+    the safety property; it must reconcile, never replay."""
+    with pytest.raises(ExecutionHistoryUnreadableError, match="DIFFERENT order"):
+        require_consistent_lifecycle(_protected_lifecycle(**mutation))
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["protective_order_refs", "protective_quantity", "protective_stop_price"],
+)
+def test_a_bracket_record_missing_its_protective_fields_is_unreadable(
+    missing: str,
+) -> None:
+    """A record that DECLARES a bracket must name the protective order, its
+    quantity AND its stop level, or its claim of protection cannot be compared
+    to a replay."""
+    payload = _prepared_payload(
+        broker_instrument_ref="conid:265598",
+        bracket_mechanism="native-bracket",
+        protective_order_refs="ord-1:stop",
+        protective_quantity="10",
+        protective_stop_price="95",
+    )
+    fingerprint = payload["execution_fingerprint"]
+    assert isinstance(fingerprint, dict)
+    fingerprint[missing] = ""
+    payload["submission_outcome"] = "SUBMITTED"
+
+    with pytest.raises(ExecutionHistoryUnreadableError, match="protective"):
+        _require_readable("EXECUTION_OUTCOME", "sha256:x", payload)
 
 
 @pytest.mark.parametrize(

@@ -64,8 +64,34 @@ MANDATORY_PREPARED_FIELDS: tuple[str, ...] = (
     "broker_instrument_ref",
 )
 
+#: The protective-structure half of a protected-entry fingerprint (ADR-0019).
+#: These are CONDITIONALLY required: a record is a protected entry iff it carries
+#: a non-empty ``bracket_mechanism``, and only then must it also name the
+#: protective order refs and the protective quantity. A plain order, and every
+#: record written before this milestone, carries none of them and stays
+#: readable — exactly as ``limit_price``/``stop_price`` are excluded above.
+#:
+#: ``bracket_mechanism`` is the discriminator, so it is listed first and its
+#: presence is what makes the other two mandatory.
+PROTECTIVE_ORDER_FIELDS: tuple[str, ...] = (
+    "bracket_mechanism",
+    "protective_order_refs",
+    "protective_quantity",
+    # The protective STOP LEVEL. A recovered stop of the right shape at the
+    # WRONG price is not protection: a long entry whose stop dropped from 95 to
+    # 80 is exposed far below where it was authorized to be. So the price is
+    # sealed and compared exactly like the rest of the protective structure.
+    "protective_stop_price",
+)
+
+#: The single field whose presence marks a record as a protected entry and thus
+#: makes the rest of ``PROTECTIVE_ORDER_FIELDS`` mandatory.
+PROTECTIVE_DISCRIMINATOR_FIELD = "bracket_mechanism"
+
 __all__ = [
     "MANDATORY_PREPARED_FIELDS",
     "PREPARED_ORDER_FIELDS",
+    "PROTECTIVE_DISCRIMINATOR_FIELD",
+    "PROTECTIVE_ORDER_FIELDS",
     "REQUEST_IDENTITY_FIELDS",
 ]

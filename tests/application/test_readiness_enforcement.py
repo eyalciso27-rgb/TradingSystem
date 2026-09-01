@@ -363,6 +363,62 @@ def _guard(
     return guard, real, sink
 
 
+# == a LATER account observation that fails is reported honestly ==============
+#
+# The owner-host defect: the first account read succeeded (the probe printed
+# "[OK] account: alias paper-poi environment PAPER") and a LATER read, during
+# readiness, raised -- which the gate reported as "session environment or
+# account alias is unknown". Both block; only one of them is true.
+
+
+class _FlakyAccountBroker(_Broker):
+    """Succeeds for the first N account reads, then raises like a real port."""
+
+    def __init__(self, *, succeed_first: int = 1, **kw: object) -> None:
+        super().__init__(**kw)  # type: ignore[arg-type]
+        self.account_reads = 0
+        self._succeed_first = succeed_first
+
+    def get_account_snapshot(self, account_alias: str) -> AccountSnapshot:
+        self.account_reads += 1
+        if self.account_reads > self._succeed_first:
+            raise BrokerPortError(
+                BrokerErrorCode.BROKER_REJECTED,
+                "account summary refused by the gateway",
+            )
+        return super().get_account_snapshot(account_alias)
+
+
+def test_a_later_account_read_that_raises_blocks_and_names_the_real_cause() -> None:
+    flaky = _FlakyAccountBroker(succeed_first=1)
+    guard, _broker, _ = _guard(flaky)
+
+    first = guard.evaluate_readiness(_intent())
+    second = guard.evaluate_readiness(_intent())
+
+    # The first observation genuinely proved PAPER.
+    first_gate = next(g for g in first.gates if g.name == "account_mode_safety")
+    assert first_gate.satisfied is True
+    # The second could not observe the account at all -- BLOCKED, and it says
+    # WHY, with the canonical code rather than the misleading generic text.
+    second_gate = next(g for g in second.gates if g.name == "account_mode_safety")
+    assert second.readiness is TradingReadiness.BLOCKED
+    assert second_gate.satisfied is False
+    assert "account snapshot unavailable" in second_gate.detail
+    assert "BROKER_REJECTED" in second_gate.detail
+    assert flaky.account_reads >= 2
+
+
+def test_a_failing_account_read_never_reaches_the_broker_with_an_order() -> None:
+    """Fail-closed is unchanged: a blocked readiness submits nothing."""
+    guard, broker, _ = _guard(_FlakyAccountBroker(succeed_first=0))
+
+    with pytest.raises(ReadinessBlockedError):
+        guard.submit_order(_intent())
+
+    assert broker.submitted == [], "an unobservable account must never submit"
+
+
 # == the double must not be more generous than the contract ===================
 
 

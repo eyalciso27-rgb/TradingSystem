@@ -68,6 +68,7 @@ from trading_execution_agent.execution_service import (
     ExecutionService,
     ExecutionStage,
 )
+from trading_execution_agent.protected_entry import IbkrProtectedEntryLifecycle
 from trading_execution_agent.safe_logging import (
     install_owner_output_protection,
     owner_print,
@@ -402,9 +403,22 @@ def _prove_object_store() -> object:
 
 
 def build_service(
-    *, symbol: str, account_alias: str, host: str, port: int, equity_cap: Decimal
+    *,
+    symbol: str,
+    account_alias: str,
+    host: str,
+    port: int,
+    equity_cap: Decimal,
+    authorization: object | None = None,
 ) -> ProbeResources:
-    """Wire the REAL components. Imported lazily so --help never opens a socket."""
+    """Wire the REAL components. Imported lazily so --help never opens a socket.
+
+    ``authorization`` is None on every production path, so the service uses its
+    default ``DenyAllExecutionAuthorization`` and cannot submit -- the read-only
+    probe relies on exactly that. The owner-safe protected-bracket PROOF (and
+    only it) passes a scoped, Paper-only, single-use authority here; nothing in
+    production wiring ever does.
+    """
     from trading_broker_ibkr.paper_adapter import build_paper_adapter
     from trading_broker_ibkr.poi_market_data_session import create_session
     from trading_persistence.db import create_sync_engine
@@ -443,6 +457,7 @@ def build_service(
         service = _build(
             adapter, session, engine, config.object_store,
             account_alias=account_alias, equity_cap=equity_cap,
+            authorization=authorization,
         )
     except BaseException:
         # Anything at all: unwind what opened, then let it propagate.
@@ -464,6 +479,7 @@ def _build(
     *,
     account_alias: str,
     equity_cap: Decimal,
+    authorization: object | None = None,
 ) -> ExecutionService:
     """Assemble the service from already-owned resources."""
     from trading_execution_agent.reconciliation_latch import ReconciliationLatch
@@ -503,7 +519,13 @@ def _build(
         # there is no wiring in which the latched gate and the gate the agent
         # consults could be different.
         entry_gate=latch,
-        # No authorization argument: the production default DENIES.
+        # The production protected-entry authority (ADR-0019): it PROVES a
+        # native bracket will protect the entry and never submits. Without it a
+        # protection-required entry is refused (no lifecycle => no evidence).
+        protection=IbkrProtectedEntryLifecycle(adapter),  # type: ignore[arg-type]
+        # None on every production path => the service's default DenyAll. Only
+        # the owner-safe proof passes a scoped, Paper-only, single-use authority.
+        authorization=authorization,  # type: ignore[arg-type]
     )
 
 

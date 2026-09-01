@@ -1180,9 +1180,12 @@ def test_gap10_adapter_assumptions_match_the_real_ibkr_paper_capabilities() -> N
     # PLAIN_STOP protection needs a NATIVE stop and nothing else.
     assert IBKR_PAPER_CAPABILITIES.order_types[OrderType.STOP] is BrokerCapabilityMode.NATIVE
     assert IBKR_PAPER_CAPABILITIES.order_types[OrderType.LIMIT] is BrokerCapabilityMode.NATIVE
-    # The harness must NOT rely on bracket/OCA - the adapter has neither.
-    assert IBKR_PAPER_CAPABILITIES.bracket is BrokerCapabilityMode.UNSUPPORTED
-    assert IBKR_PAPER_CAPABILITIES.oco is BrokerCapabilityMode.UNSUPPORTED
+    # ADR-0019: the adapter now ALSO carries a native bracket/OCA. This older
+    # plain-stop manual-lifecycle CLI does not use them (it remains PLAIN_STOP by
+    # design; the milestone's atomic bracket has its own proof command), which is
+    # what the assertions below still pin.
+    assert IBKR_PAPER_CAPABILITIES.bracket is BrokerCapabilityMode.NATIVE
+    assert IBKR_PAPER_CAPABILITIES.oco is BrokerCapabilityMode.NATIVE
     assert IBKR_PAPER_CAPABILITIES.what_if is BrokerCapabilityMode.NATIVE
 
     source = (REPO_ROOT / "scripts" / "poi_ibkr_lifecycle.py").read_text(encoding="utf-8")

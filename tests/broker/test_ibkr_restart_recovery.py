@@ -337,11 +337,13 @@ def test_no_global_cancel_surface_exists() -> None:
         assert "reqGlobalCancel" not in path.read_text(encoding="utf-8")
 
 
-def test_capabilities_still_exclude_bracket_and_oca() -> None:
+def test_capabilities_declare_native_bracket_and_oca() -> None:
+    # ADR-0019: the adapter now establishes a real native bracket atomically in
+    # submit_order, so bracket/oca are NATIVE (implementation and flip together).
     adapter, _transport = _restarted(())
     capabilities = adapter.capabilities()
-    assert capabilities.bracket.value != "NATIVE"
-    assert capabilities.oco.value != "NATIVE"
+    assert capabilities.bracket.value == "NATIVE"
+    assert capabilities.oco.value == "NATIVE"
 
 
 def test_the_aliases_map_is_still_paper_only() -> None:
