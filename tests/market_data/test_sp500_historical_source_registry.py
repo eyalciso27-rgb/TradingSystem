@@ -32,7 +32,7 @@ import copy
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeGuard, cast
 
@@ -101,17 +101,27 @@ def _validate_eligibility(eligibility: object, where: str) -> None:
 
 
 def _parse_iso8601(value: object, where: str) -> datetime:
-    """Parse a real ISO-8601 instant. Fails closed on anything else, including
-    a missing/null value - VERIFIED timestamps must be recorded, not implied."""
+    """Parse a real, timezone-AWARE ISO-8601 instant and normalize it to UTC.
+    Fails closed on anything else, including a missing/null value (VERIFIED
+    timestamps must be recorded, not implied) and a naive timestamp: a PIT
+    instant whose ordering depends on a later, unspecified timezone
+    interpretation is not a fixed point on the timeline and can silently
+    invalidate the no-look-ahead boundary (CLAUDE.md point-in-time semantics)."""
     if not isinstance(value, str) or not value.strip():
         raise RegistryError(f"{where}: must be a non-empty ISO-8601 timestamp string")
     text = value.strip()
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text)
     except ValueError as exc:
         raise RegistryError(f"{where}: {value!r} is not a valid ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise RegistryError(
+            f"{where}: {value!r} must be timezone-aware (no naive clocks) - "
+            "a PIT instant must not depend on an unspecified later timezone"
+        )
+    return parsed.astimezone(UTC)
 
 
 def _validate_bound_artifact(candidate: dict[str, Any], checksum: str, where: str) -> None:
@@ -634,6 +644,24 @@ def test_validator_rejects_verified_with_out_of_order_timestamps(tmp_path: Path)
         candidate["timestamps"]["effective_at"] = "2024-06-01T00:00:00+00:00"  # after available_at
 
     with pytest.raises(RegistryError, match="effective_at <= observed_at <= available_at"):
+        validate_registry(_tampered(mutate))
+
+
+@pytest.mark.parametrize("naive_key", ["effective_at", "observed_at", "available_at"])
+def test_validator_rejects_verified_with_timezone_naive_timestamp(
+    tmp_path: Path, naive_key: str
+) -> None:
+    """A naive timestamp's ordering depends on a later, unspecified timezone
+    interpretation - it is not a fixed PIT instant and must be rejected, not
+    silently accepted as whatever the reader's local/UTC assumption happens
+    to be."""
+
+    def mutate(data: dict[str, Any]) -> None:
+        candidate = _candidate(data, "fja05680-sp500-github")
+        candidate.update(_verified_evidence_patch(tmp_path))
+        candidate["timestamps"][naive_key] = "2024-01-02T00:00:00"  # no offset, no "Z"
+
+    with pytest.raises(RegistryError, match="must be timezone-aware"):
         validate_registry(_tampered(mutate))
 
 
