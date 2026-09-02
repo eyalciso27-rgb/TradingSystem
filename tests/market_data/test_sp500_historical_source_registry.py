@@ -29,8 +29,10 @@ own ``status`` is ``NOT_INTEGRATED`` and ``integration_evidence_claim`` is
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TypeGuard, cast
 
@@ -98,6 +100,86 @@ def _validate_eligibility(eligibility: object, where: str) -> None:
         _require(checked[flag] is False, f"{where}: eligibility.{flag} must be False")
 
 
+def _parse_iso8601(value: object, where: str) -> datetime:
+    """Parse a real ISO-8601 instant. Fails closed on anything else, including
+    a missing/null value - VERIFIED timestamps must be recorded, not implied."""
+    if not isinstance(value, str) or not value.strip():
+        raise RegistryError(f"{where}: must be a non-empty ISO-8601 timestamp string")
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise RegistryError(f"{where}: {value!r} is not a valid ISO-8601 timestamp") from exc
+
+
+def _validate_bound_artifact(candidate: dict[str, Any], checksum: str, where: str) -> None:
+    """A VERIFIED checksum must be bound to real bytes on disk, re-derived here
+    - never trusted from the label alone (this closes the exact gap a review
+    flagged: an all-zero digest with no artifact behind it was previously
+    accepted as 'genuinely verified')."""
+    artifact_path = candidate.get("artifact_path")
+    _require(
+        isinstance(artifact_path, str) and artifact_path.strip() != "",
+        f"{where}: checksum_status VERIFIED requires a non-empty artifact_path",
+    )
+    assert isinstance(artifact_path, str)
+    path = Path(artifact_path)
+    _require(
+        path.is_absolute(),
+        f"{where}: artifact_path must be an absolute path, not {artifact_path!r}",
+    )
+    _require(path.is_file(), f"{where}: artifact_path {artifact_path!r} does not exist")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    _require(
+        digest == checksum.lower(),
+        f"{where}: checksum_sha256 does not match the recomputed digest of artifact_path bytes",
+    )
+
+
+def _validate_verified_timestamps(timestamps: dict[str, Any], where: str) -> None:
+    effective = _parse_iso8601(timestamps.get("effective_at"), f"{where}: timestamps.effective_at")
+    observed = _parse_iso8601(timestamps.get("observed_at"), f"{where}: timestamps.observed_at")
+    available = _parse_iso8601(timestamps.get("available_at"), f"{where}: timestamps.available_at")
+    _require(
+        effective <= observed <= available,
+        f"{where}: timestamps must satisfy effective_at <= observed_at <= available_at",
+    )
+
+
+def _validate_passed_cross_check(
+    candidate: dict[str, Any], cross_check: dict[str, Any], minimum: int, where: str
+) -> None:
+    """A PASSED cross-check must name real, distinct, independent sources -
+    never the candidate's own URL, never duplicates padding out the count."""
+    _require(
+        cross_check.get("status") == "PASSED",
+        f"{where}: cross_check.status must be PASSED",
+    )
+    corroborating = cross_check.get("corroborating_sources")
+    _require(
+        isinstance(corroborating, list),
+        f"{where}: cross_check.corroborating_sources must be a list",
+    )
+    assert isinstance(corroborating, list)
+    cleaned = [s.strip() for s in corroborating if isinstance(s, str) and s.strip()]
+    _require(
+        len(cleaned) == len(corroborating),
+        f"{where}: cross_check.corroborating_sources must all be non-empty strings",
+    )
+    distinct = set(cleaned)
+    _require(
+        len(distinct) >= minimum,
+        f"{where}: cross_check needs at least {minimum} distinct corroborating sources",
+    )
+    own_url = candidate.get("source_url")
+    _require(
+        own_url not in distinct,
+        f"{where}: a corroborating source cannot be the candidate's own source_url",
+    )
+
+
 def _validate_secondary_research_pit(candidate: dict[str, Any], where: str) -> None:
     _require(
         candidate.get("source_authority") == "PUBLIC_SECONDARY",
@@ -109,20 +191,6 @@ def _validate_secondary_research_pit(candidate: dict[str, Any], where: str) -> N
         status_key = f"{key}_status"
         _require(status_key in timestamps, f"{where}: timestamps.{status_key} is required")
 
-    checksum = candidate.get("checksum_sha256")
-    checksum_status = candidate.get("checksum_status")
-    if checksum_status == "VERIFIED":
-        is_real_sha256 = isinstance(checksum, str) and SHA256_RE.match(checksum) is not None
-        _require(
-            is_real_sha256,
-            f"{where}: checksum_status VERIFIED requires a real 64-hex sha256, not {checksum!r}",
-        )
-    else:
-        _require(
-            checksum is None,
-            f"{where}: checksum_sha256 must be null until checksum_status is VERIFIED",
-        )
-
     cross_check = _expect_dict(candidate.get("cross_check"), f"{where}: cross_check")
     _require(
         cross_check.get("required") is True,
@@ -133,12 +201,40 @@ def _validate_secondary_research_pit(candidate: dict[str, Any], where: str) -> N
         isinstance(minimum, int) and minimum >= 2,
         f"{where}: cross_check.minimum_independent_corroborating_sources must be >= 2",
     )
-    if cross_check.get("status") in {"PASSED", "VERIFIED"}:
-        corroborating = cross_check.get("corroborating_sources", [])
-        enough_sources = isinstance(corroborating, list) and len(corroborating) >= minimum
+
+    checksum = candidate.get("checksum_sha256")
+    checksum_status = candidate.get("checksum_status")
+    if checksum_status == "VERIFIED":
+        # Reaching VERIFIED requires ALL FOUR legs of evidence at once, each
+        # independently re-derived by this validator - never accepted from a
+        # label. A real-shaped checksum with nothing bound behind it (the
+        # gap a prior review flagged) is rejected by _validate_bound_artifact.
+        is_real_sha256 = isinstance(checksum, str) and SHA256_RE.match(checksum) is not None
         _require(
-            enough_sources,
-            f"{where}: cross_check cannot read PASSED/VERIFIED without {minimum} sources",
+            is_real_sha256,
+            f"{where}: checksum_status VERIFIED requires a real 64-hex sha256, not {checksum!r}",
+        )
+        assert isinstance(checksum, str)
+        _validate_bound_artifact(candidate, checksum, where)
+        _validate_verified_timestamps(timestamps, where)
+        _validate_passed_cross_check(candidate, cross_check, minimum, where)
+    else:
+        _require(
+            checksum is None,
+            f"{where}: checksum_sha256 must be null until checksum_status is VERIFIED",
+        )
+        _require(
+            candidate.get("artifact_path") is None,
+            f"{where}: artifact_path must be null until checksum_status is VERIFIED",
+        )
+        for key in ("effective_at", "observed_at", "available_at"):
+            _require(
+                timestamps.get(key) is None,
+                f"{where}: timestamps.{key} must be null until checksum_status is VERIFIED",
+            )
+        _require(
+            cross_check.get("status") != "PASSED",
+            f"{where}: cross_check.status cannot be PASSED before checksum_status is VERIFIED",
         )
 
 
@@ -303,6 +399,7 @@ def test_fja05680_requires_checksum_and_three_timestamps_and_cross_check() -> No
     # Not yet computed/performed - this registry never fetched the source.
     assert candidate["checksum_sha256"] is None
     assert candidate["checksum_status"] == "NOT_YET_COMPUTED"
+    assert candidate["artifact_path"] is None
 
     timestamps = candidate["timestamps"]
     for key in ("effective_at", "observed_at", "available_at"):
@@ -427,26 +524,174 @@ def test_validator_rejects_bogus_checksum_value_even_if_present() -> None:
         validate_registry(_tampered(mutate))
 
 
-def test_validator_accepts_a_genuinely_verified_checksum_shape() -> None:
-    """The validator is not just permanently closed - a real 64-hex digest is
-    accepted once actually present, proving the check is on shape/substance,
-    not a blanket rejection of the VERIFIED state itself."""
+def test_validator_rejects_a_bare_checksum_shape_with_no_bound_evidence() -> None:
+    """The exact gap a prior review flagged: a real-shaped 64-hex digest with
+    no artifact, no timestamps and no cross-check behind it must NOT reach
+    VERIFIED. Decorative metadata is not evidence."""
 
     def mutate(data: dict[str, Any]) -> None:
         candidate = _candidate(data, "fja05680-sp500-github")
         candidate["checksum_status"] = "VERIFIED"
-        candidate["checksum_sha256"] = "0" * 64
+        candidate["checksum_sha256"] = "0" * 64  # no artifact_path behind it
+
+    with pytest.raises(RegistryError, match="requires a non-empty artifact_path"):
+        validate_registry(_tampered(mutate))
+
+
+def _verified_evidence_patch(tmp_path: Path) -> dict[str, Any]:
+    """A genuinely verifiable VERIFIED patch: real bytes on disk, a checksum
+    recomputed from those exact bytes, ordered ISO-8601 timestamps, and a
+    PASSED cross-check naming two distinct sources that are not the
+    candidate's own URL. Mirrors the EvidenceBinding pattern used for the
+    dataset-manifest fixtures (checksum over ACTUAL bytes, never a label)."""
+    artifact = tmp_path / "fja05680-sp500-snapshot.csv"
+    artifact.write_bytes(b"date,ticker,action\n2024-01-01,ABCX,ADDED\n")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    return {
+        "checksum_status": "VERIFIED",
+        "checksum_sha256": digest,
+        "artifact_path": str(artifact),
+        "timestamps": {
+            "effective_at": "2024-01-01T00:00:00+00:00",
+            "effective_at_status": "RECORDED",
+            "observed_at": "2024-01-02T00:00:00+00:00",
+            "observed_at_status": "RECORDED",
+            "available_at": "2024-01-03T00:00:00+00:00",
+            "available_at_status": "RECORDED",
+        },
+        "cross_check": {
+            "required": True,
+            "status": "PASSED",
+            "minimum_independent_corroborating_sources": 2,
+            "corroborating_sources": [
+                "https://www.sec.gov/cgi-bin/browse-edgar",
+                "https://www.wsj.com/market-data/quotes/index/US/SPX",
+            ],
+        },
+    }
+
+
+def test_validator_accepts_a_genuinely_bound_verified_candidate(tmp_path: Path) -> None:
+    """Positive control: the validator is not permanently closed - full,
+    re-derivable evidence (real bytes + real digest + ordered timestamps +
+    an independent PASSED cross-check) is accepted."""
+
+    def mutate(data: dict[str, Any]) -> None:
+        candidate = _candidate(data, "fja05680-sp500-github")
+        candidate.update(_verified_evidence_patch(tmp_path))
 
     validate_registry(_tampered(mutate))  # must not raise
 
 
-def test_validator_rejects_cross_check_passed_without_enough_sources() -> None:
+def test_validator_rejects_verified_with_nonexistent_artifact_path(tmp_path: Path) -> None:
+    def mutate(data: dict[str, Any]) -> None:
+        candidate = _candidate(data, "fja05680-sp500-github")
+        candidate.update(_verified_evidence_patch(tmp_path))
+        candidate["artifact_path"] = str(tmp_path / "does-not-exist.csv")
+
+    with pytest.raises(RegistryError, match="does not exist"):
+        validate_registry(_tampered(mutate))
+
+
+def test_validator_rejects_verified_with_relative_artifact_path(tmp_path: Path) -> None:
+    def mutate(data: dict[str, Any]) -> None:
+        candidate = _candidate(data, "fja05680-sp500-github")
+        candidate.update(_verified_evidence_patch(tmp_path))
+        candidate["artifact_path"] = "relative/path.csv"
+
+    with pytest.raises(RegistryError, match="must be an absolute path"):
+        validate_registry(_tampered(mutate))
+
+
+def test_validator_rejects_verified_with_mismatched_artifact_bytes(tmp_path: Path) -> None:
+    """The checksum is re-derived from the file on disk, not trusted from the
+    field: tampering the bytes AFTER the checksum was recorded is caught."""
+
+    def mutate(data: dict[str, Any]) -> None:
+        candidate = _candidate(data, "fja05680-sp500-github")
+        patch = _verified_evidence_patch(tmp_path)
+        candidate.update(patch)
+        Path(patch["artifact_path"]).write_bytes(b"tampered bytes, different content")
+
+    with pytest.raises(RegistryError, match="does not match the recomputed digest"):
+        validate_registry(_tampered(mutate))
+
+
+def test_validator_rejects_verified_with_missing_timestamp(tmp_path: Path) -> None:
+    def mutate(data: dict[str, Any]) -> None:
+        candidate = _candidate(data, "fja05680-sp500-github")
+        candidate.update(_verified_evidence_patch(tmp_path))
+        candidate["timestamps"]["observed_at"] = None
+
+    with pytest.raises(RegistryError, match="non-empty ISO-8601 timestamp"):
+        validate_registry(_tampered(mutate))
+
+
+def test_validator_rejects_verified_with_out_of_order_timestamps(tmp_path: Path) -> None:
+    def mutate(data: dict[str, Any]) -> None:
+        candidate = _candidate(data, "fja05680-sp500-github")
+        candidate.update(_verified_evidence_patch(tmp_path))
+        candidate["timestamps"]["effective_at"] = "2024-06-01T00:00:00+00:00"  # after available_at
+
+    with pytest.raises(RegistryError, match="effective_at <= observed_at <= available_at"):
+        validate_registry(_tampered(mutate))
+
+
+def test_validator_rejects_verified_without_passed_cross_check(tmp_path: Path) -> None:
+    def mutate(data: dict[str, Any]) -> None:
+        candidate = _candidate(data, "fja05680-sp500-github")
+        candidate.update(_verified_evidence_patch(tmp_path))
+        candidate["cross_check"]["status"] = "NOT_PERFORMED"
+
+    with pytest.raises(RegistryError, match="cross_check.status must be PASSED"):
+        validate_registry(_tampered(mutate))
+
+
+def test_validator_rejects_verified_cross_check_naming_its_own_source_url(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, Any]) -> None:
+        candidate = _candidate(data, "fja05680-sp500-github")
+        candidate.update(_verified_evidence_patch(tmp_path))
+        candidate["cross_check"]["corroborating_sources"] = [
+            candidate["source_url"],
+            "https://www.wsj.com/market-data/quotes/index/US/SPX",
+        ]
+
+    with pytest.raises(RegistryError, match="cannot be the candidate's own source_url"):
+        validate_registry(_tampered(mutate))
+
+
+def test_validator_rejects_verified_cross_check_with_duplicate_sources(
+    tmp_path: Path,
+) -> None:
+    """Two copies of the same string never count as two independent sources."""
+
+    def mutate(data: dict[str, Any]) -> None:
+        candidate = _candidate(data, "fja05680-sp500-github")
+        candidate.update(_verified_evidence_patch(tmp_path))
+        candidate["cross_check"]["corroborating_sources"] = [
+            "https://www.sec.gov/cgi-bin/browse-edgar",
+            "https://www.sec.gov/cgi-bin/browse-edgar",
+        ]
+
+    with pytest.raises(RegistryError, match="at least 2 distinct corroborating sources"):
+        validate_registry(_tampered(mutate))
+
+
+def test_validator_rejects_cross_check_marked_passed_before_checksum_is_verified() -> None:
+    """Cross-check PASSED can never run ahead of checksum VERIFIED - a
+    candidate cannot be half-promoted."""
+
     def mutate(data: dict[str, Any]) -> None:
         candidate = _candidate(data, "fja05680-sp500-github")
         candidate["cross_check"]["status"] = "PASSED"
-        candidate["cross_check"]["corroborating_sources"] = ["only-one-source"]
+        candidate["cross_check"]["corroborating_sources"] = [
+            "https://www.sec.gov/cgi-bin/browse-edgar",
+            "https://www.wsj.com/market-data/quotes/index/US/SPX",
+        ]
 
-    with pytest.raises(RegistryError, match="cannot read PASSED/VERIFIED"):
+    with pytest.raises(RegistryError, match="cannot be PASSED before checksum_status is VERIFIED"):
         validate_registry(_tampered(mutate))
 
 

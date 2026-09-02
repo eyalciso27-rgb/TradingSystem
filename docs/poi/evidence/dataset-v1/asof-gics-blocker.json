@@ -1,6 +1,6 @@
 {
   "artifact_type": "auxiliary_data_quality_report",
-  "checksum": "sha256:0ca78f5858a916e1f6b756f147e2e85e666951fd4d9e03a5702f1ab464c93564",
+  "checksum": "sha256:dbb0572d42173b2e3645b8832ea886a37b2664c10bcce0607335d9028ac24bc5",
   "counts": {
     "sources_reviewed": 5
   },
@@ -11,7 +11,7 @@
   "notes": [
     "{\n  \"blocker_class\": \"LICENSE_REQUIRED\",\n  \"capability\": \"asof_gics\",\n  \"data_requirement\": \"A company-level HISTORICAL GICS assignment series: security_id -> GICS sub-industry code -> effective date -> knowledge date, revision-safe, covering the backtest window.\",\n  \"licensed_provider_must_supply\": [\n    \"company-level GICS assignment per security\",\n    \"effective date for each assignment\",\n    \"knowledge/announcement date for each assignment (revision-safe)\",\n    \"a stable, non-ticker security identifier\",\n    \"coverage across the full backtest window\",\n    \"redistribution terms compatible with storing derived evidence\"\n  ],\n  \"minimum_qualification_acceptance\": [\n    \"at least one real historical classification CHANGE\",\n    \"both time axes present on every row\",\n    \"stable identity resolution with zero ambiguity\",\n    \"a bounded, declared coverage window\",\n    \"a raw source checksum bound into the evidence\"\n  ],\n  \"sources_reviewed\": {\n    \"free_secondary\": \"Free datasets republish CURRENT classifications without effective or knowledge dates, so they cannot answer an as-of question and would back-project today's sector onto history.\",\n    \"ibkr\": \"No classification history is exposed through the read-only API. Contract details carry no GICS field and no as-of dimension.\",\n    \"issuer_exchange_public\": \"Issuer and exchange material states a sector in prose; it is neither the official GICS assignment nor dated as a revision-safe series.\",\n    \"sec\": \"SEC assigns SIC, not GICS. SIC is a different taxonomy maintained by a different body with different boundaries; mapping SIC to GICS is an approximation, not the published assignment.\",\n    \"sp_dji_public\": \"S&P DJI publishes the GICS STRUCTURE (the code hierarchy) publicly, but company-level assignments - and their history - are licensed.\"\n  },\n  \"state\": \"BLOCKED_EXTERNAL\",\n  \"why_current_gics_is_insufficient\": \"Using today's classification for a historical date is look-ahead: GICS assignments change, and a security reclassified in 2023 would appear to have held that classification in 2018.\"\n}"
   ],
-  "observed_at": "2026-09-02T06:54:34.215266+00:00",
+  "observed_at": "2026-09-02T06:59:36.949009+00:00",
   "qualifies_nothing": true,
   "schema_version": "dataset-v1-artifacts-1.0.0"
 }
