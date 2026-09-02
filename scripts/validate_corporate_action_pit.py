@@ -24,23 +24,32 @@ PIT-consistent, or fails closed with a precise reason.
 
 Invariants enforced (fail closed, no silent defaults):
 
-* Every record carries a stable Instrument Master identifier (never a raw
-  ticker symbol), a recognised ``CorporateActionType``, all four point-in-time
-  timestamps (``effective_at``, ``observed_at``, ``available_at``,
-  ``ingested_at``), non-empty source provenance, and a real 64-hex
-  ``artifact_sha256`` (re-derived from ``artifact_path`` bytes when supplied —
-  never trusted from the label alone).
+* Every record carries a stable Instrument Master identifier, a recognised
+  ``CorporateActionType``, all four point-in-time timestamps (``effective_at``,
+  ``observed_at``, ``available_at``, ``ingested_at``), non-empty source
+  provenance, and a real 64-hex ``artifact_sha256`` (re-derived from
+  ``artifact_path`` bytes when supplied — never trusted from the label alone).
+  "Stable Instrument Master identifier" is not inferred from spelling: the
+  Data Model (24.1) and the actual schema
+  (``trading_persistence.models``: ``instruments.id`` is a UUID primary key,
+  and every ``instrument_id`` foreign key — including ``corporate_actions`` —
+  references that UUID) fix the identity space as a UUID, never a ticker,
+  venue-qualified symbol, or any other provider-facing spelling. A value that
+  does not parse as a UUID is rejected outright, so no ticker-shaped string in
+  any casing or venue-suffixed form can pass by accident.
 * ``observed_at <= available_at <= ingested_at`` — a record cannot become
   usable before it was observed, and cannot be ingested before it was usable.
 * ``available_at`` must not be later than the fixture's decision ``as_of``:
   a record the fixture claims is part of the point-in-time picture at a given
   decision must actually have been available by then.
 * Correction lineage (``corrects_record_id``) must reference a real record for
-  the SAME instrument, must not cycle, the correction must become available
-  strictly after the record it corrects, and the corrected record must carry
-  a ``superseded_at`` that exactly matches the correction's ``available_at``
-  (the same binding the offline dataset-manifest foundation uses for
-  amendments).
+  the SAME instrument, must not cycle, must not branch (a corrected record may
+  have at most one correcting record — two records correcting the same
+  original would leave an ambiguous, unresolvable effective lineage), the
+  correction must become available strictly after the record it corrects, and
+  the corrected record must carry a ``superseded_at`` that exactly matches the
+  correction's ``available_at`` (the same binding the offline dataset-manifest
+  foundation uses for amendments).
 * An ``adjusted_history_uses`` entry (a claim that some series was built from
   provider-adjusted prices) must name an existing, same-instrument, split-type
   corporate-action record that was itself available by the decision ``as_of``
@@ -55,6 +64,7 @@ import hashlib
 import json
 import re
 import sys
+import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -72,11 +82,6 @@ ALLOWED_ACTION_TYPES = frozenset(member.value for member in CorporateActionType)
 ADJUSTMENT_QUALIFYING_ACTION_TYPES = frozenset(
     {CorporateActionType.SPLIT.value, CorporateActionType.REVERSE_SPLIT.value}
 )
-
-#: A stable Instrument Master id is never a bare ticker symbol (Data Model
-#: 24.1 keeps ``instrument_symbols`` separate from ``instruments.instrument_id``;
-#: ``trading_application.corporate_actions`` documents the same rule).
-_BARE_TICKER_RE = re.compile(r"^[A-Z]{1,6}$")
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -146,6 +151,28 @@ def parse_iso8601(value: object, where: str) -> datetime:
             f"{where}: {value!r} must be timezone-aware (no naive clocks)"
         )
     return parsed.astimezone(UTC)
+
+
+def validate_stable_instrument_id(instrument_id: str, where: str) -> str:
+    """Require the documented Instrument Master identity: a UUID, not a spelling.
+
+    ``trading_persistence.models``: ``instruments.id`` is a UUID primary key
+    and every ``instrument_id`` foreign key (including on ``corporate_actions``
+    itself) references that UUID — never a ticker, never a venue-qualified
+    symbol. Rejecting "looks like a ticker" spellings one at a time is not
+    stability; requiring the actual identity type is. Anything that does not
+    parse as a UUID is rejected, regardless of casing, punctuation, or venue
+    suffix.
+    """
+    try:
+        parsed = uuid.UUID(instrument_id)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise CorporateActionPitError(
+            f"{where}: instrument_id {instrument_id!r} is not a stable Instrument "
+            "Master UUID (a ticker, venue-qualified symbol, or any other "
+            "provider-facing spelling is never accepted; fail closed)"
+        ) from exc
+    return str(parsed)
 
 
 def _validate_artifact_sha256(record: dict[str, Any], where: str) -> str:
@@ -228,11 +255,7 @@ def validate_record(raw: object, index: int) -> CorporateActionPitRecord:
     where = f"corporate_actions[{index}] ({record_id})"
 
     instrument_id = _expect_nonempty_str(record.get("instrument_id"), f"{where}.instrument_id")
-    _require(
-        _BARE_TICKER_RE.match(instrument_id) is None,
-        f"{where}.instrument_id: {instrument_id!r} looks like a raw ticker symbol, "
-        "not a stable Instrument Master id (fail closed)",
-    )
+    instrument_id = validate_stable_instrument_id(instrument_id, f"{where}.instrument_id")
 
     action_type = record.get("action_type")
     _require(
@@ -306,7 +329,30 @@ def validate_pit_gate(
 
 
 def validate_correction_lineage(records: dict[str, CorporateActionPitRecord]) -> None:
-    """Reject dangling references, cross-instrument corrections, and cycles."""
+    """Reject dangling references, cross-instrument corrections, cycles, and
+    branching (more than one record correcting the same original).
+
+    A point-in-time consumer needs exactly one effective correction chain per
+    record. If two records both name the same ``corrects_record_id``, each
+    may pass every *direct-edge* check in isolation (same instrument, later
+    available_at, matching superseded_at) yet leave two incompatible
+    successors for the same original — an ambiguity that must never be
+    silently resolved by pick-one-and-hope. Reject it outright, before the
+    direct-edge checks even run.
+    """
+    correctors_by_target: dict[str, list[str]] = {}
+    for record_id, record in records.items():
+        if record.corrects_record_id is not None:
+            correctors_by_target.setdefault(record.corrects_record_id, []).append(record_id)
+    for target_id, correcting_ids in correctors_by_target.items():
+        if len(correcting_ids) > 1:
+            raise CorporateActionPitError(
+                f"corporate_actions[{target_id}]: invalid correction lineage — "
+                f"record {target_id!r} is corrected by more than one record "
+                f"{sorted(correcting_ids)!r}; correction lineage must be a single, "
+                "unambiguous chain (fail closed)"
+            )
+
     for record_id, record in records.items():
         where = f"corporate_actions[{record_id}]"
         if record.corrects_record_id is None:
@@ -361,6 +407,7 @@ def validate_adjusted_history_use(
     where = f"adjusted_history_uses[{index}]"
     use = _expect_dict(raw, where)
     instrument_id = _expect_nonempty_str(use.get("instrument_id"), f"{where}.instrument_id")
+    instrument_id = validate_stable_instrument_id(instrument_id, f"{where}.instrument_id")
     series_id = _expect_nonempty_str(use.get("series_id"), f"{where}.series_id")
     where = f"adjusted_history_uses[{index}] ({series_id})"
 

@@ -45,11 +45,17 @@ DECISION_AS_OF = AVAILABLE + timedelta(days=1)
 VALID_SHA = "a" * 64
 Capsys = pytest.CaptureFixture[str]
 
+# Stable Instrument Master identifiers are UUIDs (trading_persistence.models:
+# instruments.id is a UUID primary key; every instrument_id foreign key,
+# including corporate_actions, references it) — never a ticker spelling.
+AAPL_INSTRUMENT_ID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+MSFT_INSTRUMENT_ID = "3fa85f64-5717-4562-b3fc-2c963f66afa7"
+
 
 def ca_record(
     record_id: str = "ca-001",
     *,
-    instrument_id: str = "INST:AAPL:0001",
+    instrument_id: str = AAPL_INSTRUMENT_ID,
     action_type: str = "SPLIT",
     effective_at: datetime = EFFECTIVE,
     observed_at: datetime = ANNOUNCED,
@@ -97,7 +103,7 @@ def fixture(
 
 def use(
     *,
-    instrument_id: str = "INST:AAPL:0001",
+    instrument_id: str = AAPL_INSTRUMENT_ID,
     series_id: str = "AAPL:close:1d:adjusted",
     qualifying_corporate_action_record_id: str | None = "ca-001",
 ) -> dict[str, Any]:
@@ -203,11 +209,47 @@ def test_available_at_exactly_at_decision_as_of_is_accepted() -> None:
 # -- instrument identifier, action type, source provenance --------------------
 
 
-@pytest.mark.parametrize("ticker", ["AAPL", "MSFT", "X", "GOOGL"])
-def test_bare_ticker_instrument_id_is_rejected(ticker: str) -> None:
-    record = ca_record(instrument_id=ticker)
-    with pytest.raises(CorporateActionPitError, match="raw ticker symbol"):
+@pytest.mark.parametrize(
+    "non_uuid_id",
+    [
+        "AAPL",  # bare uppercase ticker
+        "aapl",  # bare lowercase ticker — not merely a spelling variant of AAPL
+        "AAPL.US",  # ticker + venue suffix
+        "aapl.us",  # lowercase ticker + venue suffix
+        "NASDAQ:AAPL",  # venue-qualified provider-style symbol
+        "INST:AAPL:0001",  # a plausible-looking but non-UUID "internal" id
+        "X",
+        "GOOGL",
+        "not-a-uuid-at-all",
+        "3fa85f64-5717-4562-b3fc-2c963f66afaz",  # right shape, invalid hex digit
+    ],
+)
+def test_non_uuid_instrument_id_is_rejected(non_uuid_id: str) -> None:
+    """A stable Instrument Master id is a UUID; every ticker-shaped spelling —
+    any case, any venue suffix, any provider-style prefix — is rejected by
+    construction, not by pattern-matching one particular spelling."""
+    record = ca_record(instrument_id=non_uuid_id)
+    with pytest.raises(CorporateActionPitError, match="not a stable Instrument Master UUID"):
         validate_corporate_action_pit(fixture(records=[record]))
+
+
+def test_uuid_instrument_id_is_accepted_regardless_of_case() -> None:
+    record = ca_record(instrument_id=AAPL_INSTRUMENT_ID.upper())
+    validate_corporate_action_pit(fixture(records=[record]))  # must not raise
+
+
+def test_uuid_instrument_id_case_is_normalized_for_cross_record_matching() -> None:
+    """An upper-cased UUID in a use must still match a lower-cased UUID on the
+    qualifying record — matching is by identity, not by exact string bytes."""
+    record = ca_record(instrument_id=AAPL_INSTRUMENT_ID.lower())
+    data = fixture(records=[record], uses=[use(instrument_id=AAPL_INSTRUMENT_ID.upper())])
+    validate_corporate_action_pit(data)  # must not raise
+
+
+def test_adjusted_history_use_with_non_uuid_instrument_id_is_rejected() -> None:
+    data = fixture(uses=[use(instrument_id="AAPL")])
+    with pytest.raises(CorporateActionPitError, match="not a stable Instrument Master UUID"):
+        validate_corporate_action_pit(data)
 
 
 def test_missing_instrument_id_is_rejected() -> None:
@@ -353,9 +395,78 @@ def test_two_record_correction_cycle_is_rejected() -> None:
         )
 
 
+def test_two_records_correcting_the_same_original_is_rejected() -> None:
+    """Branching lineage: two independent corrections of the same original,
+    each individually satisfying the direct-edge checks (same instrument,
+    strictly-later available_at, superseded_at matching one of them), must
+    still be rejected outright — a PIT consumer must never have to guess
+    which successor is the "real" one."""
+    shared_correction_available = AVAILABLE + timedelta(days=2)
+    original = ca_record(
+        "ca-001",
+        available_at=AVAILABLE,
+        ingested_at=AVAILABLE,
+        superseded_at=shared_correction_available,
+    )
+    correction_a = ca_record(
+        "ca-002",
+        observed_at=ANNOUNCED + timedelta(days=1),
+        available_at=shared_correction_available,
+        ingested_at=shared_correction_available,
+        corrects_record_id="ca-001",
+    )
+    correction_b = ca_record(
+        "ca-003",
+        observed_at=ANNOUNCED + timedelta(days=1),
+        available_at=shared_correction_available,
+        ingested_at=shared_correction_available,
+        corrects_record_id="ca-001",
+    )
+    with pytest.raises(CorporateActionPitError, match="corrected by more than one record"):
+        validate_corporate_action_pit(
+            fixture(
+                records=[original, correction_a, correction_b],
+                decision_as_of=DECISION_AS_OF + timedelta(days=5),
+            )
+        )
+
+
+def test_two_records_correcting_the_same_original_at_different_times_is_also_rejected() -> None:
+    """Branching is rejected even when the two corrections are NOT
+    simultaneous — the ambiguity is having two successors at all, not their
+    relative timing."""
+    original = ca_record(
+        "ca-001",
+        available_at=AVAILABLE,
+        ingested_at=AVAILABLE,
+        superseded_at=AVAILABLE + timedelta(days=2),
+    )
+    correction_a = ca_record(
+        "ca-002",
+        observed_at=ANNOUNCED + timedelta(days=1),
+        available_at=AVAILABLE + timedelta(days=2),
+        ingested_at=AVAILABLE + timedelta(days=2),
+        corrects_record_id="ca-001",
+    )
+    correction_b = ca_record(
+        "ca-003",
+        observed_at=ANNOUNCED + timedelta(days=1),
+        available_at=AVAILABLE + timedelta(days=4),
+        ingested_at=AVAILABLE + timedelta(days=4),
+        corrects_record_id="ca-001",
+    )
+    with pytest.raises(CorporateActionPitError, match="corrected by more than one record"):
+        validate_corporate_action_pit(
+            fixture(
+                records=[original, correction_a, correction_b],
+                decision_as_of=DECISION_AS_OF + timedelta(days=10),
+            )
+        )
+
+
 def test_correction_across_different_instruments_is_rejected() -> None:
     records = _corrected_pair()
-    records[1]["instrument_id"] = "INST:MSFT:0002"
+    records[1]["instrument_id"] = MSFT_INSTRUMENT_ID
     with pytest.raises(CorporateActionPitError, match="different instrument"):
         validate_corporate_action_pit(
             fixture(records=records, decision_as_of=DECISION_AS_OF + timedelta(days=5))
@@ -436,7 +547,7 @@ def test_adjusted_history_use_referencing_unknown_record_is_rejected() -> None:
 
 
 def test_adjusted_history_use_for_a_different_instrument_is_rejected() -> None:
-    data = fixture(uses=[use(instrument_id="INST:MSFT:0002")])
+    data = fixture(uses=[use(instrument_id=MSFT_INSTRUMENT_ID)])
     with pytest.raises(CorporateActionPitError, match="belongs to a different"):
         validate_corporate_action_pit(data)
 
