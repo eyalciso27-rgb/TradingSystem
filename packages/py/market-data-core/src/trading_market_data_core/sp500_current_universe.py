@@ -26,7 +26,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -201,6 +201,50 @@ def validate_snapshot(snapshot: ConstituentSnapshot) -> tuple[str, ...]:
     return tuple(findings)
 
 
+#: Greppable convention (mirrors ``DIAGNOSTIC_NOTE_PREFIX`` below) for binding a
+#: snapshot to the raw source artifact it was parsed from. Because ``notes`` is
+#: part of the checksummed body, once a snapshot is bound its normalized
+#: checksum authenticates the raw binding too -- altering the recorded raw
+#: checksum after the fact is exactly as detectable as altering a ticker.
+RAW_CHECKSUM_NOTE_PREFIX = "raw source checksum: "
+
+
+def raw_artifact_checksum(raw_bytes: bytes) -> str:
+    """The sha256 of a raw source artifact's actual bytes."""
+    return "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
+
+
+def bind_raw_source(
+    snapshot: ConstituentSnapshot, raw_checksum: str
+) -> ConstituentSnapshot:
+    """Bind a snapshot to the raw artifact it was parsed from and reseal it.
+
+    This only records and authenticates the CLAIM; it does not verify the
+    claim against real bytes. ``UniverseStore.accept_with_raw_artifact`` is
+    what enforces that the claim matches the raw bytes actually supplied at
+    archive time and durably retains them for later re-verification.
+    """
+    if not raw_checksum.startswith("sha256:"):
+        raise SourceAdapterError("raw_checksum must be a sha256: digest")
+    if recorded_raw_checksum(snapshot) is not None:
+        raise SourceAdapterError(
+            "snapshot already carries a raw source checksum binding; a snapshot"
+            " is bound to exactly one raw artifact"
+        )
+    bound = replace(
+        snapshot, notes=snapshot.notes + (f"{RAW_CHECKSUM_NOTE_PREFIX}{raw_checksum}",)
+    )
+    return replace(bound, checksum=bound.compute_checksum())
+
+
+def recorded_raw_checksum(snapshot: ConstituentSnapshot) -> str | None:
+    """The raw-artifact checksum a snapshot declares itself bound to, if any."""
+    for note in snapshot.notes:
+        if note.startswith(RAW_CHECKSUM_NOTE_PREFIX):
+            return note[len(RAW_CHECKSUM_NOTE_PREFIX) :]
+    return None
+
+
 class UniverseStore:
     """Monthly snapshots on disk, with an explicit last-known-good.
 
@@ -222,6 +266,11 @@ class UniverseStore:
 
     def _path(self, snapshot: ConstituentSnapshot) -> Path:
         return self.root / f"{snapshot.index_id}-{snapshot.as_of.isoformat()}.json"
+
+    def _raw_path(self, snapshot: ConstituentSnapshot) -> Path:
+        # Deliberately NOT ``*.json`` -- it must never be picked up by
+        # ``snapshots()``/``latest()``, which glob only normalized entries.
+        return self.root / f"{snapshot.index_id}-{snapshot.as_of.isoformat()}.raw"
 
     def accept(self, snapshot: ConstituentSnapshot) -> tuple[Path | None, tuple[str, ...]]:
         """Persist a snapshot if it validates. Returns (path, findings)."""
@@ -284,10 +333,76 @@ class UniverseStore:
         latest = self.latest()
         return latest is None or latest.age_days(now) >= REFRESH_INTERVAL_DAYS
 
+    def accept_with_raw_artifact(
+        self, snapshot: ConstituentSnapshot, raw_bytes: bytes
+    ) -> tuple[Path | None, tuple[str, ...]]:
+        """Archive a snapshot AND durably retain the raw artifact it was
+        parsed from, enforcing the raw <-> normalized checksum binding.
+
+        Fail-closed, and strictly stronger than :meth:`accept`:
+
+        * the snapshot MUST already declare a raw-checksum binding (see
+          :func:`bind_raw_source`) that matches the sha256 of ``raw_bytes``
+          actually supplied here -- a snapshot with no binding, or one whose
+          binding does not match the real bytes, is refused outright;
+        * on success the raw bytes are written to a WRITE-ONCE sidecar file
+          alongside the normalized entry, so the binding is durably
+          re-verifiable later via :meth:`verify_raw_artifact` -- independent
+          of whatever ephemeral fixture or download buffer produced
+          ``raw_bytes`` in the first place;
+        * on ANY failure (raw axis or normalized axis) NOTHING is written --
+          an archive entry that claims a raw binding it cannot authenticate
+          must never exist on disk, even partially.
+        """
+        recorded = recorded_raw_checksum(snapshot)
+        if recorded is None:
+            return None, (
+                "snapshot carries no raw source checksum binding (see"
+                " bind_raw_source); refusing to archive without durable raw"
+                " provenance",
+            )
+        actual = raw_artifact_checksum(raw_bytes)
+        if recorded != actual:
+            return None, (
+                "raw artifact checksum mismatch: snapshot declares a binding to"
+                f" {recorded}, but the supplied raw bytes hash to {actual};"
+                " refusing to archive",
+            )
+        raw_path = self._raw_path(snapshot)
+        if raw_path.is_file() and raw_path.read_bytes() != raw_bytes:
+            return None, (
+                f"a raw artifact for {snapshot.index_id} as_of"
+                f" {snapshot.as_of.isoformat()} is already archived immutably at"
+                f" {raw_path}; refusing to overwrite it with different bytes",
+            )
+        normalized_path, findings = self.accept(snapshot)
+        if findings or normalized_path is None:
+            return None, findings
+        if not raw_path.is_file():
+            self.root.mkdir(parents=True, exist_ok=True)
+            raw_path.write_bytes(raw_bytes)
+        return normalized_path, ()
+
+    def verify_raw_artifact(self, snapshot: ConstituentSnapshot) -> tuple[str, ...]:
+        """Re-verify a previously archived raw artifact against the checksum
+        the snapshot declares -- durable, independent of any ephemeral
+        fixture that may no longer exist by the time this is called."""
+        recorded = recorded_raw_checksum(snapshot)
+        if recorded is None:
+            return ("snapshot carries no raw source checksum binding",)
+        raw_path = self._raw_path(snapshot)
+        if not raw_path.is_file():
+            return (f"no retained raw artifact found at {raw_path}",)
+        actual = raw_artifact_checksum(raw_path.read_bytes())
+        if actual != recorded:
+            return (
+                "retained raw artifact checksum mismatch (tampered or stale):"
+                f" declared {recorded}, recomputed {actual}",
+            )
+        return ()
+
 
 def _with_checksum(snapshot: ConstituentSnapshot) -> ConstituentSnapshot:
-    from dataclasses import replace
-
     return replace(snapshot, checksum=snapshot.compute_checksum())
 
 
@@ -529,6 +644,7 @@ __all__ = [
     "parse_wikitext_constituents",
     "fetch_current_constituents",
     "DIAGNOSTIC_NOTE_PREFIX",
+    "RAW_CHECKSUM_NOTE_PREFIX",
     "WIKIPEDIA_API_URL",
     "WIKIPEDIA_HTML_API_URL",
     "FREE_SOURCE_ID",
@@ -540,12 +656,15 @@ __all__ = [
     "Constituent",
     "ConstituentSnapshot",
     "UniverseStore",
+    "bind_raw_source",
     "classify_freshness",
     "ensure_current_universe",
     "load_snapshot",
     "diagnostic_notes",
     "parse_constituent_table",
     "parse_html_constituents",
+    "raw_artifact_checksum",
+    "recorded_raw_checksum",
     "refresh_universe",
     "sector_context",
     "validate_snapshot",
