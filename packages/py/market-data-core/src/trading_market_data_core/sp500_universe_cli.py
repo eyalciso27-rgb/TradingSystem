@@ -26,7 +26,7 @@ from trading_market_data_core.sp500_current_universe import (
     ConstituentSnapshot,
     UniverseStore,
     classify_freshness,
-    fetch_current_constituents,
+    fetch_current_constituents_with_raw,
     refresh_universe,
 )
 from trading_market_data_core.trading_readiness import (
@@ -107,7 +107,7 @@ def main(argv: list[str]) -> int:
     candidate: ConstituentSnapshot | None = None
     findings: list[str] = []
     try:
-        candidate = fetch_current_constituents(now=now)
+        candidate = fetch_current_constituents_with_raw(now=now)
     except SourceAdapterError as error:
         findings.append(f"fetch failed: {error}")
     current, _, refresh_findings = refresh_universe(

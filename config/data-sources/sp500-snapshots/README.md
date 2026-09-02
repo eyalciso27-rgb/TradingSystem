@@ -45,6 +45,22 @@ One entry per `(index_id, as_of)`, named `{index_id}-{as_of}.json` (e.g.
   representation whose diagnostic notes differ). A new observation always
   gets a new `as_of`; a past date is never corrected in place.
 
+Write-once holds under **real concurrency**, not only a single caller: the
+whole read-check-write sequence for one `(index_id, as_of)` — both `accept`
+and `accept_with_raw_artifact` — is serialized behind a per-date interprocess
+lock (`fcntl.flock` on a `.{index_id}-{as_of}.lock` file next to the archive;
+released automatically if the holder dies, so no stale-lock cleanup is
+needed). Without it, two writers (two refresh processes, or a scheduled
+refresh racing a manual CLI run) could each observe an absent entry, both pass
+validation, and both `os.replace` — the second one silently winning and
+either discarding the first writer's accepted candidate (both calls report
+success, only one survives) or pairing a normalized entry from one candidate
+with the raw sidecar from another. With the lock, exactly one concurrent
+writer for a given date wins; the other blocks until the first has fully
+committed (or fully failed), then re-observes reality and is refused (or,
+byte-identical, treated as idempotent) under the ordinary write-once rule.
+See `test_concurrent_conflicting_writers_for_the_same_date_never_both_win`.
+
 ## Required provenance metadata
 
 Every archived entry carries, at minimum:

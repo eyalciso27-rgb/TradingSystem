@@ -23,12 +23,13 @@ Safety rules:
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import re
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -147,6 +148,14 @@ class ConstituentSnapshot:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class RawConstituentRefresh:
+    """A parsed CURRENT snapshot plus the exact raw bytes it came from."""
+
+    snapshot: ConstituentSnapshot
+    raw_bytes: bytes
+
+
 def _sort_key(constituent: Constituent) -> tuple[str, str]:
     return (constituent.ticker, constituent.security_id)
 
@@ -242,23 +251,32 @@ def bind_raw_source(
 
 def recorded_raw_checksum(snapshot: ConstituentSnapshot) -> str | None:
     """The raw-artifact checksum a snapshot declares itself bound to, if any."""
-    for note in snapshot.notes:
-        if note.startswith(RAW_CHECKSUM_NOTE_PREFIX):
-            return note[len(RAW_CHECKSUM_NOTE_PREFIX) :]
-    return None
+    checksums = recorded_raw_checksums(snapshot)
+    return checksums[0] if checksums else None
+
+
+def recorded_raw_checksums(snapshot: ConstituentSnapshot) -> tuple[str, ...]:
+    """All raw-artifact checksum claims a snapshot carries."""
+    return tuple(
+        note[len(RAW_CHECKSUM_NOTE_PREFIX) :]
+        for note in snapshot.notes
+        if note.startswith(RAW_CHECKSUM_NOTE_PREFIX)
+    )
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write ``data`` to ``path`` atomically -- fsync-then-rename.
+    """Write ``data`` to ``path`` atomically -- fsync-then-rename-then-dir-fsync.
 
     A reader (this process or another) can only ever observe the COMPLETE
     previous content or the COMPLETE new content, never a partial write left
     by a crash, a full disk, or a killed process mid-write: the data is
     written to a temporary file in the SAME directory (so the final
     ``os.replace`` is an atomic rename on one filesystem, not a cross-device
-    copy), flushed and ``fsync``ed before the rename, and the temporary file
-    is removed if anything fails before the rename completes -- no visible
-    partial artifact is ever left behind on failure.
+    copy), flushed and ``fsync``ed before the rename, and then the parent
+    directory is ``fsync``ed after the rename so the directory entry itself is
+    durable on POSIX filesystems. The temporary file is removed if anything
+    fails before the rename completes -- no visible partial artifact is ever
+    left behind on failure.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
@@ -268,10 +286,20 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_name, path)
+        _fsync_directory(path.parent)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
         raise
+
+
+def _fsync_directory(path: Path) -> None:
+    """Make a just-created/replaced directory entry durable on POSIX."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 class UniverseStore:
@@ -290,8 +318,9 @@ class UniverseStore:
     ``as_of``, never as a correction of a past one.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, allow_normalized_only: bool = False) -> None:
         self.root = root
+        self.allow_normalized_only = allow_normalized_only
 
     def _path(self, snapshot: ConstituentSnapshot) -> Path:
         return self.root / f"{snapshot.index_id}-{snapshot.as_of.isoformat()}.json"
@@ -300,6 +329,49 @@ class UniverseStore:
         # Deliberately NOT ``*.json`` -- it must never be picked up by
         # ``snapshots()``/``latest()``, which glob only normalized entries.
         return self.root / f"{snapshot.index_id}-{snapshot.as_of.isoformat()}.raw"
+
+    def _lock_path(self, snapshot: ConstituentSnapshot) -> Path:
+        return self.root / f".{snapshot.index_id}-{snapshot.as_of.isoformat()}.lock"
+
+    @contextlib.contextmanager
+    def _locked(self, snapshot: ConstituentSnapshot) -> Iterator[None]:
+        """Serialize the whole read-check-write sequence for one
+        ``(index_id, as_of)`` across processes AND threads.
+
+        Without this, two concurrent writers (two refresh processes, a
+        refresh racing a manual CLI run, or two threads) could each observe
+        an absent archive entry in :meth:`_prepare_accept`, both pass
+        validation, and then both call ``os.replace`` -- which OVERWRITES
+        rather than creates exclusively. The second writer would silently
+        win, either discarding the first writer's accepted candidate outright
+        (both API calls report success, but only one survives on disk) or,
+        worse, pairing a normalized entry from one candidate with the raw
+        sidecar from another. That is exactly the write-once invariant this
+        store exists to guarantee, and a check-then-act sequence alone cannot
+        make it hold under concurrency.
+
+        ``fcntl.flock`` on an exclusively-opened lock file blocks a second
+        writer for the same date rather than failing it outright (so a
+        legitimate identical retry or an honestly concurrent refresh simply
+        waits its turn), and is released automatically if this process dies
+        while holding it -- no stale-lock cleanup is required. Every
+        accepting path re-runs :meth:`_prepare_accept` (a fresh read of
+        current disk state) only AFTER acquiring this lock, so the writer
+        that loses the race sees the winner's already-committed content and
+        is refused (or, if byte-identical, treated as idempotent) exactly as
+        the write-once contract promises.
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock_path = self._lock_path(snapshot)
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
     def _prepare_accept(
         self, snapshot: ConstituentSnapshot
@@ -348,17 +420,27 @@ class UniverseStore:
     def accept(self, snapshot: ConstituentSnapshot) -> tuple[Path | None, tuple[str, ...]]:
         """Persist a snapshot if it validates. Returns (path, findings).
 
-        The write itself is atomic (:func:`_atomic_write_bytes`): a reader
-        never observes a partially-written normalized entry.
+        The write itself is atomic (:func:`_atomic_write_bytes`), and the
+        whole check-then-write sequence is serialized per ``(index_id,
+        as_of)`` (:meth:`_locked`): a reader never observes a partially
+        written normalized entry, and a concurrent conflicting writer for the
+        same date is refused rather than racing this one.
         """
-        sealed, path, already_written, findings = self._prepare_accept(snapshot)
-        if findings or sealed is None or path is None:
-            return None, findings
-        if not already_written:
-            _atomic_write_bytes(
-                path, json.dumps(sealed.to_dict(), indent=2, sort_keys=True).encode("utf-8")
+        if not self.allow_normalized_only:
+            return None, (
+                "plain archive acceptance is disabled for this store; production"
+                " monthly snapshots must use accept_with_raw_artifact so raw"
+                " provenance is retained with the normalized entry",
             )
-        return path, ()
+        with self._locked(snapshot):
+            sealed, path, already_written, findings = self._prepare_accept(snapshot)
+            if findings or sealed is None or path is None:
+                return None, findings
+            if not already_written:
+                _atomic_write_bytes(
+                    path, json.dumps(sealed.to_dict(), indent=2, sort_keys=True).encode("utf-8")
+                )
+            return path, ()
 
     def snapshots(self) -> tuple[Path, ...]:
         if not self.root.is_dir():
@@ -387,9 +469,10 @@ class UniverseStore:
                 candidate = load_snapshot(path)
             except SourceAdapterError:
                 continue
-            if recorded_raw_checksum(candidate) is not None and self.verify_raw_artifact(
-                candidate
-            ):
+            raw_checksum = recorded_raw_checksum(candidate)
+            if raw_checksum is None and not self.allow_normalized_only:
+                continue
+            if raw_checksum is not None and self.verify_raw_artifact(candidate):
                 continue
             if best is None or candidate.as_of > best.as_of:
                 best = candidate
@@ -426,15 +509,28 @@ class UniverseStore:
           alone and only the missing normalized side is written;
         * once both sides are durably archived, :meth:`latest` re-verifies
           the raw sidecar on every lookup, so tampering it later demotes the
-          entry exactly as tampering the normalized body would.
+          entry exactly as tampering the normalized body would;
+        * the whole read-check-write sequence for both sides is serialized
+          per ``(index_id, as_of)`` (:meth:`_locked`), so two concurrent
+          writers racing DIFFERENT candidates for the same date can never
+          both succeed or pair a normalized entry with the wrong raw sidecar
+          -- exactly one wins, and the other is refused (or, if
+          byte-identical, treated as idempotent) once it observes the
+          winner's already-committed content.
         """
-        recorded = recorded_raw_checksum(snapshot)
-        if recorded is None:
+        recorded_checksums = recorded_raw_checksums(snapshot)
+        if not recorded_checksums:
             return None, (
                 "snapshot carries no raw source checksum binding (see"
                 " bind_raw_source); refusing to archive without durable raw"
                 " provenance",
             )
+        if len(recorded_checksums) != 1:
+            return None, (
+                "snapshot carries multiple raw source checksum bindings;"
+                " refusing to archive ambiguous raw provenance",
+            )
+        recorded = recorded_checksums[0]
         actual = raw_artifact_checksum(raw_bytes)
         if recorded != actual:
             return None, (
@@ -443,40 +539,44 @@ class UniverseStore:
                 " refusing to archive",
             )
 
-        sealed, normalized_path, normalized_already_written, findings = self._prepare_accept(
-            snapshot
-        )
-        if findings or sealed is None or normalized_path is None:
-            return None, findings
-
-        raw_path = self._raw_path(sealed)
-        raw_already_written = raw_path.is_file()
-        if raw_already_written and raw_path.read_bytes() != raw_bytes:
-            return None, (
-                f"a raw artifact for {sealed.index_id} as_of"
-                f" {sealed.as_of.isoformat()} is already archived immutably at"
-                f" {raw_path}; refusing to overwrite it with different bytes",
+        with self._locked(snapshot):
+            sealed, normalized_path, normalized_already_written, findings = (
+                self._prepare_accept(snapshot)
             )
+            if findings or sealed is None or normalized_path is None:
+                return None, findings
 
-        # Commit order matters for crash-safety -- see the docstring: raw
-        # first, normalized second, so a normalized entry is never visible
-        # before the raw bytes it claims are durably on disk.
-        if not raw_already_written:
-            _atomic_write_bytes(raw_path, raw_bytes)
-        if not normalized_already_written:
-            _atomic_write_bytes(
-                normalized_path,
-                json.dumps(sealed.to_dict(), indent=2, sort_keys=True).encode("utf-8"),
-            )
-        return normalized_path, ()
+            raw_path = self._raw_path(sealed)
+            raw_already_written = raw_path.is_file()
+            if raw_already_written and raw_path.read_bytes() != raw_bytes:
+                return None, (
+                    f"a raw artifact for {sealed.index_id} as_of"
+                    f" {sealed.as_of.isoformat()} is already archived immutably at"
+                    f" {raw_path}; refusing to overwrite it with different bytes",
+                )
+
+            # Commit order matters for crash-safety -- see the docstring: raw
+            # first, normalized second, so a normalized entry is never visible
+            # before the raw bytes it claims are durably on disk.
+            if not raw_already_written:
+                _atomic_write_bytes(raw_path, raw_bytes)
+            if not normalized_already_written:
+                _atomic_write_bytes(
+                    normalized_path,
+                    json.dumps(sealed.to_dict(), indent=2, sort_keys=True).encode("utf-8"),
+                )
+            return normalized_path, ()
 
     def verify_raw_artifact(self, snapshot: ConstituentSnapshot) -> tuple[str, ...]:
         """Re-verify a previously archived raw artifact against the checksum
         the snapshot declares -- durable, independent of any ephemeral
         fixture that may no longer exist by the time this is called."""
-        recorded = recorded_raw_checksum(snapshot)
-        if recorded is None:
+        recorded_checksums = recorded_raw_checksums(snapshot)
+        if not recorded_checksums:
             return ("snapshot carries no raw source checksum binding",)
+        if len(recorded_checksums) != 1:
+            return ("snapshot carries multiple raw source checksum bindings",)
+        recorded = recorded_checksums[0]
         raw_path = self._raw_path(snapshot)
         if not raw_path.is_file():
             return (f"no retained raw artifact found at {raw_path}",)
@@ -644,10 +744,11 @@ def parse_constituent_table(
 
 def refresh_universe(
     store: UniverseStore,
-    candidate: ConstituentSnapshot | None,
+    candidate: ConstituentSnapshot | RawConstituentRefresh | None,
     *,
     now: datetime,
     policy: FreshnessPolicy,
+    allow_normalized_only: bool = False,
 ) -> tuple[ConstituentSnapshot | None, UniverseListStatus, tuple[str, ...]]:
     """Apply a refresh safely and report the resulting freshness.
 
@@ -658,7 +759,41 @@ def refresh_universe(
     if candidate is None:
         findings.append("refresh produced no snapshot; keeping the last-known-good list")
     else:
-        _, problems = store.accept(candidate)
+        raw_bytes: bytes | None = None
+        problems: tuple[str, ...] | None = None
+        if isinstance(candidate, RawConstituentRefresh):
+            raw_bytes = candidate.raw_bytes
+            if (
+                candidate.snapshot.checksum
+                and candidate.snapshot.checksum != candidate.snapshot.compute_checksum()
+            ):
+                candidate = candidate.snapshot
+                problems = (
+                    "refresh candidate checksum does not authenticate before raw"
+                    " binding; refusing to archive",
+                )
+                raw_bytes = None
+            else:
+                candidate = (
+                    candidate.snapshot
+                    if recorded_raw_checksum(candidate.snapshot) is not None
+                    else bind_raw_source(candidate.snapshot, raw_artifact_checksum(raw_bytes))
+                )
+        if raw_bytes is not None:
+            _, problems = store.accept_with_raw_artifact(candidate, raw_bytes)
+        elif problems is None:
+            if allow_normalized_only and store.allow_normalized_only:
+                _, problems = store.accept(candidate)
+            elif allow_normalized_only:
+                problems = (
+                    "normalized-only refresh requested but this store was not"
+                    " constructed with allow_normalized_only=True",
+                )
+            else:
+                problems = (
+                    "refresh candidate lacks retained raw bytes; production monthly"
+                    " archive requires RawConstituentRefresh/raw-bound provenance",
+                )
         if problems:
             findings.append(
                 "refresh rejected, last-known-good retained: " + "; ".join(problems)
@@ -677,7 +812,7 @@ def ensure_current_universe(
     *,
     now: datetime,
     policy: FreshnessPolicy,
-    fetch: Callable[[], ConstituentSnapshot] | None = None,
+    fetch: Callable[[], ConstituentSnapshot | RawConstituentRefresh] | None = None,
 ) -> tuple[ConstituentSnapshot | None, UniverseListStatus, tuple[str, ...]]:
     """Fresh? use the cache. Due? refresh. Failed? keep the last-known-good.
 
@@ -698,7 +833,7 @@ def ensure_current_universe(
             "refresh is due but no fetcher was supplied; keeping the"
             " last-known-good list",
         )
-    candidate: ConstituentSnapshot | None = None
+    candidate: ConstituentSnapshot | RawConstituentRefresh | None = None
     findings: list[str] = []
     try:
         candidate = fetch()
@@ -730,6 +865,8 @@ def sector_context(
 __all__ = [
     "parse_wikitext_constituents",
     "fetch_current_constituents",
+    "fetch_current_constituents_with_raw",
+    "RawConstituentRefresh",
     "DIAGNOSTIC_NOTE_PREFIX",
     "RAW_CHECKSUM_NOTE_PREFIX",
     "WIKIPEDIA_API_URL",
@@ -985,7 +1122,7 @@ def _fetch_json(url: str, *, timeout_seconds: float, user_agent: str) -> bytes:
     return raw
 
 
-def fetch_current_constituents(
+def fetch_current_constituents_with_raw(
     *,
     url: str = WIKIPEDIA_API_URL,
     html_url: str | None = WIKIPEDIA_HTML_API_URL,
@@ -993,8 +1130,8 @@ def fetch_current_constituents(
     user_agent: str = DEFAULT_USER_AGENT,
     as_of: date | None = None,
     now: datetime | None = None,
-) -> ConstituentSnapshot:
-    """Fetch the free CURRENT constituent list over HTTPS.
+) -> RawConstituentRefresh:
+    """Fetch the free CURRENT constituent list over HTTPS with retained raw bytes.
 
     Owner-host only; unit tests parse recorded payloads and never call this.
     Content type and payload shape are validated before parsing, so a captive
@@ -1018,7 +1155,7 @@ def fetch_current_constituents(
     raw = _fetch_json(url, timeout_seconds=timeout_seconds, user_agent=user_agent)
     snapshot = parse_wikitext_constituents(raw, as_of=stamp, fetched_at=fetched_at)
     if html_url is None or not validate_snapshot(snapshot):
-        return snapshot
+        return RawConstituentRefresh(snapshot=snapshot, raw_bytes=raw)
 
     # The primary view produced something a validator would refuse. Rather than
     # store nothing, ask the same page for its other representation.
@@ -1029,9 +1166,19 @@ def fetch_current_constituents(
         fallback = parse_html_constituents(fallback_raw, as_of=stamp, fetched_at=fetched_at)
     except SourceAdapterError:
         # The fallback failing must never hide what the primary said.
-        return snapshot
+        return RawConstituentRefresh(snapshot=snapshot, raw_bytes=raw)
     if validate_snapshot(fallback):
         # Both views are unusable. Return the primary, whose diagnostics
         # describe the representation that is actually authoritative.
-        return snapshot
-    return fallback
+        return RawConstituentRefresh(snapshot=snapshot, raw_bytes=raw)
+    return RawConstituentRefresh(snapshot=fallback, raw_bytes=fallback_raw)
+
+
+def fetch_current_constituents(**kwargs) -> ConstituentSnapshot:
+    """Fetch the free CURRENT constituent list, returning only the parsed snapshot.
+
+    Kept for compatibility. Production refresh/archive callers must use
+    :func:`fetch_current_constituents_with_raw` so the monthly archive can retain
+    and re-verify the exact raw source artifact.
+    """
+    return fetch_current_constituents_with_raw(**kwargs).snapshot

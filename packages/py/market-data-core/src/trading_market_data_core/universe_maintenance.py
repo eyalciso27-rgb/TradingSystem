@@ -35,6 +35,7 @@ from trading_market_data_core.dataset_v1_sources import SourceAdapterError
 from trading_market_data_core.sp500_current_universe import (
     REFRESH_INTERVAL_DAYS,
     ConstituentSnapshot,
+    RawConstituentRefresh,
     UniverseStore,
     classify_freshness,
     refresh_universe,
@@ -153,7 +154,7 @@ class UniverseMaintenance:
         self,
         store: UniverseStore,
         *,
-        fetch: Callable[[], ConstituentSnapshot] | None,
+        fetch: Callable[[], ConstituentSnapshot | RawConstituentRefresh] | None,
         mode: TradingMode = TradingMode.PAPER,
         policy: FreshnessPolicy | None = None,
         interval_days: int = REFRESH_INTERVAL_DAYS,
@@ -252,7 +253,7 @@ class UniverseMaintenance:
             findings.append("refresh is due but no source is configured")
             return self._outcome(trigger, False, False, now, findings, state)
 
-        candidate: ConstituentSnapshot | None = None
+        candidate: ConstituentSnapshot | RawConstituentRefresh | None = None
         failure = ""
         try:
             candidate = self._fetch()

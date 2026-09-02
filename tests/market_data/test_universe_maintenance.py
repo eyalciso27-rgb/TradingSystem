@@ -11,6 +11,7 @@ Offline: the source is an injected callable, never a real fetch.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from trading_market_data_core.dataset_v1_sources import SourceAdapterError
 from trading_market_data_core.sp500_current_universe import (
     Constituent,
     ConstituentSnapshot,
+    RawConstituentRefresh,
     UniverseStore,
 )
 from trading_market_data_core.trading_readiness import TradingMode, UniverseListStatus
@@ -54,18 +56,22 @@ class _Source:
         self._snapshot = snapshot
         self._raises = raises
 
-    def __call__(self) -> ConstituentSnapshot:
+    def __call__(self) -> RawConstituentRefresh:
         self.calls += 1
         if self._raises is not None:
             raise self._raises
         assert self._snapshot is not None
-        return self._snapshot
+        raw = self._snapshot.to_dict()["as_of"].encode("utf-8") + b"\n" + json.dumps(
+            [row.to_dict() for row in self._snapshot.constituents],
+            sort_keys=True,
+        ).encode("utf-8")
+        return RawConstituentRefresh(snapshot=self._snapshot, raw_bytes=raw)
 
 
 def _maintenance(
     tmp_path: Path, source: _Source, *, mode: TradingMode = TradingMode.PAPER
 ) -> tuple[UniverseMaintenance, UniverseStore]:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     return UniverseMaintenance(store, fetch=source, mode=mode), store
 
 

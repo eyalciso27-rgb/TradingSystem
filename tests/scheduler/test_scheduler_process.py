@@ -39,7 +39,10 @@ import pytest
 from trading_market_data_core.sp500_current_universe import (
     Constituent,
     ConstituentSnapshot,
+    RawConstituentRefresh,
     UniverseStore,
+    bind_raw_source,
+    raw_artifact_checksum,
 )
 from trading_market_data_core.trading_readiness import TradingMode
 from trading_market_data_core.universe_maintenance import (
@@ -99,13 +102,17 @@ class _Source:
         self.raises = raises
         self.as_of = date(2026, 8, 18)
 
-    def __call__(self) -> ConstituentSnapshot:
+    def __call__(self) -> RawConstituentRefresh:
         self.calls += 1
         if self.raises is not None:
             raise self.raises
         # Each successful fetch reports a later list, as a real month would.
         self.as_of = self.as_of + timedelta(days=30)
-        return _snapshot(self.as_of)
+        raw = b"scheduler-fixture-sp500\n" + self.as_of.isoformat().encode("utf-8")
+        return RawConstituentRefresh(
+            snapshot=bind_raw_source(_snapshot(self.as_of), raw_artifact_checksum(raw)),
+            raw_bytes=raw,
+        )
 
 
 def _service(
@@ -375,6 +382,39 @@ def test_the_entry_point_defaults_to_paper(tmp_path: Path) -> None:
     assert isinstance(service, SchedulerService)
 
 
+def test_default_scheduler_refresh_retains_the_raw_source_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The production scheduler default must use the raw-retaining source.
+
+    This is an offline integration-level pin for the real maintenance assembly:
+    no injected snapshot-only source, and no network. The monkeypatch replaces
+    only the external adapter return value, proving the default scheduler wiring
+    archives both normalized JSON and the immutable raw sidecar.
+    """
+    import trading_scheduler as scheduler_pkg
+
+    as_of = date(2026, 9, 1)
+    raw = b"default-scheduler-current-sp500"
+    refresh = RawConstituentRefresh(
+        snapshot=bind_raw_source(_snapshot(as_of), raw_artifact_checksum(raw)),
+        raw_bytes=raw,
+    )
+
+    monkeypatch.setattr(
+        scheduler_pkg,
+        "fetch_current_constituents_with_raw",
+        lambda *, now: refresh,
+    )
+
+    outcome = scheduler_pkg.run_startup_maintenance(root=tmp_path, now=START)
+
+    assert outcome.refreshed
+    assert UniverseStore(tmp_path).latest() is not None
+    assert (tmp_path / f"SP500-{as_of.isoformat()}.raw").read_bytes() == raw
+
+
 @pytest.mark.parametrize(
     "env",
     [
@@ -457,7 +497,12 @@ def test_the_real_process_starts_and_exits_cleanly_on_sigterm(tmp_path: Path) ->
     this test offline like every other.
     """
     store = UniverseStore(tmp_path)
-    path, findings = store.accept(_snapshot(datetime.now(tz=UTC).date()))
+    raw = b"fresh-process-seed-sp500"
+    snapshot = bind_raw_source(
+        _snapshot(datetime.now(tz=UTC).date()),
+        raw_artifact_checksum(raw),
+    )
+    path, findings = store.accept_with_raw_artifact(snapshot, raw)
     assert path is not None, findings
 
     env = {
