@@ -24,6 +24,7 @@ from trading_market_data_core.sp500_current_universe import (
     FREE_SOURCE_ID,
     REFRESH_INTERVAL_DAYS,
     ConstituentSnapshot,
+    RawConstituentRefresh,
     UniverseStore,
     classify_freshness,
     fetch_current_constituents_with_raw,
@@ -104,7 +105,7 @@ def main(argv: list[str]) -> int:
         print("refresh not due; using the existing snapshot")
         return _report(store, store.latest(), mode=mode, now=now)
 
-    candidate: ConstituentSnapshot | None = None
+    candidate: ConstituentSnapshot | RawConstituentRefresh | None = None
     findings: list[str] = []
     try:
         candidate = fetch_current_constituents_with_raw(now=now)

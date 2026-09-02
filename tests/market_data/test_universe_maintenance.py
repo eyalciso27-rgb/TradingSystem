@@ -61,7 +61,7 @@ class _Source:
         if self._raises is not None:
             raise self._raises
         assert self._snapshot is not None
-        raw = self._snapshot.to_dict()["as_of"].encode("utf-8") + b"\n" + json.dumps(
+        raw = self._snapshot.as_of.isoformat().encode("utf-8") + b"\n" + json.dumps(
             [row.to_dict() for row in self._snapshot.constituents],
             sort_keys=True,
         ).encode("utf-8")

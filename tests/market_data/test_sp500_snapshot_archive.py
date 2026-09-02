@@ -436,25 +436,31 @@ def test_atomic_write_fsyncs_the_parent_directory_after_replace(
     real_fsync = os.fsync
     real_close = os.close
 
-    def recording_open(path, flags, *args, **kwargs):
-        fd = real_open(path, flags, *args, **kwargs)
+    def recording_open(path: str | Path, flags: int, *args: object, **kwargs: object) -> int:
+        fd = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
         if Path(path) == tmp_path:
             opened_directory_fds.add(fd)
         return fd
 
-    def recording_fsync(fd):
+    def recording_fsync(fd: int) -> None:
         if fd in opened_directory_fds:
             fsynced_directory_fds.add(fd)
-        return real_fsync(fd)
+        real_fsync(fd)
 
-    def recording_close(fd):
+    def recording_close(fd: int) -> None:
         if fd in opened_directory_fds:
             closed_directory_fds.add(fd)
-        return real_close(fd)
+        real_close(fd)
 
-    monkeypatch.setattr(_module.os, "open", recording_open)
-    monkeypatch.setattr(_module.os, "fsync", recording_fsync)
-    monkeypatch.setattr(_module.os, "close", recording_close)
+    # `_module` does `import os` and calls `os.open`/`os.fsync`/`os.close`
+    # through that same module-level name, which is the one true `os` module
+    # object -- patching it here (the same object this file already imports)
+    # affects `_module`'s calls identically to patching `_module.os` would,
+    # without reaching into `_module`'s private namespace for an attribute
+    # it does not explicitly export.
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    monkeypatch.setattr(os, "close", recording_close)
 
     _module._atomic_write_bytes(tmp_path / "snapshot.json", b"{}")
 

@@ -1174,11 +1174,26 @@ def fetch_current_constituents_with_raw(
     return RawConstituentRefresh(snapshot=fallback, raw_bytes=fallback_raw)
 
 
-def fetch_current_constituents(**kwargs) -> ConstituentSnapshot:
+def fetch_current_constituents(
+    *,
+    url: str = WIKIPEDIA_API_URL,
+    html_url: str | None = WIKIPEDIA_HTML_API_URL,
+    timeout_seconds: float = 30.0,
+    user_agent: str = DEFAULT_USER_AGENT,
+    as_of: date | None = None,
+    now: datetime | None = None,
+) -> ConstituentSnapshot:
     """Fetch the free CURRENT constituent list, returning only the parsed snapshot.
 
     Kept for compatibility. Production refresh/archive callers must use
     :func:`fetch_current_constituents_with_raw` so the monthly archive can retain
     and re-verify the exact raw source artifact.
     """
-    return fetch_current_constituents_with_raw(**kwargs).snapshot
+    return fetch_current_constituents_with_raw(
+        url=url,
+        html_url=html_url,
+        timeout_seconds=timeout_seconds,
+        user_agent=user_agent,
+        as_of=as_of,
+        now=now,
+    ).snapshot

@@ -351,7 +351,7 @@ def test_a_current_snapshot_may_never_claim_to_be_history() -> None:
 
 
 def test_a_failed_refresh_keeps_the_last_known_good(tmp_path: Path) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_snapshot())
     current, status, findings = refresh_universe(
         store, None, now=NOW, policy=DEFAULT_FRESHNESS[TradingMode.PAPER]
@@ -362,22 +362,22 @@ def test_a_failed_refresh_keeps_the_last_known_good(tmp_path: Path) -> None:
 
 
 def test_a_malformed_refresh_never_replaces_a_good_list(tmp_path: Path) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_snapshot())
     current, _, findings = refresh_universe(
         store, _snapshot(count=3, as_of=date(2026, 8, 15)), now=NOW,
-        policy=DEFAULT_FRESHNESS[TradingMode.PAPER],
+        policy=DEFAULT_FRESHNESS[TradingMode.PAPER], allow_normalized_only=True,
     )
     assert current is not None and current.count == 500, "the good list survives"
     assert any("refresh rejected" in f for f in findings)
 
 
 def test_a_valid_refresh_is_accepted(tmp_path: Path) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_snapshot(as_of=date(2026, 7, 1)))
     current, status, findings = refresh_universe(
         store, _snapshot(as_of=date(2026, 8, 15)), now=NOW,
-        policy=DEFAULT_FRESHNESS[TradingMode.PAPER],
+        policy=DEFAULT_FRESHNESS[TradingMode.PAPER], allow_normalized_only=True,
     )
     assert findings == ()
     assert current is not None and current.as_of == date(2026, 8, 15)
@@ -385,7 +385,7 @@ def test_a_valid_refresh_is_accepted(tmp_path: Path) -> None:
 
 
 def test_monthly_refresh_is_due_after_the_interval(tmp_path: Path) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     assert store.due_for_refresh(now=NOW), "no snapshot at all is always due"
     store.accept(_snapshot(as_of=date(2026, 8, 15)))
     assert not store.due_for_refresh(now=NOW)
@@ -396,7 +396,7 @@ def test_monthly_refresh_is_due_after_the_interval(tmp_path: Path) -> None:
 def test_a_tampered_snapshot_fails_on_load(tmp_path: Path) -> None:
     import json
 
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     path, _ = store.accept(_snapshot())
     assert path is not None
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -407,7 +407,7 @@ def test_a_tampered_snapshot_fails_on_load(tmp_path: Path) -> None:
 
 
 def test_snapshots_round_trip(tmp_path: Path) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     path, findings = store.accept(_snapshot())
     assert findings == () and path is not None
     loaded = load_snapshot(path)

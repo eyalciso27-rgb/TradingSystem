@@ -177,7 +177,7 @@ def test_the_parsed_snapshot_validates_and_becomes_last_known_good(
     snapshot = _snapshot()
     assert validate_snapshot(snapshot) == ()
 
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     path, findings = store.accept(snapshot)
     assert path is not None, findings
     assert store.latest() is not None
@@ -358,8 +358,8 @@ def test_a_rejected_refresh_surfaces_the_diagnostics(tmp_path: Path) -> None:
         fetched_at=FETCHED_AT,
     )
     _, _, findings = refresh_universe(
-        UniverseStore(tmp_path), empty, now=FETCHED_AT,
-        policy=DEFAULT_FRESHNESS[TradingMode.PAPER],
+        UniverseStore(tmp_path, allow_normalized_only=True), empty, now=FETCHED_AT,
+        policy=DEFAULT_FRESHNESS[TradingMode.PAPER], allow_normalized_only=True,
     )
 
     joined = "\n".join(findings)
@@ -486,7 +486,7 @@ def test_a_failing_fallback_never_hides_what_the_primary_reported(
 
 
 def test_an_empty_parse_is_still_refused(tmp_path: Path) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     good = _snapshot()
     store.accept(good)
 
@@ -499,7 +499,7 @@ def test_an_empty_parse_is_still_refused(tmp_path: Path) -> None:
     )
     current, _, findings = refresh_universe(
         store, empty, now=datetime(2026, 9, 19, tzinfo=UTC),
-        policy=DEFAULT_FRESHNESS[TradingMode.PAPER],
+        policy=DEFAULT_FRESHNESS[TradingMode.PAPER], allow_normalized_only=True,
     )
 
     assert current is not None
@@ -519,7 +519,7 @@ def test_a_stored_list_with_an_unresolved_constituent_can_be_read_back(
     row arrived without a CIK. Never observed before now only because the parse
     had never produced a row at all.
     """
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     snapshot = _snapshot()
     assert any(not c.identity_resolved for c in snapshot.constituents)
 
