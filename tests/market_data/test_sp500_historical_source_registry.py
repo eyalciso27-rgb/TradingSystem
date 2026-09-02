@@ -56,6 +56,16 @@ ELIGIBILITY_FLAGS = (
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
+# Exact cross_check.status enum, by lifecycle state - no other string (a typo,
+# "VERIFIED", "COMPLETE", ...) is ever accepted. A SECONDARY_RESEARCH_PIT
+# candidate's cross-check has not run, has run and failed, or has run and
+# passed; nothing else exists. A NOT_FOUND_OR_COMMERCIAL_ONLY candidate has no
+# cross-check to run at all.
+SECONDARY_RESEARCH_CROSS_CHECK_STATUSES = frozenset({"NOT_PERFORMED", "FAILED", "PASSED"})
+NOT_FOUND_CROSS_CHECK_STATUS = "NOT_APPLICABLE"
+SECONDARY_RESEARCH_CHECKSUM_STATUSES = frozenset({"NOT_YET_COMPUTED", "VERIFIED"})
+NOT_FOUND_CHECKSUM_STATUS = "NOT_APPLICABLE"
+
 # Claims this registry must never make about itself (it is a provenance
 # ledger, not proof that anything was ingested, verified or traded on).
 FORBIDDEN_CLAIM_STRINGS = (
@@ -211,9 +221,20 @@ def _validate_secondary_research_pit(candidate: dict[str, Any], where: str) -> N
         isinstance(minimum, int) and minimum >= 2,
         f"{where}: cross_check.minimum_independent_corroborating_sources must be >= 2",
     )
+    cross_check_status = cross_check.get("status")
+    _require(
+        cross_check_status in SECONDARY_RESEARCH_CROSS_CHECK_STATUSES,
+        f"{where}: cross_check.status must be one of "
+        f"{sorted(SECONDARY_RESEARCH_CROSS_CHECK_STATUSES)}, not {cross_check_status!r}",
+    )
 
     checksum = candidate.get("checksum_sha256")
     checksum_status = candidate.get("checksum_status")
+    _require(
+        checksum_status in SECONDARY_RESEARCH_CHECKSUM_STATUSES,
+        f"{where}: checksum_status must be one of "
+        f"{sorted(SECONDARY_RESEARCH_CHECKSUM_STATUSES)}, not {checksum_status!r}",
+    )
     if checksum_status == "VERIFIED":
         # Reaching VERIFIED requires ALL FOUR legs of evidence at once, each
         # independently re-derived by this validator - never accepted from a
@@ -258,10 +279,20 @@ def _validate_not_found_or_commercial_only(candidate: dict[str, Any], where: str
         candidate.get("checksum_sha256") is None,
         f"{where}: NOT_FOUND_OR_COMMERCIAL_ONLY must not carry a checksum",
     )
+    _require(
+        candidate.get("checksum_status") == NOT_FOUND_CHECKSUM_STATUS,
+        f"{where}: NOT_FOUND_OR_COMMERCIAL_ONLY checksum_status must be "
+        f"{NOT_FOUND_CHECKSUM_STATUS!r}, not {candidate.get('checksum_status')!r}",
+    )
     cross_check = _expect_dict(candidate.get("cross_check"), f"{where}: cross_check")
     _require(
         cross_check.get("required") is False,
         f"{where}: NOT_FOUND_OR_COMMERCIAL_ONLY must not require cross-check",
+    )
+    _require(
+        cross_check.get("status") == NOT_FOUND_CROSS_CHECK_STATUS,
+        f"{where}: NOT_FOUND_OR_COMMERCIAL_ONLY cross_check.status must be "
+        f"{NOT_FOUND_CROSS_CHECK_STATUS!r}, not {cross_check.get('status')!r}",
     )
 
 
@@ -723,6 +754,54 @@ def test_validator_rejects_cross_check_marked_passed_before_checksum_is_verified
         validate_registry(_tampered(mutate))
 
 
+@pytest.mark.parametrize(
+    "bogus_status",
+    ["VERIFIED", "COMPLETE", "SUCCESS", "Passed", "passed", "TRUE", ""],
+)
+def test_validator_rejects_unsupported_cross_check_status_values(bogus_status: str) -> None:
+    """Only NOT_PERFORMED / FAILED / PASSED ever exist for a
+    SECONDARY_RESEARCH_PIT cross-check. A misleading success-like value such
+    as "VERIFIED" or "COMPLETE" - or a plain typo - must be rejected exactly
+    like an unrecognised classification, not silently accepted because it
+    merely isn't the literal string "PASSED"."""
+
+    def mutate(data: dict[str, Any]) -> None:
+        candidate = _candidate(data, "fja05680-sp500-github")
+        candidate["cross_check"]["status"] = bogus_status
+
+    with pytest.raises(RegistryError, match="cross_check.status must be one of"):
+        validate_registry(_tampered(mutate))
+
+
+@pytest.mark.parametrize(
+    "bogus_status",
+    ["COMPLETE", "CHECKSUM_VERIFIED", "SUCCESS", "Passed", "passed", "TRUE", ""],
+)
+def test_validator_rejects_unsupported_checksum_status_values(bogus_status: str) -> None:
+    """Only NOT_YET_COMPUTED / VERIFIED ever exist for a
+    SECONDARY_RESEARCH_PIT checksum lifecycle. A success-like typo must not
+    bypass the strict VERIFIED evidence path while still looking reassuring
+    in the registry."""
+
+    def mutate(data: dict[str, Any]) -> None:
+        candidate = _candidate(data, "fja05680-sp500-github")
+        candidate["checksum_status"] = bogus_status
+
+    with pytest.raises(RegistryError, match="checksum_status must be one of"):
+        validate_registry(_tampered(mutate))
+
+
+def test_validator_rejects_not_found_candidate_with_non_not_applicable_cross_check_status() -> None:
+    def mutate(data: dict[str, Any]) -> None:
+        not_found = next(
+            c for c in data["candidates"] if c["classification"] == "NOT_FOUND_OR_COMMERCIAL_ONLY"
+        )
+        not_found["cross_check"]["status"] = "NOT_PERFORMED"
+
+    with pytest.raises(RegistryError, match="cross_check.status must be 'NOT_APPLICABLE'"):
+        validate_registry(_tampered(mutate))
+
+
 def test_validator_rejects_secondary_research_pit_with_low_cross_check_minimum() -> None:
     def mutate(data: dict[str, Any]) -> None:
         candidate = _candidate(data, "fja05680-sp500-github")
@@ -740,6 +819,17 @@ def test_validator_rejects_not_found_candidate_carrying_a_checksum() -> None:
         not_found["checksum_sha256"] = "1" * 64
 
     with pytest.raises(RegistryError, match="must not carry a checksum"):
+        validate_registry(_tampered(mutate))
+
+
+def test_validator_rejects_not_found_candidate_with_non_not_applicable_checksum_status() -> None:
+    def mutate(data: dict[str, Any]) -> None:
+        not_found = next(
+            c for c in data["candidates"] if c["classification"] == "NOT_FOUND_OR_COMMERCIAL_ONLY"
+        )
+        not_found["checksum_status"] = "NOT_YET_COMPUTED"
+
+    with pytest.raises(RegistryError, match="checksum_status must be 'NOT_APPLICABLE'"):
         validate_registry(_tampered(mutate))
 
 
