@@ -18,6 +18,17 @@ constituent list, including its optional CURRENT-only GICS context
   artifact alongside the normalized entry so the binding stays verifiable
   later via ``verify_raw_artifact`` — independent of whatever ephemeral
   fixture or download buffer produced those bytes in the first place;
+* that raw-sidecar verification is wired into SELECTION, not just available
+  for a caller to invoke manually: ``UniverseStore.latest()`` demotes a
+  raw-bound entry whose retained sidecar has been lost or tampered with
+  exactly as it would a normalized body that fails to authenticate, and falls
+  back to the newest entry that is fully valid on every axis it declares;
+* the raw artifact and the normalized entry are each written atomically
+  (temp file + fsync + rename) and committed in an order — raw first,
+  normalized second — chosen so that a crash or storage failure between the
+  two writes can never leave a normalized entry claiming a raw binding that
+  is not durably backed by real bytes on disk; at worst it leaves a harmless,
+  unreferenced raw sidecar that a retry with the same inputs heals;
 * every archived entry carries the required provenance metadata, and its GICS
   fields are always labelled CURRENT / ``FREE_RECONSTRUCTED`` — never
   point-in-time history;
@@ -40,6 +51,8 @@ from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pytest
+from trading_market_data_core import sp500_current_universe as _module
 from trading_market_data_core.sp500_current_universe import (
     RAW_CHECKSUM_NOTE_PREFIX,
     ConstituentSnapshot,
@@ -217,6 +230,149 @@ def test_a_conflicting_date_reuse_never_silently_swaps_the_retained_raw_artifact
     assert second_path is None
     assert refusal and "already archived immutably" in refusal[0]
     assert raw_path.read_bytes() == retained_before, "the retained raw artifact must be untouched"
+
+
+# == raw-sidecar verification is wired into SELECTION, not just available ====
+
+
+def test_latest_skips_a_raw_bound_entry_whose_retained_sidecar_is_tampered(
+    tmp_path: Path,
+) -> None:
+    """``latest()`` must not serve a newer entry whose independent raw
+    provenance has failed, even though its normalized body is still intact —
+    it demotes it exactly as it would a tampered normalized body, and falls
+    back to the newest entry that is fully valid."""
+    store = UniverseStore(tmp_path)
+    older, older_raw = _raw_bound_snapshot(as_of=date(2026, 7, 1))
+    newer, newer_raw = _raw_bound_snapshot(as_of=date(2026, 8, 1))
+    assert store.accept_with_raw_artifact(older, older_raw)[0] is not None
+    assert store.accept_with_raw_artifact(newer, newer_raw)[0] is not None
+
+    newer_raw_path = tmp_path / f"SP500-{date(2026, 8, 1).isoformat()}.raw"
+    newer_raw_path.write_bytes(newer_raw_path.read_bytes() + b"tampered")
+
+    latest = store.latest()
+
+    assert latest is not None
+    assert latest.as_of == date(2026, 7, 1)
+
+
+def test_latest_skips_a_raw_bound_entry_whose_retained_sidecar_is_missing(
+    tmp_path: Path,
+) -> None:
+    store = UniverseStore(tmp_path)
+    older, older_raw = _raw_bound_snapshot(as_of=date(2026, 7, 1))
+    newer, newer_raw = _raw_bound_snapshot(as_of=date(2026, 8, 1))
+    store.accept_with_raw_artifact(older, older_raw)
+    store.accept_with_raw_artifact(newer, newer_raw)
+
+    (tmp_path / f"SP500-{date(2026, 8, 1).isoformat()}.raw").unlink()
+
+    latest = store.latest()
+
+    assert latest is not None and latest.as_of == date(2026, 7, 1)
+
+
+def test_latest_returns_none_when_the_only_entry_is_raw_bound_and_invalidated(
+    tmp_path: Path,
+) -> None:
+    """No fallback candidate exists at all: latest() must report unavailable
+    rather than serving the one entry it can no longer authenticate."""
+    store = UniverseStore(tmp_path)
+    snapshot, raw = _raw_bound_snapshot()
+    store.accept_with_raw_artifact(snapshot, raw)
+    (tmp_path / f"SP500-{AS_OF.isoformat()}.raw").unlink()
+
+    assert store.latest() is None
+
+
+def test_latest_is_unaffected_by_the_raw_check_for_a_normalized_only_entry(
+    tmp_path: Path,
+) -> None:
+    """An entry archived through the plain ``accept()`` path never declared a
+    raw binding, so it is not subject to raw-sidecar verification at all."""
+    store = UniverseStore(tmp_path)
+    path, findings = store.accept(_wikitext_snapshot())
+    assert path is not None and findings == ()
+
+    latest = store.latest()
+
+    assert latest is not None and latest.as_of == AS_OF
+
+
+# == atomic, crash-safe archival (raw + normalized are not a single write) ===
+
+
+def test_a_write_failure_persisting_the_raw_artifact_leaves_no_partial_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A storage failure during the FIRST (raw) atomic write must leave
+    nothing on disk on either axis, and a clean retry afterwards must still
+    succeed — the failure must not corrupt or half-populate the archive."""
+    store = UniverseStore(tmp_path)
+    snapshot, raw = _raw_bound_snapshot()
+
+    def _boom(_path: Path, _data: bytes) -> None:
+        raise OSError("simulated storage failure")
+
+    monkeypatch.setattr(_module, "_atomic_write_bytes", _boom)
+    with pytest.raises(OSError, match="simulated storage failure"):
+        store.accept_with_raw_artifact(snapshot, raw)
+    monkeypatch.undo()
+
+    assert store.snapshots() == ()
+    raw_path = tmp_path / f"SP500-{AS_OF.isoformat()}.raw"
+    assert not raw_path.exists()
+    assert list(tmp_path.glob("*.tmp")) == [], "no temp file may survive a failed write"
+
+    # Storage works again: retrying with the SAME inputs succeeds cleanly.
+    path, findings = store.accept_with_raw_artifact(snapshot, raw)
+    assert path is not None and findings == ()
+    assert store.verify_raw_artifact(load_snapshot(path)) == ()
+
+
+def test_a_crash_between_the_raw_and_normalized_writes_recovers_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash AFTER the raw artifact is durably committed but BEFORE the
+    normalized entry is written must leave at most a harmless, unreferenced
+    raw sidecar — never a normalized entry claiming a raw binding that isn't
+    durably backed — and a retry with the same inputs must recover fully."""
+    store = UniverseStore(tmp_path)
+    snapshot, raw = _raw_bound_snapshot()
+    real_atomic_write = _module._atomic_write_bytes
+    calls = {"n": 0}
+
+    def _fail_on_second_write(path: Path, data: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("simulated crash before the normalized write commits")
+        real_atomic_write(path, data)
+
+    monkeypatch.setattr(_module, "_atomic_write_bytes", _fail_on_second_write)
+    with pytest.raises(OSError, match="simulated crash"):
+        store.accept_with_raw_artifact(snapshot, raw)
+    monkeypatch.undo()
+
+    # The normalized side never became visible...
+    assert store.snapshots() == ()
+    assert store.latest() is None
+    # ...but the raw side is ALREADY durable: it was fsynced and renamed into
+    # place before the normalized write was even attempted.
+    raw_path = tmp_path / f"SP500-{AS_OF.isoformat()}.raw"
+    assert raw_path.is_file()
+    assert raw_artifact_checksum(raw_path.read_bytes()) == recorded_raw_checksum(snapshot)
+    assert list(tmp_path.glob("*.tmp")) == []
+
+    # A retry with the SAME inputs recovers: the already-durable raw side is
+    # left untouched (write-once), and only the missing normalized side is
+    # written.
+    path, findings = store.accept_with_raw_artifact(snapshot, raw)
+    assert path is not None and findings == ()
+    reloaded = load_snapshot(path)
+    assert store.verify_raw_artifact(reloaded) == ()
+    latest = store.latest()
+    assert latest is not None and latest.checksum == snapshot.checksum
 
 
 # == required provenance metadata + CURRENT-only GICS =========================

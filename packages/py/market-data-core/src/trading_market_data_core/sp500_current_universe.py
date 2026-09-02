@@ -22,9 +22,12 @@ Safety rules:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import re
+import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
@@ -245,6 +248,32 @@ def recorded_raw_checksum(snapshot: ConstituentSnapshot) -> str | None:
     return None
 
 
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically -- fsync-then-rename.
+
+    A reader (this process or another) can only ever observe the COMPLETE
+    previous content or the COMPLETE new content, never a partial write left
+    by a crash, a full disk, or a killed process mid-write: the data is
+    written to a temporary file in the SAME directory (so the final
+    ``os.replace`` is an atomic rename on one filesystem, not a cross-device
+    copy), flushed and ``fsync``ed before the rename, and the temporary file
+    is removed if anything fails before the rename completes -- no visible
+    partial artifact is ever left behind on failure.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
 class UniverseStore:
     """Monthly snapshots on disk, with an explicit last-known-good.
 
@@ -272,39 +301,63 @@ class UniverseStore:
         # ``snapshots()``/``latest()``, which glob only normalized entries.
         return self.root / f"{snapshot.index_id}-{snapshot.as_of.isoformat()}.raw"
 
-    def accept(self, snapshot: ConstituentSnapshot) -> tuple[Path | None, tuple[str, ...]]:
-        """Persist a snapshot if it validates. Returns (path, findings)."""
+    def _prepare_accept(
+        self, snapshot: ConstituentSnapshot
+    ) -> tuple[ConstituentSnapshot | None, Path | None, bool, tuple[str, ...]]:
+        """Validate and resolve write-once conflicts WITHOUT writing anything.
+
+        Returns ``(sealed, path, already_written, findings)``:
+
+        * ``findings`` non-empty -> refuse; nothing may be written;
+        * ``already_written`` True -> an idempotent retry: ``path`` already
+          holds byte-identical content and must NOT be written again;
+        * otherwise the caller may proceed to atomically write ``sealed`` to
+          ``path``.
+
+        Read-only: this only ever reads the existing archive entry (if any)
+        to check for a write-once conflict. Splitting validation from the
+        actual write is what lets :meth:`accept_with_raw_artifact` confirm
+        BOTH the raw and normalized sides are writable before committing
+        either one.
+        """
         findings = validate_snapshot(snapshot)
         if findings:
-            return None, findings
-        sealed = (
-            snapshot
-            if snapshot.checksum
-            else _with_checksum(snapshot)
-        )
+            return None, None, False, findings
+        sealed = snapshot if snapshot.checksum else _with_checksum(snapshot)
         path = self._path(sealed)
         if path.is_file():
             try:
                 existing = load_snapshot(path)
             except SourceAdapterError as error:
-                return None, (
+                return None, None, False, (
                     f"an archived snapshot already exists at {path} and is unreadable"
                     f" ({error}); refusing to overwrite an immutable archive entry",
                 )
             if existing.checksum != sealed.checksum:
-                return None, (
+                return None, None, False, (
                     f"a snapshot for {sealed.index_id} as_of {sealed.as_of.isoformat()} is"
                     f" already archived immutably at {path}; refusing to overwrite it with"
                     " different content (archive entries are write-once; a new"
                     " observation needs a new as_of date, not a correction of a past one)",
                 )
             # Byte-identical to what is already archived: an idempotent retry,
-            # not a mutation. Nothing to do.
-            return path, ()
-        self.root.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(sealed.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
-        )
+            # not a mutation. Nothing to write.
+            return sealed, path, True, ()
+        return sealed, path, False, ()
+
+    def accept(self, snapshot: ConstituentSnapshot) -> tuple[Path | None, tuple[str, ...]]:
+        """Persist a snapshot if it validates. Returns (path, findings).
+
+        The write itself is atomic (:func:`_atomic_write_bytes`): a reader
+        never observes a partially-written normalized entry.
+        """
+        sealed, path, already_written, findings = self._prepare_accept(snapshot)
+        if findings or sealed is None or path is None:
+            return None, findings
+        if not already_written:
+            _atomic_write_bytes(
+                path, json.dumps(sealed.to_dict(), indent=2, sort_keys=True).encode("utf-8")
+            )
         return path, ()
 
     def snapshots(self) -> tuple[Path, ...]:
@@ -318,12 +371,25 @@ class UniverseStore:
         )
 
     def latest(self) -> ConstituentSnapshot | None:
-        """The most recent accepted snapshot — the last-known-good list."""
+        """The most recent FULLY VALID accepted snapshot — the last-known-good.
+
+        For a raw-bound entry (see :meth:`accept_with_raw_artifact`), "fully
+        valid" also requires its retained raw sidecar to still verify: a
+        newer entry whose normalized body is intact but whose independent raw
+        provenance has since been lost or tampered with is not eligible here,
+        exactly as if its normalized body itself had failed to authenticate.
+        Selection falls back to the newest entry that IS fully valid (which
+        may carry no raw binding at all, or a raw binding that still verifies).
+        """
         best: ConstituentSnapshot | None = None
         for path in self.snapshots():
             try:
                 candidate = load_snapshot(path)
             except SourceAdapterError:
+                continue
+            if recorded_raw_checksum(candidate) is not None and self.verify_raw_artifact(
+                candidate
+            ):
                 continue
             if best is None or candidate.as_of > best.as_of:
                 best = candidate
@@ -344,15 +410,23 @@ class UniverseStore:
         * the snapshot MUST already declare a raw-checksum binding (see
           :func:`bind_raw_source`) that matches the sha256 of ``raw_bytes``
           actually supplied here -- a snapshot with no binding, or one whose
-          binding does not match the real bytes, is refused outright;
-        * on success the raw bytes are written to a WRITE-ONCE sidecar file
-          alongside the normalized entry, so the binding is durably
-          re-verifiable later via :meth:`verify_raw_artifact` -- independent
-          of whatever ephemeral fixture or download buffer produced
-          ``raw_bytes`` in the first place;
-        * on ANY failure (raw axis or normalized axis) NOTHING is written --
-          an archive entry that claims a raw binding it cannot authenticate
-          must never exist on disk, even partially.
+          binding does not match the real bytes, is refused outright, and
+          nothing is written;
+        * BOTH sides are validated (raw match, normalized validation, AND
+          each side's write-once conflict check) before either one is
+          written, so a refusal never leaves a partial write behind;
+        * the two writes are each individually atomic
+          (:func:`_atomic_write_bytes`), and the RAW artifact is committed
+          FIRST, the normalized entry SECOND. A crash between the two can
+          leave at most an unreferenced raw sidecar with no normalized entry
+          claiming it yet -- never the reverse (a normalized entry claiming a
+          raw binding that is not durably backed by real bytes). Calling this
+          method again with the SAME ``(snapshot, raw_bytes)`` after such a
+          crash recovers idempotently: the already-written raw side is left
+          alone and only the missing normalized side is written;
+        * once both sides are durably archived, :meth:`latest` re-verifies
+          the raw sidecar on every lookup, so tampering it later demotes the
+          entry exactly as tampering the normalized body would.
         """
         recorded = recorded_raw_checksum(snapshot)
         if recorded is None:
@@ -368,19 +442,32 @@ class UniverseStore:
                 f" {recorded}, but the supplied raw bytes hash to {actual};"
                 " refusing to archive",
             )
-        raw_path = self._raw_path(snapshot)
-        if raw_path.is_file() and raw_path.read_bytes() != raw_bytes:
+
+        sealed, normalized_path, normalized_already_written, findings = self._prepare_accept(
+            snapshot
+        )
+        if findings or sealed is None or normalized_path is None:
+            return None, findings
+
+        raw_path = self._raw_path(sealed)
+        raw_already_written = raw_path.is_file()
+        if raw_already_written and raw_path.read_bytes() != raw_bytes:
             return None, (
-                f"a raw artifact for {snapshot.index_id} as_of"
-                f" {snapshot.as_of.isoformat()} is already archived immutably at"
+                f"a raw artifact for {sealed.index_id} as_of"
+                f" {sealed.as_of.isoformat()} is already archived immutably at"
                 f" {raw_path}; refusing to overwrite it with different bytes",
             )
-        normalized_path, findings = self.accept(snapshot)
-        if findings or normalized_path is None:
-            return None, findings
-        if not raw_path.is_file():
-            self.root.mkdir(parents=True, exist_ok=True)
-            raw_path.write_bytes(raw_bytes)
+
+        # Commit order matters for crash-safety -- see the docstring: raw
+        # first, normalized second, so a normalized entry is never visible
+        # before the raw bytes it claims are durably on disk.
+        if not raw_already_written:
+            _atomic_write_bytes(raw_path, raw_bytes)
+        if not normalized_already_written:
+            _atomic_write_bytes(
+                normalized_path,
+                json.dumps(sealed.to_dict(), indent=2, sort_keys=True).encode("utf-8"),
+            )
         return normalized_path, ()
 
     def verify_raw_artifact(self, snapshot: ConstituentSnapshot) -> tuple[str, ...]:

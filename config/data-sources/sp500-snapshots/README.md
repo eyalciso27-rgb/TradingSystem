@@ -8,9 +8,9 @@ supplied source document.
 
 The implementing code is `trading_market_data_core.sp500_current_universe`
 (`ConstituentSnapshot`, `UniverseStore`, `refresh_universe`, `bind_raw_source`,
-`UniverseStore.accept_with_raw_artifact`, `UniverseStore.verify_raw_artifact`).
-This directory holds only this README — it is **not** where live snapshot
-files are written.
+`UniverseStore.accept_with_raw_artifact`, `UniverseStore.verify_raw_artifact`,
+`UniverseStore.latest`). This directory holds only this README — it is **not**
+where live snapshot files are written.
 The runtime archive root is `docs/poi/evidence/sp500-current/`
 (`DEFAULT_UNIVERSE_ROOT` in `apps/scheduler`), populated by the scheduler's
 monthly maintenance job or the `sp500_universe_cli` diagnostic tool. Nothing in
@@ -92,18 +92,48 @@ is what turns this from a claim into an enforced invariant:
   bytes originally, and that sidecar is immutable under the same write-once
   rule as the normalized entry: a differently-bound candidate for a date
   already on record can never silently replace the retained raw artifact;
-* on any failure — missing binding, mismatched binding, or a normalized-side
-  validation/immutability failure — **nothing is written**, neither the raw
-  sidecar nor the normalized entry, so a partially-bound archive entry can
-  never exist on disk.
+* on a clean refusal — missing binding, mismatched binding, or a
+  normalized-side validation/immutability failure detected before any write
+  is attempted — **nothing is written**, neither the raw sidecar nor the
+  normalized entry.
+
+### Selection re-verifies the raw sidecar — this is not just a manual check
+
+`UniverseStore.latest()` (and therefore `due_for_refresh`, freshness
+evaluation, and every consumer of the last-known-good list) re-verifies a
+raw-bound entry's retained sidecar on every lookup, not only when a caller
+happens to invoke `verify_raw_artifact` explicitly. An entry whose normalized
+body still authenticates but whose retained raw artifact has since been lost
+or tampered with is demoted exactly as a tampered normalized body would be,
+and selection falls back to the newest entry that is fully valid on every
+axis it declares (which may itself carry no raw binding, or one that still
+verifies). A raw-bound archive can never silently regress to serving
+unverifiable raw provenance just because nobody asked.
+
+### Crash-safety: two artifacts, not one atomic operation
+
+The raw sidecar and the normalized entry are two separate files, so committing
+both can never be a single atomic filesystem operation. Each write is
+individually atomic (temp file in the same directory, `fsync`, then
+`os.replace` — a reader only ever sees the complete old content or the
+complete new content, never a partial write), and the two are committed in a
+specific order: **raw first, normalized second**. That ordering is what
+prevents the dangerous failure mode: a crash or storage failure between the
+two writes can leave at most an **unreferenced, harmless raw sidecar** with no
+normalized entry claiming it yet — never a normalized entry that claims a raw
+binding which is not durably backed by real bytes on disk. Retrying
+`accept_with_raw_artifact` with the exact same `(snapshot, raw_bytes)`
+afterwards recovers idempotently: the already-durable raw side is left
+untouched (write-once) and only the missing normalized side is written.
 
 `UniverseStore.accept` (without a raw artifact) remains available for callers
 with no raw artifact to retain (e.g. hand-authored fixtures, or the plain
 CLI/manual override path); it still enforces normalized self-authentication
 and dated-layout immutability, it just does not carry a raw-provenance
 guarantee. See `tests/market_data/test_sp500_snapshot_archive.py` for the
-enforcement, durability, tamper-detection and write-once-immutability proofs
-on both axes.
+enforcement, durability, tamper-detection, selection-fallback and
+crash-recovery proofs on both axes, including failure-injection tests for the
+two-write commit sequence.
 
 ## Fail-closed last-known-good retention
 
@@ -121,8 +151,12 @@ destroy a good list:
   (normalized + retained-raw) snapshot is retained unchanged;
 * a candidate that conflicts with an already-archived date for a *different*
   reason (immutability, on either the normalized or the raw axis) is likewise
-  refused without disturbing any other archived date.
+  refused without disturbing any other archived date;
+* an entry that was once good but whose retained raw sidecar has since failed
+  (lost or tampered) is demoted at selection time (see above) rather than
+  served — this is "last-known-good", not "last-archived".
 
 Freshness (`CURRENT_LIST_VALID` / `CURRENT_LIST_STALE` /
 `CURRENT_LIST_UNAVAILABLE`) is evaluated against the last-known-good entry
-that actually survived — never against a rejected candidate.
+that actually survived — never against a rejected or since-invalidated
+candidate.
