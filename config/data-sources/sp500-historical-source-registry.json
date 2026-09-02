@@ -1,0 +1,191 @@
+{
+  "_README": [
+    "OFFLINE PROVENANCE REGISTRY - lists candidate SECONDARY sources for",
+    "historical (point-in-time) S&P 500 constituent data. It records what a",
+    "candidate IS and IS NOT; it does not ingest, fetch, or trust any of them.",
+    "",
+    "No entry here was fetched by this repository. No network call was made to",
+    "produce this file. Every checksum/timestamp field is either null or an",
+    "owner-supplied value recorded AFTER an owner-run validation step; this file",
+    "never fabricates one.",
+    "",
+    "Hard rules enforced by tests/market_data/test_sp500_historical_source_registry.py",
+    "(all fail closed):",
+    "  * classification must be exactly one of SECONDARY_RESEARCH_PIT or",
+    "    NOT_FOUND_OR_COMMERCIAL_ONLY - no other value is recognised.",
+    "  * every candidate.eligibility flag is FALSE, unconditionally:",
+    "      - authoritative_official_evidence  (a secondary source is never official)",
+    "      - eligible_for_promotion_without_validation (validation is mandatory)",
+    "      - substitute_for_historical_gics   (membership history is not GICS)",
+    "  * a SECONDARY_RESEARCH_PIT candidate must declare source_authority",
+    "    PUBLIC_SECONDARY, must carry effective_at/observed_at/available_at",
+    "    timestamp slots, and must require cross-check against at least 2",
+    "    independent corroborating sources before its checksum_status or",
+    "    cross_check.status may ever read VERIFIED/PASSED.",
+    "  * a NOT_FOUND_OR_COMMERCIAL_ONLY candidate must carry no checksum and no",
+    "    cross-check requirement - there is nothing here to validate.",
+    "",
+    "This registry never authorizes Paper Auto or Live trading, never claims",
+    "integration evidence, and never edits strategy parameters (CLAUDE.md)."
+  ],
+  "registry_id": "sp500-historical-source-registry",
+  "registry_version": "1.0.0",
+  "created_at": "2026-09-02",
+  "authority": "OFFLINE_PROVENANCE_REGISTRY_ONLY",
+  "status": "NOT_INTEGRATED",
+  "integration_evidence_claim": "NONE",
+  "network_fetch_performed_by_this_registry": false,
+  "invariants": {
+    "no_candidate_is_authoritative_official_evidence": true,
+    "no_candidate_is_eligible_for_promotion_without_validation": true,
+    "no_candidate_substitutes_for_historical_gics": true
+  },
+  "classifications": {
+    "SECONDARY_RESEARCH_PIT": {
+      "description": "A non-official, third-party or community source that CLAIMS point-in-time S&P 500 membership history. May be useful for cross-checking research after independent validation. Never authoritative.",
+      "source_authority": "PUBLIC_SECONDARY",
+      "required_fields": [
+        "checksum_sha256",
+        "checksum_status",
+        "timestamps.effective_at",
+        "timestamps.observed_at",
+        "timestamps.available_at",
+        "cross_check"
+      ],
+      "eligibility": {
+        "authoritative_official_evidence": false,
+        "eligible_for_promotion_without_validation": false,
+        "substitute_for_historical_gics": false
+      }
+    },
+    "NOT_FOUND_OR_COMMERCIAL_ONLY": {
+      "description": "A candidate that could not be located as a legally accessible, unambiguous free source, or that exists only behind a commercial license/paywall. Recorded so the gap is explicit, never so the license can be bypassed.",
+      "source_authority": null,
+      "required_fields": [
+        "unavailability_reason"
+      ],
+      "eligibility": {
+        "authoritative_official_evidence": false,
+        "eligible_for_promotion_without_validation": false,
+        "substitute_for_historical_gics": false
+      }
+    }
+  },
+  "candidates": [
+    {
+      "candidate_id": "fja05680-sp500-github",
+      "source_name": "fja05680/sp500 (community-maintained GitHub CSV of historical S&P 500 additions/removals)",
+      "source_url": "https://github.com/fja05680/sp500",
+      "classification": "SECONDARY_RESEARCH_PIT",
+      "source_authority": "PUBLIC_SECONDARY",
+      "is_point_in_time_history_claimed": true,
+      "verified": false,
+      "checksum_sha256": null,
+      "checksum_status": "NOT_YET_COMPUTED",
+      "timestamps": {
+        "effective_at": null,
+        "effective_at_status": "REQUIRED_NOT_YET_RECORDED",
+        "observed_at": null,
+        "observed_at_status": "REQUIRED_NOT_YET_RECORDED",
+        "available_at": null,
+        "available_at_status": "REQUIRED_NOT_YET_RECORDED"
+      },
+      "cross_check": {
+        "required": true,
+        "status": "NOT_PERFORMED",
+        "minimum_independent_corroborating_sources": 2,
+        "corroborating_sources": []
+      },
+      "eligibility": {
+        "authoritative_official_evidence": false,
+        "eligible_for_promotion_without_validation": false,
+        "substitute_for_historical_gics": false
+      },
+      "notes": [
+        "Community-maintained repository; not an SEC or S&P DJI official document.",
+        "Never fetched by this repository - no bytes retrieved, no checksum computed here.",
+        "Any future use requires, in order: (1) an owner-supplied snapshot file, (2) a sha256 checksum recomputed over that exact file's bytes, (3) effective/observed/available timestamps recorded per record (not assumed), (4) cross-check against at least 2 independent sources.",
+        "Even after full validation this source remains PUBLIC_SECONDARY; it can never be relabelled OFFICIAL_PUBLIC or OWNER_PRIMARY (ADR-0017).",
+        "Carries no GICS/sector data at all and must never be cited as a GICS source."
+      ]
+    },
+    {
+      "candidate_id": "spdji-licensed-index-membership-history",
+      "source_name": "S&P Dow Jones Indices licensed historical constituent and GICS assignment history",
+      "source_url": "https://www.spglobal.com/spdji/",
+      "classification": "NOT_FOUND_OR_COMMERCIAL_ONLY",
+      "unavailability_reason": "COMMERCIAL_LICENSE_REQUIRED",
+      "source_authority": null,
+      "checksum_sha256": null,
+      "checksum_status": "NOT_APPLICABLE",
+      "timestamps": null,
+      "cross_check": {
+        "required": false,
+        "status": "NOT_APPLICABLE",
+        "minimum_independent_corroborating_sources": 0,
+        "corroborating_sources": []
+      },
+      "eligibility": {
+        "authoritative_official_evidence": false,
+        "eligible_for_promotion_without_validation": false,
+        "substitute_for_historical_gics": false
+      },
+      "notes": [
+        "The index owner's own historical constituent/GICS assignment data is only available under a paid license (see ADR-0017 ASOF_GICS_BLOCKER, blocker_class LICENSE_REQUIRED).",
+        "No paid provider may be integrated per owner decision; this entry records the gap, it does not authorize purchase or license circumvention."
+      ]
+    },
+    {
+      "candidate_id": "commercial-terminal-index-history-composite",
+      "source_name": "Terminal-only index constituent history (e.g. Bloomberg, FactSet, Refinitiv)",
+      "source_url": null,
+      "classification": "NOT_FOUND_OR_COMMERCIAL_ONLY",
+      "unavailability_reason": "COMMERCIAL_LICENSE_REQUIRED",
+      "source_authority": null,
+      "checksum_sha256": null,
+      "checksum_status": "NOT_APPLICABLE",
+      "timestamps": null,
+      "cross_check": {
+        "required": false,
+        "status": "NOT_APPLICABLE",
+        "minimum_independent_corroborating_sources": 0,
+        "corroborating_sources": []
+      },
+      "eligibility": {
+        "authoritative_official_evidence": false,
+        "eligible_for_promotion_without_validation": false,
+        "substitute_for_historical_gics": false
+      },
+      "notes": [
+        "Access requires a paid market-data terminal subscription; no free or public endpoint exists.",
+        "No paid provider may be integrated per owner decision (CLAUDE.md)."
+      ]
+    },
+    {
+      "candidate_id": "unattributed-web-sp500-changes-lists",
+      "source_name": "Assorted unattributed finance-blog and forum 'S&P 500 additions/removals' lists",
+      "source_url": null,
+      "classification": "NOT_FOUND_OR_COMMERCIAL_ONLY",
+      "unavailability_reason": "AMBIGUOUS_PROVENANCE",
+      "source_authority": null,
+      "checksum_sha256": null,
+      "checksum_status": "NOT_APPLICABLE",
+      "timestamps": null,
+      "cross_check": {
+        "required": false,
+        "status": "NOT_APPLICABLE",
+        "minimum_independent_corroborating_sources": 0,
+        "corroborating_sources": []
+      },
+      "eligibility": {
+        "authoritative_official_evidence": false,
+        "eligible_for_promotion_without_validation": false,
+        "substitute_for_historical_gics": false
+      },
+      "notes": [
+        "No single stable, versioned, checksum-able artifact could be identified: content varies by copy, has no declared author or update methodology, and no stated primary source.",
+        "Recorded as ambiguous rather than silently dropped, so the gap stays visible."
+      ]
+    }
+  ]
+}
