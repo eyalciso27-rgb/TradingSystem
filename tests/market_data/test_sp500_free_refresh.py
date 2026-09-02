@@ -20,6 +20,7 @@ from trading_market_data_core.sp500_current_universe import (
     WIKIPEDIA_API_URL,
     Constituent,
     ConstituentSnapshot,
+    RawConstituentRefresh,
     UniverseStore,
     parse_wikitext_constituents,
     refresh_universe,
@@ -128,27 +129,48 @@ def _good(count: int = 500, as_of: date = date(2026, 8, 1)) -> ConstituentSnapsh
     )
 
 
+def _accept_production_snapshot(store: UniverseStore, snapshot: ConstituentSnapshot) -> None:
+    from trading_market_data_core.sp500_current_universe import (
+        bind_raw_source,
+        raw_artifact_checksum,
+    )
+
+    raw = b"fixture-current-sp500\n" + snapshot.as_of.isoformat().encode("utf-8")
+    path, findings = store.accept_with_raw_artifact(
+        bind_raw_source(snapshot, raw_artifact_checksum(raw)), raw
+    )
+    assert path is not None and findings == ()
+
+
 def test_a_parsed_but_implausible_snapshot_never_replaces_a_good_list(
     tmp_path: Path,
 ) -> None:
     """Two constituents is a parse accident, not an index."""
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_good())
     thin = parse_wikitext_constituents(
         _payload(WIKITEXT), as_of=date(2026, 8, 15), fetched_at=NOW
     )
     current, _, findings = refresh_universe(
-        store, thin, now=NOW, policy=DEFAULT_FRESHNESS[TradingMode.PAPER]
+        store,
+        thin,
+        now=NOW,
+        policy=DEFAULT_FRESHNESS[TradingMode.PAPER],
+        allow_normalized_only=True,
     )
     assert current is not None and current.count == 500
     assert any("refresh rejected" in finding for finding in findings)
 
 
 def test_a_failed_fetch_retains_the_last_known_good(tmp_path: Path) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_good())
     current, status, findings = refresh_universe(
-        store, None, now=NOW, policy=DEFAULT_FRESHNESS[TradingMode.PAPER]
+        store,
+        None,
+        now=NOW,
+        policy=DEFAULT_FRESHNESS[TradingMode.PAPER],
+        allow_normalized_only=True,
     )
     assert current is not None and current.count == 500
     assert status.value == "CURRENT_LIST_VALID"
@@ -157,7 +179,7 @@ def test_a_failed_fetch_retains_the_last_known_good(tmp_path: Path) -> None:
 
 def test_monthly_snapshots_accumulate_as_forward_history(tmp_path: Path) -> None:
     """Collection builds OUR history going forward - never backwards."""
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_good(as_of=date(2026, 6, 1)))
     store.accept(_good(as_of=date(2026, 7, 1)))
     store.accept(_good(as_of=date(2026, 8, 1)))
@@ -168,14 +190,14 @@ def test_monthly_snapshots_accumulate_as_forward_history(tmp_path: Path) -> None
 
 
 def test_refresh_is_not_due_within_the_monthly_interval(tmp_path: Path) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_good(as_of=date(2026, 8, 15)))
     assert not store.due_for_refresh(now=NOW)
     assert REFRESH_INTERVAL_DAYS == 30
 
 
 def test_refresh_is_due_after_the_interval(tmp_path: Path) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_good(as_of=date(2026, 6, 1)))
     assert store.due_for_refresh(now=NOW)
 
@@ -196,7 +218,7 @@ def test_status_reports_unavailable_without_a_snapshot(
 def test_status_reports_the_snapshot_details(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    UniverseStore(tmp_path).accept(_good())
+    _accept_production_snapshot(UniverseStore(tmp_path), _good())
     code = universe_main(["prog", "status", "--root", str(tmp_path)])
     out = capsys.readouterr().out
     assert code == 0
@@ -211,7 +233,7 @@ def test_refresh_does_not_refetch_when_not_due(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """No network is touched here: the CLI must short-circuit on freshness."""
-    UniverseStore(tmp_path).accept(_good(as_of=date(2026, 8, 15)))
+    _accept_production_snapshot(UniverseStore(tmp_path), _good(as_of=date(2026, 8, 15)))
     code = universe_main(["prog", "refresh", "--root", str(tmp_path)])
     out = capsys.readouterr().out
     assert code == 0
@@ -221,7 +243,7 @@ def test_refresh_does_not_refetch_when_not_due(
 def test_status_is_stricter_for_live_than_paper(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    UniverseStore(tmp_path).accept(_good(as_of=date(2026, 6, 25)))
+    _accept_production_snapshot(UniverseStore(tmp_path), _good(as_of=date(2026, 6, 25)))
     paper = universe_main(["prog", "status", "--root", str(tmp_path), "--mode", "PAPER"])
     capsys.readouterr()
     live = universe_main(["prog", "status", "--root", str(tmp_path), "--mode", "LIVE"])
@@ -270,7 +292,7 @@ def test_automatic_refresh_does_no_fetch_when_fresh(tmp_path: Path) -> None:
     """Normal operation must not require a manual monthly command."""
     from trading_market_data_core.sp500_current_universe import ensure_current_universe
 
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_good(as_of=date(2026, 8, 15)))
     calls: list[int] = []
 
@@ -290,11 +312,14 @@ def test_automatic_refresh_does_no_fetch_when_fresh(tmp_path: Path) -> None:
 def test_automatic_refresh_fetches_when_due(tmp_path: Path) -> None:
     from trading_market_data_core.sp500_current_universe import ensure_current_universe
 
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_good(as_of=date(2026, 6, 1)))
     current, status, findings = ensure_current_universe(
         store, now=NOW, policy=DEFAULT_FRESHNESS[TradingMode.PAPER],
-        fetch=lambda: _good(as_of=date(2026, 8, 17)),
+        fetch=lambda: RawConstituentRefresh(
+            snapshot=_good(as_of=date(2026, 8, 17)),
+            raw_bytes=b"fake-current-sp500-2026-08-17",
+        ),
     )
     assert current is not None and current.as_of == date(2026, 8, 17)
     assert status.value == "CURRENT_LIST_VALID"
@@ -304,7 +329,7 @@ def test_automatic_refresh_fetches_when_due(tmp_path: Path) -> None:
 def test_automatic_refresh_keeps_last_known_good_on_failure(tmp_path: Path) -> None:
     from trading_market_data_core.sp500_current_universe import ensure_current_universe
 
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_good(as_of=date(2026, 6, 1)))
 
     def _failing() -> ConstituentSnapshot:
@@ -320,7 +345,7 @@ def test_automatic_refresh_keeps_last_known_good_on_failure(tmp_path: Path) -> N
 def test_automatic_refresh_without_a_fetcher_keeps_the_cached_list(tmp_path: Path) -> None:
     from trading_market_data_core.sp500_current_universe import ensure_current_universe
 
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_good(as_of=date(2026, 6, 1)))
     current, _, findings = ensure_current_universe(
         store, now=NOW, policy=DEFAULT_FRESHNESS[TradingMode.PAPER]

@@ -70,7 +70,7 @@ def _snapshot(
 def test_a_conflicting_candidate_for_an_already_archived_date_is_refused(
     tmp_path: Path,
 ) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     first_path, findings = store.accept(_snapshot(as_of=date(2026, 8, 1)))
     assert first_path is not None and findings == ()
     original_bytes = first_path.read_bytes()
@@ -89,7 +89,7 @@ def test_an_identical_resubmission_of_an_archived_date_is_an_idempotent_no_op(
     tmp_path: Path,
 ) -> None:
     """A crashed-and-retried refresh must not be treated as a violation."""
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     snapshot = _snapshot(as_of=date(2026, 8, 1))
     first_path, first_findings = store.accept(snapshot)
     second_path, second_findings = store.accept(snapshot)
@@ -102,7 +102,7 @@ def test_an_identical_resubmission_of_an_archived_date_is_an_idempotent_no_op(
 def test_forward_history_accumulates_while_each_date_stays_independently_immutable(
     tmp_path: Path,
 ) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_snapshot(as_of=date(2026, 6, 1)))
     store.accept(_snapshot(as_of=date(2026, 7, 1)))
     store.accept(_snapshot(as_of=date(2026, 8, 1)))
@@ -120,7 +120,7 @@ def test_a_tampered_on_disk_entry_is_never_silently_repaired_by_a_good_candidate
     tmp_path: Path,
 ) -> None:
     """Corruption must be surfaced, not quietly papered over by the next refresh."""
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     path, _ = store.accept(_snapshot(as_of=date(2026, 8, 1)))
     assert path is not None
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -139,12 +139,16 @@ def test_refresh_never_lets_a_same_day_retry_corrupt_the_archived_snapshot(
     tmp_path: Path,
 ) -> None:
     """The refresh path (not just accept()) inherits the immutability guarantee."""
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_snapshot(as_of=date(2026, 8, 1)))
 
     conflicting = _snapshot(as_of=date(2026, 8, 1), ticker_offset=3)
     current, status, findings = refresh_universe(
-        store, conflicting, now=NOW, policy=DEFAULT_FRESHNESS[TradingMode.PAPER]
+        store,
+        conflicting,
+        now=NOW,
+        policy=DEFAULT_FRESHNESS[TradingMode.PAPER],
+        allow_normalized_only=True,
     )
 
     assert current is not None
@@ -159,7 +163,7 @@ def test_refresh_never_lets_a_same_day_retry_corrupt_the_archived_snapshot(
 def test_an_archived_snapshot_carries_the_required_provenance_fields(
     tmp_path: Path,
 ) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     path, _ = store.accept(_snapshot(as_of=date(2026, 8, 1)))
     assert path is not None
     body = json.loads(path.read_text(encoding="utf-8"))
@@ -176,7 +180,7 @@ def test_an_archived_snapshot_carries_the_required_provenance_fields(
 
 
 def test_the_checksum_is_sha256_and_self_authenticates(tmp_path: Path) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     path, _ = store.accept(_snapshot(as_of=date(2026, 8, 1)))
     assert path is not None
     loaded = load_snapshot(path)
@@ -193,7 +197,7 @@ def test_a_checksum_that_does_not_match_its_own_body_is_rejected_by_accept(
     corrupted = replace(_snapshot(as_of=date(2026, 8, 1)), checksum="sha256:" + "0" * 64)
     assert any("does not authenticate" in f for f in validate_snapshot(corrupted))
 
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     path, findings = store.accept(corrupted)
     assert path is None
     assert any("does not authenticate" in f for f in findings)
@@ -204,7 +208,7 @@ def test_latest_skips_a_tampered_archive_entry_rather_than_serving_it(
     tmp_path: Path,
 ) -> None:
     """Tamper detection must protect ``latest()``, not only ``load_snapshot``."""
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_snapshot(as_of=date(2026, 7, 1)))
     tampered_path, _ = store.accept(_snapshot(as_of=date(2026, 8, 1)))
     assert tampered_path is not None
@@ -222,7 +226,7 @@ def test_latest_skips_a_tampered_archive_entry_rather_than_serving_it(
 
 
 def test_an_empty_candidate_is_never_written_to_the_archive(tmp_path: Path) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     path, findings = store.accept(_snapshot(count=0, as_of=date(2026, 8, 1)))
     assert path is None
     assert "snapshot is empty" in findings[0]
@@ -232,11 +236,12 @@ def test_an_empty_candidate_is_never_written_to_the_archive(tmp_path: Path) -> N
 def test_refresh_with_an_empty_candidate_keeps_the_archive_untouched(
     tmp_path: Path,
 ) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     store.accept(_snapshot(as_of=date(2026, 8, 1)))
     current, status, findings = refresh_universe(
         store, _snapshot(count=0, as_of=date(2026, 8, 31)), now=NOW,
         policy=DEFAULT_FRESHNESS[TradingMode.PAPER],
+        allow_normalized_only=True,
     )
     assert current is not None and current.count == 500
     assert status is UniverseListStatus.CURRENT_LIST_VALID
@@ -266,7 +271,7 @@ def test_cli_status_never_reports_an_empty_archive_entry_as_valid(
     tmp_path: Path, capsys: object,
 ) -> None:
     """A malformed zero-count file that bypassed ``accept()`` must not read as OK."""
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     path, _ = store.accept(_snapshot(as_of=date(2026, 8, 1)))
     assert path is not None
     hand_placed = ConstituentSnapshot(
@@ -286,7 +291,7 @@ def test_cli_status_never_reports_an_empty_archive_entry_as_valid(
 def test_a_forward_snapshot_never_declares_itself_point_in_time_history(
     tmp_path: Path,
 ) -> None:
-    store = UniverseStore(tmp_path)
+    store = UniverseStore(tmp_path, allow_normalized_only=True)
     _, findings = store.accept(
         replace(_snapshot(as_of=date(2026, 8, 1)), is_point_in_time_history=True)
     )

@@ -30,8 +30,9 @@ from pathlib import Path
 
 from trading_market_data_core.sp500_current_universe import (
     ConstituentSnapshot,
+    RawConstituentRefresh,
     UniverseStore,
-    fetch_current_constituents,
+    fetch_current_constituents_with_raw,
 )
 from trading_market_data_core.trading_readiness import TradingMode
 from trading_market_data_core.universe_maintenance import (
@@ -48,7 +49,7 @@ def build_universe_maintenance(
     *,
     mode: TradingMode = TradingMode.PAPER,
     root: Path | None = None,
-    fetch: Callable[[], ConstituentSnapshot] | None = None,
+    fetch: Callable[[], ConstituentSnapshot | RawConstituentRefresh] | None = None,
 ) -> UniverseMaintenance:
     """The maintenance job for one mode.
 
@@ -63,16 +64,21 @@ def build_universe_maintenance(
     )
 
 
-def _default_fetch() -> ConstituentSnapshot:
-    """The real free source. Only ever called when a refresh is genuinely due."""
-    return fetch_current_constituents(now=datetime.now(tz=UTC))
+def _default_fetch() -> RawConstituentRefresh:
+    """The real free source. Only ever called when a refresh is genuinely due.
+
+    Production refreshes must retain the raw source artifact beside the
+    normalized snapshot, so the scheduler uses the raw-returning adapter rather
+    than the legacy snapshot-only compatibility helper.
+    """
+    return fetch_current_constituents_with_raw(now=datetime.now(tz=UTC))
 
 
 def run_startup_maintenance(
     *,
     mode: TradingMode = TradingMode.PAPER,
     root: Path | None = None,
-    fetch: Callable[[], ConstituentSnapshot] | None = None,
+    fetch: Callable[[], ConstituentSnapshot | RawConstituentRefresh] | None = None,
     now: datetime | None = None,
 ) -> MaintenanceOutcome:
     """Call once on application boot, in Paper and in Live alike."""
@@ -83,7 +89,7 @@ def run_maintenance_tick(
     *,
     mode: TradingMode = TradingMode.PAPER,
     root: Path | None = None,
-    fetch: Callable[[], ConstituentSnapshot] | None = None,
+    fetch: Callable[[], ConstituentSnapshot | RawConstituentRefresh] | None = None,
     now: datetime | None = None,
 ) -> MaintenanceOutcome:
     """Call periodically from the maintenance loop; cheap unless refresh is due."""
