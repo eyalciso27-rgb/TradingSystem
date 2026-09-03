@@ -67,6 +67,19 @@ Every other track is plumbing by comparison.
 - **Exit:** `persistence` and `replay` move off fakes.
 - **Hard stop:** any look-ahead leak, or any field without a point-in-time
   timestamp.
+- **State (reconciled 2026-09-03): WAITING_EXTERNAL / BLOCKED_FOR_OWNER.**
+  Merged and complete — do not recreate: A-WP2 owner decision, forward S&P 500
+  snapshot hardening, DatasetManifest/no-look-ahead binding, the S&P
+  historical-secondary source registry (offline provenance only), the
+  current/forward S&P 500 + current-GICS archive hardening, and the
+  fail-closed corporate-action PIT validator (offline, fixture-only). Every
+  remaining gap — historical S&P 500 PIT membership, historical GICS,
+  survivorship-free delisted-name OHLCV, and real (not fixture) corporate-
+  action evidence — needs an owner-supplied artifact, a licensing decision, or
+  an owner-run against SEC EDGAR/IBKR. See
+  [`MVP_DELIVERY_PLAN.md`](MVP_DELIVERY_PLAN.md) §5 M3 for the authoritative,
+  itemized owner-action list. No further autonomous A-WP2 implementation task
+  exists until one of those owner actions lands.
 
 ### A-WP3 — Replay and in-sample backtest
 - **Work:** deterministic replay of the frozen manifest; in-sample backtest with

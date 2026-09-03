@@ -99,8 +99,12 @@ The following milestones are already merged and must be treated as facts, not re
 | A-WP2 PIT owner decision | PR #100 | MERGED |
 | S&P 500 forward immutable snapshot hardening | PR #101 | MERGED |
 | Dataset manifest lineage + no-look-ahead binding | PR #102 | MERGED |
+| Canonical MVP delivery plan (this file) | PR #103 | MERGED |
+| A-WP2-SP500-HISTORICAL-SECONDARY-PIT-EVAL — offline provenance registry of candidate secondary S&P membership-history sources (nothing fetched, nothing integrated, nothing promoted to authoritative) | PR #104 | MERGED |
+| A-WP2-SP500-CURRENT-GICS-ARCHIVE — current/forward S&P 500 + current-GICS immutable monthly snapshot archive hardening (write-once dated layout, raw+normalized checksum binding, crash-safe two-write commit, fail-closed last-known-good retention) | PR #105 | MERGED |
+| A-WP2-CORPORATE-ACTION-PIT-VALIDATION — fail-closed, offline, fixture-only structural validator for corporate-action point-in-time records | PR #106 | MERGED |
 
-Do not create replacement implementations for these milestones unless a concrete defect or missing acceptance criterion is proven.
+Do not create replacement implementations for these milestones unless a concrete defect or missing acceptance criterion is proven. **In particular, PR #104, #105 and #106 are complete; do not re-open, re-plan or re-implement A-WP2-SP500-HISTORICAL-SECONDARY-PIT-EVAL, A-WP2-SP500-CURRENT-GICS-ARCHIVE or A-WP2-CORPORATE-ACTION-PIT-VALIDATION.**
 
 ---
 
@@ -134,13 +138,33 @@ Any future strategy-semantic change requires a new version/fingerprint and the a
 
 ### M3 — Point-in-time strategy dataset and evidence
 
-**State:** IN PROGRESS.
+**State (reconciled 2026-09-03): WAITING_EXTERNAL / BLOCKED_FOR_OWNER.**
 
-Already merged:
+Already merged (repository fact; do not rebuild):
 
 - A-WP2 owner decision — PR #100.
 - Forward S&P 500 immutable snapshot behavior — PR #101.
 - Dataset manifest lineage / no-look-ahead binding — PR #102.
+- S&P historical-secondary source registry (offline provenance record of
+  candidate secondary sources; nothing fetched or integrated) — PR #104.
+- Current/forward S&P 500 + current-GICS immutable snapshot archive hardening
+  — PR #105.
+- Fail-closed corporate-action point-in-time qualification (offline,
+  fixture-only structural validator) — PR #106.
+
+#### Validation machinery vs. empirical integration evidence
+
+M3 now has substantial **validation and ingestion machinery** merged and
+tested. None of it is, by itself, **empirical PIT integration evidence** for
+the frozen strategy, and passing its tests is never treated as such:
+
+| Merged machinery | What it proves | What it does NOT prove |
+|---|---|---|
+| Dataset V1 ingestion/qualification pipeline (`trading_market_data_core.dataset_v1*`, `scripts/run_dataset_v1_real_qualification.sh`) | the pipeline can discover, checksum, parse and qualify real IBKR/SEC/S&P artifacts when it is run against them | nothing — it has not been run against real sources in this reconciliation; it is an **owner-run** tool |
+| S&P forward snapshot archive (PR #101, hardened by PR #105) | immutable, checksum-bound, crash-safe monthly CURRENT S&P 500 / current-GICS snapshots, building genuine forward history from collection start | historical (pre-collection) S&P membership or historical GICS — explicitly forbidden from being treated as such |
+| S&P historical-secondary source registry (PR #104) | which candidate secondary sources exist and exactly what would be required to validate one (checksum, timestamps, 2-source cross-check) | nothing about historical S&P membership itself — every candidate is unfetched (`checksum_status: NOT_YET_COMPUTED`) and, even fully validated, stays `SECONDARY_RESEARCH_PIT` — it can never become authoritative (ADR-0017) |
+| Corporate-action PIT validator (PR #106) | that a *given* corporate-action fixture is internally PIT-consistent (four timestamps ordered, stable UUID identity, non-cyclic correction lineage) | that any real corporate-action record exists for the frozen strategy's universe — it is explicitly OFFLINE and FIXTURE-ONLY and never performs a network call |
+| Dataset V1 real-source qualifiers (`qualify_corporate_actions`, `qualify_pit_membership`, `qualify_delisted_security_history`) | the pipeline can qualify real SEC/IBKR evidence once it is fetched | nothing until the owner-run qualification script is actually executed against live SEC EDGAR / IBKR sources |
 
 Required A-WP2 principles:
 
@@ -188,6 +212,57 @@ Known source boundary:
 - A free, legitimate company-level historical GICS assignment series has not been established as canonical evidence.
 
 If a permitted source supplies **current** GICS, immutable monthly snapshots may build trustworthy forward history from collection start. They do not constitute historical backfill for earlier periods.
+
+#### Remaining M3 gaps (reconciled 2026-09-03) — all owner/external
+
+After PR #104, #105 and #106, every remaining M3 gap for the frozen
+`baseline-trend-breakout-v1` manifest requires an owner-supplied artifact, a
+licensed data source, credentials, or an owner-run. None is closable by
+further autonomous implementation:
+
+1. **Historical S&P 500 membership evidence not yet admitted as PIT truth.**
+   The ingestion path (`config/data-sources/sp500-documents/` +
+   `bash scripts/run_dataset_v1_real_qualification.sh`) is fully built and
+   waiting empty. Automated retrieval from `spglobal.com` returns HTTP 403 /
+   robots protection and this project does not circumvent that (ADR-0017).
+   **Owner action required:** download official S&P DJI historical
+   index-change announcement documents (HTML/text/CSV/text-layer PDF) and
+   place them under `config/data-sources/sp500-documents/`, then run the
+   qualification script. The historical-secondary registry (PR #104) may at
+   most cross-check this evidence — it can never substitute for it
+   (`eligible_for_promotion_without_validation: false`,
+   `authoritative_official_evidence: false` on every candidate).
+2. **True historical company-level GICS effective/knowledge-dated history.**
+   Recorded `BLOCKED_EXTERNAL` / `LICENSE_REQUIRED` in
+   `docs/poi/evidence/dataset-v1/asof-gics-blocker.json`: S&P DJI licenses
+   company-level GICS assignments; SEC SIC is a different taxonomy and is not
+   an acceptable substitute; no free, legitimate, company-level historical
+   GICS series has been established. **Owner action required:** an explicit
+   owner decision to license a qualifying provider (with an ADR, per
+   CLAUDE.md's "no paid provider without owner approval"), or an owner
+   decision to accept this as a permanent V1 gap and scope the strategy's
+   GICS sector-concentration rule accordingly. No autonomous or free path
+   exists.
+3. **Survivorship-free delisted-name daily OHLCV.** IBKR does not price
+   delisted names historically; no free source has been established (see
+   `docs/status/PIT_DATASET_QUALIFICATION.md` §2/§4, blocker N-02/N-03 in
+   `docs/status/COMPONENT_EVIDENCE_MATRIX.yaml`). **Owner action required:**
+   select and approve an external market-data provider with delisted-name
+   coverage, commercial terms and test credentials.
+4. **Effective-dated corporate actions for the frozen universe.** The
+   qualification pipeline (`qualify_corporate_actions`, SEC EDGAR / Form 25
+   ingestion) and the new PIT structural validator (PR #106) both exist, but
+   neither has been run against real data — that requires the owner-run
+   `scripts/run_dataset_v1_real_qualification.sh` on a host with network
+   access to SEC EDGAR (and, for cross-checking, an IBKR Paper session).
+   **Owner action required:** execute that owner-run and record the resulting
+   evidence under `docs/poi/evidence/`.
+
+**No dependency-safe autonomous M3 implementation task remains.** Every path
+forward requires an owner-supplied artifact, a licensing decision, or an
+owner-run with network/broker access that this worker may not perform.
+AutoDev must not select, plan, or fabricate work to close gaps 1–4 above; it
+must wait for the named owner action and re-inspect `main` afterward.
 
 ### M4 — Historical replay / backtest qualification
 
@@ -498,9 +573,30 @@ Do not use chat history as the only durable record of a product/safety decision.
 
 ## 11. Immediate next-work rule
 
-At the time this plan is created, AutoDev has already merged the initial A-WP2 owner-decision, forward-S&P-snapshot, and DatasetManifest/no-look-ahead work. Therefore the Architect must inspect `main` and select the **next genuinely unmet M3 acceptance criterion** rather than recreating completed A-WP2 components.
+**Reconciled 2026-09-03.** AutoDev has already merged the A-WP2 owner-decision
+(PR #100), forward-S&P-snapshot (PR #101), DatasetManifest/no-look-ahead (PR
+#102), the S&P historical-secondary source registry (PR #104), the
+current/forward S&P 500 + current-GICS archive hardening (PR #105), and the
+corporate-action PIT validator (PR #106). **None of these may be recreated.**
+A prior Architect pass duplicated PR #104's task; this reconciliation exists
+to prevent that recurring.
 
-After M3 is sufficiently complete for the frozen strategy, proceed in order through M4 -> M5 -> M6 -> M7 -> M8 -> M9. A later milestone may be worked in parallel only when doing so does not consume or assume an unresolved upstream owner/evidence decision and does not weaken fail-closed behavior.
+Having re-inspected `main` against §5 M3 (including the "Validation machinery
+vs. empirical integration evidence" table and the "Remaining M3 gaps"
+subsection), **M3 is WAITING_EXTERNAL / BLOCKED_FOR_OWNER.** Every remaining
+M3 acceptance criterion for the frozen strategy depends on one of: an
+owner-supplied official S&P document, an owner licensing decision for
+historical GICS, an owner decision on a delisted-name data provider, or an
+owner-run of the real qualification pipeline against SEC EDGAR / IBKR. None of
+these is a dependency-safe autonomous implementation task. The Architect must
+**not** invent M3 implementation work to keep the loop occupied; it must
+record `WAITING_EXTERNAL` and surface the four owner actions listed in §5.
+
+M4 → M5 → M6 remain gated on M3 dataset evidence and stay `PENDING`. A later
+milestone (e.g. parts of M7) may be worked in parallel **only** when doing so
+does not consume or assume an unresolved upstream owner/evidence decision and
+does not weaken fail-closed behavior — selecting such work is a separate
+Architect decision, out of scope for this reconciliation.
 
 ---
 

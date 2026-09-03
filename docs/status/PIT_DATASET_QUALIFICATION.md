@@ -5,6 +5,19 @@
 > change, no backtest, no OOS. Frozen strategy fingerprint
 > `sha256:75f299b8…dfed0`.
 
+> **2026-09-03 reconciliation.** Since this matrix was written, PR #104 added
+> an offline S&P historical-secondary source registry
+> (`config/data-sources/sp500-historical-source-registry.json` — nothing
+> fetched, nothing integrated, nothing promoted to authoritative), PR #105
+> hardened the current/forward S&P 500 + current-GICS immutable snapshot
+> archive, and PR #106 added a fail-closed, offline, fixture-only
+> corporate-action PIT structural validator. None of the three closes a
+> **GAP** row below — every remaining GAP is still WAITING_EXTERNAL (owner-
+> supplied official documents, a historical-GICS licensing decision, or a
+> delisted-name/corporate-action provider decision). See
+> [`../roadmaps/MVP_DELIVERY_PLAN.md`](../roadmaps/MVP_DELIVERY_PLAN.md) §5
+> M3 for the authoritative, itemized owner-action list.
+
 ## 1. Sourcing principle (owner correction #1)
 The remaining reference-data gaps do **not** have to be bought from one bundled
 provider. Historical S&P 500 membership, historical GICS, delisted price history

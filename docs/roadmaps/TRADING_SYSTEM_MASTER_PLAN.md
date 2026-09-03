@@ -156,6 +156,21 @@ real-account PoIs remain **BLOCKED**.
 > **These are readiness machinery for existing tasks; the canonical IMPLEMENTED
 > count is unchanged at 69.**
 
+> **A-WP2 canonical-state reconciliation (2026-09-03).** PR #104 (S&P
+> historical-secondary PIT source registry — offline provenance only, nothing
+> fetched or integrated), PR #105 (current/forward S&P 500 + current-GICS
+> immutable snapshot archive hardening) and PR #106 (fail-closed
+> corporate-action PIT qualification — an offline, fixture-only validator) are
+> **MERGED and complete; do not recreate them.** They are validation/ingestion
+> **machinery**, not empirical PIT integration evidence: no real historical
+> S&P 500 membership or historical GICS evidence has been admitted, because
+> both remain externally gated (owner-supplied official S&P documents;
+> licensed historical GICS — `LICENSE_REQUIRED`, no free source exists). M3 is
+> reconciled as **WAITING_EXTERNAL / BLOCKED_FOR_OWNER**; see
+> [`MVP_DELIVERY_PLAN.md`](MVP_DELIVERY_PLAN.md) §5 M3 for the authoritative,
+> itemized owner-action list. No autonomous A-WP2/M3 implementation task
+> remains.
+
 > **A-WP1 — baseline hypothesis FROZEN (2026-08-13).** The owner completed
 > `STRATEGY_FREEZE_TEMPLATE.md` for `baseline-trend-breakout-v1` and it
 > transitioned DRAFT → FROZEN: 34/34 mandatory owner parameters recorded with
@@ -452,7 +467,13 @@ Broker-mutating owner-runs are **serialized**: DEF-18, the fill path, DEF-20,
 Gateway restarts and destructive drills never overlap on one account.
 The single next strategy action is **building the point-in-time research
 dataset** for the now-FROZEN `baseline-trend-breakout-v1`, which needs no
-broker at all.
+broker at all — but as of the 2026-09-03 reconciliation this action is itself
+**WAITING_EXTERNAL / BLOCKED_FOR_OWNER**: see
+[`MVP_DELIVERY_PLAN.md`](MVP_DELIVERY_PLAN.md) §5 M3 for the exact owner
+actions (official S&P documents, a historical-GICS licensing decision, a
+delisted-name provider decision, and an owner-run of the real qualification
+pipeline). No autonomous dataset-building task remains until one of those
+lands.
 
 ---
 

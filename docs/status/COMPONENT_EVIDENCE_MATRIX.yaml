@@ -18,8 +18,19 @@
 #   * the canonical task count must equal the count in CLAUDE_CODE_TASKS.yaml.
 #
 # Tests passing is NEVER integration evidence.
+#
+# 2026-09-03 A-WP2 canonical-state reconciliation. PR #104 (S&P historical
+# secondary PIT source registry — offline provenance only, nothing fetched or
+# integrated), PR #105 (current/forward S&P 500 + current-GICS immutable
+# snapshot archive hardening) and PR #106 (fail-closed corporate-action PIT
+# qualification — an offline, fixture-only validator) are MERGED and
+# COMPLETE. Do not recreate them. None of the three closes the frozen
+# strategy's required historical S&P 500 PIT membership or historical GICS
+# evidence: those remain WAITING_EXTERNAL. See
+# docs/roadmaps/MVP_DELIVERY_PLAN.md §5 (M3) for the full gap accounting and
+# docs/status/PIT_DATASET_QUALIFICATION.md for the capability matrix.
 version: "1.0"
-updated: "2026-08-13"
+updated: "2026-09-03"
 baseline: docs/baseline-v0.5/
 authoritative_prose: docs/roadmaps/TRADING_SYSTEM_MASTER_PLAN.md
 
@@ -100,9 +111,20 @@ components:
     strategy_dependency: REQUIRED
     current_blocker: >-
       no real point-in-time research dataset has been loaded; migrations are
-      exercised in the CI db-migration job only
-    owner_dependency: NONE
-    next_action: build the point-in-time research dataset (Track A, EVD-0004)
+      exercised in the CI db-migration job only. Dataset V1 ingestion/
+      qualification machinery, the S&P forward snapshot archive, the S&P
+      historical-secondary source registry and the corporate-action PIT
+      validator are all merged (docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3),
+      but the frozen strategy's required historical S&P 500 PIT membership
+      and historical GICS evidence remain WAITING_EXTERNAL — see
+      docs/status/PIT_DATASET_QUALIFICATION.md.
+    owner_dependency: OWNER_DECISION
+    next_action: >-
+      WAITING_EXTERNAL — see docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3 for the
+      exact owner actions (official S&P announcement documents, a
+      historical-GICS licensing decision, a delisted-name price-history
+      provider decision); no autonomous implementation task remains for this
+      component until an owner action closes one of those gaps
     exit_criterion: >-
       a real as_of/lineage dataset is loaded and a no-look-ahead audit passes
 
@@ -425,12 +447,16 @@ components:
       owner_approval_ref OWNER-EYAL-2026-08-13-BASELINE-TREND-BREAKOUT-V1,
       pinned by tests/strategy/test_frozen_baseline_manifest.py); it has not
       been evaluated against any dataset — no point-in-time research dataset
-      exists to run it against, so nothing is HISTORICALLY_TESTED yet
-    owner_dependency: NONE
+      exists to run it against, so nothing is HISTORICALLY_TESTED yet. The
+      manifest requires true historical S&P 500 PIT membership and
+      as-of GICS (universe.definition, GICS sector-concentration rule); both
+      remain WAITING_EXTERNAL (docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3)
+    owner_dependency: OWNER_DECISION
     next_action: >-
-      build the point-in-time research dataset (Track A, EVD-0004), then
-      evaluate the frozen v1 manifest in-sample only; no parameter may be
-      inspected or changed on v1 without a new version_id (supersede)
+      WAITING_EXTERNAL — see docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3; once
+      the owner closes the historical S&P membership and historical GICS
+      gaps, evaluate the frozen v1 manifest in-sample only; no parameter may
+      be inspected or changed on v1 without a new version_id (supersede)
     exit_criterion: >-
       the frozen, owner-approved manifest evaluated on a real point-in-time
       dataset (HISTORICALLY_TESTED)
@@ -639,9 +665,14 @@ components:
     evidence_class: TESTED_WITH_FAKES
     real_integration_status: NONE
     strategy_dependency: REQUIRED
-    current_blocker: no real point-in-time dataset exists to replay
-    owner_dependency: NONE
-    next_action: build the dataset (EVD-0004), then replay the frozen baseline
+    current_blocker: >-
+      no real point-in-time dataset exists to replay; WAITING_EXTERNAL on the
+      same historical S&P membership / GICS gaps as `strategy-manifests`
+      (docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3)
+    owner_dependency: OWNER_DECISION
+    next_action: >-
+      WAITING_EXTERNAL — see docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3; once the
+      owner closes the M3 gaps, replay the frozen baseline
     exit_criterion: >-
       deterministic replay over a real dataset with a passing no-look-ahead audit
 
@@ -655,11 +686,13 @@ components:
     current_blocker: >-
       baseline-trend-breakout-v1 is FROZEN with owner-approved cost/slippage/
       spread assumptions (docs/strategies/baseline-trend-breakout-v1.yaml); no
-      real point-in-time dataset exists yet to backtest it against
-    owner_dependency: NONE
+      real point-in-time dataset exists yet to backtest it against.
+      WAITING_EXTERNAL on the same historical S&P membership / GICS gaps as
+      `strategy-manifests` (docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3)
+    owner_dependency: OWNER_DECISION
     next_action: >-
-      build the point-in-time dataset (Track A), then backtest the frozen v1
-      manifest in-sample only
+      WAITING_EXTERNAL — see docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3; once the
+      owner closes the M3 gaps, backtest the frozen v1 manifest in-sample only
     exit_criterion: HISTORICALLY_TESTED, then OUT_OF_SAMPLE_PASS via walk-forward
 
   - component_id: shadow
@@ -708,9 +741,19 @@ strategies:
       change requires a NEW version_id, never an edit to v1); no real
       point-in-time research dataset has been built, so no backtest,
       OUT_OF_SAMPLE_PASS or SHADOW_PASS evidence exists yet and no strategy is
-      eligible for any automated mode
+      eligible for any automated mode. M3 dataset work is WAITING_EXTERNAL:
+      the manifest's `universe.definition` requires true historical S&P 500
+      PIT membership (official S&P DJI documents, owner-supplied — automated
+      retrieval is bot-protected) and its GICS sector-concentration rule
+      requires historical (as-of) GICS, which is LICENSE_REQUIRED with no free
+      legitimate source (see docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3,
+      docs/status/PIT_DATASET_QUALIFICATION.md,
+      docs/poi/evidence/dataset-v1/asof-gics-blocker.json)
     next_action: >-
-      build the point-in-time research dataset (Track A), then evaluate the
+      WAITING_EXTERNAL / BLOCKED_FOR_OWNER — see
+      docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3 for the exact owner actions;
+      once the historical S&P membership and historical GICS gaps are closed,
+      build/finish the point-in-time research dataset, then evaluate the
       frozen v1 manifest in-sample only, walk-forward, and Final OOS before any
       Go/No-Go
 
