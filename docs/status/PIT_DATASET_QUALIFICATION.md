@@ -12,11 +12,22 @@
 > hardened the current/forward S&P 500 + current-GICS immutable snapshot
 > archive, and PR #106 added a fail-closed, offline, fixture-only
 > corporate-action PIT structural validator. None of the three closes a
-> **GAP** row below — every remaining GAP is still WAITING_EXTERNAL (owner-
-> supplied official documents, a historical-GICS licensing decision, or a
-> delisted-name/corporate-action provider decision). See
+> **GAP** row below — every remaining GAP requiring an **official** source is
+> still WAITING_EXTERNAL (owner-supplied official documents, a
+> historical-GICS licensing decision, or a delisted-name/corporate-action
+> provider decision). See
 > [`../roadmaps/MVP_DELIVERY_PLAN.md`](../roadmaps/MVP_DELIVERY_PLAN.md) §5
 > M3 for the authoritative, itemized owner-action list.
+>
+> **2026-09-06 follow-up (ChatGPT review).** The above had not evaluated one
+> legitimate free candidate for the PIT S&P 500 membership and as-of GICS
+> GAP rows: MediaWiki's own contemporaneous revision history for the
+> Wikipedia S&P 500 article. That evaluation is now built and tested
+> (`trading_market_data_core.dataset_v1_wikipedia_pit`) and referenced from
+> `ASOF_GICS_BLOCKER["free_secondary_research_alternative"]`. It provides a
+> free, cross-checked `SECONDARY_RESEARCH_PIT` path usable for
+> `BacktestQuality.APPROXIMATE` research only (ADR-0017) — it does not close
+> either GAP row, which remain WAITING_EXTERNAL for **official** evidence.
 
 ## 1. Sourcing principle (owner correction #1)
 The remaining reference-data gaps do **not** have to be bought from one bundled

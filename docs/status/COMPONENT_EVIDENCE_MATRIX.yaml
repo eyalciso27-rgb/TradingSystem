@@ -25,12 +25,25 @@
 # snapshot archive hardening) and PR #106 (fail-closed corporate-action PIT
 # qualification — an offline, fixture-only validator) are MERGED and
 # COMPLETE. Do not recreate them. None of the three closes the frozen
-# strategy's required historical S&P 500 PIT membership or historical GICS
-# evidence: those remain WAITING_EXTERNAL. See
+# strategy's OFFICIAL historical S&P 500 PIT membership or OFFICIAL historical
+# GICS evidence requirement: those remain WAITING_EXTERNAL. See
 # docs/roadmaps/MVP_DELIVERY_PLAN.md §5 (M3) for the full gap accounting and
 # docs/status/PIT_DATASET_QUALIFICATION.md for the capability matrix.
+#
+# 2026-09-06 follow-up (ChatGPT review). The 2026-09-03 pass concluded no free
+# path existed at all for historical GICS/membership without evaluating one
+# legitimate candidate: MediaWiki's own contemporaneous revision history. That
+# evaluation is now built and tested
+# (trading_market_data_core.dataset_v1_wikipedia_pit; 17 offline tests) and
+# ASOF_GICS_BLOCKER now references it via free_secondary_research_alternative.
+# It provides a free, cross-checked SECONDARY_RESEARCH_PIT path usable for
+# BacktestQuality.APPROXIMATE research ONLY (ADR-0017); it does not, and
+# cannot, close the OFFICIAL/PIT_STRICT gap above, which is unchanged. Do not
+# recreate this evaluation; the one remaining dependency-safe task is to
+# actually run it against real data (A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD,
+# see MVP_DELIVERY_PLAN.md §5 M3 gap 5).
 version: "1.0"
-updated: "2026-09-03"
+updated: "2026-09-06"
 baseline: docs/baseline-v0.5/
 authoritative_prose: docs/roadmaps/TRADING_SYSTEM_MASTER_PLAN.md
 

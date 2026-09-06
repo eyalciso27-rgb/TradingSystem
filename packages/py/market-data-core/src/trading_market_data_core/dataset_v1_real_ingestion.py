@@ -57,6 +57,9 @@ from trading_market_data_core.dataset_v1_sources import (
     SourceAdapterError,
     SourceAuthority,
 )
+from trading_market_data_core.dataset_v1_wikipedia_pit import (
+    WIKIPEDIA_REVISION_HISTORY_EVALUATION,
+)
 
 REAL_INGESTION_VERSION = "dataset-v1-real-ingestion-1.0.0"
 
@@ -817,9 +820,18 @@ ASOF_GICS_BLOCKER: Mapping[str, object] = {
             " the official GICS assignment nor dated as a revision-safe series."
         ),
         "free_secondary": (
-            "Free datasets republish CURRENT classifications without effective or"
-            " knowledge dates, so they cannot answer an as-of question and would"
-            " back-project today's sector onto history."
+            "Free datasets that only republish CURRENT classifications carry no"
+            " effective or knowledge dates, so they cannot answer an as-of"
+            " question and would back-project today's sector onto history. A"
+            " DISTINCT contemporaneous-revision path was separately evaluated and"
+            " is NOT subject to that objection: MediaWiki's own revision history"
+            " for the Wikipedia S&P 500 article binds each observation to a"
+            " real, immutable, independently-verifiable revision id and"
+            " timestamp rather than to today's page state. See"
+            " 'free_secondary_research_alternative' below -- it remains a"
+            " non-authoritative SECONDARY source and does not close this"
+            " LICENSE_REQUIRED gap, but it is a real, evidence-bounded free path,"
+            " not an absent one."
         ),
     },
     "why_current_gics_is_insufficient": (
@@ -827,6 +839,11 @@ ASOF_GICS_BLOCKER: Mapping[str, object] = {
         " assignments change, and a security reclassified in 2023 would appear to"
         " have held that classification in 2018."
     ),
+    #: This does NOT close the LICENSE_REQUIRED gap above -- it replaces a
+    #: categorical "no free path exists" conclusion with an evidence-bounded
+    #: one. See docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3 and
+    #: dataset_v1_wikipedia_pit.WIKIPEDIA_REVISION_HISTORY_EVALUATION.
+    "free_secondary_research_alternative": WIKIPEDIA_REVISION_HISTORY_EVALUATION,
     "licensed_provider_must_supply": [
         "company-level GICS assignment per security",
         "effective date for each assignment",

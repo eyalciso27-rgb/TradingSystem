@@ -67,19 +67,25 @@ Every other track is plumbing by comparison.
 - **Exit:** `persistence` and `replay` move off fakes.
 - **Hard stop:** any look-ahead leak, or any field without a point-in-time
   timestamp.
-- **State (reconciled 2026-09-03): WAITING_EXTERNAL / BLOCKED_FOR_OWNER.**
-  Merged and complete — do not recreate: A-WP2 owner decision, forward S&P 500
-  snapshot hardening, DatasetManifest/no-look-ahead binding, the S&P
-  historical-secondary source registry (offline provenance only), the
-  current/forward S&P 500 + current-GICS archive hardening, and the
-  fail-closed corporate-action PIT validator (offline, fixture-only). Every
-  remaining gap — historical S&P 500 PIT membership, historical GICS,
-  survivorship-free delisted-name OHLCV, and real (not fixture) corporate-
-  action evidence — needs an owner-supplied artifact, a licensing decision, or
-  an owner-run against SEC EDGAR/IBKR. See
-  [`MVP_DELIVERY_PLAN.md`](MVP_DELIVERY_PLAN.md) §5 M3 for the authoritative,
-  itemized owner-action list. No further autonomous A-WP2 implementation task
-  exists until one of those owner actions lands.
+- **State (reconciled 2026-09-06): official/PIT_STRICT gaps stay
+  WAITING_EXTERNAL / BLOCKED_FOR_OWNER; one dependency-safe SECONDARY/
+  APPROXIMATE task is available.** Merged and complete — do not recreate:
+  A-WP2 owner decision, forward S&P 500 snapshot hardening,
+  DatasetManifest/no-look-ahead binding, the S&P historical-secondary source
+  registry (offline provenance only), the current/forward S&P 500 +
+  current-GICS archive hardening, the fail-closed corporate-action PIT
+  validator (offline, fixture-only), and the Wikipedia/MediaWiki
+  contemporaneous-revision SECONDARY PIT evaluation
+  (`dataset_v1_wikipedia_pit.py`, 2026-09-06). The official/PIT_STRICT gaps —
+  historical S&P 500 PIT membership, historical GICS, survivorship-free
+  delisted-name OHLCV, and real (not fixture) corporate-action evidence —
+  still need an owner-supplied artifact, a licensing decision, or an
+  owner-run against SEC EDGAR/IBKR; the Wikipedia-revision path never
+  substitutes for any of them (it is permanently `SECONDARY_RESEARCH_PIT`).
+  See [`MVP_DELIVERY_PLAN.md`](MVP_DELIVERY_PLAN.md) §5 M3 for the
+  authoritative, itemized owner-action list and the one dependency-safe next
+  task (`A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD`, needs only public
+  network access, no owner action).
 
 ### A-WP3 — Replay and in-sample backtest
 - **Work:** deterministic replay of the frozen manifest; in-sample backtest with
