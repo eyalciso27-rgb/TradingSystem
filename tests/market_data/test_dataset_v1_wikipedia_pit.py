@@ -342,6 +342,69 @@ def test_cross_check_requires_a_nonempty_secondary_set() -> None:
         )
 
 
+def test_cross_check_membership_refuses_a_later_revision_for_an_earlier_as_of() -> None:
+    """A later immutable revision must never be corroborated for an earlier decision."""
+    snapshot = _snapshot(revision_id=1, timestamp=REV_B_TS)  # 2020-06-15
+    earlier_as_of = date(2020, 1, 15)  # strictly before the revision's own timestamp
+    with pytest.raises(SourceAdapterError, match="no look-ahead"):
+        cross_check_membership(
+            wikipedia=snapshot,
+            secondary_tickers=snapshot.tickers(),
+            secondary_source_id="fja05680-sp500-github",
+            as_of=earlier_as_of,
+        )
+
+
+def test_cross_check_membership_allows_as_of_on_the_revision_date() -> None:
+    """The boundary case (same calendar day) must not be refused."""
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    result = cross_check_membership(
+        wikipedia=snapshot,
+        secondary_tickers=snapshot.tickers(),
+        secondary_source_id="fja05680-sp500-github",
+        as_of=REV_A_TS.date(),
+    )
+    assert result.corroborated is True
+
+
+@pytest.mark.parametrize("weakened_ratio", [0.0, -1.0, 0.5, 0.979999])
+def test_cross_check_membership_refuses_a_weakened_threshold(weakened_ratio: float) -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    with pytest.raises(SourceAdapterError, match="weaken"):
+        cross_check_membership(
+            wikipedia=snapshot,
+            secondary_tickers=snapshot.tickers(),
+            secondary_source_id="fja05680-sp500-github",
+            as_of=date(2020, 1, 15),
+            minimum_agreement_ratio=weakened_ratio,
+        )
+
+
+def test_cross_check_membership_refuses_a_threshold_above_one() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    with pytest.raises(SourceAdapterError, match="weaken"):
+        cross_check_membership(
+            wikipedia=snapshot,
+            secondary_tickers=snapshot.tickers(),
+            secondary_source_id="fja05680-sp500-github",
+            as_of=date(2020, 1, 15),
+            minimum_agreement_ratio=1.5,
+        )
+
+
+def test_cross_check_membership_allows_tightening_the_threshold() -> None:
+    """The override may only ever make the gate stricter, never looser."""
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    result = cross_check_membership(
+        wikipedia=snapshot,
+        secondary_tickers=snapshot.tickers(),
+        secondary_source_id="fja05680-sp500-github",
+        as_of=date(2020, 1, 15),
+        minimum_agreement_ratio=1.0,
+    )
+    assert result.corroborated is True
+
+
 # -- sector/GICS cross-check: deterministic coverage + anomaly handling -------
 
 
@@ -434,6 +497,71 @@ def test_cross_check_sectors_records_uncovered_tickers_separately() -> None:
     # Uncovered tickers are never counted as disagreements.
     uncovered_set = set(result.uncovered_tickers)
     assert not any(ticker in uncovered_set for ticker, _, _ in result.disagreements)
+
+
+def test_cross_check_sectors_refuses_a_later_revision_for_an_earlier_as_of() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_B_TS)  # 2020-06-15
+    secondary_sectors = {
+        o.ticker: o.gics_sector for o in snapshot.observations if o.gics_sector
+    }
+    with pytest.raises(SourceAdapterError, match="no look-ahead"):
+        cross_check_sectors(
+            wikipedia=snapshot,
+            secondary_sectors=secondary_sectors,
+            secondary_source_id="fixture-secondary-gics",
+            as_of=date(2020, 1, 15),
+        )
+
+
+@pytest.mark.parametrize("weakened_ratio", [0.0, -1.0, 0.5, 0.899999])
+def test_cross_check_sectors_refuses_a_weakened_coverage_threshold(weakened_ratio: float) -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    secondary_sectors = {
+        o.ticker: o.gics_sector for o in snapshot.observations if o.gics_sector
+    }
+    with pytest.raises(SourceAdapterError, match="weaken"):
+        cross_check_sectors(
+            wikipedia=snapshot,
+            secondary_sectors=secondary_sectors,
+            secondary_source_id="fixture-secondary-gics",
+            as_of=date(2020, 1, 15),
+            minimum_coverage_ratio=weakened_ratio,
+        )
+
+
+@pytest.mark.parametrize("weakened_ratio", [0.0, -1.0, 0.5, 0.899999])
+def test_cross_check_sectors_refuses_a_weakened_agreement_threshold(weakened_ratio: float) -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    secondary_sectors = {
+        o.ticker: o.gics_sector for o in snapshot.observations if o.gics_sector
+    }
+    with pytest.raises(SourceAdapterError, match="weaken"):
+        cross_check_sectors(
+            wikipedia=snapshot,
+            secondary_sectors=secondary_sectors,
+            secondary_source_id="fixture-secondary-gics",
+            as_of=date(2020, 1, 15),
+            minimum_agreement_ratio=weakened_ratio,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwarg", "value"),
+    [("minimum_coverage_ratio", 1.5), ("minimum_agreement_ratio", 1.5)],
+)
+def test_cross_check_sectors_refuses_a_threshold_above_one(kwarg: str, value: float) -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    secondary_sectors = {
+        o.ticker: o.gics_sector for o in snapshot.observations if o.gics_sector
+    }
+    with pytest.raises(SourceAdapterError, match="weaken"):
+        cross_check_sectors(
+            wikipedia=snapshot,
+            secondary_sectors=secondary_sectors,
+            secondary_source_id="fixture-secondary-gics",
+            as_of=date(2020, 1, 15),
+            **{kwarg: value},
+        )
 
 
 # -- provenance is verified, never trusted -------------------------------------

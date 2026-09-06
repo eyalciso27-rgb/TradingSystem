@@ -63,6 +63,16 @@ separate from the official capability machinery in ``dataset_v1.py`` /
 * it never accepts a single, uncorroborated revision as usable research
   evidence: :func:`cross_check_membership` is mandatory and every
   disagreement it finds is recorded, never silently dropped;
+* it never cross-checks a revision timestamped after the decision date being
+  checked: :func:`cross_check_membership` and :func:`cross_check_sectors`
+  both re-enforce the same no-look-ahead rule :func:`select_revision_as_of`
+  applies at selection time, so a later immutable revision cannot be handed
+  to either function directly and labeled/corroborated for an earlier
+  ``as_of``;
+* it never lets a caller weaken the mandatory corroboration gates: both
+  cross-check functions' ``minimum_*_ratio`` overrides are bounded to
+  ``[canonical_minimum, 1.0]`` and refuse anything outside that range —
+  the parameter exists to tighten a check in a test, never to loosen one;
 * it never admits GICS/sector values as corroborated evidence without an
   actual, independent, dated cross-check having been run
   (:func:`cross_check_sectors`) — capturing them is not the same as admitting
@@ -404,7 +414,35 @@ def cross_check_membership(
     (this mirrors the two-independent-source rule already enforced on the
     offline historical-source registry,
     ``config/data-sources/sp500-historical-source-registry.json``).
+
+    Fails closed, before any comparison is attempted, on two distinct misuse
+    classes:
+
+    * ``minimum_agreement_ratio`` outside ``[MINIMUM_CROSS_CHECK_AGREEMENT_RATIO,
+      1.0]`` -- the parameter exists for tests to tighten the gate, never to
+      weaken it. A caller passing 0.0 (or any value below the canonical
+      minimum) would silently corroborate evidence the canonical threshold
+      would have refused; that is rejected outright rather than honoured;
+    * ``wikipedia.revision.revision_timestamp`` dated AFTER ``as_of`` -- this
+      is the same no-look-ahead rule :func:`select_revision_as_of` enforces
+      when choosing a revision; enforcing it again here means a caller cannot
+      bypass it by handing this function a later revision directly and
+      claiming an earlier decision date for it.
     """
+    if not (MINIMUM_CROSS_CHECK_AGREEMENT_RATIO <= minimum_agreement_ratio <= 1.0):
+        raise SourceAdapterError(
+            f"minimum_agreement_ratio={minimum_agreement_ratio!r} would weaken the"
+            " mandatory corroboration gate; it must be between"
+            f" MINIMUM_CROSS_CHECK_AGREEMENT_RATIO ({MINIMUM_CROSS_CHECK_AGREEMENT_RATIO})"
+            " and 1.0 inclusive (fail closed)"
+        )
+    if wikipedia.revision.revision_timestamp.date() > as_of:
+        raise SourceAdapterError(
+            f"revision {wikipedia.revision.revision_id} is timestamped"
+            f" {wikipedia.revision.revision_timestamp.date().isoformat()}, after the"
+            f" decision date {as_of.isoformat()}; refusing to cross-check or label a"
+            " later revision for an earlier decision (no look-ahead)"
+        )
     if not secondary_tickers:
         raise SourceAdapterError(
             "cross-check requires a non-empty independent secondary ticker set;"
@@ -509,7 +547,34 @@ def cross_check_sectors(
     explicitly records that sector/GICS stays `CAPTURED_UNEVALUATED_NOT_ADMITTED`
     because no such independent dated source has been identified yet -- adding
     this function does not, by itself, change that claim.
+
+    Fails closed, before any comparison is attempted, on the same misuse
+    classes :func:`cross_check_membership` guards against: both ratio
+    overrides are refused outside their canonical-to-1.0 range (never
+    weakenable), and a revision timestamped after ``as_of`` is refused
+    (no look-ahead).
     """
+    if not (MINIMUM_SECTOR_COVERAGE_RATIO <= minimum_coverage_ratio <= 1.0):
+        raise SourceAdapterError(
+            f"minimum_coverage_ratio={minimum_coverage_ratio!r} would weaken the"
+            " mandatory sector coverage gate; it must be between"
+            f" MINIMUM_SECTOR_COVERAGE_RATIO ({MINIMUM_SECTOR_COVERAGE_RATIO}) and"
+            " 1.0 inclusive (fail closed)"
+        )
+    if not (MINIMUM_SECTOR_AGREEMENT_RATIO <= minimum_agreement_ratio <= 1.0):
+        raise SourceAdapterError(
+            f"minimum_agreement_ratio={minimum_agreement_ratio!r} would weaken the"
+            " mandatory sector corroboration gate; it must be between"
+            f" MINIMUM_SECTOR_AGREEMENT_RATIO ({MINIMUM_SECTOR_AGREEMENT_RATIO}) and"
+            " 1.0 inclusive (fail closed)"
+        )
+    if wikipedia.revision.revision_timestamp.date() > as_of:
+        raise SourceAdapterError(
+            f"revision {wikipedia.revision.revision_id} is timestamped"
+            f" {wikipedia.revision.revision_timestamp.date().isoformat()}, after the"
+            f" decision date {as_of.isoformat()}; refusing to cross-check or label a"
+            " later revision for an earlier decision (no look-ahead)"
+        )
     if not secondary_sectors:
         raise SourceAdapterError(
             "sector cross-check requires a non-empty independent secondary"
