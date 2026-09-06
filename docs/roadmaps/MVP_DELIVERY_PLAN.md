@@ -138,17 +138,26 @@ Any future strategy-semantic change requires a new version/fingerprint and the a
 
 ### M3 — Point-in-time strategy dataset and evidence
 
-**State (reconciled 2026-09-06, updated same day after independent review):
-official gaps stay WAITING_EXTERNAL / BLOCKED_FOR_OWNER; one dependency-safe
-SECONDARY/APPROXIMATE-research task (MEMBERSHIP only) is now available and
-backed by one real, recorded experiment** (see "Free contemporaneous-revision
-path evaluated" and "Remaining M3 gaps" below). Two review passes shaped this:
-a 2026-09-03 pass had concluded no free path existed at all for historical
-GICS/membership; a first ChatGPT review found that premature and required the
-path actually be evaluated; a second ChatGPT review then found the evaluation
-was fixture-only (no real revision fetched) and that the claim covered
-GICS/sector without an actual cross-check for it. Both are addressed below: a
-real experiment is now recorded, and the claim is narrowed to membership only.
+**State (reconciled 2026-09-06, updated same day after independent review,
+and again same day after A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD):
+official gaps stay WAITING_EXTERNAL / BLOCKED_FOR_OWNER; one
+SECONDARY/APPROXIMATE-research task (MEMBERSHIP only) is backed by one real,
+recorded experiment plus a now-complete, tested, resumable BATCH machinery;
+the real FULL-WINDOW dataset itself remains blocked on a new, precise,
+owner-gated requirement (`WINDOW_DEFINITION_REQUIRED`)** (see "Free
+contemporaneous-revision path evaluated" and "Remaining M3 gaps" below).
+Three passes shaped this: a 2026-09-03 pass had concluded no free path
+existed at all for historical GICS/membership; a first ChatGPT review found
+that premature and required the path actually be evaluated; a second
+ChatGPT review then found the evaluation was fixture-only (no real revision
+fetched) and that the claim covered GICS/sector without an actual
+cross-check for it; a third pass
+(A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD) built the reusable
+multi-date batch machinery and, on independently re-verifying that no
+absolute backtest-window date exists on main, recorded that gap precisely
+instead of fabricating one. All three are addressed below: a real experiment
+is recorded, the claim is narrowed to membership only, the batch machinery
+exists and is tested, and the window gap is explicit.
 
 Already merged (repository fact; do not rebuild):
 
@@ -170,6 +179,19 @@ Already merged (repository fact; do not rebuild):
   (`scripts/run_wikipedia_revision_history_experiment.py`,
   `docs/poi/evidence/dataset-v1/wikipedia-revision-history/experiment-2023-12-31.json`)
   — 2026-09-06, this reconciliation.
+- Deterministic, resumable, idempotent multi-date BATCH machinery on top of
+  the above (`WikipediaDatasetEntry` / `WikipediaDatasetStore` /
+  `run_wikipedia_revision_history_batch` / `build_dataset_manifest` in
+  `dataset_v1_wikipedia_pit.py`,
+  `scripts/run_wikipedia_revision_history_batch.py`), covered by 24 further
+  offline, fixture-based tests including tests proving a later revision
+  cannot enter the dataset through a retry, a resumed run, or a
+  hand-imported entry file. Does NOT fetch a full-window dataset: no
+  owner-approved absolute start/end date for the frozen strategy's backtest
+  window exists on main, recorded precisely as `WINDOW_DEFINITION_REQUIRED`
+  rather than fabricated — see "Remaining M3 gaps", gap 5, below. The single
+  real experiment above is unchanged. — 2026-09-06,
+  A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD.
 
 #### Validation machinery vs. empirical integration evidence
 
@@ -367,12 +389,25 @@ further autonomous implementation:
    evidence under `docs/poi/evidence/`.
 5. **The Wikipedia-revision SECONDARY/APPROXIMATE MEMBERSHIP research dataset
    covers exactly one date so far.** One real, bounded experiment has now
-   been fetched, verified and cross-checked (2023-12-31 — see above); the
-   full backtest-window dataset (many dates) has not been built. This is the
-   one gap below that is **not** owner-gated — it needs only public,
-   unauthenticated network access to MediaWiki's documented API, exactly the
-   same class of access already used for the CURRENT-universe refresh and
-   already exercised for the one recorded experiment.
+   been fetched, verified and cross-checked (2023-12-31 — see above), and the
+   reusable, deterministic, resumable, idempotent BATCH machinery to fetch
+   many dates now exists and is tested
+   (`WikipediaDatasetStore` / `run_wikipedia_revision_history_batch` /
+   `build_dataset_manifest`, `scripts/run_wikipedia_revision_history_batch.py`
+   — see "Already merged" above). The full backtest-window dataset (many
+   dates) has still not been built, and — unlike the earlier read of this gap
+   — the remaining blocker IS an owner decision, not just network access:
+   `docs/strategies/baseline-trend-breakout-v1.yaml` freezes only the
+   RELATIVE 60/20/20 chronological split and 60-month-context/12-month-
+   evaluation walk-forward proportions, with no ABSOLUTE calendar start/end
+   date anywhere on main. Fetching real dates without that anchor would mean
+   inventing which dates constitute "the full backtest window" — forbidden by
+   CLAUDE.md. Recorded precisely as `WINDOW_DEFINITION_REQUIRED`
+   (`dataset_v1_wikipedia_pit.WINDOW_DEFINITION_REQUIRED`). **Owner action
+   required (new):** supply an absolute start date and end date for the
+   frozen strategy's full backtest window (or approve an ADR that does), so
+   the existing relative split/walk-forward specification can be anchored to
+   real calendar dates and the machinery run for real, unmodified.
 6. **GICS/sector cross-check has no independent source to run against.**
    `cross_check_sectors` is built, deterministic and tested with fixtures,
    but has never been run against a real independent dated GICS source
@@ -383,28 +418,37 @@ further autonomous implementation:
 
 Items 1–4 are unchanged: every official/PIT_STRICT path forward requires an
 owner-supplied artifact, a licensing decision, or an owner-run with
-network/broker access that this worker may not perform. AutoDev must not
-select, plan, or fabricate work to close 1–4; it must wait for the named
-owner action and re-inspect `main` afterward.
+network/broker access that this worker may not perform. Item 5's MACHINERY is
+now dependency-safe and COMPLETE (2026-09-06,
+A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD), but building the real
+FULL-WINDOW dataset with it now also requires a named owner action (the
+absolute backtest window), exactly like 1–4. AutoDev must not select, plan,
+or fabricate work to close 1–5; it must wait for the named owner action(s)
+and re-inspect `main` afterward.
 
-**One dependency-safe autonomous M3 task now exists (item 5), encoded as the
-next bounded task:**
+**Item 5's machinery is built; the remaining work is owner-gated on
+`WINDOW_DEFINITION_REQUIRED`, encoded as the next bounded task:**
 
-> **A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD** — using the now-merged
-> and now-real-experiment-validated
-> `trading_market_data_core.dataset_v1_wikipedia_pit` machinery, fetch real
-> MediaWiki revisions of "List of S&P 500 companies" spanning the frozen
-> strategy's full backtest window (`fetch_revision_at_or_before` /
-> `fetch_revision_wikitext`; the recorded experiment above covers exactly one
-> date, 2023-12-31), cross-check each against an independent secondary source
-> (`cross_check_membership`; the recorded experiment already uses the
-> fja05680/sp500 community CSV), and record the resulting
+> **A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD** — the batch machinery
+> (`WikipediaDatasetStore` / `run_wikipedia_revision_history_batch` /
+> `build_dataset_manifest`,
+> `scripts/run_wikipedia_revision_history_batch.py`) is built and tested; the
+> FULL-WINDOW empirical dataset itself is NOT built, because no
+> owner-approved absolute start/end date for the frozen strategy's full
+> backtest window exists on main to fetch it against (see
+> `WINDOW_DEFINITION_REQUIRED` above). The real experiment above still covers
+> exactly one date (2023-12-31), unchanged. Once the owner (or an approved
+> ADR) supplies that absolute window, run
+> `scripts/run_wikipedia_revision_history_batch.py` over the resulting
+> calendar decision-date grid (`fetch_revision_at_or_before` /
+> `fetch_revision_wikitext`, cross-checked per date with
+> `cross_check_membership` against the fja05680/sp500 community CSV, exactly
+> as the single-date experiment already does) and record the resulting
 > SECONDARY_RESEARCH_PIT / `BacktestQuality.APPROXIMATE` MEMBERSHIP dataset
-> under `docs/poi/evidence/`
-> (`scripts/run_wikipedia_revision_history_experiment.py --as-of <date>` per
-> date). This does not close gaps 1, 2 or 4 above, and does not admit
-> GICS/sector evidence (gap 6) — the official/PIT_STRICT requirements stay
-> separately tracked and owner-gated — and must not be represented as such.
+> under `docs/poi/evidence/`. This does not close gaps 1, 2 or 4 above, and
+> does not admit GICS/sector evidence (gap 6) — the official/PIT_STRICT
+> requirements stay separately tracked and owner-gated — and must not be
+> represented as such.
 
 This mirrors `dataset_v1_wikipedia_pit.WIKIPEDIA_REVISION_HISTORY_EVALUATION["next_bounded_task"]`
 exactly; keep the two in sync if either changes.
@@ -719,7 +763,8 @@ Do not use chat history as the only durable record of a product/safety decision.
 ## 11. Immediate next-work rule
 
 **Reconciled 2026-09-06 (updated same day after a second independent
-review).** AutoDev has already merged the A-WP2 owner-decision (PR #100),
+review, and again same day after A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD).**
+AutoDev has already merged the A-WP2 owner-decision (PR #100),
 forward-S&P-snapshot (PR #101), DatasetManifest/no-look-ahead (PR #102), the
 S&P historical-secondary source registry (PR #104), the current/forward S&P
 500 + current-GICS archive hardening (PR #105), the corporate-action PIT
@@ -727,14 +772,23 @@ validator (PR #106), and the Wikipedia/MediaWiki contemporaneous-revision
 SECONDARY PIT evaluation (`dataset_v1_wikipedia_pit.py`, 2026-09-06),
 **including one real, recorded MediaWiki-revision experiment**
 (`scripts/run_wikipedia_revision_history_experiment.py --as-of 2023-12-31`;
-result under `docs/poi/evidence/dataset-v1/wikipedia-revision-history/`).
-**None of these may be recreated.** A prior Architect pass duplicated PR
-#104's task; this reconciliation exists to prevent that recurring. A second
-review found the first Wikipedia-path fix was fixture-only (no real
-experiment) and over-scoped (claimed GICS/sector without a cross-check for
-it); both are closed as of this update — do not re-litigate them, re-inspect
-the evidence file and the narrowed `WIKIPEDIA_REVISION_HISTORY_EVALUATION`
-scope instead.
+result under `docs/poi/evidence/dataset-v1/wikipedia-revision-history/`), and
+the deterministic, resumable, idempotent multi-date BATCH machinery built on
+top of it (`WikipediaDatasetStore` / `run_wikipedia_revision_history_batch` /
+`build_dataset_manifest`,
+`scripts/run_wikipedia_revision_history_batch.py`). **None of these may be
+recreated.** A prior Architect pass duplicated PR #104's task; this
+reconciliation exists to prevent that recurring. A second review found the
+first Wikipedia-path fix was fixture-only (no real experiment) and
+over-scoped (claimed GICS/sector without a cross-check for it); both are
+closed — do not re-litigate them, re-inspect the evidence file and the
+narrowed `WIKIPEDIA_REVISION_HISTORY_EVALUATION` scope instead. The batch
+machinery's FULL-WINDOW empirical dataset was NOT fetched, because no
+owner-approved absolute start/end date for the frozen strategy's full
+backtest window exists on main — recorded precisely as
+`WINDOW_DEFINITION_REQUIRED`, not fabricated; do not invent one, and do not
+re-attempt this same gap discovery — re-inspect `WINDOW_DEFINITION_REQUIRED`
+and gap 5 below instead.
 
 Having re-inspected `main` against §5 M3 (including the "Free
 contemporaneous-revision path evaluated AND experimentally recorded",
@@ -748,11 +802,17 @@ provider, or an owner-run with network/broker access. The Architect must
 **not** invent implementation work to close those; it must keep recording
 `WAITING_EXTERNAL` for them.
 
-**One dependency-safe autonomous M3 task now exists and is not owner-gated:**
-`A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD` (§5, gap 5) — it needs only
-public, unauthenticated network access to MediaWiki's documented API, exactly
-what the one recorded experiment already used. It must be scoped and reported
-honestly: it produces `SECONDARY_RESEARCH_PIT` / `BacktestQuality.APPROXIMATE`
+**`A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD` (§5, gap 5) is now DONE for
+its dependency-safe part and OWNER-GATED for the rest.** The batch machinery
+needed only public, unauthenticated network access to MediaWiki's documented
+API (exactly what the one recorded experiment already used) and is now built
+and tested. Building the real FULL-WINDOW dataset with it additionally
+requires an owner-approved absolute start/end date for the frozen strategy's
+backtest window — that does not exist on main, so it was not fetched, and
+this is recorded precisely as `WINDOW_DEFINITION_REQUIRED` rather than
+fabricated. Once that date range exists, running the machinery is
+dependency-safe again. It must be scoped and reported honestly either way: it
+produces `SECONDARY_RESEARCH_PIT` / `BacktestQuality.APPROXIMATE`
 **MEMBERSHIP** evidence only, GICS/sector stays
 `CAPTURED_UNEVALUATED_NOT_ADMITTED` (gap 6, no independent GICS source
 identified), and none of it closes or is represented as closing the official

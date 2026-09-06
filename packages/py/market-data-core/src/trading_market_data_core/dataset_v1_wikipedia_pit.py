@@ -33,6 +33,25 @@ The distinction that makes this a genuine PIT candidate, not a repeat of the
   observation reflects what the page asserted *at the time*, not today's
   page projected backward.
 
+A third review (A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD, same day) then
+asked for the one-date experiment to become a real multi-date dataset. Two
+things were verified before writing any of that code: (1) whether an
+owner-approved ABSOLUTE start/end date for the frozen strategy's full
+backtest window already existed anywhere on main -- it does not; only
+RELATIVE/proportional temporal structure is frozen (60/20/20 chronological
+splits, 60-month-context/12-month-evaluation/12-month-step walk-forward:
+``docs/strategies/baseline-trend-breakout-v1.yaml``); and (2) that inventing
+one would be exactly the kind of fabricated decision this project's rules
+forbid. So this module adds the reusable, deterministic, resumable and
+idempotent BATCH machinery (:class:`WikipediaDatasetEntry`,
+:class:`WikipediaDatasetStore`, :func:`run_wikipedia_revision_history_batch`,
+:func:`build_dataset_manifest`) and its offline tests, but does not fetch a
+fabricated set of "the" backtest-window dates: :data:`WINDOW_DEFINITION_REQUIRED`
+records that gap precisely, and ``WIKIPEDIA_REVISION_HISTORY_EVALUATION``
+carries it under ``"batch_dataset"`` so it cannot be silently dropped. The one
+already-recorded real experiment (2023-12-31) is unchanged and is not
+regenerated.
+
 Scope: membership vs. GICS/sector. The same table that carries tickers also
 carries the GICS Sector / GICS Sub-Industry columns already parsed by
 :mod:`sp500_wikitable`, so every :class:`WikipediaRevisionSnapshot` CAPTURES
@@ -104,9 +123,16 @@ unevaluated until an independent dated source is found.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import tempfile
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 from trading_market_data_core.dataset_v1_sources import SourceAdapterError, SourceAuthority
 from trading_market_data_core.sp500_current_universe import (
@@ -848,6 +874,792 @@ def fetch_revision_wikitext(
     return RawWikipediaRevisionFetch(snapshot=snapshot, raw_bytes=raw)
 
 
+# -- the WINDOW_DEFINITION_REQUIRED gap (checked, not invented) --------------
+
+#: Whether an owner-approved ABSOLUTE start/end date for the frozen
+#: ``baseline-trend-breakout-v1`` strategy's full historical backtest window
+#: exists anywhere on main was independently re-verified for
+#: A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD (2026-09-06). It does not.
+#: ``docs/strategies/baseline-trend-breakout-v1.yaml`` freezes only
+#: RELATIVE/proportional temporal structure -- ``splits.train`` (60%,
+#: chronological), ``splits.validation`` (20%, chronological, immediately
+#: follows Train), ``splits.test_oos`` (final 20%, chronological, locked) and
+#: ``splits.walk_forward`` (60-month context / 12-month evaluation / 12-month
+#: step) -- with no calendar anchor, and
+#: ``docs/strategies/STRATEGY_FREEZE_TEMPLATE.md`` section 10 ("Data splits
+#: and validation") leaves the Train/Validation/Test-OOS window date fields
+#: empty. Without an owner-approved anchor there is no non-arbitrary way to
+#: choose which real historical ``as_of`` dates constitute "the full backtest
+#: window", a trading-calendar cadence, or a history depth -- so none are
+#: invented here. This is a precise evidence/configuration gap, not
+#: permission to fabricate one, and it does not block the dependency-safe
+#: batch MACHINERY below, only the FULL-WINDOW empirical dataset.
+WINDOW_DEFINITION_REQUIRED: dict[str, object] = {
+    "status": "WINDOW_DEFINITION_REQUIRED",
+    "gap": (
+        "No owner-approved ABSOLUTE calendar start/end date for the frozen"
+        " baseline-trend-breakout-v1 strategy's full historical backtest"
+        " window exists anywhere on main (re-verified"
+        " 2026-09-06, A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD)."
+        " docs/strategies/baseline-trend-breakout-v1.yaml defines only"
+        " RELATIVE/proportional temporal structure: splits.train (60%,"
+        " chronological), splits.validation (20%, chronological, immediately"
+        " follows Train), splits.test_oos (final 20%, chronological, locked"
+        " until final evaluation) and splits.walk_forward (60-month context /"
+        " 12-month evaluation / 12-month step) -- none anchored to a calendar"
+        " date. docs/strategies/STRATEGY_FREEZE_TEMPLATE.md section 10 (Data"
+        " splits and validation) leaves the Train/Validation/Test-OOS window"
+        " date fields empty for this strategy."
+    ),
+    "what_this_task_completed_instead": (
+        "The reusable, deterministic, resumable and idempotent batch-build"
+        " machinery (WikipediaDatasetEntry, WikipediaDatasetStore,"
+        " run_wikipedia_revision_history_batch, build_dataset_manifest, and"
+        " scripts/run_wikipedia_revision_history_batch.py) plus offline,"
+        " fixture-based tests proving it is resumable, idempotent and"
+        " fail-closed against a later revision entering through a retry,"
+        " resume, or hand-imported dataset entry. The single already-recorded"
+        " real experiment (2023-12-31) is preserved unchanged, not"
+        " regenerated. No additional real MediaWiki fetch was performed by"
+        " this task: there is no owner-approved date, date range, or cadence"
+        " to fetch that would not itself be an invented choice."
+    ),
+    "unblocks_when": (
+        "the owner (or an approved ADR) supplies an absolute start date and"
+        " end date for the frozen strategy's full backtest window, anchoring"
+        " the existing relative 60/20/20 + 60-month/12-month walk-forward"
+        " specification to real calendar dates and the canonical"
+        " trading_domain.calendar decision-date grid. Once that exists, the"
+        " machinery built here runs unmodified to build the full-window"
+        " dataset."
+    ),
+    "does_not_block": (
+        "This gap blocks only the FULL-WINDOW empirical research dataset. It"
+        " does not block or weaken the single recorded 2023-12-31 experiment,"
+        " the batch machinery/tests built in this task, the official/licensed"
+        " ASOF_GICS_BLOCKER or pit_sp500_membership gaps (unchanged,"
+        " owner-gated), TRADING_READINESS, or Paper/Live authorization"
+        " (unaffected either way -- ADR-0017)."
+    ),
+}
+
+
+# -- deterministic, resumable, idempotent multi-date BATCH machinery ---------
+#
+# Everything below builds MULTIPLE dated MEMBERSHIP research observations
+# on top of the single-revision machinery above, using the SAME no-look-ahead
+# and mandatory-cross-check rules -- it never relaxes either. It does not,
+# by itself, choose which as_of dates to fetch: a caller (owner/agent, or
+# scripts/run_wikipedia_revision_history_batch.py) supplies the dates
+# explicitly, exactly because WINDOW_DEFINITION_REQUIRED above means there is
+# no canonical window to derive them from automatically.
+
+WIKIPEDIA_DATASET_ENTRY_SCHEMA_VERSION = "dataset-v1-wikipedia-pit-entry-1.0.0"
+DATASET_MANIFEST_SCHEMA_VERSION = "dataset-v1-wikipedia-pit-manifest-1.0.0"
+
+BATCH_OUTCOME_ADMITTED = "ADMITTED"
+BATCH_OUTCOME_RESUMED = "RESUMED_ALREADY_PRESENT"
+BATCH_OUTCOME_REFUSED_NOT_CORROBORATED = "REFUSED_NOT_CORROBORATED"
+BATCH_OUTCOME_FAILED = "FAILED"
+
+_VALID_BATCH_OUTCOMES = frozenset(
+    {
+        BATCH_OUTCOME_ADMITTED,
+        BATCH_OUTCOME_RESUMED,
+        BATCH_OUTCOME_REFUSED_NOT_CORROBORATED,
+        BATCH_OUTCOME_FAILED,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WikipediaDatasetEntry:
+    """One ADMITTED, dated MEMBERSHIP research observation in the batch dataset.
+
+    Deliberately stricter than :class:`WikipediaRevisionSnapshot` alone: this
+    type can only be constructed once a snapshot has ALREADY been bound to a
+    requested ``as_of`` date (no look-ahead) AND cross-checked and found
+    ``corroborated`` against an independent secondary source. An
+    uncorroborated cross-check, an as_of/cross_check mismatch, or a revision
+    dated after ``as_of`` is refused fail closed by the constructor itself --
+    never by caller discipline -- which is what makes this type usable as the
+    "this may be persisted as an admitted dataset entry" gate throughout the
+    rest of this module (:class:`WikipediaDatasetStore`,
+    :func:`run_wikipedia_revision_history_batch`).
+    """
+
+    as_of: date
+    snapshot: WikipediaRevisionSnapshot
+    cross_check: CrossCheckResult
+    #: When THIS process fetched/observed the revision -- distinct from
+    #: ``snapshot.revision.revision_timestamp`` (when MediaWiki saved it).
+    #: Deliberately excluded from :meth:`compute_checksum` (see there): two
+    #: fetches of the very same immutable revision, made at different real
+    #: times, must be treated as the SAME admitted observation, not a conflict.
+    fetch_observed_at: datetime
+    #: Path to the immutable raw MediaWiki API response bytes this snapshot
+    #: was parsed from (see :class:`WikipediaDatasetStore`).
+    raw_provenance_path: str
+
+    def __post_init__(self) -> None:
+        if self.snapshot.revision.revision_timestamp.date() > self.as_of:
+            raise SourceAdapterError(
+                f"revision {self.snapshot.revision.revision_id} is timestamped"
+                f" {self.snapshot.revision.revision_timestamp.date().isoformat()},"
+                f" after as_of {self.as_of.isoformat()}; refusing to admit a"
+                " later revision for an earlier decision date (no look-ahead)"
+            )
+        if self.cross_check.as_of != self.as_of:
+            raise SourceAdapterError(
+                f"cross-check as_of {self.cross_check.as_of.isoformat()} does not"
+                f" match entry as_of {self.as_of.isoformat()}; refusing to bind a"
+                " mismatched cross-check result"
+            )
+        if not self.cross_check.corroborated:
+            raise SourceAdapterError(
+                f"cross-check for as_of {self.as_of.isoformat()} is not"
+                f" corroborated ({self.cross_check.detail}); only corroborated"
+                " observations may be admitted to the research dataset"
+            )
+        if self.fetch_observed_at.tzinfo is None:
+            raise SourceAdapterError(
+                "fetch_observed_at must be timezone-aware (a real, recorded"
+                " instant, never a naive guess)"
+            )
+        if not self.raw_provenance_path.strip():
+            raise SourceAdapterError(
+                "a dataset entry requires a non-empty raw_provenance_path"
+            )
+
+    def body(self) -> dict[str, object]:
+        """The checksummed body -- deliberately excludes ``fetch_observed_at``.
+
+        See the field's docstring: two fetches of the identical immutable
+        revision at different real times must produce the identical checksum,
+        so a crash-recovery retry (fetch again, get the same revision, call
+        :meth:`WikipediaDatasetStore.accept` again) is recognised as an
+        idempotent no-op rather than a spurious conflict.
+        """
+        return {
+            "schema_version": WIKIPEDIA_DATASET_ENTRY_SCHEMA_VERSION,
+            "classification": CLASSIFICATION,
+            "backtest_quality": "APPROXIMATE",
+            "as_of": self.as_of.isoformat(),
+            "raw_provenance_path": self.raw_provenance_path,
+            "snapshot": self.snapshot.to_dict(),
+            "cross_check": {
+                "as_of": self.cross_check.as_of.isoformat(),
+                "secondary_source_id": self.cross_check.secondary_source_id,
+                "corroborated": self.cross_check.corroborated,
+                "agreement_ratio": self.cross_check.agreement_ratio,
+                "agreements": list(self.cross_check.agreements),
+                "only_in_wikipedia": list(self.cross_check.only_in_wikipedia),
+                "only_in_secondary": list(self.cross_check.only_in_secondary),
+                "detail": self.cross_check.detail,
+            },
+            "gics_sector_status": "CAPTURED_UNEVALUATED_NOT_ADMITTED",
+            "eligibility": {
+                "authoritative_official_evidence": False,
+                "eligible_for_promotion_without_validation": False,
+                "substitute_for_historical_gics": False,
+            },
+        }
+
+    def compute_checksum(self) -> str:
+        serialized = json.dumps(
+            self.body(), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        return "sha256:" + hashlib.sha256(serialized.encode("ascii")).hexdigest()
+
+    def to_dict(self) -> dict[str, object]:
+        payload = self.body()
+        payload["fetch_observed_at"] = self.fetch_observed_at.isoformat()
+        payload["entry_checksum"] = self.compute_checksum()
+        return payload
+
+
+def _snapshot_from_dict(payload: Mapping[str, object]) -> WikipediaRevisionSnapshot:
+    """Rebuild a :class:`WikipediaRevisionSnapshot` from its own ``to_dict()``.
+
+    Reconstruction re-runs every fail-closed check
+    :class:`WikipediaRevisionSnapshot` already enforces (classification,
+    source authority, checksum shape, plausible count, no duplicate tickers)
+    -- a hand-edited or corrupted file cannot bypass any of them by being
+    loaded back in rather than freshly parsed.
+    """
+    revision_payload = payload["revision"]
+    assert isinstance(revision_payload, Mapping)
+    revision = WikipediaRevisionRef(
+        page_title=str(revision_payload["page_title"]),
+        revision_id=int(str(revision_payload["revision_id"])),
+        revision_timestamp=datetime.fromisoformat(str(revision_payload["revision_timestamp"])),
+    )
+    raw_observations = payload.get("observations", ())
+    assert isinstance(raw_observations, Sequence)
+    observations = tuple(
+        WikipediaConstituentObservation(
+            ticker=str(o["ticker"]),
+            name=str(o.get("name", "")),
+            gics_sector=str(o["gics_sector"]) if o.get("gics_sector") else None,
+            gics_sub_industry=(
+                str(o["gics_sub_industry"]) if o.get("gics_sub_industry") else None
+            ),
+        )
+        for o in raw_observations
+    )
+    raw_diagnostics = payload.get("parse_diagnostics", ())
+    assert isinstance(raw_diagnostics, Sequence)
+    return WikipediaRevisionSnapshot(
+        revision=revision,
+        raw_checksum=str(payload["raw_checksum"]),
+        observations=observations,
+        parse_diagnostics=tuple(str(d) for d in raw_diagnostics),
+    )
+
+
+def _cross_check_from_dict(payload: Mapping[str, object]) -> CrossCheckResult:
+    """Rebuild a :class:`CrossCheckResult` from the full dict this module writes.
+
+    The dict shape here comes from :meth:`WikipediaDatasetEntry.body`,
+    deliberately NOT the same shape as :meth:`CrossCheckResult.to_dict`
+    (which reports ``agreement_count`` only, not the ticker list) -- this
+    module's own persisted form carries the full ``agreements`` list so a
+    stored entry round-trips exactly, with nothing lossily summarised away.
+    """
+    raw_agreements = payload.get("agreements", ())
+    raw_only_wikipedia = payload.get("only_in_wikipedia", ())
+    raw_only_secondary = payload.get("only_in_secondary", ())
+    assert isinstance(raw_agreements, Sequence)
+    assert isinstance(raw_only_wikipedia, Sequence)
+    assert isinstance(raw_only_secondary, Sequence)
+    return CrossCheckResult(
+        as_of=date.fromisoformat(str(payload["as_of"])),
+        secondary_source_id=str(payload["secondary_source_id"]),
+        corroborated=bool(payload["corroborated"]),
+        agreement_ratio=float(str(payload["agreement_ratio"])),
+        agreements=tuple(str(t) for t in raw_agreements),
+        only_in_wikipedia=tuple(str(t) for t in raw_only_wikipedia),
+        only_in_secondary=tuple(str(t) for t in raw_only_secondary),
+        detail=str(payload.get("detail", "")),
+    )
+
+
+def _entry_from_dict(payload: Mapping[str, object]) -> WikipediaDatasetEntry:
+    """Rebuild a :class:`WikipediaDatasetEntry`, re-running every constructor check.
+
+    This is what stops a hand-edited or externally "imported" JSON file --
+    e.g. one claiming a revision timestamped after its own ``as_of``, or a
+    cross-check that is not ``corroborated`` -- from ever becoming a usable
+    dataset entry merely by being placed on disk and loaded: every guard in
+    :meth:`WikipediaDatasetEntry.__post_init__` runs again here, on load, not
+    only at original construction time.
+    """
+    snapshot_payload = payload["snapshot"]
+    cross_check_payload = payload["cross_check"]
+    assert isinstance(snapshot_payload, Mapping)
+    assert isinstance(cross_check_payload, Mapping)
+    return WikipediaDatasetEntry(
+        as_of=date.fromisoformat(str(payload["as_of"])),
+        snapshot=_snapshot_from_dict(snapshot_payload),
+        cross_check=_cross_check_from_dict(cross_check_payload),
+        fetch_observed_at=datetime.fromisoformat(str(payload["fetch_observed_at"])),
+        raw_provenance_path=str(payload["raw_provenance_path"]),
+    )
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically (fsync-then-rename-then-dir-fsync).
+
+    A small, deliberate duplicate of
+    ``sp500_current_universe._atomic_write_bytes`` (same package, but a
+    private helper there) rather than a cross-module reach into another
+    module's internals -- the same duplication choice already made between
+    this module's real fetch helpers and
+    ``scripts/run_wikipedia_revision_history_experiment.py``'s.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+        descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+@contextlib.contextmanager
+def _flock(lock_path: Path) -> Iterator[None]:
+    """Serialize a read-check-write sequence across processes AND threads.
+
+    Mirrors ``sp500_current_universe.UniverseStore._locked``: an
+    exclusively-held ``fcntl.flock`` on a dedicated lock file blocks a second
+    writer rather than failing it outright, and is released automatically if
+    this process dies while holding it.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+@dataclass(frozen=True, slots=True)
+class WikipediaDatasetAcceptResult:
+    """The outcome of one :meth:`WikipediaDatasetStore.accept` call."""
+
+    as_of: date
+    entry_path: Path
+    raw_path: Path
+    already_written: bool
+
+
+class WikipediaDatasetStore:
+    """A deterministic, resumable, idempotent, write-once archive of
+    :class:`WikipediaDatasetEntry` records, one per ``as_of`` date.
+
+    Mirrors ``sp500_current_universe.UniverseStore`` deliberately: archived
+    entries are WRITE-ONCE per ``as_of`` -- a later call for the same date is
+    accepted only when it is semantically byte-identical (an idempotent retry
+    after a crash, or a resumed batch run), and any OTHER candidate for a
+    date already on record is refused rather than silently rewriting archived
+    history. A raw MediaWiki API response is stored once PER REVISION ID
+    (``revision-<id>.raw.json``), shared across every ``as_of`` date that
+    happens to resolve to the same immutable revision -- consecutive trading
+    days between two page edits legitimately do.
+
+    Loading ALWAYS re-validates: :meth:`load` re-runs every
+    :class:`WikipediaDatasetEntry` and :class:`WikipediaRevisionSnapshot`
+    constructor check and re-verifies the raw sidecar's checksum, so a
+    tampered or hand-imported file on disk can never be trusted merely
+    because it is present -- exactly the same "verified, not trusted" posture
+    :func:`fetch_revision_wikitext` already applies to a live fetch.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def _entry_path(self, as_of: date) -> Path:
+        return self.root / f"membership-{as_of.isoformat()}.json"
+
+    def _raw_path(self, revision_id: int) -> Path:
+        return self.root / f"revision-{revision_id}.raw.json"
+
+    def _entry_lock_path(self, as_of: date) -> Path:
+        return self.root / f".membership-{as_of.isoformat()}.lock"
+
+    def _raw_lock_path(self, revision_id: int) -> Path:
+        return self.root / f".revision-{revision_id}.lock"
+
+    def has(self, as_of: date) -> bool:
+        return self._entry_path(as_of).is_file()
+
+    def dates(self) -> tuple[date, ...]:
+        """Every ``as_of`` date currently archived, sorted ascending."""
+        if not self.root.is_dir():
+            return ()
+        found: list[date] = []
+        for path in self.root.glob("membership-*.json"):
+            try:
+                found.append(date.fromisoformat(path.stem.removeprefix("membership-")))
+            except ValueError:
+                continue  # not a dated entry file; ignore rather than fail closed here
+        return tuple(sorted(found))
+
+    def load(self, as_of: date) -> WikipediaDatasetEntry:
+        """Load and fully re-validate the entry archived for ``as_of``."""
+        path = self._entry_path(as_of)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise SourceAdapterError(f"unreadable dataset entry {path}: {error}") from error
+        if not isinstance(payload, dict):
+            raise SourceAdapterError(f"{path} is not a dataset entry JSON object")
+        entry = _entry_from_dict(payload)
+        declared = payload.get("entry_checksum")
+        recomputed = entry.compute_checksum()
+        if isinstance(declared, str) and declared and declared != recomputed:
+            raise SourceAdapterError(
+                f"{path}: dataset entry checksum mismatch (tampered or stale):"
+                f" declared {declared}, recomputed {recomputed}"
+            )
+        raw_path = self._raw_path(entry.snapshot.revision.revision_id)
+        if not raw_path.is_file():
+            raise SourceAdapterError(
+                f"{raw_path}: raw provenance sidecar is missing; refusing to"
+                " trust a dataset entry without its immutable raw artifact"
+            )
+        if not entry.snapshot.verify_raw_bytes(raw_path.read_bytes()):
+            raise SourceAdapterError(
+                f"{raw_path}: raw provenance no longer matches the recorded"
+                " checksum (tampered); refusing to trust this dataset entry"
+            )
+        return entry
+
+    def entries(self) -> tuple[WikipediaDatasetEntry, ...]:
+        """Every archived entry, fully re-validated, sorted by ``as_of``."""
+        return tuple(self.load(as_of) for as_of in self.dates())
+
+    def accept(
+        self, entry: WikipediaDatasetEntry, raw_bytes: bytes
+    ) -> WikipediaDatasetAcceptResult:
+        """Persist ``entry`` and its raw provenance, enforcing write-once + idempotence.
+
+        Fails closed before writing anything if ``raw_bytes`` does not
+        authenticate ``entry.snapshot.raw_checksum``. The raw sidecar
+        (keyed by revision id, locked independently so two different
+        ``as_of`` dates resolving to the same revision cannot race each
+        other) is written first; the entry (keyed by ``as_of``, write-once)
+        second -- a crash between the two leaves at most an unreferenced raw
+        sidecar, never an entry pointing at a raw artifact that was never
+        durably written.
+        """
+        if not entry.snapshot.verify_raw_bytes(raw_bytes):
+            raise SourceAdapterError(
+                f"raw bytes supplied for as_of {entry.as_of.isoformat()} do not"
+                " match the snapshot's own raw_checksum claim; refusing to"
+                " accept unverifiable provenance"
+            )
+        revision_id = entry.snapshot.revision.revision_id
+        raw_path = self._raw_path(revision_id)
+        entry_path = self._entry_path(entry.as_of)
+        with _flock(self._entry_lock_path(entry.as_of)):
+            already_written = False
+            if entry_path.is_file():
+                try:
+                    existing = self.load(entry.as_of)
+                except SourceAdapterError as error:
+                    raise SourceAdapterError(
+                        f"an archived dataset entry already exists at {entry_path}"
+                        f" and is unreadable ({error}); refusing to overwrite"
+                        " immutable provenance"
+                    ) from error
+                if existing.compute_checksum() != entry.compute_checksum():
+                    raise SourceAdapterError(
+                        f"a dataset entry for as_of {entry.as_of.isoformat()} is"
+                        f" already archived immutably at {entry_path} (bound to"
+                        f" revision {existing.snapshot.revision.revision_id});"
+                        " refusing to overwrite it with different content"
+                        " (write-once: a new observation needs a new as_of date,"
+                        " never a correction of a past one)"
+                    )
+                already_written = True
+            with _flock(self._raw_lock_path(revision_id)):
+                if raw_path.is_file():
+                    existing_raw = raw_path.read_bytes()
+                    if raw_artifact_checksum(existing_raw) != entry.snapshot.raw_checksum:
+                        raise SourceAdapterError(
+                            f"{raw_path} already exists with different content"
+                            " than the freshly supplied raw bytes for the same"
+                            " revision id; refusing to overwrite immutable raw"
+                            " provenance"
+                        )
+                else:
+                    _atomic_write_bytes(raw_path, raw_bytes)
+            if not already_written:
+                _atomic_write_bytes(
+                    entry_path,
+                    json.dumps(entry.to_dict(), indent=2, sort_keys=True).encode("utf-8"),
+                )
+        return WikipediaDatasetAcceptResult(
+            as_of=entry.as_of, entry_path=entry_path, raw_path=raw_path,
+            already_written=already_written,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WikipediaDatasetBatchRow:
+    """One requested ``as_of`` date's outcome from one batch run.
+
+    Every requested date gets exactly one row, whatever happened to it --
+    admitted, already resumed, refused for lacking corroboration, or a hard
+    fetch/parse failure. Nothing is silently dropped: a refusal or failure is
+    as visible in the returned result as a success.
+    """
+
+    as_of: date
+    outcome: str
+    detail: str
+    revision_id: int | None = None
+    agreement_ratio: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.outcome not in _VALID_BATCH_OUTCOMES:
+            raise SourceAdapterError(
+                f"unrecognised batch outcome {self.outcome!r}; must be one of"
+                f" {sorted(_VALID_BATCH_OUTCOMES)}"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "as_of": self.as_of.isoformat(),
+            "outcome": self.outcome,
+            "detail": self.detail,
+            "revision_id": self.revision_id,
+            "agreement_ratio": self.agreement_ratio,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class WikipediaDatasetBatchRunResult:
+    """Every row from one call to :func:`run_wikipedia_revision_history_batch`."""
+
+    rows: tuple[WikipediaDatasetBatchRow, ...]
+
+    def admitted_dates(self) -> tuple[date, ...]:
+        return tuple(row.as_of for row in self.rows if row.outcome == BATCH_OUTCOME_ADMITTED)
+
+    def by_outcome(self, outcome: str) -> tuple[WikipediaDatasetBatchRow, ...]:
+        return tuple(row for row in self.rows if row.outcome == outcome)
+
+    def to_dict(self) -> dict[str, object]:
+        return {"rows": [row.to_dict() for row in self.rows]}
+
+
+def run_wikipedia_revision_history_batch(
+    as_of_dates: Sequence[date],
+    *,
+    store: WikipediaDatasetStore,
+    secondary_tickers_at_or_before: Callable[[date], frozenset[str]],
+    secondary_source_id: str,
+    page_title: str = DEFAULT_PAGE_TITLE,
+    fetch_revision_at_or_before_fn: Callable[
+        ..., WikipediaRevisionRef
+    ] = fetch_revision_at_or_before,
+    fetch_revision_wikitext_fn: Callable[
+        ..., RawWikipediaRevisionFetch
+    ] = fetch_revision_wikitext,
+    now: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
+    timeout_seconds: float = 30.0,
+    user_agent: str = DEFAULT_USER_AGENT,
+) -> WikipediaDatasetBatchRunResult:
+    """Fetch, cross-check and archive one MEMBERSHIP observation per requested date.
+
+    Deterministic, resumable and idempotent:
+
+    * dates are processed in SORTED order regardless of the order requested,
+      so two calls with the same set (in any order) behave identically;
+    * a date already archived in ``store`` is RESUMED, not re-fetched --
+      ``fetch_revision_at_or_before_fn``/``fetch_revision_wikitext_fn`` are
+      never called for it, so a later real-world page edit can never
+      retroactively replace an already-admitted historical observation
+      through a resumed or retried run;
+    * a date whose cross-check is not corroborated is refused
+      (:data:`BATCH_OUTCOME_REFUSED_NOT_CORROBORATED`) and nothing is written
+      for it -- exactly the same mandatory-corroboration gate
+      :func:`cross_check_membership` already enforces, never weakened here;
+    * a fetch/parse/verification failure for one date
+      (:data:`BATCH_OUTCOME_FAILED`) does not abort the whole batch -- the
+      remaining requested dates are still attempted, and the failure is
+      recorded, never silently swallowed.
+
+    ``fetch_revision_at_or_before_fn``/``fetch_revision_wikitext_fn``/
+    ``secondary_tickers_at_or_before`` are injectable specifically so this
+    function is fully unit-testable without any network call; production
+    callers (``scripts/run_wikipedia_revision_history_batch.py``) pass the
+    real fetch functions and a real independent-secondary-source lookup.
+    """
+    if len(set(as_of_dates)) != len(as_of_dates):
+        raise SourceAdapterError(
+            "duplicate as_of dates requested in one batch run; each date must"
+            " appear at most once"
+        )
+    rows: list[WikipediaDatasetBatchRow] = []
+    for as_of in sorted(as_of_dates):
+        if store.has(as_of):
+            existing = store.load(as_of)
+            rows.append(
+                WikipediaDatasetBatchRow(
+                    as_of=as_of,
+                    outcome=BATCH_OUTCOME_RESUMED,
+                    detail=(
+                        f"already archived at revision"
+                        f" {existing.snapshot.revision.revision_id}; resumed,"
+                        " not re-fetched"
+                    ),
+                    revision_id=existing.snapshot.revision.revision_id,
+                    agreement_ratio=existing.cross_check.agreement_ratio,
+                )
+            )
+            continue
+        try:
+            revision_ref = fetch_revision_at_or_before_fn(
+                as_of, page_title=page_title, timeout_seconds=timeout_seconds,
+                user_agent=user_agent,
+            )
+            fetched = fetch_revision_wikitext_fn(
+                revision_ref, timeout_seconds=timeout_seconds, user_agent=user_agent
+            )
+            snapshot = fetched.snapshot
+            secondary_tickers = secondary_tickers_at_or_before(as_of)
+            cross_check = cross_check_membership(
+                wikipedia=snapshot, secondary_tickers=secondary_tickers,
+                secondary_source_id=secondary_source_id, as_of=as_of,
+            )
+        except SourceAdapterError as error:
+            rows.append(
+                WikipediaDatasetBatchRow(
+                    as_of=as_of, outcome=BATCH_OUTCOME_FAILED, detail=str(error)
+                )
+            )
+            continue
+        if not cross_check.corroborated:
+            rows.append(
+                WikipediaDatasetBatchRow(
+                    as_of=as_of,
+                    outcome=BATCH_OUTCOME_REFUSED_NOT_CORROBORATED,
+                    detail=cross_check.detail,
+                    revision_id=snapshot.revision.revision_id,
+                    agreement_ratio=cross_check.agreement_ratio,
+                )
+            )
+            continue
+        raw_path = store._raw_path(snapshot.revision.revision_id)  # noqa: SLF001
+        entry = WikipediaDatasetEntry(
+            as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+            fetch_observed_at=now(), raw_provenance_path=str(raw_path),
+        )
+        store.accept(entry, fetched.raw_bytes)
+        rows.append(
+            WikipediaDatasetBatchRow(
+                as_of=as_of, outcome=BATCH_OUTCOME_ADMITTED, detail=cross_check.detail,
+                revision_id=snapshot.revision.revision_id,
+                agreement_ratio=cross_check.agreement_ratio,
+            )
+        )
+    return WikipediaDatasetBatchRunResult(rows=tuple(rows))
+
+
+def build_dataset_manifest(
+    entries: Sequence[WikipediaDatasetEntry],
+    *,
+    requested_as_of_dates: Sequence[date] = (),
+    other_rows: Sequence[WikipediaDatasetBatchRow] = (),
+) -> WikipediaDatasetManifest:
+    """A deterministic, reproducible manifest over a set of admitted entries.
+
+    Pure function of its inputs: re-running it over byte-identical archived
+    entries (the write-once/idempotent guarantee :class:`WikipediaDatasetStore`
+    already provides) produces an identical ``content_fingerprint`` every
+    time -- re-running the batch build never silently changes previously
+    recorded snapshot provenance, and this manifest cannot either.
+    """
+    ordered_entries = tuple(sorted(entries, key=lambda entry: entry.as_of))
+    covered = tuple(entry.as_of for entry in ordered_entries)
+    if len(set(covered)) != len(covered):
+        raise SourceAdapterError(
+            "dataset manifest cannot be built over duplicate as_of entries"
+        )
+    requested = tuple(sorted(set(requested_as_of_dates)))
+    covered_set = set(covered)
+    gaps = tuple(
+        f"{requested_date.isoformat()}: requested but not admitted"
+        for requested_date in requested
+        if requested_date not in covered_set
+    )
+    ratios = [entry.cross_check.agreement_ratio for entry in ordered_entries]
+    disagreement_total = sum(
+        len(entry.cross_check.only_in_wikipedia) + len(entry.cross_check.only_in_secondary)
+        for entry in ordered_entries
+    )
+    aggregate: dict[str, object] = {
+        "admitted_count": len(ordered_entries),
+        "requested_count": len(requested),
+        "gap_count": len(gaps),
+        "other_row_count": len(other_rows),
+        "other_rows_by_outcome": {
+            outcome: sum(1 for row in other_rows if row.outcome == outcome)
+            for outcome in sorted(_VALID_BATCH_OUTCOMES)
+        },
+        "mean_agreement_ratio": (sum(ratios) / len(ratios)) if ratios else None,
+        "min_agreement_ratio": min(ratios) if ratios else None,
+        "disagreement_observation_count_total": disagreement_total,
+        "distinct_revision_ids": sorted({e.snapshot.revision.revision_id for e in ordered_entries}),
+    }
+    fingerprint_material = [
+        {
+            "as_of": entry.as_of.isoformat(),
+            "revision_id": entry.snapshot.revision.revision_id,
+            "revision_timestamp": entry.snapshot.revision.revision_timestamp.isoformat(),
+            "raw_checksum": entry.snapshot.raw_checksum,
+            "secondary_source_id": entry.cross_check.secondary_source_id,
+            "agreement_ratio": entry.cross_check.agreement_ratio,
+        }
+        for entry in ordered_entries
+    ]
+    serialized = json.dumps(
+        fingerprint_material, sort_keys=True, separators=(",", ":")
+    ).encode("ascii", "backslashreplace")
+    content_fingerprint = "sha256:" + hashlib.sha256(serialized).hexdigest()
+    return WikipediaDatasetManifest(
+        schema_version=DATASET_MANIFEST_SCHEMA_VERSION,
+        classification=CLASSIFICATION,
+        backtest_quality="APPROXIMATE",
+        date_coverage=covered,
+        requested_dates=requested,
+        gaps=gaps,
+        aggregate=aggregate,
+        content_fingerprint=content_fingerprint,
+        window_definition_status=WINDOW_DEFINITION_REQUIRED,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class WikipediaDatasetManifest:
+    """Dataset-level coverage/aggregate/reproducibility record over a batch run.
+
+    Never claims official evidence or PIT_STRICT quality (``eligibility`` in
+    :meth:`to_dict` is always the same all-``False`` record every other type
+    in this module carries) and always names the
+    :data:`WINDOW_DEFINITION_REQUIRED` gap so a reader of the manifest alone
+    -- without also reading this module -- cannot mistake partial date
+    coverage for a completed full-window dataset.
+    """
+
+    schema_version: str
+    classification: str
+    backtest_quality: str
+    date_coverage: tuple[date, ...]
+    requested_dates: tuple[date, ...]
+    gaps: tuple[str, ...]
+    aggregate: Mapping[str, object]
+    content_fingerprint: str
+    window_definition_status: Mapping[str, object]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "classification": self.classification,
+            "backtest_quality": self.backtest_quality,
+            "date_coverage": [d.isoformat() for d in self.date_coverage],
+            "date_coverage_count": len(self.date_coverage),
+            "requested_dates": [d.isoformat() for d in self.requested_dates],
+            "requested_date_count": len(self.requested_dates),
+            "gaps": list(self.gaps),
+            "aggregate": dict(self.aggregate),
+            "content_fingerprint": self.content_fingerprint,
+            "window_definition_status": dict(self.window_definition_status),
+            "eligibility": {
+                "authoritative_official_evidence": False,
+                "eligible_for_promotion_without_validation": False,
+                "substitute_for_historical_gics": False,
+            },
+        }
+
+
 # -- the evaluation record (referenced from ASOF_GICS_BLOCKER) ---------------
 
 #: This is a research-path EVALUATION, not a capability PASS. It never flips
@@ -957,12 +1769,38 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
         " bot-protection bypass); unit tests use recorded wikitext/JSON fixtures"
         " and never call these. Exercised for real in 'real_experiment' above."
     ),
+    "batch_dataset": {
+        "machinery": (
+            "WikipediaDatasetEntry / WikipediaDatasetStore /"
+            " run_wikipedia_revision_history_batch / build_dataset_manifest"
+            " (this module) plus scripts/run_wikipedia_revision_history_batch.py:"
+            " a deterministic, resumable, idempotent, write-once batch path"
+            " that fetches, independently verifies, cross-checks and archives"
+            " one MEMBERSHIP research observation per requested --as-of date,"
+            " and a reproducible dataset-level manifest (date coverage, gaps,"
+            " per-date agreement, aggregate disagreement counts, and a content"
+            " fingerprint that does not change on re-run over identical"
+            " archived evidence). Built 2026-09-06"
+            " (A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD) and covered by"
+            " offline, fixture-based tests, including tests proving a later"
+            " revision cannot enter the dataset through a retry, a resumed"
+            " run, or a hand-imported entry file."
+        ),
+        "full_window_status": WINDOW_DEFINITION_REQUIRED,
+    },
     "next_bounded_task": (
-        "A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD: using this now-merged"
-        " and now-real-experiment-validated machinery, fetch and cross-check"
-        " real revisions spanning the frozen strategy's full backtest window"
-        " (the real_experiment above covers exactly one date) and record the"
-        " resulting APPROXIMATE-quality MEMBERSHIP research dataset under"
+        "The batch MACHINERY for A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD"
+        " is now built and tested (see 'batch_dataset' above); the FULL-WINDOW"
+        " empirical dataset itself is NOT built, because no owner-approved"
+        " absolute start/end date for the frozen strategy's full backtest"
+        " window exists on main to fetch it against (see"
+        " WINDOW_DEFINITION_REQUIRED under 'batch_dataset'.'full_window_status')."
+        " The real_experiment above still covers exactly one date"
+        " (2023-12-31), unchanged. Once the owner (or an approved ADR) supplies"
+        " that absolute window, run"
+        " scripts/run_wikipedia_revision_history_batch.py over the resulting"
+        " calendar decision-date grid to build and record the"
+        " APPROXIMATE-quality MEMBERSHIP research dataset under"
         " docs/poi/evidence/; separately, identify and validate an independent"
         " dated GICS source before sector/GICS evidence from this path can be"
         " admitted. The official/licensed gap stays separately tracked in"
@@ -972,27 +1810,42 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
 
 
 __all__ = [
+    "BATCH_OUTCOME_ADMITTED",
+    "BATCH_OUTCOME_FAILED",
+    "BATCH_OUTCOME_REFUSED_NOT_CORROBORATED",
+    "BATCH_OUTCOME_RESUMED",
     "CLASSIFICATION",
+    "DATASET_MANIFEST_SCHEMA_VERSION",
     "DEFAULT_PAGE_TITLE",
     "MINIMUM_CROSS_CHECK_AGREEMENT_RATIO",
     "MINIMUM_SECTOR_AGREEMENT_RATIO",
     "MINIMUM_SECTOR_COVERAGE_RATIO",
+    "WIKIPEDIA_DATASET_ENTRY_SCHEMA_VERSION",
     "WIKIPEDIA_PIT_SCHEMA_VERSION",
     "WIKIPEDIA_REVISION_HISTORY_EVALUATION",
     "WIKIPEDIA_REVISION_LOOKUP_API_URL",
     "WIKIPEDIA_REVISION_METADATA_API_URL",
     "WIKIPEDIA_REVISION_PARSE_API_URL",
+    "WINDOW_DEFINITION_REQUIRED",
     "CrossCheckResult",
     "RawWikipediaRevisionFetch",
     "SectorCrossCheckResult",
     "WikipediaConstituentObservation",
+    "WikipediaDatasetAcceptResult",
+    "WikipediaDatasetBatchRow",
+    "WikipediaDatasetBatchRunResult",
+    "WikipediaDatasetEntry",
+    "WikipediaDatasetManifest",
+    "WikipediaDatasetStore",
     "WikipediaRevisionRef",
     "WikipediaRevisionSnapshot",
+    "build_dataset_manifest",
     "cross_check_membership",
     "cross_check_sectors",
     "fetch_revision_at_or_before",
     "fetch_revision_metadata",
     "fetch_revision_wikitext",
     "parse_revision_snapshot",
+    "run_wikipedia_revision_history_batch",
     "select_revision_as_of",
 ]

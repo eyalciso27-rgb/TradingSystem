@@ -39,6 +39,26 @@
 > to cross-check against). Neither the membership evidence nor the captured
 > GICS values close either GAP row below, which remain WAITING_EXTERNAL for
 > **official** evidence.
+>
+> **2026-09-06 follow-up (A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD,
+> same day).** Re-verified independently: no owner-approved ABSOLUTE
+> start/end date for the frozen strategy's full backtest window exists
+> anywhere on main (only the RELATIVE 60/20/20 chronological split and
+> 60-month-context/12-month-evaluation walk-forward proportions are frozen,
+> `docs/strategies/baseline-trend-breakout-v1.yaml`). Rather than invent one,
+> this task built the reusable, deterministic, resumable and idempotent BATCH
+> machinery on top of the single-date experiment above
+> (`WikipediaDatasetStore` / `run_wikipedia_revision_history_batch` /
+> `build_dataset_manifest` in `dataset_v1_wikipedia_pit.py`,
+> `scripts/run_wikipedia_revision_history_batch.py`), covered by offline,
+> fixture-based tests proving it is resumable, idempotent, and fail-closed
+> against a later revision entering the dataset through a retry, a resumed
+> run, or a hand-imported entry file. The single already-recorded real
+> experiment (2023-12-31) is unchanged. The gap is recorded precisely as
+> `WINDOW_DEFINITION_REQUIRED`
+> (`dataset_v1_wikipedia_pit.WINDOW_DEFINITION_REQUIRED`); it blocks only the
+> FULL-WINDOW empirical MEMBERSHIP research dataset, not this machinery, and
+> it does not touch either GAP row below.
 
 ## 1. Sourcing principle (owner correction #1)
 The remaining reference-data gaps do **not** have to be bought from one bundled

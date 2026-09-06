@@ -23,28 +23,39 @@ No network call is made anywhere in this file.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pytest
 from trading_market_data_core.dataset_v1_real_ingestion import ASOF_GICS_BLOCKER
 from trading_market_data_core.dataset_v1_sources import SourceAdapterError, SourceAuthority
 from trading_market_data_core.dataset_v1_wikipedia_pit import (
+    BATCH_OUTCOME_ADMITTED,
+    BATCH_OUTCOME_FAILED,
+    BATCH_OUTCOME_REFUSED_NOT_CORROBORATED,
+    BATCH_OUTCOME_RESUMED,
     CLASSIFICATION,
     MINIMUM_CROSS_CHECK_AGREEMENT_RATIO,
     MINIMUM_SECTOR_AGREEMENT_RATIO,
     WIKIPEDIA_REVISION_HISTORY_EVALUATION,
     WIKIPEDIA_REVISION_LOOKUP_API_URL,
     WIKIPEDIA_REVISION_PARSE_API_URL,
+    WINDOW_DEFINITION_REQUIRED,
     CrossCheckResult,
     RawWikipediaRevisionFetch,
     SectorCrossCheckResult,
     WikipediaConstituentObservation,
+    WikipediaDatasetEntry,
+    WikipediaDatasetStore,
     WikipediaRevisionRef,
     WikipediaRevisionSnapshot,
     _verify_revision_metadata,
+    build_dataset_manifest,
     cross_check_membership,
     cross_check_sectors,
     parse_revision_snapshot,
+    run_wikipedia_revision_history_batch,
     select_revision_as_of,
 )
 from trading_market_data_core.sp500_current_universe import (
@@ -716,3 +727,555 @@ def test_to_dict_never_claims_official_eligibility() -> None:
     revision_payload = payload["revision"]
     assert isinstance(revision_payload, dict)
     assert revision_payload["revision_id"] == 1
+
+
+# == A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD: multi-date batch =========
+#
+# Deterministic, offline proofs for WikipediaDatasetEntry / WikipediaDatasetStore
+# / run_wikipedia_revision_history_batch / build_dataset_manifest, and for the
+# WINDOW_DEFINITION_REQUIRED gap record. No network call is made anywhere here
+# either: fetch functions are always faked/injected.
+
+
+def _cross_check_for(
+    snapshot: WikipediaRevisionSnapshot, *, as_of: date, corroborated: bool = True
+) -> CrossCheckResult:
+    secondary = snapshot.tickers() if corroborated else frozenset({"ZZZZ", "YYYY", "XXXX"})
+    return cross_check_membership(
+        wikipedia=snapshot, secondary_tickers=secondary,
+        secondary_source_id="fja05680-sp500-github", as_of=as_of,
+    )
+
+
+def _entry_for(
+    *, as_of: date, revision_id: int, timestamp: datetime, raw_provenance_path: str = "raw.json"
+) -> WikipediaDatasetEntry:
+    snapshot = _snapshot(revision_id=revision_id, timestamp=timestamp)
+    cross_check = _cross_check_for(snapshot, as_of=as_of)
+    return WikipediaDatasetEntry(
+        as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+        fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
+        raw_provenance_path=raw_provenance_path,
+    )
+
+
+# -- WikipediaDatasetEntry: fail closed --------------------------------------
+
+
+def test_dataset_entry_refuses_a_revision_after_as_of() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_B_TS)  # 2020-06-15
+    earlier = date(2020, 1, 15)
+    cross_check = CrossCheckResult(
+        as_of=earlier, secondary_source_id="x", corroborated=True, agreement_ratio=1.0,
+        agreements=(), only_in_wikipedia=(), only_in_secondary=(), detail="fabricated for test",
+    )
+    with pytest.raises(SourceAdapterError, match="no look-ahead"):
+        WikipediaDatasetEntry(
+            as_of=earlier, snapshot=snapshot, cross_check=cross_check,
+            fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC), raw_provenance_path="raw.json",
+        )
+
+
+def test_dataset_entry_refuses_a_cross_check_as_of_mismatch() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    cross_check = _cross_check_for(snapshot, as_of=date(2020, 3, 1))
+    with pytest.raises(SourceAdapterError, match="does not"):
+        WikipediaDatasetEntry(
+            as_of=date(2020, 1, 15), snapshot=snapshot, cross_check=cross_check,
+            fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC), raw_provenance_path="raw.json",
+        )
+
+
+def test_dataset_entry_refuses_an_uncorroborated_cross_check() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    as_of = date(2020, 1, 15)
+    cross_check = _cross_check_for(snapshot, as_of=as_of, corroborated=False)
+    assert cross_check.corroborated is False
+    with pytest.raises(SourceAdapterError, match="not.*corroborated"):
+        WikipediaDatasetEntry(
+            as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+            fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC), raw_provenance_path="raw.json",
+        )
+
+
+def test_dataset_entry_refuses_a_naive_fetch_observed_at() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    as_of = date(2020, 1, 15)
+    cross_check = _cross_check_for(snapshot, as_of=as_of)
+    with pytest.raises(SourceAdapterError, match="timezone-aware"):
+        WikipediaDatasetEntry(
+            as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+            fetch_observed_at=datetime(2026, 9, 6), raw_provenance_path="raw.json",
+        )
+
+
+def test_dataset_entry_refuses_an_empty_raw_provenance_path() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    as_of = date(2020, 1, 15)
+    cross_check = _cross_check_for(snapshot, as_of=as_of)
+    with pytest.raises(SourceAdapterError, match="raw_provenance_path"):
+        WikipediaDatasetEntry(
+            as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+            fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC), raw_provenance_path="   ",
+        )
+
+
+def test_dataset_entry_checksum_ignores_fetch_observed_at() -> None:
+    """Two fetches of the SAME immutable revision at different real times must
+    be recognised as the SAME admitted observation (idempotent), never a
+    conflict -- this is what makes crash-recovery retries safe."""
+    as_of = date(2020, 1, 15)
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    cross_check = _cross_check_for(snapshot, as_of=as_of)
+    first = WikipediaDatasetEntry(
+        as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+        fetch_observed_at=datetime(2026, 9, 6, 10, 0, tzinfo=UTC), raw_provenance_path="raw.json",
+    )
+    second = WikipediaDatasetEntry(
+        as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+        fetch_observed_at=datetime(2026, 9, 6, 23, 59, tzinfo=UTC), raw_provenance_path="raw.json",
+    )
+    assert first.compute_checksum() == second.compute_checksum()
+
+
+def test_dataset_entry_to_dict_round_trips() -> None:
+    entry = _entry_for(revision_id=1, timestamp=REV_A_TS, as_of=date(2020, 1, 15))
+    payload = entry.to_dict()
+    assert payload["classification"] == "SECONDARY_RESEARCH_PIT"
+    assert payload["backtest_quality"] == "APPROXIMATE"
+    assert payload["gics_sector_status"] == "CAPTURED_UNEVALUATED_NOT_ADMITTED"
+    assert payload["eligibility"] == {
+        "authoritative_official_evidence": False,
+        "eligible_for_promotion_without_validation": False,
+        "substitute_for_historical_gics": False,
+    }
+
+
+# -- WikipediaDatasetStore: resumable, idempotent, write-once, verified-on-load
+
+
+def test_store_accepts_and_reloads_an_entry(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    wikitext = _wikitext_table()
+    raw_bytes = _raw(wikitext)
+    snapshot = parse_revision_snapshot(
+        wikitext, raw_bytes=raw_bytes, revision=_revision(1, REV_A_TS)
+    )
+    cross_check = _cross_check_for(snapshot, as_of=as_of)
+    entry = WikipediaDatasetEntry(
+        as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+        fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
+        raw_provenance_path=str(store._raw_path(1)),  # noqa: SLF001
+    )
+
+    assert store.has(as_of) is False
+    result = store.accept(entry, raw_bytes)
+    assert result.already_written is False
+    assert store.has(as_of) is True
+    assert store.dates() == (as_of,)
+
+    reloaded = store.load(as_of)
+    assert reloaded.compute_checksum() == entry.compute_checksum()
+    assert reloaded.snapshot.revision.revision_id == 1
+
+
+def test_store_accept_is_idempotent_on_retry(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    wikitext = _wikitext_table()
+    raw_bytes = _raw(wikitext)
+    snapshot = parse_revision_snapshot(
+        wikitext, raw_bytes=raw_bytes, revision=_revision(1, REV_A_TS)
+    )
+    cross_check = _cross_check_for(snapshot, as_of=as_of)
+    # Two SEPARATE entry objects for the identical real observation, built as
+    # if by two different fetch attempts (different fetch_observed_at) -- the
+    # crash-recovery-retry scenario.
+    first = WikipediaDatasetEntry(
+        as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+        fetch_observed_at=datetime(2026, 9, 6, 10, 0, tzinfo=UTC),
+        raw_provenance_path=str(store._raw_path(1)),  # noqa: SLF001
+    )
+    second = WikipediaDatasetEntry(
+        as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+        fetch_observed_at=datetime(2026, 9, 6, 23, 59, tzinfo=UTC),
+        raw_provenance_path=str(store._raw_path(1)),  # noqa: SLF001
+    )
+
+    first_result = store.accept(first, raw_bytes)
+    assert first_result.already_written is False
+    second_result = store.accept(second, raw_bytes)
+    assert second_result.already_written is True
+    assert store.dates() == (as_of,)
+    # The FIRST fetch's observation time is what survives -- a retry never
+    # silently updates previously recorded provenance.
+    reloaded = store.load(as_of)
+    assert reloaded.fetch_observed_at == datetime(2026, 9, 6, 10, 0, tzinfo=UTC)
+
+
+def test_store_accept_refuses_a_conflicting_candidate_for_the_same_as_of(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    original = _entry_for(
+        revision_id=1, timestamp=REV_A_TS, as_of=as_of,
+        raw_provenance_path=str(store._raw_path(1)),  # noqa: SLF001
+    )
+    original_wikitext = _wikitext_table()
+    store.accept(original, _raw(original_wikitext))
+
+    # A DIFFERENT revision (different content) for the SAME as_of date.
+    conflicting_wikitext = _wikitext_table(reclassify_first_n=5)
+    conflicting_raw = _raw(conflicting_wikitext)
+    conflicting_snapshot = parse_revision_snapshot(
+        conflicting_wikitext, raw_bytes=conflicting_raw, revision=_revision(2, REV_A_TS)
+    )
+    conflicting_cross_check = _cross_check_for(conflicting_snapshot, as_of=as_of)
+    conflicting_entry = WikipediaDatasetEntry(
+        as_of=as_of, snapshot=conflicting_snapshot, cross_check=conflicting_cross_check,
+        fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
+        raw_provenance_path=str(store._raw_path(2)),  # noqa: SLF001
+    )
+    with pytest.raises(SourceAdapterError, match="write-once"):
+        store.accept(conflicting_entry, conflicting_raw)
+    # The original entry must still be exactly what was first archived.
+    assert store.load(as_of).snapshot.revision.revision_id == 1
+
+
+def test_store_load_detects_tampered_raw_provenance(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    wikitext = _wikitext_table()
+    raw_bytes = _raw(wikitext)
+    snapshot = parse_revision_snapshot(
+        wikitext, raw_bytes=raw_bytes, revision=_revision(1, REV_A_TS)
+    )
+    cross_check = _cross_check_for(snapshot, as_of=as_of)
+    entry = WikipediaDatasetEntry(
+        as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+        fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
+        raw_provenance_path=str(store._raw_path(1)),  # noqa: SLF001
+    )
+    store.accept(entry, raw_bytes)
+
+    store._raw_path(1).write_bytes(raw_bytes + b"tampered")  # noqa: SLF001
+    with pytest.raises(SourceAdapterError, match="tampered"):
+        store.load(as_of)
+
+
+def test_store_load_refuses_a_hand_imported_entry_with_a_later_revision(tmp_path: Path) -> None:
+    """A file placed directly on disk (never through accept()) claiming a
+    revision timestamped AFTER its own as_of must be refused on load -- the
+    no-look-ahead guard is enforced by reconstruction, not by trusting
+    whichever process wrote the file."""
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    # Build a validly-admitted entry first, purely to get a realistic body
+    # shape, then hand-edit the as_of down so the bound revision (dated
+    # REV_B_TS, 2020-06-15) is now AFTER the claimed as_of -- exactly what an
+    # externally "imported" file might (incorrectly) assert.
+    snapshot = _snapshot(revision_id=1, timestamp=REV_B_TS)
+    cross_check = _cross_check_for(snapshot, as_of=date(2020, 6, 15))
+    legitimate = WikipediaDatasetEntry(
+        as_of=date(2020, 6, 15), snapshot=snapshot, cross_check=cross_check,
+        fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
+        raw_provenance_path=str(store._raw_path(1)),  # noqa: SLF001
+    )
+    payload = legitimate.to_dict()
+    payload["as_of"] = as_of.isoformat()  # hand-tamper: pretend this is an EARLIER date
+    cross_check_payload = payload["cross_check"]
+    assert isinstance(cross_check_payload, dict)
+    cross_check_payload["as_of"] = as_of.isoformat()
+    entry_path = tmp_path / f"membership-{as_of.isoformat()}.json"
+    entry_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SourceAdapterError, match="no look-ahead"):
+        store.load(as_of)
+
+
+def test_store_dates_and_entries_are_sorted(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    for as_of, revision_id, timestamp in (
+        (date(2020, 6, 15), 2, REV_B_TS),
+        (date(2020, 1, 15), 1, REV_A_TS),
+    ):
+        wikitext = _wikitext_table()
+        raw_bytes = _raw(wikitext)
+        snapshot = parse_revision_snapshot(
+            wikitext, raw_bytes=raw_bytes, revision=_revision(revision_id, timestamp)
+        )
+        cross_check = _cross_check_for(snapshot, as_of=as_of)
+        entry = WikipediaDatasetEntry(
+            as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+            fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
+            raw_provenance_path=str(store._raw_path(revision_id)),  # noqa: SLF001
+        )
+        store.accept(entry, raw_bytes)
+
+    assert store.dates() == (date(2020, 1, 15), date(2020, 6, 15))
+    entries = store.entries()
+    assert [e.as_of for e in entries] == [date(2020, 1, 15), date(2020, 6, 15)]
+
+
+# -- run_wikipedia_revision_history_batch: resumable, idempotent, fail-closed
+
+
+class _FakeFetcher:
+    """A deterministic, in-memory stand-in for the real MediaWiki fetch path.
+
+    Each call is counted so tests can prove a RESUMED date never triggers a
+    fetch.
+    """
+
+    def __init__(self, revisions: dict[date, tuple[int, datetime]]) -> None:
+        self._revisions = revisions
+        self.lookup_calls: list[date] = []
+        self.wikitext_calls: list[int] = []
+
+    def lookup(self, as_of: date, **_kwargs: object) -> WikipediaRevisionRef:
+        self.lookup_calls.append(as_of)
+        revision_id, timestamp = self._revisions[as_of]
+        return WikipediaRevisionRef(
+            page_title="List of S&P 500 companies", revision_id=revision_id,
+            revision_timestamp=timestamp,
+        )
+
+    def wikitext(
+        self, revision: WikipediaRevisionRef, **_kwargs: object
+    ) -> RawWikipediaRevisionFetch:
+        self.wikitext_calls.append(revision.revision_id)
+        wikitext = _wikitext_table()
+        raw = _raw(wikitext)
+        snapshot = parse_revision_snapshot(wikitext, raw_bytes=raw, revision=revision)
+        return RawWikipediaRevisionFetch(snapshot=snapshot, raw_bytes=raw)
+
+
+def _always_full_agreement() -> Callable[[date], frozenset[str]]:
+    def _lookup(as_of: date) -> frozenset[str]:
+        return frozenset(_ticker_for_index(i) for i in range(TABLE_ROW_COUNT))
+    return _lookup
+
+
+def test_batch_admits_new_dates(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    fetcher = _FakeFetcher({date(2020, 1, 15): (1, REV_A_TS)})
+    result = run_wikipedia_revision_history_batch(
+        [date(2020, 1, 15)], store=store,
+        secondary_tickers_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github",
+        fetch_revision_at_or_before_fn=fetcher.lookup,
+        fetch_revision_wikitext_fn=fetcher.wikitext,
+        now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
+    )
+    assert result.admitted_dates() == (date(2020, 1, 15),)
+    assert result.rows[0].outcome == BATCH_OUTCOME_ADMITTED
+    assert store.has(date(2020, 1, 15))
+
+
+def test_batch_resumes_already_archived_dates_without_refetching(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    fetcher = _FakeFetcher({
+        date(2020, 1, 15): (1, REV_A_TS),
+        date(2020, 6, 15): (2, REV_B_TS),
+    })
+    run_wikipedia_revision_history_batch(
+        [date(2020, 1, 15)], store=store,
+        secondary_tickers_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github",
+        fetch_revision_at_or_before_fn=fetcher.lookup,
+        fetch_revision_wikitext_fn=fetcher.wikitext,
+        now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
+    )
+    assert fetcher.lookup_calls == [date(2020, 1, 15)]
+
+    # A second, larger batch request that RE-REQUESTS the already-archived
+    # date alongside a genuinely new one.
+    result = run_wikipedia_revision_history_batch(
+        [date(2020, 6, 15), date(2020, 1, 15)], store=store,
+        secondary_tickers_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github",
+        fetch_revision_at_or_before_fn=fetcher.lookup,
+        fetch_revision_wikitext_fn=fetcher.wikitext,
+        now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
+    )
+    # The already-archived date was NEVER fetched again.
+    assert fetcher.lookup_calls == [date(2020, 1, 15), date(2020, 6, 15)]
+    outcomes = {row.as_of: row.outcome for row in result.rows}
+    assert outcomes[date(2020, 1, 15)] == BATCH_OUTCOME_RESUMED
+    assert outcomes[date(2020, 6, 15)] == BATCH_OUTCOME_ADMITTED
+    # Rows are returned in deterministic sorted order regardless of request order.
+    assert [row.as_of for row in result.rows] == [date(2020, 1, 15), date(2020, 6, 15)]
+
+
+def test_batch_resume_survives_a_later_valid_revision_for_the_same_date(tmp_path: Path) -> None:
+    """Proves the specific no-look-ahead-through-retry failure mode: even if a
+    later fetch WOULD return a different (but still valid, still
+    at-or-before) revision for an already-archived date, resuming never lets
+    it replace the original archived observation."""
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 6, 15)
+    first_fetcher = _FakeFetcher({as_of: (1, REV_A_TS)})
+    run_wikipedia_revision_history_batch(
+        [as_of], store=store, secondary_tickers_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github",
+        fetch_revision_at_or_before_fn=first_fetcher.lookup,
+        fetch_revision_wikitext_fn=first_fetcher.wikitext,
+        now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
+    )
+    archived_revision_id = store.load(as_of).snapshot.revision.revision_id
+    assert archived_revision_id == 1
+
+    # A hypothetical retry whose fetcher would now report revision 2 (still
+    # <= as_of) for the SAME date -- e.g. the page was edited again between
+    # runs, still before the decision date.
+    second_fetcher = _FakeFetcher({as_of: (2, REV_B_TS)})
+    result = run_wikipedia_revision_history_batch(
+        [as_of], store=store, secondary_tickers_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github",
+        fetch_revision_at_or_before_fn=second_fetcher.lookup,
+        fetch_revision_wikitext_fn=second_fetcher.wikitext,
+        now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
+    )
+    assert second_fetcher.lookup_calls == []  # never even attempted: resumed first
+    assert result.rows[0].outcome == BATCH_OUTCOME_RESUMED
+    assert store.load(as_of).snapshot.revision.revision_id == 1  # unchanged
+
+
+def test_batch_refuses_dates_that_fail_corroboration(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    fetcher = _FakeFetcher({date(2020, 1, 15): (1, REV_A_TS)})
+
+    def _no_agreement(as_of: date) -> frozenset[str]:
+        return frozenset({"FOREIGN1", "FOREIGN2", "FOREIGN3"})
+
+    result = run_wikipedia_revision_history_batch(
+        [date(2020, 1, 15)], store=store, secondary_tickers_at_or_before=_no_agreement,
+        secondary_source_id="fja05680-sp500-github",
+        fetch_revision_at_or_before_fn=fetcher.lookup,
+        fetch_revision_wikitext_fn=fetcher.wikitext,
+        now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
+    )
+    assert result.rows[0].outcome == BATCH_OUTCOME_REFUSED_NOT_CORROBORATED
+    assert result.admitted_dates() == ()
+    assert store.has(date(2020, 1, 15)) is False
+
+
+def test_batch_records_a_failure_without_aborting_the_rest(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+
+    def _lookup(as_of: date, **_kwargs: object) -> WikipediaRevisionRef:
+        if as_of == date(2020, 1, 15):
+            raise SourceAdapterError("simulated fetch failure")
+        return WikipediaRevisionRef(
+            page_title="List of S&P 500 companies", revision_id=2, revision_timestamp=REV_B_TS,
+        )
+
+    fetcher = _FakeFetcher({date(2020, 6, 15): (2, REV_B_TS)})
+    result = run_wikipedia_revision_history_batch(
+        [date(2020, 1, 15), date(2020, 6, 15)], store=store,
+        secondary_tickers_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github",
+        fetch_revision_at_or_before_fn=_lookup,
+        fetch_revision_wikitext_fn=fetcher.wikitext,
+        now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
+    )
+    outcomes = {row.as_of: row.outcome for row in result.rows}
+    assert outcomes[date(2020, 1, 15)] == BATCH_OUTCOME_FAILED
+    assert outcomes[date(2020, 6, 15)] == BATCH_OUTCOME_ADMITTED
+
+
+def test_batch_refuses_duplicate_requested_dates(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    fetcher = _FakeFetcher({date(2020, 1, 15): (1, REV_A_TS)})
+    with pytest.raises(SourceAdapterError, match="duplicate"):
+        run_wikipedia_revision_history_batch(
+            [date(2020, 1, 15), date(2020, 1, 15)], store=store,
+            secondary_tickers_at_or_before=_always_full_agreement(),
+            secondary_source_id="fja05680-sp500-github",
+            fetch_revision_at_or_before_fn=fetcher.lookup,
+            fetch_revision_wikitext_fn=fetcher.wikitext,
+            now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
+        )
+
+
+# -- build_dataset_manifest: deterministic, reproducible, gap-aware ----------
+
+
+def test_manifest_is_deterministic_across_rebuilds(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    fetcher = _FakeFetcher({
+        date(2020, 1, 15): (1, REV_A_TS),
+        date(2020, 6, 15): (2, REV_B_TS),
+    })
+    run_wikipedia_revision_history_batch(
+        [date(2020, 1, 15), date(2020, 6, 15)], store=store,
+        secondary_tickers_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github",
+        fetch_revision_at_or_before_fn=fetcher.lookup,
+        fetch_revision_wikitext_fn=fetcher.wikitext,
+        now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
+    )
+    manifest_1 = build_dataset_manifest(store.entries())
+    manifest_2 = build_dataset_manifest(store.entries())
+    assert manifest_1.content_fingerprint == manifest_2.content_fingerprint
+    assert manifest_1.date_coverage == (date(2020, 1, 15), date(2020, 6, 15))
+    assert manifest_1.aggregate["admitted_count"] == 2
+    assert manifest_1.aggregate["mean_agreement_ratio"] == pytest.approx(1.0)
+
+
+def test_manifest_records_gaps_for_requested_but_unadmitted_dates(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    fetcher = _FakeFetcher({date(2020, 1, 15): (1, REV_A_TS)})
+    run_wikipedia_revision_history_batch(
+        [date(2020, 1, 15)], store=store,
+        secondary_tickers_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github",
+        fetch_revision_at_or_before_fn=fetcher.lookup,
+        fetch_revision_wikitext_fn=fetcher.wikitext,
+        now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
+    )
+    manifest = build_dataset_manifest(
+        store.entries(), requested_as_of_dates=[date(2020, 1, 15), date(2020, 12, 31)],
+    )
+    assert len(manifest.gaps) == 1
+    assert "2020-12-31" in manifest.gaps[0]
+
+
+def test_manifest_never_claims_eligibility_and_names_window_gap(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    manifest = build_dataset_manifest(store.entries())
+    payload = manifest.to_dict()
+    assert payload["classification"] == "SECONDARY_RESEARCH_PIT"
+    assert payload["backtest_quality"] == "APPROXIMATE"
+    assert payload["eligibility"] == {
+        "authoritative_official_evidence": False,
+        "eligible_for_promotion_without_validation": False,
+        "substitute_for_historical_gics": False,
+    }
+    window_status = payload["window_definition_status"]
+    assert isinstance(window_status, dict)
+    assert window_status["status"] == "WINDOW_DEFINITION_REQUIRED"
+
+
+# -- WINDOW_DEFINITION_REQUIRED: a precise gap, never a fabricated window ----
+
+
+def test_window_definition_required_is_precise_and_non_fabricating() -> None:
+    assert WINDOW_DEFINITION_REQUIRED["status"] == "WINDOW_DEFINITION_REQUIRED"
+    gap_text = WINDOW_DEFINITION_REQUIRED["gap"]
+    assert isinstance(gap_text, str)
+    assert "baseline-trend-breakout-v1" in gap_text
+    assert "chronological" in gap_text  # describes the relative split, not a fabricated date
+    completed = WINDOW_DEFINITION_REQUIRED["what_this_task_completed_instead"]
+    assert isinstance(completed, str)
+    assert "2023-12-31" in completed
+
+
+def test_evaluation_record_references_batch_dataset_and_window_gap() -> None:
+    batch_dataset = WIKIPEDIA_REVISION_HISTORY_EVALUATION["batch_dataset"]
+    assert isinstance(batch_dataset, dict)
+    assert batch_dataset["full_window_status"] is WINDOW_DEFINITION_REQUIRED
+    next_task = WIKIPEDIA_REVISION_HISTORY_EVALUATION["next_bounded_task"]
+    assert isinstance(next_task, str)
+    assert "WINDOW_DEFINITION_REQUIRED" in next_task
+    # Must never claim the full-window dataset is complete.
+    assert "is NOT built" in next_task or "not built" in next_task.lower()
