@@ -6,7 +6,16 @@ categorical "no free path" conclusion without evaluating one specific
 candidate: MediaWiki's own, public, immutable **revision history** for the
 "List of S&P 500 companies" article, as distinct from scraping the CURRENT
 page (which is what ``sp500_current_universe.py`` does and which carries no
-effective/knowledge date at all).
+effective/knowledge date at all). A follow-up review (2026-09-06) then found
+two gaps in that first pass, both closed here: (1) the path had been proven
+only against fixtures, never a real MediaWiki revision -- see
+``scripts/run_wikipedia_revision_history_experiment.py`` and the recorded
+result under ``docs/poi/evidence/dataset-v1/wikipedia-revision-history/`` for
+the real, bounded experiment now performed; (2) the evaluation record claimed
+a bounded path for both membership AND GICS/sector while only membership had
+an actual independent cross-check -- the claim is now split explicitly (see
+"Scope: membership vs. GICS/sector" below) and provenance in
+:func:`fetch_revision_wikitext` is independently verified, not trusted.
 
 The distinction that makes this a genuine PIT candidate, not a repeat of the
 "free datasets only carry today's values" problem:
@@ -14,14 +23,29 @@ The distinction that makes this a genuine PIT candidate, not a repeat of the
 * every MediaWiki revision is immutable once saved, and the API returns its
   own ``revid`` and ``timestamp`` alongside the exact wikitext that existed at
   that revision — a real, independently-verifiable knowledge date, not one we
-  assert ourselves;
+  assert ourselves; :func:`fetch_revision_wikitext` re-derives both from
+  MediaWiki's OWN metadata for the exact revision id
+  (:func:`_verify_revision_metadata`) rather than trusting a caller's claim,
+  so a wrong page or a fabricated/stale timestamp is rejected fail closed
+  before it could be bound to real content;
 * binding a historical decision date to the *latest revision at or before*
   that date (never a later one — see :func:`select_revision_as_of`) means the
   observation reflects what the page asserted *at the time*, not today's
-  page projected backward;
-* the same table that carries tickers also carries the GICS Sector / GICS
-  Sub-Industry columns already parsed by :mod:`sp500_wikitable`, so one
-  mechanism answers both the membership and the GICS-as-of question.
+  page projected backward.
+
+Scope: membership vs. GICS/sector. The same table that carries tickers also
+carries the GICS Sector / GICS Sub-Industry columns already parsed by
+:mod:`sp500_wikitable`, so every :class:`WikipediaRevisionSnapshot` CAPTURES
+both. But only **membership** currently has a working independent
+cross-check (:func:`cross_check_membership`) and is therefore admissible
+SECONDARY research evidence. **GICS/sector-as-recorded is NOT currently
+cross-checked** — no independent, dated, free GICS source has been
+identified — and stays ``CAPTURED_UNEVALUATED_NOT_ADMITTED``
+(``WIKIPEDIA_REVISION_HISTORY_EVALUATION``): it is retained on the snapshot
+for future use, never claimed as corroborated evidence today.
+:func:`cross_check_sectors` exists, is deterministic, and is tested, so that
+claim can change the moment such a source exists — adding the function does
+not, by itself, change it.
 
 What this module explicitly does NOT do, per the owner decisions and
 ADR-0017 (repeated here because it is the entire point of keeping this
@@ -39,29 +63,38 @@ separate from the official capability machinery in ``dataset_v1.py`` /
 * it never accepts a single, uncorroborated revision as usable research
   evidence: :func:`cross_check_membership` is mandatory and every
   disagreement it finds is recorded, never silently dropped;
+* it never admits GICS/sector values as corroborated evidence without an
+  actual, independent, dated cross-check having been run
+  (:func:`cross_check_sectors`) — capturing them is not the same as admitting
+  them, and this module never conflates the two;
 * it never fabricates a revision, a timestamp or a checksum: every
   constructor here recomputes what it can verify and fails closed
   (:class:`trading_market_data_core.dataset_v1_sources.SourceAdapterError`)
   on anything missing, mismatched, or out of plausible range;
-* it never fetches anything during a test run: :func:`fetch_revision_at_or_before`
-  and :func:`fetch_revision_wikitext` are owner-host-only real network calls
-  against MediaWiki's public, documented API (no authentication, no bot-
-  protection bypass — this is the same class of access already used, and
-  already accepted, for the CURRENT-universe refresh in
-  ``sp500_current_universe.py``); unit tests parse recorded wikitext strings
-  and never call them.
+* it never fetches anything during a test run: :func:`fetch_revision_at_or_before`,
+  :func:`fetch_revision_metadata` and :func:`fetch_revision_wikitext` are
+  owner/agent-run real network calls against MediaWiki's public, documented
+  API (no authentication, no bot-protection bypass — this is the same class
+  of access already used, and already accepted, for the CURRENT-universe
+  refresh in ``sp500_current_universe.py``); unit tests parse recorded
+  wikitext/JSON strings and never call them. The one exception is the bounded
+  real experiment recorded by ``scripts/run_wikipedia_revision_history_experiment.py``,
+  run once outside of CI/tests to produce the evidence this module's claim
+  depends on.
 
 Net effect on M3 (see ``docs/roadmaps/MVP_DELIVERY_PLAN.md`` §5): the official
 historical S&P membership and official historical GICS gaps remain
 WAITING_EXTERNAL / owner-gated, unchanged. A free, legitimate, cross-checked
-SECONDARY_RESEARCH_PIT path now exists and is usable for
-``BacktestQuality.APPROXIMATE`` research (ADR-0017) — it is not blocked, and
-it does not block the official gap from staying separately tracked.
+SECONDARY_RESEARCH_PIT path now exists FOR MEMBERSHIP, backed by one real
+recorded experiment, and is usable for ``BacktestQuality.APPROXIMATE``
+research (ADR-0017) — it is not blocked, and it does not block the official
+gap from staying separately tracked. GICS/sector from this source remains
+unevaluated until an independent dated source is found.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 
@@ -103,6 +136,17 @@ WIKIPEDIA_REVISION_LOOKUP_API_URL = (
     "?action=query&prop=revisions&titles={page_title}"
     "&rvlimit=1&rvdir=older&rvstart={rvstart}&rvprop=ids|timestamp"
     "&format=json&formatversion=2"
+)
+
+#: ``action=query&prop=revisions&revids=`` returns MediaWiki's OWN record of
+#: which page and what timestamp one specific revision id belongs to --
+#: independent of, and used to verify, whatever a caller claims. This is what
+#: makes provenance verified rather than trusted (see
+#: :func:`_verify_revision_metadata`).
+WIKIPEDIA_REVISION_METADATA_API_URL = (
+    "https://en.wikipedia.org/w/api.php"
+    "?action=query&prop=revisions&revids={revision_id}"
+    "&rvprop=ids|timestamp&format=json&formatversion=2"
 )
 
 
@@ -391,6 +435,133 @@ def cross_check_membership(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class SectorCrossCheckResult:
+    """Agreement/disagreement/coverage for GICS Sector between two sources.
+
+    Distinct from :class:`CrossCheckResult` (membership) because sector
+    agreement is only meaningful over tickers BOTH sources actually cover --
+    unlike membership, where "only in one side" is itself the signal, a
+    ticker missing a sector value on one side is a coverage gap, not a
+    disagreement, and the two must never be conflated.
+    """
+
+    as_of: date
+    secondary_source_id: str
+    corroborated: bool
+    coverage_ratio: float
+    agreement_ratio: float
+    covered_tickers: int
+    agreements: tuple[str, ...]
+    disagreements: tuple[tuple[str, str, str], ...]  # (ticker, wiki_sector, secondary_sector)
+    uncovered_tickers: tuple[str, ...]
+    detail: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "as_of": self.as_of.isoformat(),
+            "secondary_source_id": self.secondary_source_id,
+            "corroborated": self.corroborated,
+            "coverage_ratio": self.coverage_ratio,
+            "agreement_ratio": self.agreement_ratio,
+            "covered_tickers": self.covered_tickers,
+            "agreement_count": len(self.agreements),
+            "disagreement_count": len(self.disagreements),
+            "disagreements": [list(item) for item in self.disagreements],
+            "uncovered_ticker_count": len(self.uncovered_tickers),
+            "detail": self.detail,
+        }
+
+
+#: Below this ratio of Wikipedia tickers having a corroborating secondary
+#: sector value at all, the check is refused outright (fail closed) rather
+#: than reporting a possibly-meaningless ratio over a handful of tickers.
+MINIMUM_SECTOR_COVERAGE_RATIO = 0.90
+
+#: Below this ratio, of the COVERED tickers, agreeing on sector, the sector
+#: evidence is NOT corroborated. Looser than the membership threshold because
+#: sector taxonomies and boundary calls legitimately vary more between two
+#: independently-maintained sources than membership does.
+MINIMUM_SECTOR_AGREEMENT_RATIO = 0.90
+
+
+def cross_check_sectors(
+    *,
+    wikipedia: WikipediaRevisionSnapshot,
+    secondary_sectors: Mapping[str, str],
+    secondary_source_id: str,
+    as_of: date,
+    minimum_coverage_ratio: float = MINIMUM_SECTOR_COVERAGE_RATIO,
+    minimum_agreement_ratio: float = MINIMUM_SECTOR_AGREEMENT_RATIO,
+) -> SectorCrossCheckResult:
+    """Corroborate GICS Sector values against one independent SECONDARY source.
+
+    Deterministic, coverage- and anomaly-aware: a ticker the secondary source
+    does not cover is recorded as ``uncovered``, never silently treated as
+    agreement or disagreement, and every actual disagreement is recorded by
+    ticker with both sector values -- never reduced to a single ratio only.
+
+    This exists so GICS/sector-as-recorded from a Wikipedia revision CAN be
+    admitted as SECONDARY historical evidence once a real independent,
+    dated sector source is available to run it against. Until then, no
+    caller in this repository invokes this with anything but a fabricated or
+    fixture mapping in a test: ``WIKIPEDIA_REVISION_HISTORY_EVALUATION``
+    explicitly records that sector/GICS stays `CAPTURED_UNEVALUATED_NOT_ADMITTED`
+    because no such independent dated source has been identified yet -- adding
+    this function does not, by itself, change that claim.
+    """
+    if not secondary_sectors:
+        raise SourceAdapterError(
+            "sector cross-check requires a non-empty independent secondary"
+            " sector mapping; an empty mapping is not corroboration, it is the"
+            " absence of a check"
+        )
+    wiki_tickers = wikipedia.tickers()
+    covered = sorted(t for t in wiki_tickers if t in secondary_sectors)
+    uncovered = sorted(t for t in wiki_tickers if t not in secondary_sectors)
+    coverage_ratio = len(covered) / len(wiki_tickers) if wiki_tickers else 0.0
+    if coverage_ratio < minimum_coverage_ratio:
+        raise SourceAdapterError(
+            f"sector cross-check coverage {coverage_ratio:.4f} against"
+            f" {secondary_source_id} is below the minimum"
+            f" {minimum_coverage_ratio:.4f} ({len(covered)}/{len(wiki_tickers)}"
+            " tickers covered); refusing to report a ratio over too few"
+            " covered tickers (fail closed)"
+        )
+    agreements: list[str] = []
+    disagreements: list[tuple[str, str, str]] = []
+    for ticker in covered:
+        wiki_sector = wikipedia.gics_sector_of(ticker)
+        secondary_sector = secondary_sectors[ticker]
+        if wiki_sector is not None and wiki_sector.strip().casefold() == (
+            secondary_sector.strip().casefold()
+        ):
+            agreements.append(ticker)
+        else:
+            disagreements.append((ticker, wiki_sector or "", secondary_sector))
+    agreement_ratio = len(agreements) / len(covered) if covered else 0.0
+    corroborated = agreement_ratio >= minimum_agreement_ratio
+    detail = (
+        f"{len(agreements)}/{len(covered)} covered tickers agree on sector"
+        f" (coverage={coverage_ratio:.4f}, agreement_ratio={agreement_ratio:.4f},"
+        f" thresholds coverage>={minimum_coverage_ratio:.4f}"
+        f" agreement>={minimum_agreement_ratio:.4f}); {len(uncovered)} ticker(s)"
+        f" not covered by {secondary_source_id}"
+    )
+    return SectorCrossCheckResult(
+        as_of=as_of,
+        secondary_source_id=secondary_source_id,
+        corroborated=corroborated,
+        coverage_ratio=coverage_ratio,
+        agreement_ratio=agreement_ratio,
+        covered_tickers=len(covered),
+        agreements=tuple(agreements),
+        disagreements=tuple(disagreements),
+        uncovered_tickers=tuple(uncovered),
+        detail=detail,
+    )
+
+
 # -- the REAL fetch path (owner host only; never exercised in CI) ------------
 
 
@@ -455,8 +626,12 @@ def fetch_revision_at_or_before(
             f"no MediaWiki revision found for {page_title!r} at or before {as_of.isoformat()}"
         )
     revision = pages[0]["revisions"][0]
+    page = pages[0]
     return WikipediaRevisionRef(
-        page_title=page_title,
+        # MediaWiki normalizes the requested title (underscores, redirects);
+        # the page object's own "title" is what the revision actually belongs
+        # to, so it -- not the caller's input spelling -- is what gets bound.
+        page_title=str(page.get("title", page_title)),
         revision_id=int(revision["revid"]),
         revision_timestamp=datetime.fromisoformat(
             str(revision["timestamp"]).replace("Z", "+00:00")
@@ -464,36 +639,148 @@ def fetch_revision_at_or_before(
     )
 
 
+def fetch_revision_metadata(
+    revision_id: int,
+    *,
+    timeout_seconds: float = 30.0,
+    user_agent: str = DEFAULT_USER_AGENT,
+) -> bytes:
+    """Fetch MediaWiki's own page/timestamp record for one revision id.
+
+    Owner-host only. Kept separate from :func:`fetch_revision_wikitext` so
+    the verification logic in :func:`_verify_revision_metadata` can be unit
+    tested against a fabricated payload without any network call.
+    """
+    url = WIKIPEDIA_REVISION_METADATA_API_URL.format(revision_id=revision_id)
+    return _fetch_json(url, timeout_seconds=timeout_seconds, user_agent=user_agent)
+
+
+def _verify_revision_metadata(
+    claimed: WikipediaRevisionRef, metadata_raw: bytes
+) -> WikipediaRevisionRef:
+    """Extract MediaWiki's own page/timestamp record and fail closed on conflict.
+
+    ``claimed`` is whatever a caller (or a previous fetch step) asserts about
+    one revision id. ``metadata_raw`` is the raw bytes of a
+    ``action=query&prop=revisions&revids=<id>`` response for that SAME id,
+    fetched independently. This function trusts neither the caller's
+    ``page_title`` nor its ``revision_timestamp`` on their own -- it recomputes
+    both from MediaWiki's metadata and returns the VERIFIED reference, raising
+    if the metadata conflicts with what was claimed. This is what stops a
+    revision id being paired with the wrong page identity or a fabricated/
+    stale timestamp before either is bound to real content.
+    """
+    import json as _json
+
+    payload = _json.loads(metadata_raw.decode("utf-8"))
+    pages = (payload.get("query") or {}).get("pages") or []
+    if not pages:
+        raise SourceAdapterError(
+            f"MediaWiki returned no page for revision {claimed.revision_id};"
+            " refusing to bind unverified metadata"
+        )
+    page = pages[0]
+    revisions = page.get("revisions") or []
+    if not revisions:
+        raise SourceAdapterError(
+            f"MediaWiki returned no revision metadata for revision"
+            f" {claimed.revision_id}; refusing to bind unverified metadata"
+        )
+    revision_payload = revisions[0]
+    actual_revid = int(revision_payload["revid"])
+    if actual_revid != claimed.revision_id:
+        raise SourceAdapterError(
+            f"MediaWiki metadata reports revid {actual_revid}, not the requested"
+            f" {claimed.revision_id}; refusing to bind"
+        )
+    actual_title = str(page["title"])
+    claimed_title = claimed.page_title.replace("_", " ").strip().casefold()
+    if actual_title.replace("_", " ").strip().casefold() != claimed_title:
+        raise SourceAdapterError(
+            f"revision {claimed.revision_id} belongs to page {actual_title!r},"
+            f" not the claimed {claimed.page_title!r}; refusing to bind the"
+            " wrong page's identity to this revision"
+        )
+    actual_timestamp = datetime.fromisoformat(
+        str(revision_payload["timestamp"]).replace("Z", "+00:00")
+    )
+    if actual_timestamp != claimed.revision_timestamp:
+        raise SourceAdapterError(
+            f"revision {claimed.revision_id} was saved at"
+            f" {actual_timestamp.isoformat()}, not the claimed"
+            f" {claimed.revision_timestamp.isoformat()}; refusing to bind a"
+            " fabricated or stale timestamp"
+        )
+    return WikipediaRevisionRef(
+        page_title=actual_title, revision_id=actual_revid, revision_timestamp=actual_timestamp
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RawWikipediaRevisionFetch:
+    """A parsed revision snapshot plus the exact raw API response bytes.
+
+    Mirrors :class:`trading_market_data_core.sp500_current_universe.RawConstituentRefresh`:
+    ``snapshot.raw_checksum`` authenticates a claim, this pairs it with the
+    actual bytes so a caller (e.g. an evidence-recording script) can persist
+    genuine immutable raw provenance rather than re-deriving it.
+    """
+
+    snapshot: WikipediaRevisionSnapshot
+    raw_bytes: bytes
+
+
 def fetch_revision_wikitext(
     revision: WikipediaRevisionRef,
     *,
     timeout_seconds: float = 30.0,
     user_agent: str = DEFAULT_USER_AGENT,
-) -> WikipediaRevisionSnapshot:
+) -> RawWikipediaRevisionFetch:
     """Fetch and parse the exact wikitext of one immutable revision.
+
+    The page identity and revision timestamp bound to the returned snapshot
+    are VERIFIED against MediaWiki's own metadata for this exact revision id
+    (:func:`_verify_revision_metadata`) before anything is bound -- ``revision``
+    is a claim, used only to select which revision id to fetch; what actually
+    gets bound is what MediaWiki itself reports. A caller (or a stale/forged
+    reference) asserting the wrong page or the wrong timestamp for a real
+    revision id is rejected here, fail closed, rather than silently trusted.
+
+    Returns the raw API response bytes alongside the parsed snapshot
+    (:class:`RawWikipediaRevisionFetch`) so a caller can retain genuine
+    immutable raw provenance, not just the checksum claim.
 
     Owner-host only; unit tests call :func:`parse_revision_snapshot` directly
     against a recorded wikitext string and never call this.
     """
     import json as _json
 
-    url = WIKIPEDIA_REVISION_PARSE_API_URL.format(revision_id=revision.revision_id)
+    metadata_raw = fetch_revision_metadata(
+        revision.revision_id, timeout_seconds=timeout_seconds, user_agent=user_agent
+    )
+    verified_revision = _verify_revision_metadata(revision, metadata_raw)
+
+    url = WIKIPEDIA_REVISION_PARSE_API_URL.format(revision_id=verified_revision.revision_id)
     raw = _fetch_json(url, timeout_seconds=timeout_seconds, user_agent=user_agent)
     payload = _json.loads(raw.decode("utf-8"))
     parse = payload.get("parse")
     if not isinstance(parse, dict):
         raise SourceAdapterError(
-            f"revision {revision.revision_id} payload carries no MediaWiki parse result"
+            f"revision {verified_revision.revision_id} payload carries no MediaWiki"
+            " parse result"
         )
     wikitext = parse.get("wikitext")
     if not isinstance(wikitext, str):
-        raise SourceAdapterError(f"revision {revision.revision_id} payload carries no wikitext")
-    if int(parse.get("revid", revision.revision_id)) != revision.revision_id:
+        raise SourceAdapterError(
+            f"revision {verified_revision.revision_id} payload carries no wikitext"
+        )
+    if int(parse.get("revid", verified_revision.revision_id)) != verified_revision.revision_id:
         raise SourceAdapterError(
             "MediaWiki returned a different revid than requested; refusing to bind"
             " the wrong revision's content to this timestamp"
         )
-    return parse_revision_snapshot(wikitext, raw_bytes=raw, revision=revision)
+    snapshot = parse_revision_snapshot(wikitext, raw_bytes=raw, revision=verified_revision)
+    return RawWikipediaRevisionFetch(snapshot=snapshot, raw_bytes=raw)
 
 
 # -- the evaluation record (referenced from ASOF_GICS_BLOCKER) ---------------
@@ -504,23 +791,48 @@ def fetch_revision_wikitext(
 #: LICENSE_REQUIRED / owner-gated for the OFFICIAL requirement. This record
 #: exists so the "no free path at all" conclusion is replaced by an
 #: evidence-bounded one: a free, legitimate, cross-checked SECONDARY path DOES
-#: exist and IS usable for APPROXIMATE-quality research, per ADR-0017.
+#: exist for MEMBERSHIP and IS usable for APPROXIMATE-quality research, per
+#: ADR-0017 -- backed by one real, recorded experiment
+#: (``real_experiment`` below), not fixture machinery alone. GICS/sector from
+#: this source is explicitly NOT part of that claim (see ``sector_gics``).
 WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
-    "capability": "wikipedia_revision_history_secondary_pit",
+    "capability": "wikipedia_revision_history_secondary_pit_membership",
     "state": "SECONDARY_RESEARCH_AVAILABLE",
+    "scope": "MEMBERSHIP ONLY -- see 'sector_gics' for why GICS/sector is separate",
     "classification": CLASSIFICATION,
     "evaluated_at": "2026-09-03",
+    "real_experiment": {
+        "performed_at": "2026-09-06",
+        "performed_by": "scripts/run_wikipedia_revision_history_experiment.py",
+        "evidence_path": (
+            "docs/poi/evidence/dataset-v1/wikipedia-revision-history/"
+            "experiment-2023-12-31.json"
+        ),
+        "summary": (
+            "One real, bounded experiment was fetched and recorded (not just"
+            " fixture-tested): a real MediaWiki revision of 'List of S&P 500"
+            " companies' at or before 2023-12-31, with its page identity and"
+            " revision timestamp independently verified against MediaWiki's own"
+            " metadata for that exact revision id, cross-checked against the"
+            " independent fja05680/sp500 community CSV's own row at or before"
+            " the same date. See the evidence_path above for the full result"
+            " (revision id, timestamps, checksums, cross-check ratio)."
+        ),
+    },
     "mechanism": (
         "MediaWiki's public, documented revisions API (action=query/parse with"
         " oldid) returns the exact wikitext of 'List of S&P 500 companies' AS IT"
         " STOOD at one specific, immutable, timestamped revision. Binding a"
         " historical decision date to the latest revision at or before that date"
         " (select_revision_as_of; never a later one) yields a genuinely dated"
-        " observation of what the page asserted about GICS Sector/Sub-Industry"
-        " and constituent membership at that time -- distinct from scraping the"
-        " CURRENT page (sp500_current_universe.py), which carries no"
-        " effective/knowledge date and would back-project today's classification"
-        " onto history."
+        " observation of what the page asserted about constituent membership at"
+        " that time -- distinct from scraping the CURRENT page"
+        " (sp500_current_universe.py), which carries no effective/knowledge date"
+        " and would back-project today's classification onto history."
+        " fetch_revision_wikitext independently verifies the page identity and"
+        " revision timestamp against MediaWiki's own metadata for the exact"
+        " revision id before binding either to the fetched content -- neither is"
+        " trusted from a caller's claim."
     ),
     "why_secondary_not_official": (
         "Wikipedia is a community-maintained encyclopedia, not S&P Dow Jones"
@@ -533,19 +845,37 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
     "cross_check_mechanism": (
         "trading_market_data_core.dataset_v1_wikipedia_pit.cross_check_membership"
         " compares the revision-bound ticker set against an independent secondary"
-        " source (e.g. the fja05680/sp500 community CSV already recorded in"
-        " config/data-sources/sp500-historical-source-registry.json, once that"
-        " candidate is itself validated per that registry's rules) and records"
+        " source (the fja05680/sp500 community CSV on GitHub -- also recorded as"
+        " a SECONDARY_RESEARCH_PIT candidate in"
+        " config/data-sources/sp500-historical-source-registry.json) and records"
         " agreement/disagreement counts explicitly; it never silently drops a"
         " disagreement, and corroborated=False below the agreement threshold"
-        " blocks use, it does not merely warn."
+        " blocks use, it does not merely warn. Exercised for real in"
+        " 'real_experiment' above."
     ),
-    "usable_for": "BacktestQuality.APPROXIMATE research/backtest only (ADR-0017)",
+    "sector_gics": {
+        "status": "CAPTURED_UNEVALUATED_NOT_ADMITTED",
+        "explanation": (
+            "The same revision table carries GICS Sector / GICS Sub-Industry"
+            " columns, so every parsed observation captures them (see"
+            " primary_source.observations in the real_experiment evidence file)."
+            " But NO independent, dated, free GICS source has been identified to"
+            " cross-check them against, so sector/GICS values from this source"
+            " are NOT admitted as corroborated SECONDARY historical evidence --"
+            " they are retained on the snapshot for future use only."
+            " cross_check_sectors (deterministic, coverage- and anomaly-aware,"
+            " unit-tested) exists for the moment an independent dated GICS"
+            " source is identified; adding that function does not, by itself,"
+            " change this status."
+        ),
+    },
+    "usable_for": "BacktestQuality.APPROXIMATE research/backtest of MEMBERSHIP only (ADR-0017)",
     "not_usable_for": (
         "BacktestQuality.PIT_STRICT",
         "the asof_gics capability (stays BLOCKED_EXTERNAL / LICENSE_REQUIRED)",
         "the pit_sp500_membership capability (stays owner-gated on official"
         " S&P DJI announcements)",
+        "GICS/sector research evidence (see 'sector_gics': UNEVALUATED)",
         "final OOS/shadow qualification evidence",
         "any claim of S&P DJI official truth",
     ),
@@ -556,17 +886,22 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
     },
     "official_licensed_gap_status": "DEFERRED_NOT_BLOCKING",
     "fetch_mechanism": (
-        "fetch_revision_at_or_before / fetch_revision_wikitext in this module --"
-        " owner-host only, real network calls against the public MediaWiki API"
-        " (no authentication, no bot-protection bypass); unit tests use recorded"
-        " wikitext fixtures and never call these."
+        "fetch_revision_at_or_before / fetch_revision_metadata /"
+        " fetch_revision_wikitext in this module -- owner/agent-run, real"
+        " network calls against the public MediaWiki API (no authentication, no"
+        " bot-protection bypass); unit tests use recorded wikitext/JSON fixtures"
+        " and never call these. Exercised for real in 'real_experiment' above."
     ),
     "next_bounded_task": (
         "A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD: using this now-merged"
-        " machinery, fetch and cross-check real revisions spanning the frozen"
-        " strategy's backtest window and record the resulting APPROXIMATE-quality"
-        " research dataset under docs/poi/evidence/; the official/licensed gap"
-        " stays separately tracked in ASOF_GICS_BLOCKER and is not closed by this."
+        " and now-real-experiment-validated machinery, fetch and cross-check"
+        " real revisions spanning the frozen strategy's full backtest window"
+        " (the real_experiment above covers exactly one date) and record the"
+        " resulting APPROXIMATE-quality MEMBERSHIP research dataset under"
+        " docs/poi/evidence/; separately, identify and validate an independent"
+        " dated GICS source before sector/GICS evidence from this path can be"
+        " admitted. The official/licensed gap stays separately tracked in"
+        " ASOF_GICS_BLOCKER and is not closed by either."
     ),
 }
 
@@ -575,16 +910,23 @@ __all__ = [
     "CLASSIFICATION",
     "DEFAULT_PAGE_TITLE",
     "MINIMUM_CROSS_CHECK_AGREEMENT_RATIO",
+    "MINIMUM_SECTOR_AGREEMENT_RATIO",
+    "MINIMUM_SECTOR_COVERAGE_RATIO",
     "WIKIPEDIA_PIT_SCHEMA_VERSION",
     "WIKIPEDIA_REVISION_HISTORY_EVALUATION",
     "WIKIPEDIA_REVISION_LOOKUP_API_URL",
+    "WIKIPEDIA_REVISION_METADATA_API_URL",
     "WIKIPEDIA_REVISION_PARSE_API_URL",
     "CrossCheckResult",
+    "RawWikipediaRevisionFetch",
+    "SectorCrossCheckResult",
     "WikipediaConstituentObservation",
     "WikipediaRevisionRef",
     "WikipediaRevisionSnapshot",
     "cross_check_membership",
+    "cross_check_sectors",
     "fetch_revision_at_or_before",
+    "fetch_revision_metadata",
     "fetch_revision_wikitext",
     "parse_revision_snapshot",
     "select_revision_as_of",

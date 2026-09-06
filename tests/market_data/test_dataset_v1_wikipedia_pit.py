@@ -22,6 +22,7 @@ No network call is made anywhere in this file.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
 
 import pytest
@@ -30,14 +31,19 @@ from trading_market_data_core.dataset_v1_sources import SourceAdapterError, Sour
 from trading_market_data_core.dataset_v1_wikipedia_pit import (
     CLASSIFICATION,
     MINIMUM_CROSS_CHECK_AGREEMENT_RATIO,
+    MINIMUM_SECTOR_AGREEMENT_RATIO,
     WIKIPEDIA_REVISION_HISTORY_EVALUATION,
     WIKIPEDIA_REVISION_LOOKUP_API_URL,
     WIKIPEDIA_REVISION_PARSE_API_URL,
     CrossCheckResult,
+    RawWikipediaRevisionFetch,
+    SectorCrossCheckResult,
     WikipediaConstituentObservation,
     WikipediaRevisionRef,
     WikipediaRevisionSnapshot,
+    _verify_revision_metadata,
     cross_check_membership,
+    cross_check_sectors,
     parse_revision_snapshot,
     select_revision_as_of,
 )
@@ -139,6 +145,17 @@ def test_parse_revision_snapshot_rejects_a_payload_with_no_table() -> None:
         parse_revision_snapshot(
             "no table here", raw_bytes=b"no table here", revision=_revision(1, REV_A_TS)
         )
+
+
+def test_raw_wikipedia_revision_fetch_pairs_snapshot_with_real_bytes() -> None:
+    """The wrapper fetch_revision_wikitext returns -- authenticable, not re-derived."""
+    wikitext = _wikitext_table()
+    raw = _raw(wikitext)
+    snapshot = parse_revision_snapshot(wikitext, raw_bytes=raw, revision=_revision(1, REV_A_TS))
+    fetched = RawWikipediaRevisionFetch(snapshot=snapshot, raw_bytes=raw)
+    assert fetched.snapshot is snapshot
+    assert fetched.raw_bytes == raw
+    assert snapshot.verify_raw_bytes(fetched.raw_bytes) is True
 
 
 def test_verify_raw_bytes_authenticates_and_detects_tamper() -> None:
@@ -252,6 +269,27 @@ def test_select_revision_as_of_refuses_when_nothing_qualifies() -> None:
         select_revision_as_of([older], date(2019, 1, 1))
 
 
+def test_cross_check_uses_the_no_look_ahead_selected_revision() -> None:
+    """The full pipeline: select, then cross-check, never the later revision."""
+    older = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    newer = _snapshot(revision_id=2, timestamp=REV_B_TS, reclassify_first_n=5)
+    decision_date = date(2020, 3, 1)  # strictly between REV_A_TS and REV_B_TS
+
+    selected = select_revision_as_of([older, newer], decision_date)
+    assert selected.revision.revision_id == 1
+
+    result = cross_check_membership(
+        wikipedia=selected,
+        secondary_tickers=selected.tickers(),
+        secondary_source_id="fja05680-sp500-github",
+        as_of=decision_date,
+    )
+    assert result.corroborated is True
+    assert f"Wikipedia revision {selected.revision.revision_id}" in result.detail
+    # Never the newer revision's id, even though it exists in the pool.
+    assert f"revision {newer.revision.revision_id}" not in result.detail
+
+
 # -- mandatory independent cross-check -----------------------------------------
 
 
@@ -302,6 +340,190 @@ def test_cross_check_requires_a_nonempty_secondary_set() -> None:
             secondary_source_id="fja05680-sp500-github",
             as_of=date(2020, 1, 15),
         )
+
+
+# -- sector/GICS cross-check: deterministic coverage + anomaly handling -------
+
+
+def test_cross_check_sectors_reports_full_agreement() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    secondary_sectors = {
+        o.ticker: o.gics_sector for o in snapshot.observations if o.gics_sector
+    }
+    result = cross_check_sectors(
+        wikipedia=snapshot,
+        secondary_sectors=secondary_sectors,
+        secondary_source_id="fixture-secondary-gics",
+        as_of=date(2020, 1, 15),
+    )
+    assert isinstance(result, SectorCrossCheckResult)
+    assert result.corroborated is True
+    assert result.coverage_ratio == pytest.approx(1.0)
+    assert result.agreement_ratio == pytest.approx(1.0)
+    assert result.disagreements == ()
+    assert result.uncovered_tickers == ()
+
+
+def test_cross_check_sectors_records_disagreements_without_dropping_them() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    secondary_sectors = {
+        o.ticker: o.gics_sector for o in snapshot.observations if o.gics_sector
+    }
+    # Flip enough sectors to push agreement below the threshold.
+    flipped = dict(secondary_sectors)
+    for ticker in list(flipped)[:100]:
+        flipped[ticker] = "Utilities"
+    result = cross_check_sectors(
+        wikipedia=snapshot,
+        secondary_sectors=flipped,
+        secondary_source_id="fixture-secondary-gics",
+        as_of=date(2020, 1, 15),
+    )
+    assert result.corroborated is False
+    assert result.agreement_ratio < MINIMUM_SECTOR_AGREEMENT_RATIO
+    assert len(result.disagreements) == 100
+    # Every disagreement carries both sides' values, not just a count.
+    first = result.disagreements[0]
+    assert first[1] == "Information Technology"
+    assert first[2] == "Utilities"
+
+
+def test_cross_check_sectors_fails_closed_on_insufficient_coverage() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    tiny_coverage = dict(
+        list({o.ticker: o.gics_sector for o in snapshot.observations if o.gics_sector}.items())[
+            :5
+        ]
+    )
+    with pytest.raises(SourceAdapterError, match="coverage"):
+        cross_check_sectors(
+            wikipedia=snapshot,
+            secondary_sectors=tiny_coverage,
+            secondary_source_id="fixture-secondary-gics",
+            as_of=date(2020, 1, 15),
+        )
+
+
+def test_cross_check_sectors_requires_a_nonempty_secondary_mapping() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    with pytest.raises(SourceAdapterError, match="non-empty"):
+        cross_check_sectors(
+            wikipedia=snapshot,
+            secondary_sectors={},
+            secondary_source_id="fixture-secondary-gics",
+            as_of=date(2020, 1, 15),
+        )
+
+
+def test_cross_check_sectors_records_uncovered_tickers_separately() -> None:
+    """A ticker missing from the secondary source is a coverage gap, not a disagreement."""
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    secondary_sectors = {
+        o.ticker: o.gics_sector for o in snapshot.observations if o.gics_sector
+    }
+    # Drop coverage for a handful of tickers -- still above the coverage floor.
+    for ticker in list(secondary_sectors)[:10]:
+        del secondary_sectors[ticker]
+    result = cross_check_sectors(
+        wikipedia=snapshot,
+        secondary_sectors=secondary_sectors,
+        secondary_source_id="fixture-secondary-gics",
+        as_of=date(2020, 1, 15),
+    )
+    assert len(result.uncovered_tickers) == 10
+    # Uncovered tickers are never counted as disagreements.
+    uncovered_set = set(result.uncovered_tickers)
+    assert not any(ticker in uncovered_set for ticker, _, _ in result.disagreements)
+
+
+# -- provenance is verified, never trusted -------------------------------------
+
+
+def _metadata_payload(*, revid: int, title: str, timestamp: str) -> bytes:
+    return json.dumps(
+        {
+            "batchcomplete": True,
+            "query": {
+                "pages": [
+                    {
+                        "pageid": 2676045,
+                        "ns": 0,
+                        "title": title,
+                        "revisions": [{"revid": revid, "timestamp": timestamp}],
+                    }
+                ]
+            },
+        }
+    ).encode("utf-8")
+
+
+def test_verify_revision_metadata_returns_the_verified_reference() -> None:
+    claimed = _revision(1192789360, datetime(2023, 12, 31, 9, 32, 39, tzinfo=UTC))
+    metadata = _metadata_payload(
+        revid=1192789360,
+        title="List of S&P 500 companies",
+        timestamp="2023-12-31T09:32:39Z",
+    )
+    verified = _verify_revision_metadata(claimed, metadata)
+    assert verified.revision_id == 1192789360
+    assert verified.page_title == "List of S&P 500 companies"
+    assert verified.revision_timestamp == datetime(2023, 12, 31, 9, 32, 39, tzinfo=UTC)
+
+
+def test_verify_revision_metadata_rejects_a_mismatched_page_title() -> None:
+    claimed = _revision(1192789360, datetime(2023, 12, 31, 9, 32, 39, tzinfo=UTC))
+    metadata = _metadata_payload(
+        revid=1192789360,
+        title="List of NASDAQ-100 companies",  # a REAL page, wrong page
+        timestamp="2023-12-31T09:32:39Z",
+    )
+    with pytest.raises(SourceAdapterError, match="belongs to page"):
+        _verify_revision_metadata(claimed, metadata)
+
+
+def test_verify_revision_metadata_rejects_a_mismatched_timestamp() -> None:
+    claimed = _revision(1192789360, datetime(2023, 12, 31, 9, 32, 39, tzinfo=UTC))
+    metadata = _metadata_payload(
+        revid=1192789360,
+        title="List of S&P 500 companies",
+        timestamp="1999-01-01T00:00:00Z",  # fabricated/stale timestamp
+    )
+    with pytest.raises(SourceAdapterError, match="fabricated or stale timestamp"):
+        _verify_revision_metadata(claimed, metadata)
+
+
+def test_verify_revision_metadata_rejects_a_mismatched_revid() -> None:
+    claimed = _revision(1192789360, datetime(2023, 12, 31, 9, 32, 39, tzinfo=UTC))
+    metadata = _metadata_payload(
+        revid=999999999,  # MediaWiki reports a different revision entirely
+        title="List of S&P 500 companies",
+        timestamp="2023-12-31T09:32:39Z",
+    )
+    with pytest.raises(SourceAdapterError, match="reports revid"):
+        _verify_revision_metadata(claimed, metadata)
+
+
+def test_verify_revision_metadata_fails_closed_on_no_pages() -> None:
+    claimed = _revision(1192789360, datetime(2023, 12, 31, 9, 32, 39, tzinfo=UTC))
+    empty_metadata = json.dumps({"query": {"pages": []}}).encode("utf-8")
+    with pytest.raises(SourceAdapterError, match="no page"):
+        _verify_revision_metadata(claimed, empty_metadata)
+
+
+def test_verify_revision_metadata_is_case_and_underscore_insensitive_on_title() -> None:
+    """MediaWiki normalizes underscores/spaces; the check must not false-positive on that."""
+    claimed = WikipediaRevisionRef(
+        page_title="List_of_S&P_500_companies",
+        revision_id=1192789360,
+        revision_timestamp=datetime(2023, 12, 31, 9, 32, 39, tzinfo=UTC),
+    )
+    metadata = _metadata_payload(
+        revid=1192789360,
+        title="List of S&P 500 companies",
+        timestamp="2023-12-31T09:32:39Z",
+    )
+    verified = _verify_revision_metadata(claimed, metadata)
+    assert verified.page_title == "List of S&P 500 companies"
 
 
 # -- the evaluation record never becomes an official claim ---------------------

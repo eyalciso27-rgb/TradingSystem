@@ -156,20 +156,37 @@ real-account PoIs remain **BLOCKED**.
 > **These are readiness machinery for existing tasks; the canonical IMPLEMENTED
 > count is unchanged at 69.**
 
-> **A-WP2 canonical-state reconciliation (2026-09-03).** PR #104 (S&P
-> historical-secondary PIT source registry — offline provenance only, nothing
-> fetched or integrated), PR #105 (current/forward S&P 500 + current-GICS
-> immutable snapshot archive hardening) and PR #106 (fail-closed
-> corporate-action PIT qualification — an offline, fixture-only validator) are
-> **MERGED and complete; do not recreate them.** They are validation/ingestion
-> **machinery**, not empirical PIT integration evidence: no real historical
-> S&P 500 membership or historical GICS evidence has been admitted, because
-> both remain externally gated (owner-supplied official S&P documents;
-> licensed historical GICS — `LICENSE_REQUIRED`, no free source exists). M3 is
-> reconciled as **WAITING_EXTERNAL / BLOCKED_FOR_OWNER**; see
+> **A-WP2 canonical-state reconciliation (2026-09-03, updated 2026-09-06 after
+> two independent reviews).** PR #104 (S&P historical-secondary PIT source
+> registry — offline provenance only, nothing fetched or integrated), PR #105
+> (current/forward S&P 500 + current-GICS immutable snapshot archive
+> hardening) and PR #106 (fail-closed corporate-action PIT qualification — an
+> offline, fixture-only validator) are **MERGED and complete; do not recreate
+> them.** They are validation/ingestion **machinery**, not empirical PIT
+> integration evidence. No real **official** historical S&P 500 membership or
+> **official** historical GICS evidence has been admitted, because both remain
+> externally gated (owner-supplied official S&P documents; licensed historical
+> GICS — `LICENSE_REQUIRED`). Those official gaps are reconciled as
+> **WAITING_EXTERNAL / BLOCKED_FOR_OWNER**; see
 > [`MVP_DELIVERY_PLAN.md`](MVP_DELIVERY_PLAN.md) §5 M3 for the authoritative,
-> itemized owner-action list. No autonomous A-WP2/M3 implementation task
-> remains.
+> itemized owner-action list.
+>
+> A free **MEMBERSHIP** path was subsequently evaluated and experimentally
+> proven: MediaWiki's contemporaneous revision history
+> (`trading_market_data_core.dataset_v1_wikipedia_pit`), with ONE real,
+> recorded, cross-checked experiment
+> (`scripts/run_wikipedia_revision_history_experiment.py --as-of 2023-12-31`;
+> 503/503 tickers corroborated; evidence under
+> `docs/poi/evidence/dataset-v1/wikipedia-revision-history/`). It is
+> permanently `SECONDARY_RESEARCH_PIT`, usable only for
+> `BacktestQuality.APPROXIMATE` membership research, and does not close the
+> official gap above. GICS/sector values are captured from the same source
+> but stay `CAPTURED_UNEVALUATED_NOT_ADMITTED` — no independent, dated, free
+> GICS source has been identified to cross-check them against. One
+> dependency-safe, non-owner-gated task remains
+> (`A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD`: extend the one recorded
+> date to the full backtest window); do not recreate the evaluation or the
+> recorded experiment.
 
 > **A-WP1 — baseline hypothesis FROZEN (2026-08-13).** The owner completed
 > `STRATEGY_FREEZE_TEMPLATE.md` for `baseline-trend-breakout-v1` and it
@@ -467,13 +484,15 @@ Broker-mutating owner-runs are **serialized**: DEF-18, the fill path, DEF-20,
 Gateway restarts and destructive drills never overlap on one account.
 The single next strategy action is **building the point-in-time research
 dataset** for the now-FROZEN `baseline-trend-breakout-v1`, which needs no
-broker at all — but as of the 2026-09-03 reconciliation this action is itself
+broker at all. The **official, PIT_STRICT** dataset is
 **WAITING_EXTERNAL / BLOCKED_FOR_OWNER**: see
 [`MVP_DELIVERY_PLAN.md`](MVP_DELIVERY_PLAN.md) §5 M3 for the exact owner
 actions (official S&P documents, a historical-GICS licensing decision, a
 delisted-name provider decision, and an owner-run of the real qualification
-pipeline). No autonomous dataset-building task remains until one of those
-lands.
+pipeline). A free, cross-checked **MEMBERSHIP** `SECONDARY_RESEARCH_PIT` /
+`BacktestQuality.APPROXIMATE` path is separately available and not
+owner-gated (`A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD`, one real date
+already recorded); it never substitutes for the official dataset above.
 
 ---
 

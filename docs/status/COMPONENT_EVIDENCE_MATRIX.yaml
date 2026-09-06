@@ -30,18 +30,34 @@
 # docs/roadmaps/MVP_DELIVERY_PLAN.md §5 (M3) for the full gap accounting and
 # docs/status/PIT_DATASET_QUALIFICATION.md for the capability matrix.
 #
-# 2026-09-06 follow-up (ChatGPT review). The 2026-09-03 pass concluded no free
-# path existed at all for historical GICS/membership without evaluating one
-# legitimate candidate: MediaWiki's own contemporaneous revision history. That
-# evaluation is now built and tested
-# (trading_market_data_core.dataset_v1_wikipedia_pit; 17 offline tests) and
-# ASOF_GICS_BLOCKER now references it via free_secondary_research_alternative.
-# It provides a free, cross-checked SECONDARY_RESEARCH_PIT path usable for
+# 2026-09-06 follow-up (ChatGPT review #1). The 2026-09-03 pass concluded no
+# free path existed at all for historical GICS/membership without evaluating
+# one legitimate candidate: MediaWiki's own contemporaneous revision history.
+# That evaluation is built and tested
+# (trading_market_data_core.dataset_v1_wikipedia_pit) and ASOF_GICS_BLOCKER
+# now references it via free_secondary_research_alternative. It provides a
+# free, cross-checked SECONDARY_RESEARCH_PIT path usable for
 # BacktestQuality.APPROXIMATE research ONLY (ADR-0017); it does not, and
-# cannot, close the OFFICIAL/PIT_STRICT gap above, which is unchanged. Do not
-# recreate this evaluation; the one remaining dependency-safe task is to
-# actually run it against real data (A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD,
-# see MVP_DELIVERY_PLAN.md §5 M3 gap 5).
+# cannot, close the OFFICIAL/PIT_STRICT gap above, which is unchanged.
+#
+# 2026-09-06 follow-up (ChatGPT review #2, same day). Review #1's fix was
+# fixture-only (no real MediaWiki revision fetched) and over-scoped (claimed
+# GICS/sector without a cross-check for it). Both closed: ONE real, recorded
+# experiment now exists
+# (scripts/run_wikipedia_revision_history_experiment.py --as-of 2023-12-31;
+# revision 1192789360; 503/503 tickers corroborated against an independent
+# secondary source; recorded under
+# docs/poi/evidence/dataset-v1/wikipedia-revision-history/), fetch provenance
+# (page identity + revision timestamp) is now independently verified against
+# MediaWiki's own metadata rather than trusted from a caller, and the claim is
+# narrowed to MEMBERSHIP only — GICS/sector is captured from the same revision
+# but stays CAPTURED_UNEVALUATED_NOT_ADMITTED (cross_check_sectors exists,
+# deterministic and tested, but no independent dated GICS source has been
+# identified to run it against). Do not recreate any of this; the one
+# remaining dependency-safe task is to extend the one recorded date to the
+# full backtest window (A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD, see
+# MVP_DELIVERY_PLAN.md §5 M3 gap 5); finding an independent dated GICS source
+# is a separate, unencoded research gap (gap 6).
 version: "1.0"
 updated: "2026-09-06"
 baseline: docs/baseline-v0.5/
