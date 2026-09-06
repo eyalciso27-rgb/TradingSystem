@@ -72,3 +72,28 @@ exclude = ["node_modules", "\\.venv", "alembic/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Fallback import path for the workspace's `src`-layout packages so that a
+# bare `python3 -m pytest ...` (no `uv run`, i.e. the interpreter that
+# `uv sync` installed the workspace into is not on PATH) can still import
+# `trading_*` modules. `uv run pytest` already resolves these via the
+# editable installs in `.venv`; this list points at the identical source
+# directories, so it is a no-op there and only matters for a plain
+# interpreter invocation. Canonical development still uses `uv run pytest`
+# (see README.md); do not remove entries here without confirming both
+# invocation styles still pass.
+pythonpath = [
+    "apps/api/src",
+    "apps/core-worker/src",
+    "apps/execution-agent/src",
+    "apps/scheduler/src",
+    "packages/py/application/src",
+    "packages/py/broker-core/src",
+    "packages/py/broker-ibkr/src",
+    "packages/py/config/src",
+    "packages/py/contracts/src",
+    "packages/py/domain/src",
+    "packages/py/event-bus/src",
+    "packages/py/market-data-core/src",
+    "packages/py/observability/src",
+    "packages/py/persistence/src",
+]

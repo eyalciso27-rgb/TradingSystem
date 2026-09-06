@@ -5,6 +5,41 @@
 > change, no backtest, no OOS. Frozen strategy fingerprint
 > `sha256:75f299b8…dfed0`.
 
+> **2026-09-03 reconciliation.** Since this matrix was written, PR #104 added
+> an offline S&P historical-secondary source registry
+> (`config/data-sources/sp500-historical-source-registry.json` — nothing
+> fetched, nothing integrated, nothing promoted to authoritative), PR #105
+> hardened the current/forward S&P 500 + current-GICS immutable snapshot
+> archive, and PR #106 added a fail-closed, offline, fixture-only
+> corporate-action PIT structural validator. None of the three closes a
+> **GAP** row below — every remaining GAP requiring an **official** source is
+> still WAITING_EXTERNAL (owner-supplied official documents, a
+> historical-GICS licensing decision, or a delisted-name/corporate-action
+> provider decision). See
+> [`../roadmaps/MVP_DELIVERY_PLAN.md`](../roadmaps/MVP_DELIVERY_PLAN.md) §5
+> M3 for the authoritative, itemized owner-action list.
+>
+> **2026-09-06 follow-up (ChatGPT review #1).** The above had not evaluated
+> one legitimate free candidate for the PIT S&P 500 membership and as-of GICS
+> GAP rows: MediaWiki's own contemporaneous revision history for the
+> Wikipedia S&P 500 article. That evaluation is built and tested
+> (`trading_market_data_core.dataset_v1_wikipedia_pit`) and referenced from
+> `ASOF_GICS_BLOCKER["free_secondary_research_alternative"]`.
+>
+> **2026-09-06 follow-up (ChatGPT review #2, same day).** Review #1 was
+> fixture-only (no real revision fetched) and claimed both membership AND
+> GICS without a cross-check for GICS. Both closed: ONE real experiment is
+> now recorded (`scripts/run_wikipedia_revision_history_experiment.py
+> --as-of 2023-12-31`; 503/503 tickers corroborated; see
+> `docs/poi/evidence/dataset-v1/wikipedia-revision-history/`), and the claim
+> is narrowed to **MEMBERSHIP only** — it is a free, cross-checked
+> `SECONDARY_RESEARCH_PIT` path usable for `BacktestQuality.APPROXIMATE`
+> membership research (ADR-0017). GICS/sector from this source is captured
+> but `CAPTURED_UNEVALUATED_NOT_ADMITTED` (no independent dated GICS source
+> to cross-check against). Neither the membership evidence nor the captured
+> GICS values close either GAP row below, which remain WAITING_EXTERNAL for
+> **official** evidence.
+
 ## 1. Sourcing principle (owner correction #1)
 The remaining reference-data gaps do **not** have to be bought from one bundled
 provider. Historical S&P 500 membership, historical GICS, delisted price history

@@ -67,6 +67,35 @@ Every other track is plumbing by comparison.
 - **Exit:** `persistence` and `replay` move off fakes.
 - **Hard stop:** any look-ahead leak, or any field without a point-in-time
   timestamp.
+- **State (reconciled 2026-09-06, updated same day after independent
+  review): official/PIT_STRICT gaps stay WAITING_EXTERNAL / BLOCKED_FOR_OWNER;
+  one dependency-safe SECONDARY/APPROXIMATE MEMBERSHIP task is available and
+  backed by one real recorded experiment.** Merged and complete — do not
+  recreate: A-WP2 owner decision, forward S&P 500 snapshot hardening,
+  DatasetManifest/no-look-ahead binding, the S&P historical-secondary source
+  registry (offline provenance only), the current/forward S&P 500 +
+  current-GICS archive hardening, the fail-closed corporate-action PIT
+  validator (offline, fixture-only), the Wikipedia/MediaWiki
+  contemporaneous-revision SECONDARY PIT evaluation
+  (`dataset_v1_wikipedia_pit.py`, independently-verified fetch provenance,
+  29 tests), and ONE real experiment
+  (`scripts/run_wikipedia_revision_history_experiment.py --as-of 2023-12-31`;
+  revision 1192789360, 503/503 tickers corroborated against an independent
+  source, recorded under
+  `docs/poi/evidence/dataset-v1/wikipedia-revision-history/`). The
+  official/PIT_STRICT gaps — historical S&P 500 PIT membership, historical
+  GICS, survivorship-free delisted-name OHLCV, and real (not fixture)
+  corporate-action evidence — still need an owner-supplied artifact, a
+  licensing decision, or an owner-run against SEC EDGAR/IBKR; the
+  Wikipedia-revision path never substitutes for any of them (permanently
+  `SECONDARY_RESEARCH_PIT`), and its GICS/sector values are captured but
+  `CAPTURED_UNEVALUATED_NOT_ADMITTED` — no independent dated GICS source has
+  been found to cross-check them against. See
+  [`MVP_DELIVERY_PLAN.md`](MVP_DELIVERY_PLAN.md) §5 M3 for the authoritative,
+  itemized owner-action list and the one dependency-safe next task
+  (`A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD`: extend the one recorded
+  date to the full backtest window; needs only public network access, no
+  owner action).
 
 ### A-WP3 — Replay and in-sample backtest
 - **Work:** deterministic replay of the frozen manifest; in-sample backtest with
