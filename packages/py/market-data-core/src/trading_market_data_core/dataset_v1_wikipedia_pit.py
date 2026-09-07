@@ -55,16 +55,13 @@ regenerated.
 Scope: membership vs. GICS/sector. The same table that carries tickers also
 carries the GICS Sector / GICS Sub-Industry columns already parsed by
 :mod:`sp500_wikitable`, so every :class:`WikipediaRevisionSnapshot` CAPTURES
-both. But only **membership** currently has a working independent
-cross-check (:func:`cross_check_membership`) and is therefore admissible
-SECONDARY research evidence. **GICS/sector-as-recorded is NOT currently
-cross-checked** — no independent, dated, free GICS source has been
-identified — and stays ``CAPTURED_UNEVALUATED_NOT_ADMITTED``
-(``WIKIPEDIA_REVISION_HISTORY_EVALUATION``): it is retained on the snapshot
-for future use, never claimed as corroborated evidence today.
-:func:`cross_check_sectors` exists, is deterministic, and is tested, so that
-claim can change the moment such a source exists — adding the function does
-not, by itself, change it.
+both. Membership is independently cross-checked by :func:`cross_check_membership`.
+As of 2026-09-07, GICS **Sector** is also independently cross-checked for the
+bounded 2023-12-31 experiment against all 11 Select Sector SPDR SEC EDGAR
+N-PORT-P filings: 482/503 tickers are confidently covered and all 482 agree.
+That admits Sector only as ``SECONDARY_RESEARCH_PIT`` / ``APPROXIMATE``; GICS
+Sub-Industry and official/PIT_STRICT company-level history remain unadmitted.
+:func:`cross_check_sectors` enforces the non-weakenable coverage/agreement gates.
 
 What this module explicitly does NOT do, per the owner decisions and
 ADR-0017 (repeated here because it is the entire point of keeping this
@@ -566,14 +563,12 @@ def cross_check_sectors(
     agreement or disagreement, and every actual disagreement is recorded by
     ticker with both sector values -- never reduced to a single ratio only.
 
-    This exists so GICS/sector-as-recorded from a Wikipedia revision CAN be
-    admitted as SECONDARY historical evidence once a real independent,
-    dated sector source is available to run it against. Until then, no
-    caller in this repository invokes this with anything but a fabricated or
-    fixture mapping in a test: ``WIKIPEDIA_REVISION_HISTORY_EVALUATION``
-    explicitly records that sector/GICS stays `CAPTURED_UNEVALUATED_NOT_ADMITTED`
-    because no such independent dated source has been identified yet -- adding
-    this function does not, by itself, change that claim.
+    This is the canonical gate used by both fixtures and the real bounded
+    2023-12-31 SEC Select Sector SPDR cross-check. A successful call can admit
+    GICS Sector only as SECONDARY historical research evidence when the caller
+    also binds a real independent dated source and provenance; the function by
+    itself never promotes evidence to official/PIT_STRICT and never covers GICS
+    Sub-Industry.
 
     Fails closed, before any comparison is attempted, on the same misuse
     classes :func:`cross_check_membership` guards against: both ratio
@@ -2066,7 +2061,7 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
     "state": "SECONDARY_RESEARCH_AVAILABLE",
     "scope": "MEMBERSHIP ONLY -- see 'sector_gics' for why GICS/sector is separate",
     "classification": CLASSIFICATION,
-    "evaluated_at": "2026-09-03",
+    "evaluated_at": "2026-09-07",
     "real_experiment": {
         "performed_at": "2026-09-06",
         "performed_by": "scripts/run_wikipedia_revision_history_experiment.py",
@@ -2120,28 +2115,38 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
         " 'real_experiment' above."
     ),
     "sector_gics": {
-        "status": "CAPTURED_UNEVALUATED_NOT_ADMITTED",
+        "status": "ADMITTED_SECONDARY_RESEARCH_PIT_APPROXIMATE",
+        "scope": "GICS Sector only; GICS Sub-Industry remains unadmitted",
+        "independent_source_id": "sec-edgar-nport-select-sector-spdr",
+        "evidence_path": (
+            "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/"
+            "experiment-2023-12-31.json"
+        ),
+        "coverage_ratio": 0.9582504970178927,
+        "agreement_ratio": 1.0,
+        "covered_tickers": 482,
+        "uncovered_tickers": 21,
         "explanation": (
-            "The same revision table carries GICS Sector / GICS Sub-Industry"
-            " columns, so every parsed observation captures them (see"
-            " primary_source.observations in the real_experiment evidence file)."
-            " But NO independent, dated, free GICS source has been identified to"
-            " cross-check them against, so sector/GICS values from this source"
-            " are NOT admitted as corroborated SECONDARY historical evidence --"
-            " they are retained on the snapshot for future use only."
-            " cross_check_sectors (deterministic, coverage- and anomaly-aware,"
-            " unit-tested) exists for the moment an independent dated GICS"
-            " source is identified; adding that function does not, by itself,"
-            " change this status."
+            "A real bounded 2023-12-31 experiment cross-checked the revision's"
+            " GICS Sector values against all 11 Select Sector SPDR funds'"
+            " contemporaneous SEC EDGAR N-PORT-P filings. Each raw filing is"
+            " retained and SHA-256-bound. Conservative generic identity"
+            " resolution covered 482/503 tickers (95.83%), above the canonical"
+            " 90% floor, and all 482 covered tickers agreed on sector (100%)."
+            " The 21 unresolved/ambiguous tickers remain explicitly uncovered;"
+            " none are guessed. This admits sector only as"
+            " SECONDARY_RESEARCH_PIT / BacktestQuality.APPROXIMATE; it does not"
+            " admit GICS Sub-Industry or close the official/licensed PIT_STRICT"
+            " historical GICS requirement."
         ),
     },
-    "usable_for": "BacktestQuality.APPROXIMATE research/backtest of MEMBERSHIP only (ADR-0017)",
+    "usable_for": "BacktestQuality.APPROXIMATE research/backtest of MEMBERSHIP and empirically corroborated GICS Sector at recorded dates (ADR-0017)",
     "not_usable_for": (
         "BacktestQuality.PIT_STRICT",
         "the asof_gics capability (stays BLOCKED_EXTERNAL / LICENSE_REQUIRED)",
         "the pit_sp500_membership capability (stays owner-gated on official"
         " S&P DJI announcements)",
-        "GICS/sector research evidence (see 'sector_gics': UNEVALUATED)",
+        "GICS Sub-Industry historical assignment evidence",
         "final OOS/shadow qualification evidence",
         "any claim of S&P DJI official truth",
     ),
@@ -2190,9 +2195,11 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
         " scripts/run_wikipedia_revision_history_batch.py over the resulting"
         " calendar decision-date grid to build and record the"
         " APPROXIMATE-quality MEMBERSHIP research dataset under"
-        " docs/poi/evidence/; separately, identify and validate an independent"
-        " dated GICS source before sector/GICS evidence from this path can be"
-        " admitted. The official/licensed gap stays separately tracked in"
+        " docs/poi/evidence/; the bounded 2023-12-31 GICS Sector cross-check is"
+        " now empirically admitted as SECONDARY_RESEARCH_PIT / APPROXIMATE;"
+        " extending it across the eventual full window must reuse the same"
+        " provenance and canonical gates. The official/licensed gap stays"
+        " separately tracked in"
         " ASOF_GICS_BLOCKER and is not closed by either."
     ),
 }
