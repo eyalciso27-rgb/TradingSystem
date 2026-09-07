@@ -124,6 +124,7 @@ unevaluated until an independent dated source is found.
 from __future__ import annotations
 
 import contextlib
+import csv
 import fcntl
 import hashlib
 import json
@@ -973,6 +974,127 @@ _VALID_BATCH_OUTCOMES = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
+class SecondaryCsvMatch:
+    """One deterministic selection from the independent secondary source's
+    own ``date,tickers`` history, at or before one decision date.
+
+    Bundles the SAME three things :func:`secondary_csv_tickers_at_or_before`
+    derives from one parse -- the effective date it actually matched, the
+    exact raw row text (so its own checksum can be computed and later
+    re-verified), and the resulting ticker set -- so no caller ever recomputes
+    one from a stale copy of another.
+    """
+
+    matched_date: date
+    matched_line: str
+    tickers: frozenset[str]
+
+
+def secondary_csv_tickers_at_or_before(csv_bytes: bytes, as_of: date) -> SecondaryCsvMatch:
+    """The fja05680/sp500-style CSV's own latest ``date,tickers`` row at or
+    before ``as_of`` -- never a later one.
+
+    The SAME no-look-ahead rule :func:`select_revision_as_of` applies to
+    MediaWiki revisions, applied here to the independent secondary source:
+    picking the nearest-but-later row would project a future secondary
+    observation onto an earlier decision. Pure, deterministic and offline --
+    this never fetches anything itself, so it is exactly as safe to call at
+    dataset-BUILD time (to select the cross-check ticker set) as it is at
+    dataset-LOAD time (to independently re-derive and verify a previously
+    admitted entry's secondary provenance against its own retained raw bytes;
+    see :meth:`WikipediaDatasetStore.load`).
+    """
+    text = csv_bytes.decode("utf-8")
+    lines = text.splitlines()
+    if not lines or lines[0].strip().lower() != "date,tickers":
+        raise SourceAdapterError(
+            "secondary CSV does not carry the expected 'date,tickers' header"
+            f" (saw: {lines[0]!r} if any); refusing to parse"
+        )
+    reader = csv.reader(lines)
+    next(reader)  # header
+    best_date: date | None = None
+    best_line: str | None = None
+    for index, row in enumerate(reader, start=1):
+        if not row:
+            continue
+        row_date = date.fromisoformat(row[0])
+        if row_date <= as_of and (best_date is None or row_date > best_date):
+            best_date = row_date
+            best_line = lines[index]
+    if best_date is None or best_line is None:
+        raise SourceAdapterError(
+            f"secondary CSV carries no row at or before {as_of.isoformat()};"
+            " refusing to use a later row for an earlier decision (no look-ahead)"
+        )
+    tickers_field = best_line.split(",", 1)[1].strip().strip('"')
+    tickers = frozenset(t for t in tickers_field.split(",") if t)
+    return SecondaryCsvMatch(matched_date=best_date, matched_line=best_line, tickers=tickers)
+
+
+@dataclass(frozen=True, slots=True)
+class SecondaryProvenance:
+    """Immutable provenance binding one admitted entry to the EXACT
+    independent secondary-source artifact and row that corroborated it.
+
+    Unlike a MediaWiki revision (immutable once saved), the community CSV at
+    ``source_url`` lives on a mutable branch and can change or disappear
+    later. Reproducing this cross-check later therefore requires the
+    RETAINED raw bytes this entry was actually built from, not merely a URL
+    -- ``full_file_checksum`` authenticates the content retained at
+    ``raw_artifact_path`` (:meth:`WikipediaDatasetStore` writes and re-verifies
+    it exactly as it does the primary MediaWiki raw sidecar), and
+    ``matched_row_checksum`` authenticates the specific row selected for
+    ``as_of`` within it.
+    """
+
+    source_id: str
+    source_url: str
+    fetched_at: datetime
+    full_file_checksum: str
+    raw_artifact_path: str
+    matched_row_date: date
+    matched_row_checksum: str
+
+    def __post_init__(self) -> None:
+        if not self.source_id.strip():
+            raise SourceAdapterError("secondary provenance requires a non-empty source_id")
+        if not self.source_url.lower().startswith("https://"):
+            raise SourceAdapterError(
+                "secondary provenance source_url must be fetched over HTTPS"
+            )
+        if self.fetched_at.tzinfo is None:
+            raise SourceAdapterError(
+                "secondary provenance fetched_at must be timezone-aware (a real,"
+                " recorded instant, never a naive guess)"
+            )
+        for label, checksum in (
+            ("full_file_checksum", self.full_file_checksum),
+            ("matched_row_checksum", self.matched_row_checksum),
+        ):
+            digest = checksum.removeprefix("sha256:")
+            if digest == checksum or len(digest) != 64:
+                raise SourceAdapterError(
+                    f"secondary provenance {label} must be a real sha256: digest"
+                )
+        if not self.raw_artifact_path.strip():
+            raise SourceAdapterError(
+                "secondary provenance requires a non-empty raw_artifact_path"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "source_id": self.source_id,
+            "source_url": self.source_url,
+            "fetched_at": self.fetched_at.isoformat(),
+            "full_file_checksum": self.full_file_checksum,
+            "raw_artifact_path": self.raw_artifact_path,
+            "matched_row_date": self.matched_row_date.isoformat(),
+            "matched_row_checksum": self.matched_row_checksum,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class WikipediaDatasetEntry:
     """One ADMITTED, dated MEMBERSHIP research observation in the batch dataset.
 
@@ -1000,6 +1122,12 @@ class WikipediaDatasetEntry:
     #: Path to the immutable raw MediaWiki API response bytes this snapshot
     #: was parsed from (see :class:`WikipediaDatasetStore`).
     raw_provenance_path: str
+    #: Provenance binding to the EXACT independent secondary-source artifact
+    #: and row that corroborated this entry's cross-check (see
+    #: :class:`SecondaryProvenance`) -- required, never optional: an entry
+    #: with no independent secondary binding is not admissible research
+    #: evidence, only a Wikipedia-only assertion.
+    secondary_provenance: SecondaryProvenance
 
     def __post_init__(self) -> None:
         if self.snapshot.revision.revision_timestamp.date() > self.as_of:
@@ -1030,15 +1158,36 @@ class WikipediaDatasetEntry:
             raise SourceAdapterError(
                 "a dataset entry requires a non-empty raw_provenance_path"
             )
+        if self.secondary_provenance.source_id != self.cross_check.secondary_source_id:
+            raise SourceAdapterError(
+                f"secondary provenance source_id"
+                f" {self.secondary_provenance.source_id!r} does not match the"
+                f" cross-check's own secondary_source_id"
+                f" {self.cross_check.secondary_source_id!r}; refusing to bind a"
+                " mismatched secondary provenance record"
+            )
+        if self.secondary_provenance.matched_row_date > self.as_of:
+            raise SourceAdapterError(
+                f"secondary source's matched row is dated"
+                f" {self.secondary_provenance.matched_row_date.isoformat()}, after"
+                f" as_of {self.as_of.isoformat()}; refusing to admit a later"
+                " secondary observation for an earlier decision date (no"
+                " look-ahead)"
+            )
 
     def body(self) -> dict[str, object]:
-        """The checksummed body -- deliberately excludes ``fetch_observed_at``.
+        """The checksummed body -- deliberately excludes ``fetch_observed_at``
+        and ``secondary_provenance.fetched_at``.
 
-        See the field's docstring: two fetches of the identical immutable
-        revision at different real times must produce the identical checksum,
-        so a crash-recovery retry (fetch again, get the same revision, call
-        :meth:`WikipediaDatasetStore.accept` again) is recognised as an
-        idempotent no-op rather than a spurious conflict.
+        See ``fetch_observed_at``'s docstring: two fetches of the identical
+        immutable revision (or, here, of the identical independent secondary
+        artifact) at different real times must produce the identical
+        checksum, so a crash-recovery retry (fetch again, get the same
+        content, call :meth:`WikipediaDatasetStore.accept` again) is
+        recognised as an idempotent no-op rather than a spurious conflict.
+        Every other secondary-provenance field (source id/url, checksums,
+        matched row date) IS part of the checksummed body: those identify
+        WHAT was used, not WHEN it happened to be fetched.
         """
         return {
             "schema_version": WIKIPEDIA_DATASET_ENTRY_SCHEMA_VERSION,
@@ -1057,6 +1206,14 @@ class WikipediaDatasetEntry:
                 "only_in_secondary": list(self.cross_check.only_in_secondary),
                 "detail": self.cross_check.detail,
             },
+            "secondary_provenance": {
+                "source_id": self.secondary_provenance.source_id,
+                "source_url": self.secondary_provenance.source_url,
+                "full_file_checksum": self.secondary_provenance.full_file_checksum,
+                "raw_artifact_path": self.secondary_provenance.raw_artifact_path,
+                "matched_row_date": self.secondary_provenance.matched_row_date.isoformat(),
+                "matched_row_checksum": self.secondary_provenance.matched_row_checksum,
+            },
             "gics_sector_status": "CAPTURED_UNEVALUATED_NOT_ADMITTED",
             "eligibility": {
                 "authoritative_official_evidence": False,
@@ -1074,6 +1231,11 @@ class WikipediaDatasetEntry:
     def to_dict(self) -> dict[str, object]:
         payload = self.body()
         payload["fetch_observed_at"] = self.fetch_observed_at.isoformat()
+        secondary_provenance_payload = payload["secondary_provenance"]
+        assert isinstance(secondary_provenance_payload, dict)
+        secondary_provenance_payload["fetched_at"] = (
+            self.secondary_provenance.fetched_at.isoformat()
+        )
         payload["entry_checksum"] = self.compute_checksum()
         return payload
 
@@ -1168,6 +1330,19 @@ def _cross_check_from_dict(
     )
 
 
+def _secondary_provenance_from_dict(payload: Mapping[str, object]) -> SecondaryProvenance:
+    """Rebuild a :class:`SecondaryProvenance`, re-running its constructor checks."""
+    return SecondaryProvenance(
+        source_id=str(payload["source_id"]),
+        source_url=str(payload["source_url"]),
+        fetched_at=datetime.fromisoformat(str(payload["fetched_at"])),
+        full_file_checksum=str(payload["full_file_checksum"]),
+        raw_artifact_path=str(payload["raw_artifact_path"]),
+        matched_row_date=date.fromisoformat(str(payload["matched_row_date"])),
+        matched_row_checksum=str(payload["matched_row_checksum"]),
+    )
+
+
 def _entry_from_dict(payload: Mapping[str, object]) -> WikipediaDatasetEntry:
     """Rebuild a :class:`WikipediaDatasetEntry`, re-running every constructor check.
 
@@ -1179,12 +1354,17 @@ def _entry_from_dict(payload: Mapping[str, object]) -> WikipediaDatasetEntry:
     loaded: every guard in :meth:`WikipediaDatasetEntry.__post_init__` runs
     again here, on load, not only at original construction time, and the
     cross-check itself is RE-DERIVED (:func:`_cross_check_from_dict`), never
-    trusted from the file.
+    trusted from the file. The secondary provenance binding is reconstructed
+    too, but only :meth:`WikipediaDatasetStore.load` -- which has the retained
+    raw secondary artifact to check it against -- can verify it is genuine
+    rather than merely well-shaped; that is done there, not here.
     """
     snapshot_payload = payload["snapshot"]
     cross_check_payload = payload["cross_check"]
+    secondary_provenance_payload = payload["secondary_provenance"]
     assert isinstance(snapshot_payload, Mapping)
     assert isinstance(cross_check_payload, Mapping)
+    assert isinstance(secondary_provenance_payload, Mapping)
     as_of = date.fromisoformat(str(payload["as_of"]))
     snapshot = _snapshot_from_dict(snapshot_payload)
     return WikipediaDatasetEntry(
@@ -1193,6 +1373,7 @@ def _entry_from_dict(payload: Mapping[str, object]) -> WikipediaDatasetEntry:
         cross_check=_cross_check_from_dict(cross_check_payload, wikipedia=snapshot, as_of=as_of),
         fetch_observed_at=datetime.fromisoformat(str(payload["fetch_observed_at"])),
         raw_provenance_path=str(payload["raw_provenance_path"]),
+        secondary_provenance=_secondary_provenance_from_dict(secondary_provenance_payload),
     )
 
 
@@ -1253,6 +1434,7 @@ class WikipediaDatasetAcceptResult:
     as_of: date
     entry_path: Path
     raw_path: Path
+    secondary_raw_path: Path
     already_written: bool
 
 
@@ -1292,6 +1474,14 @@ class WikipediaDatasetStore:
 
     def _raw_lock_path(self, revision_id: int) -> Path:
         return self.root / f".revision-{revision_id}.lock"
+
+    def _secondary_raw_path(self, full_file_checksum: str) -> Path:
+        digest = full_file_checksum.removeprefix("sha256:")
+        return self.root / f"secondary-{digest}.raw.csv"
+
+    def _secondary_raw_lock_path(self, full_file_checksum: str) -> Path:
+        digest = full_file_checksum.removeprefix("sha256:")
+        return self.root / f".secondary-{digest}.lock"
 
     def has(self, as_of: date) -> bool:
         return self._entry_path(as_of).is_file()
@@ -1347,25 +1537,94 @@ class WikipediaDatasetStore:
                 f"{raw_path}: raw provenance no longer matches the recorded"
                 " checksum (tampered); refusing to trust this dataset entry"
             )
+        self._verify_secondary_provenance(entry)
         return entry
+
+    def _verify_secondary_provenance(self, entry: WikipediaDatasetEntry) -> None:
+        """Independently re-derive and verify the secondary-source binding.
+
+        Unlike the primary MediaWiki raw sidecar (checksum-verified only --
+        it is never re-parsed on load, because :class:`WikipediaRevisionSnapshot`
+        already re-runs every structural check at construction time), the
+        secondary artifact IS re-parsed here: ``full_file_checksum`` is
+        checked first (missing/tampered retained bytes fail closed
+        immediately), then :func:`secondary_csv_tickers_at_or_before` is run
+        again against those retained bytes for ``entry.as_of`` and the result
+        must agree with what the entry claims on every axis -- the matched
+        effective date, that date's own row checksum, and (the point of this
+        check) the exact ticker set, which must equal
+        ``entry.cross_check.agreements | entry.cross_check.only_in_secondary``.
+        A JSON that forged a self-consistent ticker partition (already
+        guarded against being inconsistent with the WIKIPEDIA side by
+        :func:`_cross_check_from_dict`) can no longer pass this check either,
+        because it is now cross-checked against real bytes from the retained,
+        checksum-verified independent secondary artifact, not merely internal
+        consistency.
+        """
+        provenance = entry.secondary_provenance
+        secondary_raw_path = self._secondary_raw_path(provenance.full_file_checksum)
+        if not secondary_raw_path.is_file():
+            raise SourceAdapterError(
+                f"{secondary_raw_path}: secondary source raw provenance sidecar"
+                " is missing; refusing to trust a dataset entry without its"
+                " independent secondary-source artifact"
+            )
+        secondary_raw_bytes = secondary_raw_path.read_bytes()
+        if raw_artifact_checksum(secondary_raw_bytes) != provenance.full_file_checksum:
+            raise SourceAdapterError(
+                f"{secondary_raw_path}: secondary source raw provenance no"
+                " longer matches the recorded checksum (tampered); refusing to"
+                " trust this dataset entry"
+            )
+        match = secondary_csv_tickers_at_or_before(secondary_raw_bytes, entry.as_of)
+        if match.matched_date != provenance.matched_row_date:
+            raise SourceAdapterError(
+                f"{secondary_raw_path}: the retained secondary artifact's own"
+                f" effective row for as_of {entry.as_of.isoformat()} is dated"
+                f" {match.matched_date.isoformat()}, not the recorded"
+                f" {provenance.matched_row_date.isoformat()}; refusing to trust"
+                " a mismatched secondary provenance binding"
+            )
+        matched_line_checksum = raw_artifact_checksum(match.matched_line.encode("utf-8"))
+        if matched_line_checksum != provenance.matched_row_checksum:
+            raise SourceAdapterError(
+                f"{secondary_raw_path}: the retained secondary artifact's"
+                " matched row no longer matches the recorded"
+                " matched_row_checksum (tampered); refusing to trust this"
+                " dataset entry"
+            )
+        reconstructed_secondary_tickers = (
+            frozenset(entry.cross_check.agreements) | frozenset(entry.cross_check.only_in_secondary)
+        )
+        if match.tickers != reconstructed_secondary_tickers:
+            raise SourceAdapterError(
+                f"{secondary_raw_path}: the cross-check's recorded secondary"
+                " ticker partition no longer matches the tickers independently"
+                " re-derived from the retained secondary artifact; refusing to"
+                " trust an inconsistent or forged cross-check record"
+            )
 
     def entries(self) -> tuple[WikipediaDatasetEntry, ...]:
         """Every archived entry, fully re-validated, sorted by ``as_of``."""
         return tuple(self.load(as_of) for as_of in self.dates())
 
     def accept(
-        self, entry: WikipediaDatasetEntry, raw_bytes: bytes
+        self, entry: WikipediaDatasetEntry, raw_bytes: bytes, *, secondary_raw_bytes: bytes
     ) -> WikipediaDatasetAcceptResult:
-        """Persist ``entry`` and its raw provenance, enforcing write-once + idempotence.
+        """Persist ``entry`` and BOTH its raw provenances, enforcing write-once
+        + idempotence.
 
         Fails closed before writing anything if ``raw_bytes`` does not
-        authenticate ``entry.snapshot.raw_checksum``. The raw sidecar
-        (keyed by revision id, locked independently so two different
-        ``as_of`` dates resolving to the same revision cannot race each
-        other) is written first; the entry (keyed by ``as_of``, write-once)
-        second -- a crash between the two leaves at most an unreferenced raw
-        sidecar, never an entry pointing at a raw artifact that was never
-        durably written.
+        authenticate ``entry.snapshot.raw_checksum``, or if
+        ``secondary_raw_bytes`` does not authenticate
+        ``entry.secondary_provenance.full_file_checksum``. The two raw
+        sidecars are written first -- the primary MediaWiki one keyed by
+        revision id, the independent secondary one keyed by its own content
+        checksum, each locked independently so two different ``as_of`` dates
+        resolving to the same content cannot race each other -- and the entry
+        (keyed by ``as_of``, write-once) last -- a crash at any point leaves
+        at most an unreferenced raw sidecar, never an entry pointing at a raw
+        artifact that was never durably written.
         """
         if not entry.snapshot.verify_raw_bytes(raw_bytes):
             raise SourceAdapterError(
@@ -1373,8 +1632,17 @@ class WikipediaDatasetStore:
                 " match the snapshot's own raw_checksum claim; refusing to"
                 " accept unverifiable provenance"
             )
+        secondary_raw_checksum = raw_artifact_checksum(secondary_raw_bytes)
+        if secondary_raw_checksum != entry.secondary_provenance.full_file_checksum:
+            raise SourceAdapterError(
+                f"secondary raw bytes supplied for as_of {entry.as_of.isoformat()}"
+                " do not match the secondary provenance's own full_file_checksum"
+                " claim; refusing to accept unverifiable provenance"
+            )
         revision_id = entry.snapshot.revision.revision_id
+        secondary_full_file_checksum = entry.secondary_provenance.full_file_checksum
         raw_path = self._raw_path(revision_id)
+        secondary_raw_path = self._secondary_raw_path(secondary_full_file_checksum)
         entry_path = self._entry_path(entry.as_of)
         with _flock(self._entry_lock_path(entry.as_of)):
             already_written = False
@@ -1409,6 +1677,19 @@ class WikipediaDatasetStore:
                         )
                 else:
                     _atomic_write_bytes(raw_path, raw_bytes)
+            with _flock(self._secondary_raw_lock_path(secondary_full_file_checksum)):
+                if secondary_raw_path.is_file():
+                    existing_secondary_raw = secondary_raw_path.read_bytes()
+                    existing_secondary_checksum = raw_artifact_checksum(existing_secondary_raw)
+                    if existing_secondary_checksum != secondary_full_file_checksum:
+                        raise SourceAdapterError(
+                            f"{secondary_raw_path} already exists with different"
+                            " content than the freshly supplied secondary raw"
+                            " bytes for the same checksum; refusing to overwrite"
+                            " immutable secondary raw provenance"
+                        )
+                else:
+                    _atomic_write_bytes(secondary_raw_path, secondary_raw_bytes)
             if not already_written:
                 _atomic_write_bytes(
                     entry_path,
@@ -1416,7 +1697,7 @@ class WikipediaDatasetStore:
                 )
         return WikipediaDatasetAcceptResult(
             as_of=entry.as_of, entry_path=entry_path, raw_path=raw_path,
-            already_written=already_written,
+            secondary_raw_path=secondary_raw_path, already_written=already_written,
         )
 
 
@@ -1473,8 +1754,11 @@ def run_wikipedia_revision_history_batch(
     as_of_dates: Sequence[date],
     *,
     store: WikipediaDatasetStore,
-    secondary_tickers_at_or_before: Callable[[date], frozenset[str]],
+    secondary_match_at_or_before: Callable[[date], SecondaryCsvMatch],
     secondary_source_id: str,
+    secondary_source_url: str,
+    secondary_raw_bytes: bytes,
+    secondary_fetched_at: datetime,
     page_title: str = DEFAULT_PAGE_TITLE,
     fetch_revision_at_or_before_fn: Callable[
         ..., WikipediaRevisionRef
@@ -1493,8 +1777,9 @@ def run_wikipedia_revision_history_batch(
     * dates are processed in SORTED order regardless of the order requested,
       so two calls with the same set (in any order) behave identically;
     * a date already archived in ``store`` is RESUMED, not re-fetched --
-      ``fetch_revision_at_or_before_fn``/``fetch_revision_wikitext_fn`` are
-      never called for it, so a later real-world page edit can never
+      ``fetch_revision_at_or_before_fn``/``fetch_revision_wikitext_fn``/
+      ``secondary_match_at_or_before`` are never called for it, so a later
+      real-world page edit (or a later secondary-source update) can never
       retroactively replace an already-admitted historical observation
       through a resumed or retried run;
     * a date whose cross-check is not corroborated is refused
@@ -1506,8 +1791,15 @@ def run_wikipedia_revision_history_batch(
       remaining requested dates are still attempted, and the failure is
       recorded, never silently swallowed.
 
+    ``secondary_raw_bytes`` is the independent secondary source fetched ONCE
+    for the whole run (the community CSV does not vary per date) and is
+    archived, checksum-bound, into every admitted entry's
+    :class:`SecondaryProvenance` -- unlike a MediaWiki revision, that source
+    lives on a mutable branch and can change later, so the cross-check can
+    only be reproduced afterwards if the exact bytes it used are retained.
+
     ``fetch_revision_at_or_before_fn``/``fetch_revision_wikitext_fn``/
-    ``secondary_tickers_at_or_before`` are injectable specifically so this
+    ``secondary_match_at_or_before`` are injectable specifically so this
     function is fully unit-testable without any network call; production
     callers (``scripts/run_wikipedia_revision_history_batch.py``) pass the
     real fetch functions and a real independent-secondary-source lookup.
@@ -1517,6 +1809,7 @@ def run_wikipedia_revision_history_batch(
             "duplicate as_of dates requested in one batch run; each date must"
             " appear at most once"
         )
+    secondary_full_file_checksum = raw_artifact_checksum(secondary_raw_bytes)
     rows: list[WikipediaDatasetBatchRow] = []
     for as_of in sorted(as_of_dates):
         if store.has(as_of):
@@ -1544,9 +1837,9 @@ def run_wikipedia_revision_history_batch(
                 revision_ref, timeout_seconds=timeout_seconds, user_agent=user_agent
             )
             snapshot = fetched.snapshot
-            secondary_tickers = secondary_tickers_at_or_before(as_of)
+            match = secondary_match_at_or_before(as_of)
             cross_check = cross_check_membership(
-                wikipedia=snapshot, secondary_tickers=secondary_tickers,
+                wikipedia=snapshot, secondary_tickers=match.tickers,
                 secondary_source_id=secondary_source_id, as_of=as_of,
             )
         except SourceAdapterError as error:
@@ -1568,11 +1861,21 @@ def run_wikipedia_revision_history_batch(
             )
             continue
         raw_path = store._raw_path(snapshot.revision.revision_id)  # noqa: SLF001
+        secondary_provenance = SecondaryProvenance(
+            source_id=secondary_source_id,
+            source_url=secondary_source_url,
+            fetched_at=secondary_fetched_at,
+            full_file_checksum=secondary_full_file_checksum,
+            raw_artifact_path=str(store._secondary_raw_path(secondary_full_file_checksum)),  # noqa: SLF001
+            matched_row_date=match.matched_date,
+            matched_row_checksum=raw_artifact_checksum(match.matched_line.encode("utf-8")),
+        )
         entry = WikipediaDatasetEntry(
             as_of=as_of, snapshot=snapshot, cross_check=cross_check,
             fetch_observed_at=now(), raw_provenance_path=str(raw_path),
+            secondary_provenance=secondary_provenance,
         )
-        store.accept(entry, fetched.raw_bytes)
+        store.accept(entry, fetched.raw_bytes, secondary_raw_bytes=secondary_raw_bytes)
         rows.append(
             WikipediaDatasetBatchRow(
                 as_of=as_of, outcome=BATCH_OUTCOME_ADMITTED, detail=cross_check.detail,
@@ -1596,6 +1899,15 @@ def build_dataset_manifest(
     already provides) produces an identical ``content_fingerprint`` every
     time -- re-running the batch build never silently changes previously
     recorded snapshot provenance, and this manifest cannot either.
+
+    Both the per-date records and the fingerprint material commit to each
+    entry's own ``entry_checksum`` (:meth:`WikipediaDatasetEntry.compute_checksum`)
+    -- which already covers the full cross-check ticker partition and the
+    secondary-source binding, not merely the summary ``agreement_ratio`` --
+    so two admitted entries that differ in ANY evidentiary respect (a
+    different agreement/disagreement partition, a different secondary
+    artifact, a different matched row) can never collide into the same
+    dataset-level fingerprint merely because their ratios happen to match.
     """
     ordered_entries = tuple(sorted(entries, key=lambda entry: entry.as_of))
     covered = tuple(entry.as_of for entry in ordered_entries)
@@ -1628,14 +1940,45 @@ def build_dataset_manifest(
         "min_agreement_ratio": min(ratios) if ratios else None,
         "disagreement_observation_count_total": disagreement_total,
         "distinct_revision_ids": sorted({e.snapshot.revision.revision_id for e in ordered_entries}),
+        "distinct_secondary_source_ids": sorted(
+            {e.secondary_provenance.source_id for e in ordered_entries}
+        ),
+        "distinct_secondary_full_file_checksums": sorted(
+            {e.secondary_provenance.full_file_checksum for e in ordered_entries}
+        ),
     }
+    per_date_records = tuple(
+        {
+            "as_of": entry.as_of.isoformat(),
+            "entry_checksum": entry.compute_checksum(),
+            "revision_id": entry.snapshot.revision.revision_id,
+            "revision_timestamp": entry.snapshot.revision.revision_timestamp.isoformat(),
+            "raw_checksum": entry.snapshot.raw_checksum,
+            "raw_provenance_path": entry.raw_provenance_path,
+            "secondary_source_id": entry.cross_check.secondary_source_id,
+            "secondary_source_url": entry.secondary_provenance.source_url,
+            "secondary_full_file_checksum": entry.secondary_provenance.full_file_checksum,
+            "secondary_raw_artifact_path": entry.secondary_provenance.raw_artifact_path,
+            "secondary_matched_row_date": entry.secondary_provenance.matched_row_date.isoformat(),
+            "secondary_matched_row_checksum": entry.secondary_provenance.matched_row_checksum,
+            "agreement_ratio": entry.cross_check.agreement_ratio,
+            "corroborated": entry.cross_check.corroborated,
+            "agreement_count": len(entry.cross_check.agreements),
+            "only_in_wikipedia_count": len(entry.cross_check.only_in_wikipedia),
+            "only_in_secondary_count": len(entry.cross_check.only_in_secondary),
+        }
+        for entry in ordered_entries
+    )
     fingerprint_material = [
         {
             "as_of": entry.as_of.isoformat(),
+            "entry_checksum": entry.compute_checksum(),
             "revision_id": entry.snapshot.revision.revision_id,
             "revision_timestamp": entry.snapshot.revision.revision_timestamp.isoformat(),
             "raw_checksum": entry.snapshot.raw_checksum,
             "secondary_source_id": entry.cross_check.secondary_source_id,
+            "secondary_full_file_checksum": entry.secondary_provenance.full_file_checksum,
+            "secondary_matched_row_checksum": entry.secondary_provenance.matched_row_checksum,
             "agreement_ratio": entry.cross_check.agreement_ratio,
         }
         for entry in ordered_entries
@@ -1651,6 +1994,7 @@ def build_dataset_manifest(
         date_coverage=covered,
         requested_dates=requested,
         gaps=gaps,
+        entries=per_date_records,
         aggregate=aggregate,
         content_fingerprint=content_fingerprint,
         window_definition_status=WINDOW_DEFINITION_REQUIRED,
@@ -1675,6 +2019,10 @@ class WikipediaDatasetManifest:
     date_coverage: tuple[date, ...]
     requested_dates: tuple[date, ...]
     gaps: tuple[str, ...]
+    #: One record per admitted entry (sorted by ``as_of``), carrying that
+    #: entry's own ``entry_checksum`` and secondary-source binding -- see
+    #: :func:`build_dataset_manifest`.
+    entries: tuple[Mapping[str, object], ...]
     aggregate: Mapping[str, object]
     content_fingerprint: str
     window_definition_status: Mapping[str, object]
@@ -1689,6 +2037,7 @@ class WikipediaDatasetManifest:
             "requested_dates": [d.isoformat() for d in self.requested_dates],
             "requested_date_count": len(self.requested_dates),
             "gaps": list(self.gaps),
+            "entries": [dict(entry) for entry in self.entries],
             "aggregate": dict(self.aggregate),
             "content_fingerprint": self.content_fingerprint,
             "window_definition_status": dict(self.window_definition_status),
@@ -1869,6 +2218,8 @@ __all__ = [
     "WINDOW_DEFINITION_REQUIRED",
     "CrossCheckResult",
     "RawWikipediaRevisionFetch",
+    "SecondaryCsvMatch",
+    "SecondaryProvenance",
     "SectorCrossCheckResult",
     "WikipediaConstituentObservation",
     "WikipediaDatasetAcceptResult",
@@ -1887,5 +2238,6 @@ __all__ = [
     "fetch_revision_wikitext",
     "parse_revision_snapshot",
     "run_wikipedia_revision_history_batch",
+    "secondary_csv_tickers_at_or_before",
     "select_revision_as_of",
 ]

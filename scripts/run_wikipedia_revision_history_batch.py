@@ -12,19 +12,24 @@ path, using the same machinery
    look-ahead: never a later revision) and fetch+verify its wikitext exactly
    as the single-date experiment does;
 2. cross-check each admitted snapshot against the SAME independent free
-   secondary source (the fja05680/sp500 community-maintained CSV on GitHub)
-   using ``cross_check_membership`` -- corroboration is mandatory, never
-   weakened;
-3. archive every corroborated observation in a
+   secondary source (the fja05680/sp500 community-maintained CSV on GitHub,
+   fetched ONCE for the whole run), using ``cross_check_membership`` --
+   corroboration is mandatory, never weakened;
+3. archive every corroborated observation, INCLUDING the exact independent
+   secondary-source artifact and row that corroborated it (checksum-bound
+   ``SecondaryProvenance`` -- unlike a MediaWiki revision, that community CSV
+   lives on a mutable branch and can change later, so reproducing the
+   cross-check afterwards needs the retained bytes, not just the URL), in a
    ``trading_market_data_core.dataset_v1_wikipedia_pit.WikipediaDatasetStore``
    under ``--dataset-dir``: write-once per ``as_of``, resumable (a date
    already archived is never re-fetched), and idempotent (re-running this
    script with the same dates and the same immutable MediaWiki/secondary-CSV
    content is a no-op, not a duplicate or a silent rewrite);
 4. build and write a deterministic dataset-level manifest (coverage, gaps,
-   per-date agreement, aggregate disagreement/anomaly counts, and a content
-   fingerprint that does not change on re-run over identical archived
-   evidence) via ``build_dataset_manifest``.
+   per-date agreement, each entry's own cryptographic checksum and secondary
+   binding, aggregate disagreement/anomaly counts, and a content fingerprint
+   that does not change on re-run over identical archived evidence) via
+   ``build_dataset_manifest``.
 
 WHAT DATES TO PASS IS DELIBERATELY NOT DECIDED BY THIS SCRIPT. No
 owner-approved ABSOLUTE start/end date for the frozen strategy's full
@@ -55,7 +60,6 @@ only, exactly like ``scripts/run_wikipedia_revision_history_experiment.py``.
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import sys
 import urllib.error
@@ -74,9 +78,11 @@ from trading_market_data_core.dataset_v1_wikipedia_pit import (  # noqa: E402
     BATCH_OUTCOME_RESUMED,
     DEFAULT_PAGE_TITLE,
     WINDOW_DEFINITION_REQUIRED,
+    SecondaryCsvMatch,
     WikipediaDatasetStore,
     build_dataset_manifest,
     run_wikipedia_revision_history_batch,
+    secondary_csv_tickers_at_or_before,
 )
 
 DEFAULT_SECONDARY_SOURCE_ID = "fja05680-sp500-github-updated-csv"
@@ -113,40 +119,6 @@ def _fetch_bytes(url: str, *, timeout_seconds: float, user_agent: str) -> bytes:
     if status != 200:
         raise ValueError(f"secondary source returned HTTP {status}")
     return raw
-
-
-def _secondary_row_at_or_before(csv_bytes: bytes, as_of: date) -> frozenset[str]:
-    """The secondary CSV's own latest ticker set at or before ``as_of``.
-
-    Same no-look-ahead rule as the single-date experiment's
-    ``_secondary_row_at_or_before``: a row dated after ``as_of`` is never
-    selected, even if it is the nearest one.
-    """
-    text = csv_bytes.decode("utf-8")
-    lines = text.splitlines()
-    if not lines or lines[0].strip().lower() != "date,tickers":
-        raise ValueError(
-            "secondary CSV does not carry the expected 'date,tickers' header"
-            f" (saw: {lines[0]!r} if any); refusing to parse"
-        )
-    reader = csv.reader(lines)
-    next(reader)  # header
-    best_date: date | None = None
-    best_line: str | None = None
-    for index, row in enumerate(reader, start=1):
-        if not row:
-            continue
-        row_date = date.fromisoformat(row[0])
-        if row_date <= as_of and (best_date is None or row_date > best_date):
-            best_date = row_date
-            best_line = lines[index]
-    if best_date is None or best_line is None:
-        raise ValueError(
-            f"secondary CSV carries no row at or before {as_of.isoformat()};"
-            " refusing to use a later row for an earlier decision (no look-ahead)"
-        )
-    tickers_field = best_line.split(",", 1)[1].strip().strip('"')
-    return frozenset(t for t in tickers_field.split(",") if t)
 
 
 def _parse_as_of_dates(args: argparse.Namespace) -> list[date]:
@@ -195,7 +167,13 @@ def main(argv: list[str]) -> int:
 
     # Fetched ONCE per run, up front: every requested date's cross-check reads
     # the SAME immutable secondary-CSV bytes, so a run is fully reproducible
-    # from one real fetch rather than re-fetching per date.
+    # from one real fetch rather than re-fetching per date. The exact bytes
+    # are archived and checksum-bound into every admitted entry's
+    # SecondaryProvenance (WikipediaDatasetStore.accept) -- unlike a MediaWiki
+    # revision, this CSV lives on a mutable branch and can change later, so
+    # reproducing the cross-check afterwards requires the retained bytes, not
+    # just the URL.
+    secondary_fetched_at = datetime.now(tz=UTC)
     try:
         secondary_raw = _fetch_bytes(
             args.secondary_csv_url, timeout_seconds=args.timeout_seconds,
@@ -205,8 +183,8 @@ def main(argv: list[str]) -> int:
         print(f"BATCH FAILED (fail closed): {error}", file=sys.stderr)
         return 1
 
-    def _secondary_tickers_at_or_before(as_of: date) -> frozenset[str]:
-        return _secondary_row_at_or_before(secondary_raw, as_of)
+    def _secondary_match_at_or_before(as_of: date) -> SecondaryCsvMatch:
+        return secondary_csv_tickers_at_or_before(secondary_raw, as_of)
 
     try:
         # fetch_revision_at_or_before_fn / fetch_revision_wikitext_fn are left
@@ -216,8 +194,12 @@ def main(argv: list[str]) -> int:
         # inject fakes instead; this script is the real, owner/agent-run path.
         result = run_wikipedia_revision_history_batch(
             as_of_dates, store=store,
-            secondary_tickers_at_or_before=_secondary_tickers_at_or_before,
-            secondary_source_id=args.secondary_source_id, page_title=args.page_title,
+            secondary_match_at_or_before=_secondary_match_at_or_before,
+            secondary_source_id=args.secondary_source_id,
+            secondary_source_url=args.secondary_csv_url,
+            secondary_raw_bytes=secondary_raw,
+            secondary_fetched_at=secondary_fetched_at,
+            page_title=args.page_title,
             now=lambda: datetime.now(tz=UTC), timeout_seconds=args.timeout_seconds,
             user_agent=args.user_agent,
         )

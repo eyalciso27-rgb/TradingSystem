@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -44,6 +45,8 @@ from trading_market_data_core.dataset_v1_wikipedia_pit import (
     WINDOW_DEFINITION_REQUIRED,
     CrossCheckResult,
     RawWikipediaRevisionFetch,
+    SecondaryCsvMatch,
+    SecondaryProvenance,
     SectorCrossCheckResult,
     WikipediaConstituentObservation,
     WikipediaDatasetEntry,
@@ -56,6 +59,7 @@ from trading_market_data_core.dataset_v1_wikipedia_pit import (
     cross_check_sectors,
     parse_revision_snapshot,
     run_wikipedia_revision_history_batch,
+    secondary_csv_tickers_at_or_before,
     select_revision_as_of,
 )
 from trading_market_data_core.sp500_current_universe import (
@@ -747,6 +751,31 @@ def _cross_check_for(
     )
 
 
+def _secondary_provenance_for(
+    *, as_of: date, source_id: str = "fja05680-sp500-github", matched_row_date: date | None = None,
+    fetched_at: datetime = datetime(2026, 9, 6, tzinfo=UTC),
+) -> SecondaryProvenance:
+    """A syntactically valid :class:`SecondaryProvenance` with fabricated but
+    well-shaped checksums.
+
+    For object-level / hand-written-JSON tests where the secondary artifact
+    itself is never persisted or re-verified against real bytes (that only
+    happens inside :meth:`WikipediaDatasetStore.accept` /
+    :meth:`WikipediaDatasetStore.load`, which every test using this helper
+    deliberately bypasses -- see ``_entry_with_secondary`` for the
+    real-round-trip counterpart).
+    """
+    return SecondaryProvenance(
+        source_id=source_id,
+        source_url="https://raw.githubusercontent.com/fja05680/sp500/master/test.csv",
+        fetched_at=fetched_at,
+        full_file_checksum="sha256:" + "a" * 64,
+        raw_artifact_path="secondary.raw.csv",
+        matched_row_date=matched_row_date if matched_row_date is not None else as_of,
+        matched_row_checksum="sha256:" + "b" * 64,
+    )
+
+
 def _entry_for(
     *, as_of: date, revision_id: int, timestamp: datetime, raw_provenance_path: str = "raw.json"
 ) -> WikipediaDatasetEntry:
@@ -756,7 +785,64 @@ def _entry_for(
         as_of=as_of, snapshot=snapshot, cross_check=cross_check,
         fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
         raw_provenance_path=raw_provenance_path,
+        secondary_provenance=_secondary_provenance_for(as_of=as_of),
     )
+
+
+def _secondary_csv_bytes(
+    tickers: frozenset[str], *, effective_date: date = date(2000, 1, 1)
+) -> bytes:
+    """A minimal, schema-valid ``date,tickers`` CSV with exactly one row.
+
+    ``effective_date`` defaults far in the past so this one row is always the
+    latest one "at or before" any ``as_of`` used across these tests --
+    :func:`secondary_csv_tickers_at_or_before` always resolves to it.
+    """
+    row = f'{effective_date.isoformat()},"{",".join(sorted(tickers))}"'
+    return f"date,tickers\n{row}\n".encode()
+
+
+def _entry_with_secondary(
+    *, as_of: date, revision_id: int, timestamp: datetime, corroborated: bool = True,
+    raw_provenance_path: str = "raw.json", secondary_tickers: frozenset[str] | None = None,
+) -> tuple[WikipediaDatasetEntry, bytes, bytes]:
+    """A fully valid, REAL-ROUND-TRIPPABLE entry plus BOTH raw byte blobs
+    (MediaWiki wikitext raw bytes, secondary CSV raw bytes) needed to
+    exercise :meth:`WikipediaDatasetStore.accept` /
+    :meth:`WikipediaDatasetStore.load` for real -- unlike ``_entry_for``,
+    whose fabricated secondary checksums are never meant to authenticate real
+    bytes.
+    """
+    wikitext = _wikitext_table()
+    raw_bytes = _raw(wikitext)
+    snapshot = parse_revision_snapshot(
+        wikitext, raw_bytes=raw_bytes, revision=_revision(revision_id, timestamp)
+    )
+    if secondary_tickers is None:
+        secondary_tickers = (
+            snapshot.tickers() if corroborated else frozenset({"ZZZZ", "YYYY", "XXXX"})
+        )
+    secondary_raw = _secondary_csv_bytes(secondary_tickers)
+    match = secondary_csv_tickers_at_or_before(secondary_raw, as_of)
+    cross_check = cross_check_membership(
+        wikipedia=snapshot, secondary_tickers=match.tickers,
+        secondary_source_id="fja05680-sp500-github", as_of=as_of,
+    )
+    secondary_provenance = SecondaryProvenance(
+        source_id="fja05680-sp500-github",
+        source_url="https://raw.githubusercontent.com/fja05680/sp500/master/test.csv",
+        fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
+        full_file_checksum=raw_artifact_checksum(secondary_raw),
+        raw_artifact_path="secondary.raw.csv",
+        matched_row_date=match.matched_date,
+        matched_row_checksum=raw_artifact_checksum(match.matched_line.encode("utf-8")),
+    )
+    entry = WikipediaDatasetEntry(
+        as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+        fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
+        raw_provenance_path=raw_provenance_path, secondary_provenance=secondary_provenance,
+    )
+    return entry, raw_bytes, secondary_raw
 
 
 # -- WikipediaDatasetEntry: fail closed --------------------------------------
@@ -773,6 +859,7 @@ def test_dataset_entry_refuses_a_revision_after_as_of() -> None:
         WikipediaDatasetEntry(
             as_of=earlier, snapshot=snapshot, cross_check=cross_check,
             fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC), raw_provenance_path="raw.json",
+            secondary_provenance=_secondary_provenance_for(as_of=earlier, source_id="x"),
         )
 
 
@@ -783,6 +870,7 @@ def test_dataset_entry_refuses_a_cross_check_as_of_mismatch() -> None:
         WikipediaDatasetEntry(
             as_of=date(2020, 1, 15), snapshot=snapshot, cross_check=cross_check,
             fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC), raw_provenance_path="raw.json",
+            secondary_provenance=_secondary_provenance_for(as_of=date(2020, 1, 15)),
         )
 
 
@@ -795,6 +883,7 @@ def test_dataset_entry_refuses_an_uncorroborated_cross_check() -> None:
         WikipediaDatasetEntry(
             as_of=as_of, snapshot=snapshot, cross_check=cross_check,
             fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC), raw_provenance_path="raw.json",
+            secondary_provenance=_secondary_provenance_for(as_of=as_of),
         )
 
 
@@ -806,6 +895,7 @@ def test_dataset_entry_refuses_a_naive_fetch_observed_at() -> None:
         WikipediaDatasetEntry(
             as_of=as_of, snapshot=snapshot, cross_check=cross_check,
             fetch_observed_at=datetime(2026, 9, 6), raw_provenance_path="raw.json",
+            secondary_provenance=_secondary_provenance_for(as_of=as_of),
         )
 
 
@@ -817,12 +907,43 @@ def test_dataset_entry_refuses_an_empty_raw_provenance_path() -> None:
         WikipediaDatasetEntry(
             as_of=as_of, snapshot=snapshot, cross_check=cross_check,
             fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC), raw_provenance_path="   ",
+            secondary_provenance=_secondary_provenance_for(as_of=as_of),
+        )
+
+
+def test_dataset_entry_refuses_a_secondary_source_id_mismatch() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    as_of = date(2020, 1, 15)
+    # secondary_source_id="fja05680-sp500-github" (_cross_check_for's default)
+    cross_check = _cross_check_for(snapshot, as_of=as_of)
+    with pytest.raises(SourceAdapterError, match="does not match"):
+        WikipediaDatasetEntry(
+            as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+            fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC), raw_provenance_path="raw.json",
+            secondary_provenance=_secondary_provenance_for(
+                as_of=as_of, source_id="a-different-source"
+            ),
+        )
+
+
+def test_dataset_entry_refuses_a_secondary_matched_row_after_as_of() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    as_of = date(2020, 1, 15)
+    cross_check = _cross_check_for(snapshot, as_of=as_of)
+    with pytest.raises(SourceAdapterError, match="no look-ahead"):
+        WikipediaDatasetEntry(
+            as_of=as_of, snapshot=snapshot, cross_check=cross_check,
+            fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC), raw_provenance_path="raw.json",
+            secondary_provenance=_secondary_provenance_for(
+                as_of=as_of, matched_row_date=date(2020, 1, 16)
+            ),
         )
 
 
 def test_dataset_entry_checksum_ignores_fetch_observed_at() -> None:
-    """Two fetches of the SAME immutable revision at different real times must
-    be recognised as the SAME admitted observation (idempotent), never a
+    """Two fetches of the SAME immutable revision (and of the SAME
+    independent secondary artifact) at different real times must be
+    recognised as the SAME admitted observation (idempotent), never a
     conflict -- this is what makes crash-recovery retries safe."""
     as_of = date(2020, 1, 15)
     snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
@@ -830,10 +951,16 @@ def test_dataset_entry_checksum_ignores_fetch_observed_at() -> None:
     first = WikipediaDatasetEntry(
         as_of=as_of, snapshot=snapshot, cross_check=cross_check,
         fetch_observed_at=datetime(2026, 9, 6, 10, 0, tzinfo=UTC), raw_provenance_path="raw.json",
+        secondary_provenance=_secondary_provenance_for(
+            as_of=as_of, fetched_at=datetime(2026, 9, 6, 10, 0, tzinfo=UTC)
+        ),
     )
     second = WikipediaDatasetEntry(
         as_of=as_of, snapshot=snapshot, cross_check=cross_check,
         fetch_observed_at=datetime(2026, 9, 6, 23, 59, tzinfo=UTC), raw_provenance_path="raw.json",
+        secondary_provenance=_secondary_provenance_for(
+            as_of=as_of, fetched_at=datetime(2026, 9, 6, 23, 59, tzinfo=UTC)
+        ),
     )
     assert first.compute_checksum() == second.compute_checksum()
 
@@ -857,20 +984,12 @@ def test_dataset_entry_to_dict_round_trips() -> None:
 def test_store_accepts_and_reloads_an_entry(tmp_path: Path) -> None:
     store = WikipediaDatasetStore(tmp_path)
     as_of = date(2020, 1, 15)
-    wikitext = _wikitext_table()
-    raw_bytes = _raw(wikitext)
-    snapshot = parse_revision_snapshot(
-        wikitext, raw_bytes=raw_bytes, revision=_revision(1, REV_A_TS)
-    )
-    cross_check = _cross_check_for(snapshot, as_of=as_of)
-    entry = WikipediaDatasetEntry(
-        as_of=as_of, snapshot=snapshot, cross_check=cross_check,
-        fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
-        raw_provenance_path=str(store._raw_path(1)),  # noqa: SLF001
+    entry, raw_bytes, secondary_raw = _entry_with_secondary(
+        as_of=as_of, revision_id=1, timestamp=REV_A_TS,
     )
 
     assert store.has(as_of) is False
-    result = store.accept(entry, raw_bytes)
+    result = store.accept(entry, raw_bytes, secondary_raw_bytes=secondary_raw)
     assert result.already_written is False
     assert store.has(as_of) is True
     assert store.dates() == (as_of,)
@@ -888,78 +1007,182 @@ def test_store_accept_is_idempotent_on_retry(tmp_path: Path) -> None:
     snapshot = parse_revision_snapshot(
         wikitext, raw_bytes=raw_bytes, revision=_revision(1, REV_A_TS)
     )
-    cross_check = _cross_check_for(snapshot, as_of=as_of)
+    secondary_raw = _secondary_csv_bytes(snapshot.tickers())
+    match = secondary_csv_tickers_at_or_before(secondary_raw, as_of)
+    cross_check = cross_check_membership(
+        wikipedia=snapshot, secondary_tickers=match.tickers,
+        secondary_source_id="fja05680-sp500-github", as_of=as_of,
+    )
     # Two SEPARATE entry objects for the identical real observation, built as
-    # if by two different fetch attempts (different fetch_observed_at) -- the
-    # crash-recovery-retry scenario.
+    # if by two different fetch attempts (different fetch_observed_at /
+    # secondary fetched_at) -- the crash-recovery-retry scenario.
     first = WikipediaDatasetEntry(
         as_of=as_of, snapshot=snapshot, cross_check=cross_check,
         fetch_observed_at=datetime(2026, 9, 6, 10, 0, tzinfo=UTC),
         raw_provenance_path=str(store._raw_path(1)),  # noqa: SLF001
+        secondary_provenance=SecondaryProvenance(
+            source_id="fja05680-sp500-github",
+            source_url="https://raw.githubusercontent.com/fja05680/sp500/master/test.csv",
+            fetched_at=datetime(2026, 9, 6, 10, 0, tzinfo=UTC),
+            full_file_checksum=raw_artifact_checksum(secondary_raw),
+            raw_artifact_path=str(store._secondary_raw_path(raw_artifact_checksum(secondary_raw))),  # noqa: SLF001
+            matched_row_date=match.matched_date,
+            matched_row_checksum=raw_artifact_checksum(match.matched_line.encode("utf-8")),
+        ),
     )
     second = WikipediaDatasetEntry(
         as_of=as_of, snapshot=snapshot, cross_check=cross_check,
         fetch_observed_at=datetime(2026, 9, 6, 23, 59, tzinfo=UTC),
         raw_provenance_path=str(store._raw_path(1)),  # noqa: SLF001
+        secondary_provenance=SecondaryProvenance(
+            source_id="fja05680-sp500-github",
+            source_url="https://raw.githubusercontent.com/fja05680/sp500/master/test.csv",
+            fetched_at=datetime(2026, 9, 6, 23, 59, tzinfo=UTC),
+            full_file_checksum=raw_artifact_checksum(secondary_raw),
+            raw_artifact_path=str(store._secondary_raw_path(raw_artifact_checksum(secondary_raw))),  # noqa: SLF001
+            matched_row_date=match.matched_date,
+            matched_row_checksum=raw_artifact_checksum(match.matched_line.encode("utf-8")),
+        ),
     )
 
-    first_result = store.accept(first, raw_bytes)
+    first_result = store.accept(first, raw_bytes, secondary_raw_bytes=secondary_raw)
     assert first_result.already_written is False
-    second_result = store.accept(second, raw_bytes)
+    second_result = store.accept(second, raw_bytes, secondary_raw_bytes=secondary_raw)
     assert second_result.already_written is True
     assert store.dates() == (as_of,)
     # The FIRST fetch's observation time is what survives -- a retry never
     # silently updates previously recorded provenance.
     reloaded = store.load(as_of)
     assert reloaded.fetch_observed_at == datetime(2026, 9, 6, 10, 0, tzinfo=UTC)
+    assert reloaded.secondary_provenance.fetched_at == datetime(2026, 9, 6, 10, 0, tzinfo=UTC)
 
 
 def test_store_accept_refuses_a_conflicting_candidate_for_the_same_as_of(tmp_path: Path) -> None:
     store = WikipediaDatasetStore(tmp_path)
     as_of = date(2020, 1, 15)
-    original = _entry_for(
-        revision_id=1, timestamp=REV_A_TS, as_of=as_of,
+    original, original_raw, original_secondary_raw = _entry_with_secondary(
+        as_of=as_of, revision_id=1, timestamp=REV_A_TS,
         raw_provenance_path=str(store._raw_path(1)),  # noqa: SLF001
     )
-    original_wikitext = _wikitext_table()
-    store.accept(original, _raw(original_wikitext))
+    store.accept(original, original_raw, secondary_raw_bytes=original_secondary_raw)
 
-    # A DIFFERENT revision (different content) for the SAME as_of date.
+    # A DIFFERENT revision (different content) for the SAME as_of date --
+    # with its OWN validly-bound (not fabricated) secondary provenance, so
+    # the only thing under test is the write-once entry-level conflict, not
+    # a spurious secondary-checksum mismatch.
     conflicting_wikitext = _wikitext_table(reclassify_first_n=5)
     conflicting_raw = _raw(conflicting_wikitext)
     conflicting_snapshot = parse_revision_snapshot(
         conflicting_wikitext, raw_bytes=conflicting_raw, revision=_revision(2, REV_A_TS)
     )
-    conflicting_cross_check = _cross_check_for(conflicting_snapshot, as_of=as_of)
+    conflicting_secondary_raw = _secondary_csv_bytes(conflicting_snapshot.tickers())
+    conflicting_match = secondary_csv_tickers_at_or_before(conflicting_secondary_raw, as_of)
+    conflicting_cross_check = cross_check_membership(
+        wikipedia=conflicting_snapshot, secondary_tickers=conflicting_match.tickers,
+        secondary_source_id="fja05680-sp500-github", as_of=as_of,
+    )
     conflicting_entry = WikipediaDatasetEntry(
         as_of=as_of, snapshot=conflicting_snapshot, cross_check=conflicting_cross_check,
         fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
         raw_provenance_path=str(store._raw_path(2)),  # noqa: SLF001
+        secondary_provenance=SecondaryProvenance(
+            source_id="fja05680-sp500-github",
+            source_url="https://raw.githubusercontent.com/fja05680/sp500/master/test.csv",
+            fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
+            full_file_checksum=raw_artifact_checksum(conflicting_secondary_raw),
+            raw_artifact_path="secondary.raw.csv",
+            matched_row_date=conflicting_match.matched_date,
+            matched_row_checksum=raw_artifact_checksum(
+                conflicting_match.matched_line.encode("utf-8")
+            ),
+        ),
     )
     with pytest.raises(SourceAdapterError, match="write-once"):
-        store.accept(conflicting_entry, conflicting_raw)
+        store.accept(
+            conflicting_entry, conflicting_raw, secondary_raw_bytes=conflicting_secondary_raw
+        )
     # The original entry must still be exactly what was first archived.
     assert store.load(as_of).snapshot.revision.revision_id == 1
+
+
+def test_store_accept_refuses_mismatched_secondary_raw_bytes(tmp_path: Path) -> None:
+    """``secondary_raw_bytes`` must authenticate the entry's own
+    ``full_file_checksum`` claim -- exactly the same fail-closed guard already
+    enforced for the primary MediaWiki raw bytes."""
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    entry, raw_bytes, _secondary_raw = _entry_with_secondary(
+        as_of=as_of, revision_id=1, timestamp=REV_A_TS,
+    )
+    with pytest.raises(SourceAdapterError, match="do not match"):
+        store.accept(entry, raw_bytes, secondary_raw_bytes=b"not the real secondary csv bytes")
 
 
 def test_store_load_detects_tampered_raw_provenance(tmp_path: Path) -> None:
     store = WikipediaDatasetStore(tmp_path)
     as_of = date(2020, 1, 15)
-    wikitext = _wikitext_table()
-    raw_bytes = _raw(wikitext)
-    snapshot = parse_revision_snapshot(
-        wikitext, raw_bytes=raw_bytes, revision=_revision(1, REV_A_TS)
+    entry, raw_bytes, secondary_raw = _entry_with_secondary(
+        as_of=as_of, revision_id=1, timestamp=REV_A_TS,
     )
-    cross_check = _cross_check_for(snapshot, as_of=as_of)
-    entry = WikipediaDatasetEntry(
-        as_of=as_of, snapshot=snapshot, cross_check=cross_check,
-        fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
-        raw_provenance_path=str(store._raw_path(1)),  # noqa: SLF001
-    )
-    store.accept(entry, raw_bytes)
+    store.accept(entry, raw_bytes, secondary_raw_bytes=secondary_raw)
 
     store._raw_path(1).write_bytes(raw_bytes + b"tampered")  # noqa: SLF001
     with pytest.raises(SourceAdapterError, match="tampered"):
+        store.load(as_of)
+
+
+def test_store_load_detects_tampered_secondary_raw_provenance(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    entry, raw_bytes, secondary_raw = _entry_with_secondary(
+        as_of=as_of, revision_id=1, timestamp=REV_A_TS,
+    )
+    store.accept(entry, raw_bytes, secondary_raw_bytes=secondary_raw)
+
+    secondary_path = store._secondary_raw_path(entry.secondary_provenance.full_file_checksum)  # noqa: SLF001
+    secondary_path.write_bytes(secondary_raw + b"tampered")
+    with pytest.raises(SourceAdapterError, match="tampered"):
+        store.load(as_of)
+
+
+def test_store_load_refuses_a_missing_secondary_raw_sidecar(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    entry, raw_bytes, secondary_raw = _entry_with_secondary(
+        as_of=as_of, revision_id=1, timestamp=REV_A_TS,
+    )
+    store.accept(entry, raw_bytes, secondary_raw_bytes=secondary_raw)
+
+    secondary_path = store._secondary_raw_path(entry.secondary_provenance.full_file_checksum)  # noqa: SLF001
+    secondary_path.unlink()
+    with pytest.raises(SourceAdapterError, match="secondary source raw provenance sidecar"):
+        store.load(as_of)
+
+
+def test_store_load_refuses_a_secondary_source_that_has_drifted(tmp_path: Path) -> None:
+    """The entry's declared ``matched_row_date`` must equal what
+    :func:`secondary_csv_tickers_at_or_before` actually re-derives from the
+    RETAINED secondary bytes for this ``as_of`` -- not merely be internally
+    well-shaped. Built via ``dataclasses.replace`` on the already-validated
+    object (recomputing a genuinely matching ``entry_checksum`` for the
+    mutated content) so this test isolates the independent re-derivation
+    check from the separately-covered stale/mismatched-checksum guard."""
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    entry, raw_bytes, secondary_raw = _entry_with_secondary(
+        as_of=as_of, revision_id=1, timestamp=REV_A_TS,
+    )
+    store.accept(entry, raw_bytes, secondary_raw_bytes=secondary_raw)
+
+    tampered = replace(
+        entry,
+        secondary_provenance=replace(
+            entry.secondary_provenance, matched_row_date=date(1999, 1, 1)
+        ),
+    )
+    entry_path = store._entry_path(as_of)  # noqa: SLF001
+    entry_path.write_text(json.dumps(tampered.to_dict()), encoding="utf-8")
+    with pytest.raises(SourceAdapterError, match="effective row"):
         store.load(as_of)
 
 
@@ -980,6 +1203,7 @@ def test_store_load_refuses_a_hand_imported_entry_with_a_later_revision(tmp_path
         as_of=date(2020, 6, 15), snapshot=snapshot, cross_check=cross_check,
         fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
         raw_provenance_path=str(store._raw_path(1)),  # noqa: SLF001
+        secondary_provenance=_secondary_provenance_for(as_of=date(2020, 6, 15)),
     )
     payload = legitimate.to_dict()
     payload["as_of"] = as_of.isoformat()  # hand-tamper: pretend this is an EARLIER date
@@ -1121,18 +1345,11 @@ def test_store_dates_and_entries_are_sorted(tmp_path: Path) -> None:
         (date(2020, 6, 15), 2, REV_B_TS),
         (date(2020, 1, 15), 1, REV_A_TS),
     ):
-        wikitext = _wikitext_table()
-        raw_bytes = _raw(wikitext)
-        snapshot = parse_revision_snapshot(
-            wikitext, raw_bytes=raw_bytes, revision=_revision(revision_id, timestamp)
-        )
-        cross_check = _cross_check_for(snapshot, as_of=as_of)
-        entry = WikipediaDatasetEntry(
-            as_of=as_of, snapshot=snapshot, cross_check=cross_check,
-            fetch_observed_at=datetime(2026, 9, 6, tzinfo=UTC),
+        entry, raw_bytes, secondary_raw = _entry_with_secondary(
+            as_of=as_of, revision_id=revision_id, timestamp=timestamp,
             raw_provenance_path=str(store._raw_path(revision_id)),  # noqa: SLF001
         )
-        store.accept(entry, raw_bytes)
+        store.accept(entry, raw_bytes, secondary_raw_bytes=secondary_raw)
 
     assert store.dates() == (date(2020, 1, 15), date(2020, 6, 15))
     entries = store.entries()
@@ -1172,10 +1389,27 @@ class _FakeFetcher:
         return RawWikipediaRevisionFetch(snapshot=snapshot, raw_bytes=raw)
 
 
-def _always_full_agreement() -> Callable[[date], frozenset[str]]:
-    def _lookup(as_of: date) -> frozenset[str]:
-        return frozenset(_ticker_for_index(i) for i in range(TABLE_ROW_COUNT))
-    return _lookup
+#: One shared, real (never fabricated) secondary CSV blob with a single row
+#: dated far in the past, so "at or before" resolves to it for every ``as_of``
+#: these tests use -- exactly what the real script does with one real fetch
+#: per run, just without the network call.
+_FULL_AGREEMENT_SECONDARY_CSV = _secondary_csv_bytes(
+    frozenset(_ticker_for_index(i) for i in range(TABLE_ROW_COUNT))
+)
+_NO_AGREEMENT_SECONDARY_CSV = _secondary_csv_bytes(frozenset({"FOREIGN1", "FOREIGN2", "FOREIGN3"}))
+_SECONDARY_SOURCE_URL = "https://raw.githubusercontent.com/fja05680/sp500/master/test.csv"
+
+
+def _always_full_agreement() -> Callable[[date], SecondaryCsvMatch]:
+    def _match(as_of: date) -> SecondaryCsvMatch:
+        return secondary_csv_tickers_at_or_before(_FULL_AGREEMENT_SECONDARY_CSV, as_of)
+    return _match
+
+
+def _no_agreement() -> Callable[[date], SecondaryCsvMatch]:
+    def _match(as_of: date) -> SecondaryCsvMatch:
+        return secondary_csv_tickers_at_or_before(_NO_AGREEMENT_SECONDARY_CSV, as_of)
+    return _match
 
 
 def test_batch_admits_new_dates(tmp_path: Path) -> None:
@@ -1183,8 +1417,10 @@ def test_batch_admits_new_dates(tmp_path: Path) -> None:
     fetcher = _FakeFetcher({date(2020, 1, 15): (1, REV_A_TS)})
     result = run_wikipedia_revision_history_batch(
         [date(2020, 1, 15)], store=store,
-        secondary_tickers_at_or_before=_always_full_agreement(),
-        secondary_source_id="fja05680-sp500-github",
+        secondary_match_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github", secondary_source_url=_SECONDARY_SOURCE_URL,
+        secondary_raw_bytes=_FULL_AGREEMENT_SECONDARY_CSV,
+        secondary_fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
         fetch_revision_at_or_before_fn=fetcher.lookup,
         fetch_revision_wikitext_fn=fetcher.wikitext,
         now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
@@ -1192,6 +1428,13 @@ def test_batch_admits_new_dates(tmp_path: Path) -> None:
     assert result.admitted_dates() == (date(2020, 1, 15),)
     assert result.rows[0].outcome == BATCH_OUTCOME_ADMITTED
     assert store.has(date(2020, 1, 15))
+    # The archived entry round-trips through load(), including the
+    # independent secondary-source binding.
+    reloaded = store.load(date(2020, 1, 15))
+    assert reloaded.secondary_provenance.source_id == "fja05680-sp500-github"
+    assert reloaded.secondary_provenance.full_file_checksum == raw_artifact_checksum(
+        _FULL_AGREEMENT_SECONDARY_CSV
+    )
 
 
 def test_batch_resumes_already_archived_dates_without_refetching(tmp_path: Path) -> None:
@@ -1202,8 +1445,10 @@ def test_batch_resumes_already_archived_dates_without_refetching(tmp_path: Path)
     })
     run_wikipedia_revision_history_batch(
         [date(2020, 1, 15)], store=store,
-        secondary_tickers_at_or_before=_always_full_agreement(),
-        secondary_source_id="fja05680-sp500-github",
+        secondary_match_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github", secondary_source_url=_SECONDARY_SOURCE_URL,
+        secondary_raw_bytes=_FULL_AGREEMENT_SECONDARY_CSV,
+        secondary_fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
         fetch_revision_at_or_before_fn=fetcher.lookup,
         fetch_revision_wikitext_fn=fetcher.wikitext,
         now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
@@ -1214,8 +1459,10 @@ def test_batch_resumes_already_archived_dates_without_refetching(tmp_path: Path)
     # date alongside a genuinely new one.
     result = run_wikipedia_revision_history_batch(
         [date(2020, 6, 15), date(2020, 1, 15)], store=store,
-        secondary_tickers_at_or_before=_always_full_agreement(),
-        secondary_source_id="fja05680-sp500-github",
+        secondary_match_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github", secondary_source_url=_SECONDARY_SOURCE_URL,
+        secondary_raw_bytes=_FULL_AGREEMENT_SECONDARY_CSV,
+        secondary_fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
         fetch_revision_at_or_before_fn=fetcher.lookup,
         fetch_revision_wikitext_fn=fetcher.wikitext,
         now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
@@ -1238,8 +1485,10 @@ def test_batch_resume_survives_a_later_valid_revision_for_the_same_date(tmp_path
     as_of = date(2020, 6, 15)
     first_fetcher = _FakeFetcher({as_of: (1, REV_A_TS)})
     run_wikipedia_revision_history_batch(
-        [as_of], store=store, secondary_tickers_at_or_before=_always_full_agreement(),
-        secondary_source_id="fja05680-sp500-github",
+        [as_of], store=store, secondary_match_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github", secondary_source_url=_SECONDARY_SOURCE_URL,
+        secondary_raw_bytes=_FULL_AGREEMENT_SECONDARY_CSV,
+        secondary_fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
         fetch_revision_at_or_before_fn=first_fetcher.lookup,
         fetch_revision_wikitext_fn=first_fetcher.wikitext,
         now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
@@ -1252,8 +1501,10 @@ def test_batch_resume_survives_a_later_valid_revision_for_the_same_date(tmp_path
     # runs, still before the decision date.
     second_fetcher = _FakeFetcher({as_of: (2, REV_B_TS)})
     result = run_wikipedia_revision_history_batch(
-        [as_of], store=store, secondary_tickers_at_or_before=_always_full_agreement(),
-        secondary_source_id="fja05680-sp500-github",
+        [as_of], store=store, secondary_match_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github", secondary_source_url=_SECONDARY_SOURCE_URL,
+        secondary_raw_bytes=_FULL_AGREEMENT_SECONDARY_CSV,
+        secondary_fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
         fetch_revision_at_or_before_fn=second_fetcher.lookup,
         fetch_revision_wikitext_fn=second_fetcher.wikitext,
         now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
@@ -1267,12 +1518,11 @@ def test_batch_refuses_dates_that_fail_corroboration(tmp_path: Path) -> None:
     store = WikipediaDatasetStore(tmp_path)
     fetcher = _FakeFetcher({date(2020, 1, 15): (1, REV_A_TS)})
 
-    def _no_agreement(as_of: date) -> frozenset[str]:
-        return frozenset({"FOREIGN1", "FOREIGN2", "FOREIGN3"})
-
     result = run_wikipedia_revision_history_batch(
-        [date(2020, 1, 15)], store=store, secondary_tickers_at_or_before=_no_agreement,
-        secondary_source_id="fja05680-sp500-github",
+        [date(2020, 1, 15)], store=store, secondary_match_at_or_before=_no_agreement(),
+        secondary_source_id="fja05680-sp500-github", secondary_source_url=_SECONDARY_SOURCE_URL,
+        secondary_raw_bytes=_NO_AGREEMENT_SECONDARY_CSV,
+        secondary_fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
         fetch_revision_at_or_before_fn=fetcher.lookup,
         fetch_revision_wikitext_fn=fetcher.wikitext,
         now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
@@ -1295,8 +1545,10 @@ def test_batch_records_a_failure_without_aborting_the_rest(tmp_path: Path) -> No
     fetcher = _FakeFetcher({date(2020, 6, 15): (2, REV_B_TS)})
     result = run_wikipedia_revision_history_batch(
         [date(2020, 1, 15), date(2020, 6, 15)], store=store,
-        secondary_tickers_at_or_before=_always_full_agreement(),
-        secondary_source_id="fja05680-sp500-github",
+        secondary_match_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github", secondary_source_url=_SECONDARY_SOURCE_URL,
+        secondary_raw_bytes=_FULL_AGREEMENT_SECONDARY_CSV,
+        secondary_fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
         fetch_revision_at_or_before_fn=_lookup,
         fetch_revision_wikitext_fn=fetcher.wikitext,
         now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
@@ -1312,8 +1564,10 @@ def test_batch_refuses_duplicate_requested_dates(tmp_path: Path) -> None:
     with pytest.raises(SourceAdapterError, match="duplicate"):
         run_wikipedia_revision_history_batch(
             [date(2020, 1, 15), date(2020, 1, 15)], store=store,
-            secondary_tickers_at_or_before=_always_full_agreement(),
-            secondary_source_id="fja05680-sp500-github",
+            secondary_match_at_or_before=_always_full_agreement(),
+            secondary_source_id="fja05680-sp500-github", secondary_source_url=_SECONDARY_SOURCE_URL,
+            secondary_raw_bytes=_FULL_AGREEMENT_SECONDARY_CSV,
+            secondary_fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
             fetch_revision_at_or_before_fn=fetcher.lookup,
             fetch_revision_wikitext_fn=fetcher.wikitext,
             now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
@@ -1331,8 +1585,10 @@ def test_manifest_is_deterministic_across_rebuilds(tmp_path: Path) -> None:
     })
     run_wikipedia_revision_history_batch(
         [date(2020, 1, 15), date(2020, 6, 15)], store=store,
-        secondary_tickers_at_or_before=_always_full_agreement(),
-        secondary_source_id="fja05680-sp500-github",
+        secondary_match_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github", secondary_source_url=_SECONDARY_SOURCE_URL,
+        secondary_raw_bytes=_FULL_AGREEMENT_SECONDARY_CSV,
+        secondary_fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
         fetch_revision_at_or_before_fn=fetcher.lookup,
         fetch_revision_wikitext_fn=fetcher.wikitext,
         now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
@@ -1343,6 +1599,10 @@ def test_manifest_is_deterministic_across_rebuilds(tmp_path: Path) -> None:
     assert manifest_1.date_coverage == (date(2020, 1, 15), date(2020, 6, 15))
     assert manifest_1.aggregate["admitted_count"] == 2
     assert manifest_1.aggregate["mean_agreement_ratio"] == pytest.approx(1.0)
+    assert manifest_1.aggregate["distinct_secondary_source_ids"] == ["fja05680-sp500-github"]
+    assert manifest_1.aggregate["distinct_secondary_full_file_checksums"] == [
+        raw_artifact_checksum(_FULL_AGREEMENT_SECONDARY_CSV)
+    ]
 
 
 def test_manifest_records_gaps_for_requested_but_unadmitted_dates(tmp_path: Path) -> None:
@@ -1350,8 +1610,10 @@ def test_manifest_records_gaps_for_requested_but_unadmitted_dates(tmp_path: Path
     fetcher = _FakeFetcher({date(2020, 1, 15): (1, REV_A_TS)})
     run_wikipedia_revision_history_batch(
         [date(2020, 1, 15)], store=store,
-        secondary_tickers_at_or_before=_always_full_agreement(),
-        secondary_source_id="fja05680-sp500-github",
+        secondary_match_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github", secondary_source_url=_SECONDARY_SOURCE_URL,
+        secondary_raw_bytes=_FULL_AGREEMENT_SECONDARY_CSV,
+        secondary_fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
         fetch_revision_at_or_before_fn=fetcher.lookup,
         fetch_revision_wikitext_fn=fetcher.wikitext,
         now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
@@ -1377,6 +1639,67 @@ def test_manifest_never_claims_eligibility_and_names_window_gap(tmp_path: Path) 
     window_status = payload["window_definition_status"]
     assert isinstance(window_status, dict)
     assert window_status["status"] == "WINDOW_DEFINITION_REQUIRED"
+
+
+def test_manifest_entries_carry_checksum_and_secondary_binding(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    fetcher = _FakeFetcher({date(2020, 1, 15): (1, REV_A_TS)})
+    run_wikipedia_revision_history_batch(
+        [date(2020, 1, 15)], store=store,
+        secondary_match_at_or_before=_always_full_agreement(),
+        secondary_source_id="fja05680-sp500-github", secondary_source_url=_SECONDARY_SOURCE_URL,
+        secondary_raw_bytes=_FULL_AGREEMENT_SECONDARY_CSV,
+        secondary_fetched_at=datetime(2026, 9, 6, tzinfo=UTC),
+        fetch_revision_at_or_before_fn=fetcher.lookup,
+        fetch_revision_wikitext_fn=fetcher.wikitext,
+        now=lambda: datetime(2026, 9, 6, tzinfo=UTC),
+    )
+    entries = store.entries()
+    manifest = build_dataset_manifest(entries)
+    payload = manifest.to_dict()
+    records = payload["entries"]
+    assert isinstance(records, list)
+    assert len(records) == 1
+    record = records[0]
+    assert record["entry_checksum"] == entries[0].compute_checksum()
+    assert record["secondary_full_file_checksum"] == raw_artifact_checksum(
+        _FULL_AGREEMENT_SECONDARY_CSV
+    )
+    assert record["secondary_source_id"] == "fja05680-sp500-github"
+    expected_matched_row_checksum = entries[0].secondary_provenance.matched_row_checksum
+    assert record["secondary_matched_row_checksum"] == expected_matched_row_checksum
+
+
+def test_manifest_fingerprint_distinguishes_different_partitions_with_the_same_ratio(
+    tmp_path: Path,
+) -> None:
+    """Two admitted entries whose ``agreement_ratio`` happens to match but
+    whose actual cross-check partition (and secondary artifact) differ must
+    NOT collide into the same dataset-level fingerprint -- the fingerprint
+    must commit to each entry's own ``entry_checksum``, not merely to the
+    lossy summary ratio."""
+    entry_a, _, _ = _entry_with_secondary(
+        as_of=date(2020, 1, 15), revision_id=1, timestamp=REV_A_TS,
+    )
+    entry_b, _, _ = _entry_with_secondary(
+        as_of=date(2020, 1, 15), revision_id=1, timestamp=REV_A_TS,
+    )
+    # Both are full agreement (ratio 1.0) against a DIFFERENT independent
+    # secondary artifact (different source URL/fetch time is not enough on
+    # its own -- change the retained bytes' checksum too).
+    entry_b = replace(
+        entry_b,
+        secondary_provenance=replace(
+            entry_b.secondary_provenance,
+            full_file_checksum="sha256:" + "9" * 64,
+        ),
+    )
+    assert entry_a.cross_check.agreement_ratio == entry_b.cross_check.agreement_ratio == 1.0
+    assert entry_a.compute_checksum() != entry_b.compute_checksum()
+
+    manifest_a = build_dataset_manifest([entry_a])
+    manifest_b = build_dataset_manifest([entry_b])
+    assert manifest_a.content_fingerprint != manifest_b.content_fingerprint
 
 
 # -- WINDOW_DEFINITION_REQUIRED: a precise gap, never a fabricated window ----
