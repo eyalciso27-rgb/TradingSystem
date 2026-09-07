@@ -58,6 +58,31 @@
 # full backtest window (A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD, see
 # MVP_DELIVERY_PLAN.md §5 M3 gap 5); finding an independent dated GICS source
 # is a separate, unencoded research gap (gap 6).
+#
+# 2026-09-06 follow-up (A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD, same
+# day). Before fetching more dates, independently re-verified whether an
+# owner-approved ABSOLUTE start/end date for the frozen strategy's full
+# backtest window exists anywhere on main: it does not (only the RELATIVE
+# 60/20/20 chronological split and 60-month-context/12-month-evaluation
+# walk-forward proportions are frozen, in
+# docs/strategies/baseline-trend-breakout-v1.yaml). Fetching an arbitrary set
+# of "the" backtest-window dates would have been exactly the kind of
+# fabricated decision this project's rules forbid, so instead this task built
+# the reusable, deterministic, resumable and idempotent BATCH machinery
+# (trading_market_data_core.dataset_v1_wikipedia_pit.WikipediaDatasetStore /
+# run_wikipedia_revision_history_batch / build_dataset_manifest,
+# scripts/run_wikipedia_revision_history_batch.py) plus offline, fixture-based
+# tests proving it is resumable, idempotent, and fail-closed against a later
+# revision entering the dataset through a retry, a resumed run, or a
+# hand-imported entry file. The single already-recorded real experiment
+# (2023-12-31) is unchanged, not regenerated. The precise gap is recorded as
+# WINDOW_DEFINITION_REQUIRED
+# (dataset_v1_wikipedia_pit.WINDOW_DEFINITION_REQUIRED, mirrored under
+# WIKIPEDIA_REVISION_HISTORY_EVALUATION["batch_dataset"]); it blocks only the
+# FULL-WINDOW empirical dataset, not this machinery, not gap 5's status below,
+# and not TRADING_READINESS or Paper/Live authorization. Do not recreate this
+# machinery; do not fetch a fabricated date range against it until the owner
+# (or an approved ADR) supplies the absolute window.
 version: "1.0"
 updated: "2026-09-06"
 baseline: docs/baseline-v0.5/

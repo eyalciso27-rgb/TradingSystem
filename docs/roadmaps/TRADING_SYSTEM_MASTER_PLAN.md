@@ -182,11 +182,23 @@ real-account PoIs remain **BLOCKED**.
 > `BacktestQuality.APPROXIMATE` membership research, and does not close the
 > official gap above. GICS/sector values are captured from the same source
 > but stay `CAPTURED_UNEVALUATED_NOT_ADMITTED` — no independent, dated, free
-> GICS source has been identified to cross-check them against. One
-> dependency-safe, non-owner-gated task remains
-> (`A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD`: extend the one recorded
-> date to the full backtest window); do not recreate the evaluation or the
-> recorded experiment.
+> GICS source has been identified to cross-check them against.
+>
+> **2026-09-06, A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD.** The
+> dependency-safe multi-date BATCH machinery to extend the one recorded date
+> is now built and tested (`WikipediaDatasetStore` /
+> `run_wikipedia_revision_history_batch` / `build_dataset_manifest`,
+> `scripts/run_wikipedia_revision_history_batch.py`, 24 further offline
+> tests, including tests proving a later revision cannot enter the dataset
+> through a retry, a resumed run, or a hand-imported entry file). The real
+> FULL-WINDOW dataset was NOT fetched: no owner-approved absolute start/end
+> date for the frozen strategy's backtest window exists on main (only the
+> relative 60/20/20 chronological split and 60-month/12-month walk-forward
+> proportions are frozen), and inventing one would be a fabricated decision.
+> This is recorded precisely as `WINDOW_DEFINITION_REQUIRED`
+> (`dataset_v1_wikipedia_pit.WINDOW_DEFINITION_REQUIRED`); do not recreate
+> the evaluation, the recorded experiment, or the batch machinery, and do not
+> invent a window — wait for the owner (or an approved ADR) to supply one.
 
 > **A-WP1 — baseline hypothesis FROZEN (2026-08-13).** The owner completed
 > `STRATEGY_FREEZE_TEMPLATE.md` for `baseline-trend-breakout-v1` and it
@@ -490,9 +502,13 @@ broker at all. The **official, PIT_STRICT** dataset is
 actions (official S&P documents, a historical-GICS licensing decision, a
 delisted-name provider decision, and an owner-run of the real qualification
 pipeline). A free, cross-checked **MEMBERSHIP** `SECONDARY_RESEARCH_PIT` /
-`BacktestQuality.APPROXIMATE` path is separately available and not
-owner-gated (`A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD`, one real date
-already recorded); it never substitutes for the official dataset above.
+`BacktestQuality.APPROXIMATE` path is separately available
+(`A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD`: one real date recorded,
+plus a now-complete, tested, resumable batch-build machinery for many
+dates); it never substitutes for the official dataset above. Fetching the
+real full-window dataset with that machinery is now owner-gated too — on
+`WINDOW_DEFINITION_REQUIRED`, an absolute backtest-window start/end date,
+which does not exist on main yet.
 
 ---
 
