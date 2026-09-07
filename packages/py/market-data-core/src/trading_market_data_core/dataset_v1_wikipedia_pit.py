@@ -571,7 +571,11 @@ class SectorCrossCheckResult:
             "disagreements": [list(item) for item in self.disagreements],
             "uncovered_ticker_count": len(self.uncovered_tickers),
             "scope_tickers": list(self.scope_tickers) if self.scope_tickers is not None else None,
-            "scope": "NARROW_CLASSIFICATION_CHANGE_CASE" if self.scope_tickers is not None else "FULL_WIKIPEDIA_UNIVERSE",
+            "scope": (
+                "NARROW_CLASSIFICATION_CHANGE_CASE"
+                if self.scope_tickers is not None
+                else "FULL_WIKIPEDIA_UNIVERSE"
+            ),
             "detail": self.detail,
         }
 

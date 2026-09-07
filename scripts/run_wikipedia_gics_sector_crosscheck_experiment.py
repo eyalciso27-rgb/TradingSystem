@@ -458,7 +458,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     parser.add_argument(
         "--output", type=Path, default=None,
-        help="evidence JSON path (default: <evidence-dir>/gics-sector-crosscheck-2018-communication-services.json)",
+        help=(
+            "evidence JSON path (default: <evidence-dir>/"
+            "gics-sector-crosscheck-2018-communication-services.json)"
+        ),
     )
     args = parser.parse_args(argv[1:])
 
@@ -492,11 +495,13 @@ def main(argv: list[str]) -> int:
     print(f"evidence written: {output}")
     print(
         f"before-transition corroborated: {before_check['corroborated']}"
-        f" (ratio={before_check['agreement_ratio']}, disagreements={before_check['disagreement_count']})"
+        f" (ratio={before_check['agreement_ratio']},"
+        f" disagreements={before_check['disagreement_count']})"
     )
     print(
         f"after-transition corroborated: {after_check['corroborated']}"
-        f" (ratio={after_check['agreement_ratio']}, disagreements={after_check['disagreement_count']})"
+        f" (ratio={after_check['agreement_ratio']},"
+        f" disagreements={after_check['disagreement_count']})"
     )
     return 0
 

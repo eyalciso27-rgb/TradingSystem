@@ -30,7 +30,9 @@ from typing import Any, cast
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-REGISTRY_PATH = REPO_ROOT / "config" / "data-sources" / "gics-sector-crosscheck-source-registry.json"
+REGISTRY_PATH = (
+    REPO_ROOT / "config" / "data-sources" / "gics-sector-crosscheck-source-registry.json"
+)
 
 ALLOWED_CLASSIFICATIONS = frozenset(
     {"NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC", "NOT_SUFFICIENT_FOR_GICS_CROSSCHECK"}
@@ -84,10 +86,13 @@ def _validate_eligibility(eligibility: object, where: str) -> None:
 def _validate_narrow_event_scoped(candidate: dict[str, Any], where: str) -> None:
     _require(
         candidate.get("source_authority") == "OFFICIAL_PUBLIC",
-        f"{where}: NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC must declare source_authority OFFICIAL_PUBLIC",
+        f"{where}: NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC must declare source_authority"
+        " OFFICIAL_PUBLIC",
     )
     experiment = candidate.get("bounded_real_experiment")
-    _require(isinstance(experiment, dict), f"{where}: bounded_real_experiment object is required")
+    _require(
+        isinstance(experiment, dict), f"{where}: bounded_real_experiment object is required"
+    )
     assert isinstance(experiment, dict)
     for key in ("performed_at", "performed_by", "evidence_path", "summary"):
         value = experiment.get(key)
@@ -98,7 +103,8 @@ def _validate_narrow_event_scoped(candidate: dict[str, Any], where: str) -> None
     evidence_path = REPO_ROOT / str(experiment["evidence_path"])
     _require(
         evidence_path.is_file(),
-        f"{where}: bounded_real_experiment.evidence_path {experiment['evidence_path']!r} does not exist",
+        f"{where}: bounded_real_experiment.evidence_path"
+        f" {experiment['evidence_path']!r} does not exist",
     )
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     declared_checksum = evidence.get("evidence_checksum")
@@ -180,7 +186,10 @@ def validate_registry(data: dict[str, Any]) -> None:
         _validate_eligibility(spec.get("eligibility"), f"classifications.{name}")
 
     candidates = data.get("candidates")
-    _require(isinstance(candidates, list) and len(candidates) > 0, "registry: candidates must be a non-empty list")
+    _require(
+        isinstance(candidates, list) and len(candidates) > 0,
+        "registry: candidates must be a non-empty list",
+    )
     assert isinstance(candidates, list)
 
     seen_ids: set[str] = set()
@@ -397,7 +406,9 @@ def test_validator_rejects_unknown_classification() -> None:
 def test_validator_rejects_unknown_rejection_reason() -> None:
     def mutate(data: dict[str, Any]) -> None:
         candidate = next(
-            c for c in data["candidates"] if c["classification"] == "NOT_SUFFICIENT_FOR_GICS_CROSSCHECK"
+            c
+            for c in data["candidates"]
+            if c["classification"] == "NOT_SUFFICIENT_FOR_GICS_CROSSCHECK"
         )
         candidate["rejection_reason"] = "JUST_BECAUSE"
 
@@ -408,9 +419,13 @@ def test_validator_rejects_unknown_rejection_reason() -> None:
 def test_validator_rejects_nonexistent_evidence_path() -> None:
     def mutate(data: dict[str, Any]) -> None:
         candidate = next(
-            c for c in data["candidates"] if c["classification"] == "NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC"
+            c
+            for c in data["candidates"]
+            if c["classification"] == "NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC"
         )
-        candidate["bounded_real_experiment"]["evidence_path"] = "docs/poi/evidence/does-not-exist.json"
+        candidate["bounded_real_experiment"]["evidence_path"] = (
+            "docs/poi/evidence/does-not-exist.json"
+        )
 
     with pytest.raises(RegistryError, match="does not exist"):
         validate_registry(_tampered(mutate))
@@ -432,7 +447,9 @@ def test_validator_rejects_tampered_referenced_evidence_checksum(tmp_path: Path)
     # resolves correctly for this test.
     def mutate_absolute(data: dict[str, Any]) -> None:
         candidate = next(
-            c for c in data["candidates"] if c["classification"] == "NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC"
+            c
+            for c in data["candidates"]
+            if c["classification"] == "NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC"
         )
         candidate["bounded_real_experiment"]["evidence_path"] = str(tampered_path)
 
@@ -462,7 +479,9 @@ def test_validator_rejects_missing_classification_key() -> None:
 def test_validator_requires_at_least_one_narrow_event_scoped_candidate() -> None:
     def mutate(data: dict[str, Any]) -> None:
         data["candidates"] = [
-            c for c in data["candidates"] if c["classification"] != "NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC"
+            c
+            for c in data["candidates"]
+            if c["classification"] != "NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC"
         ]
 
     with pytest.raises(RegistryError, match="at least one NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC"):
