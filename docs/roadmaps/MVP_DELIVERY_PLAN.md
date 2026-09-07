@@ -206,7 +206,7 @@ the frozen strategy, and passing its tests is never treated as such:
 | S&P historical-secondary source registry (PR #104) | which candidate secondary sources exist and exactly what would be required to validate one (checksum, timestamps, 2-source cross-check) | nothing about historical S&P membership itself — every candidate is unfetched (`checksum_status: NOT_YET_COMPUTED`) and, even fully validated, stays `SECONDARY_RESEARCH_PIT` — it can never become authoritative (ADR-0017) |
 | Corporate-action PIT validator (PR #106) | that a *given* corporate-action fixture is internally PIT-consistent (four timestamps ordered, stable UUID identity, non-cyclic correction lineage) | that any real corporate-action record exists for the frozen strategy's universe — it is explicitly OFFLINE and FIXTURE-ONLY and never performs a network call |
 | Dataset V1 real-source qualifiers (`qualify_corporate_actions`, `qualify_pit_membership`, `qualify_delisted_security_history`) | the pipeline can qualify real SEC/IBKR evidence once it is fetched | nothing until the owner-run qualification script is actually executed against live SEC EDGAR / IBKR sources |
-| Wikipedia/MediaWiki revision-history evaluation + one real experiment (`dataset_v1_wikipedia_pit.py`, `scripts/run_wikipedia_revision_history_experiment.py`, 2026-09-06) | a free, legitimate, cross-checked SECONDARY_RESEARCH_PIT path exists for historical **membership**-as-recorded, bound to a real, independently-verified revision id/timestamp/checksum, cross-checked against a real independent secondary source (100% agreement, 503/503 tickers, recorded in `docs/poi/evidence/dataset-v1/wikipedia-revision-history/experiment-2023-12-31.json`) | official historical S&P membership or historical GICS — permanently `SECONDARY_RESEARCH_PIT`, never `OFFICIAL_PUBLIC`; does not close `ASOF_GICS_BLOCKER` (still `BLOCKED_EXTERNAL` / `LICENSE_REQUIRED`); GICS/sector values are captured in the same revision but are explicitly `CAPTURED_UNEVALUATED_NOT_ADMITTED` — no independent dated GICS source has been cross-checked, so they are not admitted as secondary evidence; only ONE date has been experimentally recorded, not the full backtest window |
+| Wikipedia/MediaWiki revision-history + SEC Select Sector SPDR cross-check (`dataset_v1_wikipedia_pit.py`, `dataset_v1_sec_sector_spdr_gics.py`, 2026-09-07) | free `SECONDARY_RESEARCH_PIT` paths are empirically recorded for membership (503/503) and historical **GICS Sector** research (482/503 coverage; 482/482 covered agreement), with immutable revision/SEC raw SHA-256 provenance | official historical S&P membership; official/PIT_STRICT company-level GICS; GICS Sub-Industry; full-window evidence before an owner-approved absolute window — all remain separately deferred; none of this enables PAPER_AUTO/LIVE |
 
 #### Free contemporaneous-revision path evaluated AND experimentally recorded (2026-09-06)
 
@@ -269,7 +269,7 @@ snapshot captures them — but no independent, dated, free GICS source has been
 identified to cross-check them against. `cross_check_sectors` (deterministic,
 coverage- and anomaly-aware, unit-tested) exists for when one is found, but
 until then sector/GICS values from this source are recorded
-`CAPTURED_UNEVALUATED_NOT_ADMITTED`: captured on the snapshot for future use,
+`previously unadmitted pending an independent dated cross-check`: captured on the snapshot for future use,
 never claimed as corroborated SECONDARY evidence today.
 
 **Conclusion, stated precisely so it cannot be over-read:** this closes the
@@ -367,12 +367,7 @@ further autonomous implementation:
    provider (with an ADR, per CLAUDE.md's "no paid provider without owner
    approval"), or an owner decision to accept this as a permanent official-
    evidence gap and scope the strategy's GICS sector-concentration rule
-   accordingly. **Unlike membership, there is no free `SECONDARY_RESEARCH_PIT`
-   alternative for GICS today**: the Wikipedia-revision mechanism captures
-   GICS Sector/Sub-Industry from the same table, but no independent, dated,
-   free GICS source has been identified to cross-check it against, so it
-   stays `CAPTURED_UNEVALUATED_NOT_ADMITTED` (`cross_check_sectors` exists,
-   deterministic and tested, for the moment one is found).
+   accordingly. **A free bounded `SECONDARY_RESEARCH_PIT` alternative now exists for GICS Sector research**: the 2023-12-31 MediaWiki revision was cross-checked against all 11 Select Sector SPDR SEC N-PORT-P filings, with 482/503 coverage and 482/482 covered-sector agreement. It is `BacktestQuality.APPROXIMATE` only; GICS Sub-Industry and official/PIT_STRICT historical company-level GICS remain licensed/deferred.
 3. **Survivorship-free delisted-name daily OHLCV.** IBKR does not price
    delisted names historically; no free source has been established (see
    `docs/status/PIT_DATASET_QUALIFICATION.md` §2/§4, blocker N-02/N-03 in
@@ -814,7 +809,7 @@ fabricated. Once that date range exists, running the machinery is
 dependency-safe again. It must be scoped and reported honestly either way: it
 produces `SECONDARY_RESEARCH_PIT` / `BacktestQuality.APPROXIMATE`
 **MEMBERSHIP** evidence only, GICS/sector stays
-`CAPTURED_UNEVALUATED_NOT_ADMITTED` (gap 6, no independent GICS source
+`previously unadmitted pending an independent dated cross-check` (gap 6, no independent GICS source
 identified), and none of it closes or is represented as closing the official
 gaps above.
 

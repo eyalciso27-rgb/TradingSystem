@@ -180,6 +180,27 @@ class SecEdgarClient:
             headers=self._headers(),
         )
 
+    def archives_document(self, relative_path: str, *, fetcher: HttpBytesFetcher) -> bytes:
+        """One arbitrary document under SEC's public ``/Archives`` tree.
+
+        Generalizes :meth:`full_index` (a single hardcoded path) to any
+        filing document -- e.g. an N-PORT-P ``primary_doc.xml`` at
+        ``edgar/data/<cik>/<accession-no-dashes>/primary_doc.xml`` -- while
+        keeping the same rate-limited, declared-User-Agent access this whole
+        client enforces. ``relative_path`` must not itself carry a scheme or
+        host (fail closed rather than silently fetch an arbitrary URL through
+        what looks like a scoped SEC-only client).
+        """
+        if not relative_path or relative_path.startswith(("http://", "https://", "//")):
+            raise SourceAdapterError(
+                f"archives_document requires a path relative to {self.ARCHIVES!r},"
+                f" not an absolute URL: {relative_path!r}"
+            )
+        self._throttle()
+        return fetcher.get_bytes(
+            f"{self.ARCHIVES}/{relative_path.lstrip('/')}", headers=self._headers()
+        )
+
 
 @runtime_checkable
 class HttpBytesFetcher(Protocol):

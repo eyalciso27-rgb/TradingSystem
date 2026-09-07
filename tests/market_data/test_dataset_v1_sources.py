@@ -112,6 +112,40 @@ def test_invalid_cik_fails_closed() -> None:
         client.submissions("not-a-cik")
 
 
+class RecordedBytesFetcher:
+    """Replays a recorded byte payload; never touches the network."""
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self.calls: list[tuple[str, Mapping[str, str]]] = []
+
+    def get_bytes(self, url: str, *, headers: Mapping[str, str]) -> bytes:
+        self.calls.append((url, dict(headers)))
+        return self._payload
+
+
+def test_archives_document_fetches_a_relative_path_under_archives() -> None:
+    fetcher = RecordedBytesFetcher(b"<xml/>")
+    client = SecEdgarClient(RecordedFetcher(_submissions()), user_agent=UA)
+    raw = client.archives_document(
+        "edgar/data/1064641/000175272424043154/primary_doc.xml", fetcher=fetcher
+    )
+    assert raw == b"<xml/>"
+    url, headers = fetcher.calls[0]
+    assert url == (
+        "https://www.sec.gov/Archives/edgar/data/1064641/000175272424043154/primary_doc.xml"
+    )
+    assert headers["User-Agent"] == UA
+
+
+def test_archives_document_refuses_an_absolute_url() -> None:
+    client = SecEdgarClient(RecordedFetcher(_submissions()), user_agent=UA)
+    with pytest.raises(SourceAdapterError, match="relative to"):
+        client.archives_document(
+            "https://evil.example/steal", fetcher=RecordedBytesFetcher(b"")
+        )
+
+
 # -- SEC normalization --------------------------------------------------------
 
 
