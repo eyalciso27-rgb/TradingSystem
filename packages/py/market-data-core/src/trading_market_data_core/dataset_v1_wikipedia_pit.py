@@ -1117,14 +1117,31 @@ def _snapshot_from_dict(payload: Mapping[str, object]) -> WikipediaRevisionSnaps
     )
 
 
-def _cross_check_from_dict(payload: Mapping[str, object]) -> CrossCheckResult:
-    """Rebuild a :class:`CrossCheckResult` from the full dict this module writes.
+def _cross_check_from_dict(
+    payload: Mapping[str, object], *, wikipedia: WikipediaRevisionSnapshot, as_of: date
+) -> CrossCheckResult:
+    """Re-derive a :class:`CrossCheckResult`, never trust the persisted verdict.
 
-    The dict shape here comes from :meth:`WikipediaDatasetEntry.body`,
-    deliberately NOT the same shape as :meth:`CrossCheckResult.to_dict`
-    (which reports ``agreement_count`` only, not the ticker list) -- this
-    module's own persisted form carries the full ``agreements`` list so a
-    stored entry round-trips exactly, with nothing lossily summarised away.
+    ``payload["corroborated"]`` and ``payload["agreement_ratio"]`` are NOT
+    read: a hand-edited or externally "imported" file could otherwise assert
+    ``corroborated: true`` with a ratio below
+    :data:`MINIMUM_CROSS_CHECK_AGREEMENT_RATIO`, or an ``agreements`` /
+    ``only_in_wikipedia`` / ``only_in_secondary`` split inconsistent with the
+    ACTUAL bound ``wikipedia`` snapshot, and (since the whole file's
+    ``entry_checksum`` is computed FROM this same payload) a self-consistent
+    forgery would otherwise authenticate itself.
+
+    Instead, only the raw ticker PARTITION is read from the persisted dict.
+    ``agreements | only_in_wikipedia`` reconstructs the claimed Wikipedia
+    ticker set, which MUST equal ``wikipedia.tickers()`` -- the real,
+    independently-reconstructed snapshot's own ticker set -- or the file is
+    refused outright as inconsistent with the snapshot it claims to
+    accompany. ``agreements | only_in_secondary`` reconstructs the
+    independent secondary source's ticker set as it was recorded at
+    admission time, and :func:`cross_check_membership` is called on it for
+    real, at the canonical (never weakened) threshold: ``corroborated`` and
+    ``agreement_ratio`` in the RETURNED :class:`CrossCheckResult` are always
+    freshly computed here, never copied from the file.
     """
     raw_agreements = payload.get("agreements", ())
     raw_only_wikipedia = payload.get("only_in_wikipedia", ())
@@ -1132,15 +1149,22 @@ def _cross_check_from_dict(payload: Mapping[str, object]) -> CrossCheckResult:
     assert isinstance(raw_agreements, Sequence)
     assert isinstance(raw_only_wikipedia, Sequence)
     assert isinstance(raw_only_secondary, Sequence)
-    return CrossCheckResult(
-        as_of=date.fromisoformat(str(payload["as_of"])),
-        secondary_source_id=str(payload["secondary_source_id"]),
-        corroborated=bool(payload["corroborated"]),
-        agreement_ratio=float(str(payload["agreement_ratio"])),
-        agreements=tuple(str(t) for t in raw_agreements),
-        only_in_wikipedia=tuple(str(t) for t in raw_only_wikipedia),
-        only_in_secondary=tuple(str(t) for t in raw_only_secondary),
-        detail=str(payload.get("detail", "")),
+    agreements = frozenset(str(t) for t in raw_agreements)
+    only_in_wikipedia = frozenset(str(t) for t in raw_only_wikipedia)
+    only_in_secondary = frozenset(str(t) for t in raw_only_secondary)
+    claimed_wikipedia_tickers = agreements | only_in_wikipedia
+    if claimed_wikipedia_tickers != wikipedia.tickers():
+        raise SourceAdapterError(
+            "persisted cross-check ticker partition (agreements +"
+            " only_in_wikipedia) does not match the bound snapshot's own"
+            " ticker set; refusing to trust an inconsistent or forged"
+            " cross-check record"
+        )
+    secondary_tickers = agreements | only_in_secondary
+    secondary_source_id = str(payload["secondary_source_id"])
+    return cross_check_membership(
+        wikipedia=wikipedia, secondary_tickers=secondary_tickers,
+        secondary_source_id=secondary_source_id, as_of=as_of,
     )
 
 
@@ -1148,20 +1172,25 @@ def _entry_from_dict(payload: Mapping[str, object]) -> WikipediaDatasetEntry:
     """Rebuild a :class:`WikipediaDatasetEntry`, re-running every constructor check.
 
     This is what stops a hand-edited or externally "imported" JSON file --
-    e.g. one claiming a revision timestamped after its own ``as_of``, or a
-    cross-check that is not ``corroborated`` -- from ever becoming a usable
-    dataset entry merely by being placed on disk and loaded: every guard in
-    :meth:`WikipediaDatasetEntry.__post_init__` runs again here, on load, not
-    only at original construction time.
+    e.g. one claiming a revision timestamped after its own ``as_of``, a
+    cross-check that is not ``corroborated``, or a self-asserted
+    ``corroborated: true`` at a below-threshold or fabricated ratio -- from
+    ever becoming a usable dataset entry merely by being placed on disk and
+    loaded: every guard in :meth:`WikipediaDatasetEntry.__post_init__` runs
+    again here, on load, not only at original construction time, and the
+    cross-check itself is RE-DERIVED (:func:`_cross_check_from_dict`), never
+    trusted from the file.
     """
     snapshot_payload = payload["snapshot"]
     cross_check_payload = payload["cross_check"]
     assert isinstance(snapshot_payload, Mapping)
     assert isinstance(cross_check_payload, Mapping)
+    as_of = date.fromisoformat(str(payload["as_of"]))
+    snapshot = _snapshot_from_dict(snapshot_payload)
     return WikipediaDatasetEntry(
-        as_of=date.fromisoformat(str(payload["as_of"])),
-        snapshot=_snapshot_from_dict(snapshot_payload),
-        cross_check=_cross_check_from_dict(cross_check_payload),
+        as_of=as_of,
+        snapshot=snapshot,
+        cross_check=_cross_check_from_dict(cross_check_payload, wikipedia=snapshot, as_of=as_of),
         fetch_observed_at=datetime.fromisoformat(str(payload["fetch_observed_at"])),
         raw_provenance_path=str(payload["raw_provenance_path"]),
     )
@@ -1291,7 +1320,18 @@ class WikipediaDatasetStore:
         entry = _entry_from_dict(payload)
         declared = payload.get("entry_checksum")
         recomputed = entry.compute_checksum()
-        if isinstance(declared, str) and declared and declared != recomputed:
+        if not isinstance(declared, str) or not declared:
+            raise SourceAdapterError(
+                f"{path}: dataset entry carries no entry_checksum; refusing to"
+                " trust an unauthenticated dataset entry"
+            )
+        digest = declared.removeprefix("sha256:")
+        if digest == declared or len(digest) != 64:
+            raise SourceAdapterError(
+                f"{path}: entry_checksum {declared!r} is not a valid sha256:"
+                " digest; refusing to trust a malformed checksum"
+            )
+        if declared != recomputed:
             raise SourceAdapterError(
                 f"{path}: dataset entry checksum mismatch (tampered or stale):"
                 f" declared {declared}, recomputed {recomputed}"

@@ -992,6 +992,129 @@ def test_store_load_refuses_a_hand_imported_entry_with_a_later_revision(tmp_path
         store.load(as_of)
 
 
+def _write_hand_tampered_entry(
+    tmp_path: Path, *, as_of: date, mutate_cross_check: Callable[[dict[str, object]], None]
+) -> None:
+    """Write a legitimately-shaped entry file with only the cross_check block
+    hand-tampered by ``mutate_cross_check`` -- everything else (schema,
+    snapshot, checksum-shape fields) stays exactly what a real ``accept()``
+    would have produced, so only the tampered field is under test."""
+    entry = _entry_for(revision_id=1, timestamp=REV_A_TS, as_of=as_of)
+    payload = entry.to_dict()
+    cross_check_payload = payload["cross_check"]
+    assert isinstance(cross_check_payload, dict)
+    mutate_cross_check(cross_check_payload)
+    entry_path = tmp_path / f"membership-{as_of.isoformat()}.json"
+    entry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_store_load_refuses_a_forged_corroborated_flag_with_a_low_real_ratio(
+    tmp_path: Path,
+) -> None:
+    """The JSON claims ``corroborated: true`` / ``agreement_ratio: 1.0``, but
+    the persisted ticker PARTITION -- once independently recomputed against
+    the bound snapshot -- proves only a tiny secondary overlap. The forged
+    boolean/ratio must never be trusted; the RECOMPUTED ratio governs, and it
+    must fail the canonical, non-weakenable threshold."""
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+
+    def _mutate(cross_check_payload: dict[str, object]) -> None:
+        agreements = cross_check_payload["agreements"]
+        assert isinstance(agreements, list)
+        # Move all but one ticker from "agreements" into "only_in_wikipedia"
+        # -- the union with only_in_wikipedia (still equal to the real
+        # snapshot's own ticker set) is preserved, so the snapshot-consistency
+        # check passes, but the RECOMPUTED secondary overlap collapses to
+        # essentially nothing.
+        kept = agreements[:1]
+        moved = agreements[1:]
+        cross_check_payload["agreements"] = kept
+        cross_check_payload["only_in_wikipedia"] = moved
+        cross_check_payload["only_in_secondary"] = []
+        # The lie: claim full corroboration anyway.
+        cross_check_payload["corroborated"] = True
+        cross_check_payload["agreement_ratio"] = 1.0
+        cross_check_payload["detail"] = "forged: claims full agreement"
+
+    _write_hand_tampered_entry(tmp_path, as_of=as_of, mutate_cross_check=_mutate)
+    with pytest.raises(SourceAdapterError, match="not.*corroborated"):
+        store.load(as_of)
+
+
+def test_store_load_refuses_a_cross_check_partition_inconsistent_with_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    """``agreements | only_in_wikipedia`` must equal the bound snapshot's own
+    ticker set; a JSON that changes this partition to something that no
+    longer reconstructs the snapshot's real tickers (e.g. injecting a ticker
+    the snapshot never had) is refused outright, before any ratio is even
+    computed."""
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+
+    def _mutate(cross_check_payload: dict[str, object]) -> None:
+        only_in_wikipedia = cross_check_payload["only_in_wikipedia"]
+        assert isinstance(only_in_wikipedia, list)
+        # Inject a ticker the real snapshot never contained.
+        cross_check_payload["only_in_wikipedia"] = [*only_in_wikipedia, "FORGEDTICKER"]
+
+    _write_hand_tampered_entry(tmp_path, as_of=as_of, mutate_cross_check=_mutate)
+    with pytest.raises(SourceAdapterError, match="does not match the bound snapshot"):
+        store.load(as_of)
+
+
+# -- entry_checksum is mandatory and must be a genuine, matching sha256 -----
+
+
+def test_store_load_refuses_a_missing_entry_checksum(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    entry = _entry_for(revision_id=1, timestamp=REV_A_TS, as_of=as_of)
+    payload = entry.to_dict()
+    del payload["entry_checksum"]
+    entry_path = tmp_path / f"membership-{as_of.isoformat()}.json"
+    entry_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SourceAdapterError, match="no entry_checksum"):
+        store.load(as_of)
+
+
+def test_store_load_refuses_an_empty_entry_checksum(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    entry = _entry_for(revision_id=1, timestamp=REV_A_TS, as_of=as_of)
+    payload = entry.to_dict()
+    payload["entry_checksum"] = ""
+    entry_path = tmp_path / f"membership-{as_of.isoformat()}.json"
+    entry_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SourceAdapterError, match="no entry_checksum"):
+        store.load(as_of)
+
+
+def test_store_load_refuses_a_malformed_entry_checksum(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    entry = _entry_for(revision_id=1, timestamp=REV_A_TS, as_of=as_of)
+    payload = entry.to_dict()
+    payload["entry_checksum"] = "not-a-real-checksum"
+    entry_path = tmp_path / f"membership-{as_of.isoformat()}.json"
+    entry_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SourceAdapterError, match="not a valid sha256"):
+        store.load(as_of)
+
+
+def test_store_load_refuses_a_mismatched_entry_checksum(tmp_path: Path) -> None:
+    store = WikipediaDatasetStore(tmp_path)
+    as_of = date(2020, 1, 15)
+    entry = _entry_for(revision_id=1, timestamp=REV_A_TS, as_of=as_of)
+    payload = entry.to_dict()
+    payload["entry_checksum"] = "sha256:" + "a" * 64
+    entry_path = tmp_path / f"membership-{as_of.isoformat()}.json"
+    entry_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SourceAdapterError, match="checksum mismatch"):
+        store.load(as_of)
+
+
 def test_store_dates_and_entries_are_sorted(tmp_path: Path) -> None:
     store = WikipediaDatasetStore(tmp_path)
     for as_of, revision_id, timestamp in (
