@@ -1,0 +1,8 @@
+# Immutable, byte-exact retained third-party evidence artifacts (raw API
+# responses / raw fetched documents bound to a SHA-256 checksum for
+# provenance). These must never be reformatted, and their inherent
+# third-party whitespace/markup is not a repository style issue -- exclude
+# them from textual diffing so `git diff --check` reports real whitespace
+# problems in code/docs, not formatting choices made by an external
+# publisher whose exact bytes we are required to retain unmodified.
+docs/poi/evidence/**/*.raw.* -diff

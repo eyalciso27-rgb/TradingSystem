@@ -579,6 +579,100 @@ def test_cross_check_sectors_refuses_a_threshold_above_one(kwarg: str, value: fl
         )
 
 
+# -- sector/GICS cross-check: narrow, named-scope classification-change case --
+
+
+def test_cross_check_sectors_scope_tickers_restricts_coverage_to_named_subset() -> None:
+    """A real classification-change source (e.g. an S&P DJI/MSCI GICS
+    structure-change press release) only makes a claim about the specific
+    companies it names, never the full ~500-ticker universe -- coverage and
+    agreement must be computed over exactly that named subset."""
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    scope = frozenset({"AAAA", "AAAB", "AAAC"})
+    secondary_sectors = {ticker: "Information Technology" for ticker in scope}
+    result = cross_check_sectors(
+        wikipedia=snapshot,
+        secondary_sectors=secondary_sectors,
+        secondary_source_id="spdji-msci-gics-structure-change-press-release",
+        as_of=date(2020, 1, 15),
+        scope_tickers=scope,
+    )
+    assert result.corroborated is True
+    assert result.coverage_ratio == pytest.approx(1.0)
+    assert result.agreement_ratio == pytest.approx(1.0)
+    assert result.covered_tickers == 3
+    assert result.scope_tickers == ("AAAA", "AAAB", "AAAC")
+    assert result.to_dict()["scope"] == "NARROW_CLASSIFICATION_CHANGE_CASE"
+    assert result.to_dict()["scope_tickers"] == ["AAAA", "AAAB", "AAAC"]
+
+
+def test_cross_check_sectors_default_scope_is_full_universe() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    secondary_sectors = {
+        o.ticker: o.gics_sector for o in snapshot.observations if o.gics_sector
+    }
+    result = cross_check_sectors(
+        wikipedia=snapshot,
+        secondary_sectors=secondary_sectors,
+        secondary_source_id="fixture-secondary-gics",
+        as_of=date(2020, 1, 15),
+    )
+    assert result.scope_tickers is None
+    assert result.to_dict()["scope"] == "FULL_WIKIPEDIA_UNIVERSE"
+    assert result.to_dict()["scope_tickers"] is None
+
+
+def test_cross_check_sectors_scope_tickers_fails_closed_on_empty_scope() -> None:
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    with pytest.raises(SourceAdapterError, match="non-empty"):
+        cross_check_sectors(
+            wikipedia=snapshot,
+            secondary_sectors={"AAAA": "Information Technology"},
+            secondary_source_id="fixture-secondary-gics",
+            as_of=date(2020, 1, 15),
+            scope_tickers=frozenset(),
+        )
+
+
+def test_cross_check_sectors_scope_tickers_fails_closed_on_unknown_ticker() -> None:
+    """A scope naming a ticker the snapshot does not carry at all is an
+    identity/coverage mistake in the caller's own claimed evidence -- it must
+    never be silently dropped or treated as an ordinary coverage gap."""
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    with pytest.raises(SourceAdapterError, match="does not carry"):
+        cross_check_sectors(
+            wikipedia=snapshot,
+            secondary_sectors={"AAAA": "Information Technology", "ZZZZ": "Financials"},
+            secondary_source_id="fixture-secondary-gics",
+            as_of=date(2020, 1, 15),
+            scope_tickers=frozenset({"AAAA", "ZZZZ"}),
+        )
+
+
+def test_cross_check_sectors_scope_tickers_records_a_real_disagreement() -> None:
+    """Mirrors the real 2018 GICS Communication Services experiment shape: one
+    named ticker in scope genuinely disagrees with the independent source --
+    that must fail closed (not corroborated) and the disagreement must be
+    recorded, never dropped merely because most of the scope agrees."""
+    snapshot = _snapshot(revision_id=1, timestamp=REV_A_TS)
+    scope = frozenset({"AAAA", "AAAB", "AAAC"})
+    secondary_sectors = {
+        "AAAA": "Information Technology",
+        "AAAB": "Information Technology",
+        "AAAC": "Communication Services",  # disagrees with the snapshot's "Information Technology"
+    }
+    result = cross_check_sectors(
+        wikipedia=snapshot,
+        secondary_sectors=secondary_sectors,
+        secondary_source_id="spdji-msci-gics-structure-change-press-release",
+        as_of=date(2020, 1, 15),
+        scope_tickers=scope,
+    )
+    assert result.corroborated is False
+    assert result.disagreements == (("AAAC", "Information Technology", "Communication Services"),)
+    assert result.agreement_ratio == pytest.approx(2 / 3)
+
+
 # -- provenance is verified, never trusted -------------------------------------
 
 
@@ -685,6 +779,29 @@ def test_evaluation_record_stays_secondary_and_non_blocking() -> None:
     }
     assert evaluation["official_licensed_gap_status"] == "DEFERRED_NOT_BLOCKING"
     assert "next_bounded_task" in evaluation
+
+
+def test_sector_gics_bounded_event_scoped_evidence_points_at_real_checksummed_evidence() -> None:
+    """A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL: the general GICS/sector
+    claim stays CAPTURED_UNEVALUATED_NOT_ADMITTED, but the recorded bounded
+    exception must point at a real, self-consistent evidence file on disk --
+    never an inline, unverifiable assertion."""
+    sector_gics = WIKIPEDIA_REVISION_HISTORY_EVALUATION["sector_gics"]
+    assert sector_gics["status"] == "CAPTURED_UNEVALUATED_NOT_ADMITTED"
+    bounded = sector_gics["bounded_event_scoped_evidence"]
+    experiment = bounded["real_experiment"]
+    evidence_path = Path(experiment["evidence_path"])
+    assert evidence_path.is_file(), f"missing {evidence_path}"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["classification"] == "SECONDARY_RESEARCH_PIT"
+    assert evidence["official_licensed_gap_status"] == "DEFERRED_NOT_BLOCKING"
+    named_tickers = set(evidence["reclassification_event"]["named_reclassifications"])
+    assert named_tickers == {"GOOGL", "GOOG", "FB", "NFLX", "TRIP", "CMCSA"}
+    after_check = evidence["after_transition"]["sector_cross_check"]
+    before_check = evidence["before_transition"]["sector_cross_check"]
+    assert after_check["corroborated"] is True
+    assert before_check["corroborated"] is False  # the real, recorded disagreement (NFLX)
+    assert set(after_check["scope_tickers"]) == named_tickers
 
 
 def test_asof_gics_blocker_still_blocked_but_no_longer_categorical() -> None:

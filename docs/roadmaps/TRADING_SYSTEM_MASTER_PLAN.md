@@ -181,8 +181,10 @@ real-account PoIs remain **BLOCKED**.
 > permanently `SECONDARY_RESEARCH_PIT`, usable only for
 > `BacktestQuality.APPROXIMATE` membership research, and does not close the
 > official gap above. GICS/sector values are captured from the same source
-> but stay `CAPTURED_UNEVALUATED_NOT_ADMITTED` — no independent, dated, free
-> GICS source has been identified to cross-check them against.
+> but stay `CAPTURED_UNEVALUATED_NOT_ADMITTED` for the GENERAL, continuous,
+> full-universe case — no independent, dated, free GICS source has been
+> identified that covers the full universe on an ongoing basis (see
+> 2026-09-07 paragraph below for one narrowly bounded exception).
 >
 > **2026-09-06, A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD.** The
 > dependency-safe multi-date BATCH machinery to extend the one recorded date
@@ -199,6 +201,33 @@ real-account PoIs remain **BLOCKED**.
 > (`dataset_v1_wikipedia_pit.WINDOW_DEFINITION_REQUIRED`); do not recreate
 > the evaluation, the recorded experiment, or the batch machinery, and do not
 > invent a window — wait for the owner (or an approved ADR) to supply one.
+>
+> **2026-09-07, A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL.** Four concrete
+> free candidates were evaluated for independently cross-checking
+> Wikipedia-recorded GICS Sector values
+> (`config/data-sources/gics-sector-crosscheck-source-registry.json`): SEC
+> SIC (different taxonomy, rejected), current-only GICS/Wikipedia/company
+> descriptions (no temporal semantics, rejected), Select Sector SPDR ETF
+> holdings (no free dated historical archive identified, rejected), and S&P
+> DJI/MSCI's own free, public, unauthenticated GICS structure-change press
+> releases (accepted, narrowly). One real, bounded experiment
+> (`scripts/run_wikipedia_gics_sector_crosscheck_experiment.py`, recorded
+> under `docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/`)
+> cross-checked the 2018 GICS Communication Services structure revision for
+> its 6 named tickers (GOOGL, GOOG, FB, NFLX, TRIP, CMCSA): the
+> AFTER-transition observation corroborated (6/6, revision 878489286); the
+> BEFORE-transition observation did NOT (5/6, revision 848091676 — a real,
+> recorded disagreement on NFLX, not hidden). `cross_check_sectors` gained an
+> optional `scope_tickers` parameter for exactly this shape of evidence. This
+> admits `SECONDARY_RESEARCH_PIT` / `BacktestQuality.APPROXIMATE` evidence
+> bounded EXACTLY to those 6 tickers and that one event — it does **not**
+> establish a general, continuous, full-universe GICS cross-check (that
+> stays `CAPTURED_UNEVALUATED_NOT_ADMITTED`), does not flip any capability in
+> `dataset_v1.py`, and does not close the official historical GICS gap above
+> (still `LICENSE_REQUIRED` / `DEFERRED_NOT_BLOCKING`). Do not recreate this
+> experiment or re-evaluate the same four candidates; identifying a source
+> for the GENERAL case remains an open research question, not a bounded next
+> task.
 
 > **A-WP1 — baseline hypothesis FROZEN (2026-08-13).** The owner completed
 > `STRATEGY_FREEZE_TEMPLATE.md` for `baseline-trend-breakout-v1` and it

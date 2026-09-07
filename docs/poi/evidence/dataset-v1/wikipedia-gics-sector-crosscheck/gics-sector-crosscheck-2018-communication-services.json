@@ -1,0 +1,145 @@
+{
+  "after_transition": {
+    "raw_checksum": "sha256:11b7247f4af86b1d57bc8fe1eb17e8a99b1b34ce870eeaa4b592a3dedc48971b",
+    "raw_provenance_path": "docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/List_of_SandP_500_companies-rev878489286.raw.json",
+    "requested_as_of": "2019-01-15",
+    "revision_id": 878489286,
+    "revision_timestamp": "2019-01-15T03:17:18+00:00",
+    "sector_cross_check": {
+      "agreement_count": 6,
+      "agreement_ratio": 1.0,
+      "as_of": "2019-01-15",
+      "corroborated": true,
+      "coverage_ratio": 1.0,
+      "covered_tickers": 6,
+      "detail": "6/6 covered tickers agree on sector (coverage=1.0000, agreement_ratio=1.0000, thresholds coverage>=0.9000 agreement>=0.9000); 0 ticker(s) not covered by spdji-msci-gics-2018-communication-services-press-release; scoped to 6 named ticker(s), not the full Wikipedia universe",
+      "disagreement_count": 0,
+      "disagreements": [],
+      "scope": "NARROW_CLASSIFICATION_CHANGE_CASE",
+      "scope_tickers": [
+        "CMCSA",
+        "FB",
+        "GOOG",
+        "GOOGL",
+        "NFLX",
+        "TRIP"
+      ],
+      "secondary_source_id": "spdji-msci-gics-2018-communication-services-press-release",
+      "uncovered_ticker_count": 0
+    }
+  },
+  "artifact_type": "wikipedia_gics_sector_crosscheck_experiment",
+  "before_transition": {
+    "raw_checksum": "sha256:877a3f8fc84e26d0b98d4eda57447fc0263c59c4fd8008a9fa9137927e309f75",
+    "raw_provenance_path": "docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/List_of_SandP_500_companies-rev848091676.raw.json",
+    "requested_as_of": "2018-06-30",
+    "revision_id": 848091676,
+    "revision_timestamp": "2018-06-29T18:49:21+00:00",
+    "sector_cross_check": {
+      "agreement_count": 5,
+      "agreement_ratio": 0.8333333333333334,
+      "as_of": "2018-06-30",
+      "corroborated": false,
+      "coverage_ratio": 1.0,
+      "covered_tickers": 6,
+      "detail": "5/6 covered tickers agree on sector (coverage=1.0000, agreement_ratio=0.8333, thresholds coverage>=0.9000 agreement>=0.9000); 0 ticker(s) not covered by spdji-msci-gics-2018-communication-services-press-release; scoped to 6 named ticker(s), not the full Wikipedia universe",
+      "disagreement_count": 1,
+      "disagreements": [
+        [
+          "NFLX",
+          "Information Technology",
+          "Consumer Discretionary"
+        ]
+      ],
+      "scope": "NARROW_CLASSIFICATION_CHANGE_CASE",
+      "scope_tickers": [
+        "CMCSA",
+        "FB",
+        "GOOG",
+        "GOOGL",
+        "NFLX",
+        "TRIP"
+      ],
+      "secondary_source_id": "spdji-msci-gics-2018-communication-services-press-release",
+      "uncovered_ticker_count": 0
+    }
+  },
+  "classification": "SECONDARY_RESEARCH_PIT",
+  "cross_check_thresholds": {
+    "minimum_agreement_ratio": 0.9,
+    "minimum_coverage_ratio": 0.9
+  },
+  "eligibility": {
+    "authoritative_official_evidence": false,
+    "eligible_for_promotion_without_validation": false,
+    "substitute_for_historical_gics": false
+  },
+  "evidence_checksum": "sha256:97183ccac19c645526cd1b42554f5d9e6a3905fd649be315bd11d5de2264ff67",
+  "not_usable_for": [
+    "BacktestQuality.PIT_STRICT",
+    "the asof_gics capability (stays BLOCKED_EXTERNAL / LICENSE_REQUIRED)",
+    "a general, continuous, full-universe GICS/sector cross-check claim",
+    "any classification-change case other than the one named here",
+    "final OOS/shadow qualification evidence",
+    "any claim of S&P DJI official truth about a DIFFERENT company or date"
+  ],
+  "official_licensed_gap_status": "DEFERRED_NOT_BLOCKING",
+  "performed_at": "2026-09-07T10:53:33.568735+00:00",
+  "press_release_source": {
+    "full_file_byte_length": 212035,
+    "full_file_checksum": "sha256:c6223355e65854bd7028c7715d502518a961f6b846039890ca17c0cc0c6fbbae",
+    "raw_artifact_path": "docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/spdji-msci-gics-2018-communication-services.raw.html",
+    "source_authority": "OFFICIAL_PUBLIC",
+    "source_authority_note": "The press release is S&P DJI/MSCI's own free, public, unauthenticated announcement of specific named company reclassifications -- an official-publisher document, but narrowly scoped to named companies at one event, never a substitute for the licensed continuous company-level GICS assignment series ASOF_GICS_BLOCKER requires.",
+    "source_id": "spdji-msci-gics-2018-communication-services-press-release",
+    "source_url": "https://www.prnewswire.com/news-releases/sp-dow-jones-indices-and-msci-announce-select-list-of-companies-changing-due-to-revisions-to-the-gics-structure-in-2018-300581770.html"
+  },
+  "reclassification_event": {
+    "announced_at": "2017-11-15",
+    "name": "2018 GICS Communication Services Sector structure revision",
+    "named_reclassifications": {
+      "CMCSA": {
+        "name": "Comcast Corp.",
+        "new_sector": "Communication Services",
+        "old_sector": "Consumer Discretionary",
+        "quoted_press_release_text": "companies selected from the Consumer Discretionary Sector currently classified under the Media Industry Group, such as Comcast Corp and Naspers Ltd"
+      },
+      "FB": {
+        "name": "Facebook Inc.",
+        "new_sector": "Communication Services",
+        "old_sector": "Information Technology",
+        "quoted_press_release_text": "certain companies currently classified in the Information Technology Sector, including Alphabet Inc. and Facebook Inc."
+      },
+      "GOOG": {
+        "name": "Alphabet Inc Class C",
+        "new_sector": "Communication Services",
+        "old_sector": "Information Technology",
+        "quoted_press_release_text": "certain companies currently classified in the Information Technology Sector, including Alphabet Inc. and Facebook Inc."
+      },
+      "GOOGL": {
+        "name": "Alphabet Inc Class A",
+        "new_sector": "Communication Services",
+        "old_sector": "Information Technology",
+        "quoted_press_release_text": "certain companies currently classified in the Information Technology Sector, including Alphabet Inc. and Facebook Inc."
+      },
+      "NFLX": {
+        "name": "Netflix Inc.",
+        "new_sector": "Communication Services",
+        "old_sector": "Consumer Discretionary",
+        "quoted_press_release_text": "select companies from the Internet & Direct Marketing Retail Sub-Industry such as Netflix Inc. and TripAdvisor Inc."
+      },
+      "TRIP": {
+        "name": "TripAdvisor Inc.",
+        "new_sector": "Communication Services",
+        "old_sector": "Consumer Discretionary",
+        "quoted_press_release_text": "select companies from the Internet & Direct Marketing Retail Sub-Industry such as Netflix Inc. and TripAdvisor Inc."
+      }
+    },
+    "press_release_effective_at": "2018-09-28",
+    "press_release_published_at": "2018-01-11"
+  },
+  "schema_version": "wikipedia-gics-sector-crosscheck-experiment-1.0.0",
+  "scope": "ONE bounded real GICS-sector reclassification-event cross-check, scoped to the 6 named tickers in GICS_2018_COMMUNICATION_SERVICES_RECLASSIFICATION; not a repeating archive and not a general full-universe GICS cross-check capability",
+  "usable_for": "BacktestQuality.APPROXIMATE research, bounded to the 6 named tickers and this one 2018 reclassification event only",
+  "wikipedia_pit_schema_version": "dataset-v1-wikipedia-pit-1.0.0"
+}

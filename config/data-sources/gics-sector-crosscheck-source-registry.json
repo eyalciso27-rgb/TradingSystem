@@ -1,0 +1,179 @@
+{
+  "_README": [
+    "A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL - records every concrete free",
+    "candidate source EVALUATED for independently cross-checking Wikipedia-",
+    "revision-captured GICS Sector/Sub-Industry values at historical as-of",
+    "dates, per CLAUDE.md ('prevent look-ahead'; 'no substitute for historical",
+    "GICS') and ADR-0017 (historical GICS is optional research context, never",
+    "authoritative, never a trading gate).",
+    "",
+    "Unlike config/data-sources/sp500-historical-source-registry.json (offline",
+    "provenance only, nothing ever fetched to produce that file), exactly ONE",
+    "candidate here (spdji-msci-gics-structure-change-press-releases) HAS been",
+    "used in a real, bounded, recorded experiment -- performed by",
+    "scripts/run_wikipedia_gics_sector_crosscheck_experiment.py, never by",
+    "loading this JSON file. This file records the EVALUATION and points at",
+    "that experiment's evidence; it does not itself fetch anything and does",
+    "not re-derive the experiment's result.",
+    "",
+    "Hard rules enforced by",
+    "tests/market_data/test_gics_sector_crosscheck_source_registry.py (all",
+    "fail closed):",
+    "  * classification must be exactly one of NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC",
+    "    or NOT_SUFFICIENT_FOR_GICS_CROSSCHECK - no other value is recognised.",
+    "  * every candidate.eligibility flag is FALSE, unconditionally:",
+    "      - authoritative_official_evidence  (never official, regardless of",
+    "        source_authority - OFFICIAL_PUBLIC here means 'S&P DJI/MSCI wrote",
+    "        it', not 'this repository's official GICS evidence')",
+    "      - eligible_for_promotion_without_validation (validation is mandatory)",
+    "      - substitute_for_historical_gics   (a single named-event announcement",
+    "        is not the licensed continuous company-level GICS assignment",
+    "        series ASOF_GICS_BLOCKER requires, no matter how it is used)",
+    "  * a NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC candidate must declare",
+    "    source_authority OFFICIAL_PUBLIC, must carry a non-empty",
+    "    bounded_real_experiment.evidence_path that RESOLVES to a real file on",
+    "    disk, and that file's own recorded evidence_checksum must recompute",
+    "    correctly over its own JSON body (re-derived by the test, never",
+    "    trusted from a label).",
+    "  * a NOT_SUFFICIENT_FOR_GICS_CROSSCHECK candidate must declare a",
+    "    rejection_reason from a fixed enum and carries no experiment reference",
+    "    - there is nothing here that was used.",
+    "",
+    "This registry never authorizes Paper Auto or Live trading, never claims",
+    "integration evidence, and never edits strategy parameters (CLAUDE.md). It",
+    "never flips ASOF_GICS_BLOCKER (docs/poi/evidence/dataset-v1/asof-gics-",
+    "blocker.json), which stays BLOCKED_EXTERNAL / LICENSE_REQUIRED for the",
+    "official, continuous, full-window company-level GICS assignment series -",
+    "that gap is DEFERRED_NOT_BLOCKING, not closed by anything recorded here."
+  ],
+  "registry_id": "gics-sector-crosscheck-source-registry",
+  "registry_version": "1.0.0",
+  "created_at": "2026-09-07",
+  "authority": "OFFLINE_EVALUATION_PLUS_ONE_REFERENCED_REAL_BOUNDED_EXPERIMENT",
+  "status": "NOT_INTEGRATED",
+  "integration_evidence_claim": "NONE",
+  "network_fetch_performed_by_this_registry": false,
+  "invariants": {
+    "no_candidate_is_authoritative_official_evidence": true,
+    "no_candidate_is_eligible_for_promotion_without_validation": true,
+    "no_candidate_substitutes_for_historical_gics": true
+  },
+  "classifications": {
+    "NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC": {
+      "description": "A free, dated, official-publisher (S&P DJI/MSCI themselves) announcement naming specific companies reclassified between specific named GICS sectors as of a specific effective date. Genuinely official authorship, but bounded to the named companies and named event only - never a continuous, full-universe, or general-purpose GICS series.",
+      "source_authority": "OFFICIAL_PUBLIC",
+      "required_fields": [
+        "source_url",
+        "bounded_real_experiment.performed_at",
+        "bounded_real_experiment.performed_by",
+        "bounded_real_experiment.evidence_path",
+        "temporal_semantics",
+        "access_constraints",
+        "limitations"
+      ],
+      "eligibility": {
+        "authoritative_official_evidence": false,
+        "eligible_for_promotion_without_validation": false,
+        "substitute_for_historical_gics": false
+      }
+    },
+    "NOT_SUFFICIENT_FOR_GICS_CROSSCHECK": {
+      "description": "A candidate evaluated and found insufficient to serve as a free, dated, independent GICS cross-check source - either it is not GICS at all, carries no temporal/as-of semantics, or no free dated historical archive of it could be identified. Recorded so the gap is explicit, never so the limitation can be bypassed.",
+      "source_authority": null,
+      "required_fields": [
+        "rejection_reason",
+        "limitations"
+      ],
+      "eligibility": {
+        "authoritative_official_evidence": false,
+        "eligible_for_promotion_without_validation": false,
+        "substitute_for_historical_gics": false
+      }
+    }
+  },
+  "candidates": [
+    {
+      "candidate_id": "spdji-msci-gics-structure-change-press-releases",
+      "source_name": "S&P Dow Jones Indices / MSCI joint press releases announcing GICS structure revisions (distributed free, unauthenticated, via PRNewswire)",
+      "source_url": "https://www.prnewswire.com/news-releases/sp-dow-jones-indices-and-msci-announce-select-list-of-companies-changing-due-to-revisions-to-the-gics-structure-in-2018-300581770.html",
+      "classification": "NARROW_EVENT_SCOPED_OFFICIAL_PUBLIC",
+      "source_authority": "OFFICIAL_PUBLIC",
+      "temporal_semantics": "Each release states a stated effective date for the structure revision (here: after close of business ET on 2018-09-28 in GICS Direct; 2018-09-24 open for S&P DJI index rebalance) and names specific companies moving FROM a stated OLD GICS Sector TO a stated NEW GICS Sector as of that date. This is a real, dated, before/after claim about NAMED companies only - never a claim about any company it does not name, and never a claim usable for any date other than the one it states.",
+      "access_constraints": "Freely reachable over plain HTTPS with no authentication, no paywall, and no bot-protection challenge encountered (verified 2026-09-07). Note: S&P DJI's own primary domain (spglobal.com/spdji) returned HTTP 403 when probed directly and was NOT used; PRNewswire is the free, public distribution channel S&P DJI/MSCI themselves used to publish this exact announcement, and is what was actually fetched.",
+      "limitations": [
+        "Only a HANDFUL of companies are named per release (this one: Alphabet Inc. (GOOGL/GOOG), Facebook Inc. (FB), Netflix Inc. (NFLX), TripAdvisor Inc. (TRIP), Comcast Corp. (CMCSA); Naspers Ltd is also named but is not an S&P 500 / US-ticker constituent and is excluded from the experiment's scope) - it is never a substitute for a continuous, full-universe, per-company-per-date GICS series.",
+        "Only covers ONE reclassification EVENT (the 2018 Communication Services structure revision); a different historical classification change would require locating and evaluating a different release.",
+        "Prose text, not a machine-readable table - the mapping used in the experiment (scripts/run_wikipedia_gics_sector_crosscheck_experiment.py:GICS_2018_COMMUNICATION_SERVICES_RECLASSIFICATION) is hand-curated FROM the release's own quoted text and is verified at run time to still be an exact substring of the retained raw bytes (see _verify_quoted_claims in that script) - it is not auto-parsed.",
+        "Being S&P DJI/MSCI's own announcement makes it authoritative for what it explicitly states, but it is still evaluated here as a bounded research cross-check, not folded into the licensed 'official' capability path (asof_gics stays BLOCKED_EXTERNAL / LICENSE_REQUIRED) - a single event announcement is not the continuous, revision-safe, full-window company-level series that capability requires."
+      ],
+      "bounded_real_experiment": {
+        "performed_at": "2026-09-07",
+        "performed_by": "scripts/run_wikipedia_gics_sector_crosscheck_experiment.py",
+        "evidence_path": "docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/gics-sector-crosscheck-2018-communication-services.json",
+        "summary": "Two real MediaWiki revisions of 'List of S&P 500 companies' (before: 2018-06-30 request -> revision 848091676; after: 2019-01-15 request -> revision 878489286, both page identity/timestamp-verified against MediaWiki's own metadata) were cross-checked, scoped to the 6 named tickers above, against this press release's stated OLD and NEW GICS Sector values respectively (dataset_v1_wikipedia_pit.cross_check_sectors(..., scope_tickers=...)). Result: the BEFORE-transition scope did NOT corroborate (5/6 agree, ratio 0.8333 < 0.90 threshold - NFLX's Wikipedia-recorded 'Information Technology' disagrees with the release's stated pre-move 'Consumer Discretionary'); the AFTER-transition scope fully corroborated (6/6 agree, ratio 1.0). Both outcomes, including the disagreement, are recorded in evidence_path - neither was hidden or forced to agree."
+      },
+      "eligibility": {
+        "authoritative_official_evidence": false,
+        "eligible_for_promotion_without_validation": false,
+        "substitute_for_historical_gics": false
+      },
+      "notes": [
+        "This is the ONE candidate in this registry that has actually been used in a real experiment; see bounded_real_experiment.evidence_path for the full, self-checksummed result.",
+        "Admissible only as BacktestQuality.APPROXIMATE research evidence, bounded to the 6 named tickers and this one 2018 event (dataset_v1_wikipedia_pit.WIKIPEDIA_REVISION_HISTORY_EVALUATION['sector_gics']['bounded_event_scoped_evidence']). It does not admit a general, continuous, full-universe GICS/sector cross-check claim, which stays CAPTURED_UNEVALUATED_NOT_ADMITTED.",
+        "Does not close ASOF_GICS_BLOCKER; the official/licensed company-level GICS history gap stays DEFERRED_NOT_BLOCKING."
+      ]
+    },
+    {
+      "candidate_id": "sec-edgar-sic-codes",
+      "source_name": "SEC EDGAR company-level Standard Industrial Classification (SIC) codes",
+      "source_url": "https://www.sec.gov/cgi-bin/browse-edgar",
+      "classification": "NOT_SUFFICIENT_FOR_GICS_CROSSCHECK",
+      "rejection_reason": "DIFFERENT_TAXONOMY_NOT_GICS",
+      "temporal_semantics": "SIC assignments carry a filing date and can change over time, so a temporal signal exists in principle.",
+      "limitations": [
+        "SIC is a different taxonomy maintained by a different body (the SEC) with different sector/industry boundaries than GICS (maintained jointly by S&P DJI and MSCI). Mapping SIC to GICS is an approximation, not the published GICS assignment, and is explicitly forbidden as a historical-GICS substitute by this task's owner instructions and docs/poi/evidence/dataset-v1/asof-gics-blocker.json.",
+        "Never evaluated further for this reason alone - no amount of temporal/dated coverage would make a different taxonomy an acceptable GICS cross-check source."
+      ],
+      "eligibility": {
+        "authoritative_official_evidence": false,
+        "eligible_for_promotion_without_validation": false,
+        "substitute_for_historical_gics": false
+      }
+    },
+    {
+      "candidate_id": "current-only-gics-or-wikipedia-or-company-descriptions",
+      "source_name": "Any source publishing only CURRENT GICS/sector classifications (current Wikipedia table, current issuer/exchange material, current company descriptions) with no dated revision history",
+      "source_url": null,
+      "classification": "NOT_SUFFICIENT_FOR_GICS_CROSSCHECK",
+      "rejection_reason": "NO_TEMPORAL_SEMANTICS_CURRENT_ONLY",
+      "temporal_semantics": "None - a CURRENT-only source carries no effective date and no knowledge date. Using it to cross-check a historical as-of claim would back-project today's classification onto history, exactly the look-ahead failure mode CLAUDE.md and this task's owner instructions forbid.",
+      "limitations": [
+        "Explicitly excluded by this task's owner instructions: 'Do not treat SEC SIC, current GICS, current Wikipedia, or company descriptions as historical GICS substitutes.'",
+        "Distinct from the CONTEMPORANEOUS Wikipedia MediaWiki REVISION history this same package already uses as primary evidence (dataset_v1_wikipedia_pit.py) - a revision's own immutable, independently-verified timestamp is what makes that path admissible; the CURRENT page alone (as scraped by sp500_current_universe.py) is not."
+      ],
+      "eligibility": {
+        "authoritative_official_evidence": false,
+        "eligible_for_promotion_without_validation": false,
+        "substitute_for_historical_gics": false
+      }
+    },
+    {
+      "candidate_id": "select-sector-spdr-etf-daily-holdings",
+      "source_name": "State Street Select Sector SPDR ETF (e.g. XLK, XLF, XLC) daily published holdings, each fund tracking one GICS sector",
+      "source_url": null,
+      "classification": "NOT_SUFFICIENT_FOR_GICS_CROSSCHECK",
+      "rejection_reason": "NO_FREE_DATED_HISTORICAL_ARCHIVE_IDENTIFIED",
+      "temporal_semantics": "The publisher's site exposes only the CURRENT day's holdings for free; no free, dated, historical archive of past daily holdings files was identified during this evaluation (a comprehensive per-date reconstruction via generic web-archive snapshots was not attempted for this bounded task and would need its own coverage/access validation before being treated as evidence).",
+      "limitations": [
+        "Each fund's holdings are licensed-GICS-derived (State Street licenses the GICS-sector index each fund tracks), so even a fully validated historical archive would still be evaluating S&P DJI/MSCI's own classifications at one remove, not an independent second opinion.",
+        "Holdings reflect portfolio weights and inclusion/exclusion, not a clean, explicit per-company GICS Sub-Industry label - deriving one would require additional, unvalidated inference.",
+        "Recorded here as evaluated-and-not-pursued, not as NOT_FOUND_OR_COMMERCIAL_ONLY in the sibling registry's stricter sense: the current-day page itself is free and accessible, but no sufficient DATED history of it was established."
+      ],
+      "eligibility": {
+        "authoritative_official_evidence": false,
+        "eligible_for_promotion_without_validation": false,
+        "substitute_for_historical_gics": false
+      }
+    }
+  ]
+}

@@ -83,8 +83,35 @@
 # and not TRADING_READINESS or Paper/Live authorization. Do not recreate this
 # machinery; do not fetch a fabricated date range against it until the owner
 # (or an approved ADR) supplies the absolute window.
+#
+# 2026-09-07 follow-up (A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL). Gap 6
+# below ("GICS/sector cross-check has no independent source to run against")
+# was a research question, not an implementation task, and stayed open with
+# no bounded next task encoded. Four concrete free candidates were now
+# evaluated (config/data-sources/gics-sector-crosscheck-source-registry.json):
+# SEC SIC (different taxonomy, rejected), current-only GICS/Wikipedia/company
+# descriptions (no temporal semantics, rejected), Select Sector SPDR ETF
+# holdings (no free dated historical archive identified, rejected), and S&P
+# DJI/MSCI's own free, public, unauthenticated press releases announcing GICS
+# structure revisions (accepted, narrowly). One real, bounded experiment
+# (scripts/run_wikipedia_gics_sector_crosscheck_experiment.py, recorded under
+# docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/) cross-checked
+# the 2018 GICS Communication Services structure revision for its 6 named
+# tickers (GOOGL, GOOG, FB, NFLX, TRIP, CMCSA): the AFTER-transition
+# observation corroborated (6/6, revision 878489286); the BEFORE-transition
+# observation did NOT (5/6, revision 848091676 - a real, recorded disagreement
+# on NFLX, not hidden). This admits SECONDARY_RESEARCH_PIT /
+# BacktestQuality.APPROXIMATE evidence bounded EXACTLY to those 6 tickers and
+# that one event (dataset_v1_wikipedia_pit.WIKIPEDIA_REVISION_HISTORY_EVALUATION
+# ["sector_gics"]["bounded_event_scoped_evidence"]) - it does NOT establish a
+# general, continuous, full-universe GICS cross-check (still
+# CAPTURED_UNEVALUATED_NOT_ADMITTED), does not flip any capability in
+# dataset_v1.py, and does not close ASOF_GICS_BLOCKER (still
+# BLOCKED_EXTERNAL / LICENSE_REQUIRED / DEFERRED_NOT_BLOCKING). Do not recreate
+# this experiment or re-evaluate the same four candidates; a general
+# full-universe GICS cross-check source remains an open research question.
 version: "1.0"
-updated: "2026-09-06"
+updated: "2026-09-07"
 baseline: docs/baseline-v0.5/
 authoritative_prose: docs/roadmaps/TRADING_SYSTEM_MASTER_PLAN.md
 
@@ -800,7 +827,11 @@ strategies:
       PIT membership (official S&P DJI documents, owner-supplied — automated
       retrieval is bot-protected) and its GICS sector-concentration rule
       requires historical (as-of) GICS, which is LICENSE_REQUIRED with no free
-      legitimate source (see docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3,
+      legitimate CONTINUOUS/full-universe source (a narrowly bounded free
+      SECONDARY research cross-check exists for exactly 6 named tickers and
+      one 2018 reclassification event only — see
+      docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/ — and
+      does not close this gap) (see docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3,
       docs/status/PIT_DATASET_QUALIFICATION.md,
       docs/poi/evidence/dataset-v1/asof-gics-blocker.json)
     next_action: >-

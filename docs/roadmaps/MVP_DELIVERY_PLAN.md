@@ -206,7 +206,8 @@ the frozen strategy, and passing its tests is never treated as such:
 | S&P historical-secondary source registry (PR #104) | which candidate secondary sources exist and exactly what would be required to validate one (checksum, timestamps, 2-source cross-check) | nothing about historical S&P membership itself — every candidate is unfetched (`checksum_status: NOT_YET_COMPUTED`) and, even fully validated, stays `SECONDARY_RESEARCH_PIT` — it can never become authoritative (ADR-0017) |
 | Corporate-action PIT validator (PR #106) | that a *given* corporate-action fixture is internally PIT-consistent (four timestamps ordered, stable UUID identity, non-cyclic correction lineage) | that any real corporate-action record exists for the frozen strategy's universe — it is explicitly OFFLINE and FIXTURE-ONLY and never performs a network call |
 | Dataset V1 real-source qualifiers (`qualify_corporate_actions`, `qualify_pit_membership`, `qualify_delisted_security_history`) | the pipeline can qualify real SEC/IBKR evidence once it is fetched | nothing until the owner-run qualification script is actually executed against live SEC EDGAR / IBKR sources |
-| Wikipedia/MediaWiki revision-history evaluation + one real experiment (`dataset_v1_wikipedia_pit.py`, `scripts/run_wikipedia_revision_history_experiment.py`, 2026-09-06) | a free, legitimate, cross-checked SECONDARY_RESEARCH_PIT path exists for historical **membership**-as-recorded, bound to a real, independently-verified revision id/timestamp/checksum, cross-checked against a real independent secondary source (100% agreement, 503/503 tickers, recorded in `docs/poi/evidence/dataset-v1/wikipedia-revision-history/experiment-2023-12-31.json`) | official historical S&P membership or historical GICS — permanently `SECONDARY_RESEARCH_PIT`, never `OFFICIAL_PUBLIC`; does not close `ASOF_GICS_BLOCKER` (still `BLOCKED_EXTERNAL` / `LICENSE_REQUIRED`); GICS/sector values are captured in the same revision but are explicitly `CAPTURED_UNEVALUATED_NOT_ADMITTED` — no independent dated GICS source has been cross-checked, so they are not admitted as secondary evidence; only ONE date has been experimentally recorded, not the full backtest window |
+| Wikipedia/MediaWiki revision-history evaluation + one real experiment (`dataset_v1_wikipedia_pit.py`, `scripts/run_wikipedia_revision_history_experiment.py`, 2026-09-06) | a free, legitimate, cross-checked SECONDARY_RESEARCH_PIT path exists for historical **membership**-as-recorded, bound to a real, independently-verified revision id/timestamp/checksum, cross-checked against a real independent secondary source (100% agreement, 503/503 tickers, recorded in `docs/poi/evidence/dataset-v1/wikipedia-revision-history/experiment-2023-12-31.json`) | official historical S&P membership or historical GICS — permanently `SECONDARY_RESEARCH_PIT`, never `OFFICIAL_PUBLIC`; does not close `ASOF_GICS_BLOCKER` (still `BLOCKED_EXTERNAL` / `LICENSE_REQUIRED`); a GENERAL, continuous, full-universe GICS/sector cross-check — one narrowly bounded exception is recorded separately below |
+| GICS-sector cross-check candidate evaluation + one real bounded experiment (`config/data-sources/gics-sector-crosscheck-source-registry.json`, `scripts/run_wikipedia_gics_sector_crosscheck_experiment.py`, 2026-09-07) | a free, dated, official-publisher (S&P DJI/MSCI) source exists that names specific companies reclassified between specific GICS sectors on a specific date; one real experiment cross-checked the 2018 Communication Services revision for its 6 named tickers both before (`corroborated=False`, 5/6, a real recorded NFLX disagreement) and after (`corroborated=True`, 6/6) — see "GICS/sector: one bounded, real cross-check now exists" below | a general, continuous, full-universe GICS/sector cross-check for any OTHER ticker, date, or event (stays `CAPTURED_UNEVALUATED_NOT_ADMITTED`); official historical GICS — does not close `ASOF_GICS_BLOCKER` (still `BLOCKED_EXTERNAL` / `LICENSE_REQUIRED` / `DEFERRED_NOT_BLOCKING`) |
 
 #### Free contemporaneous-revision path evaluated AND experimentally recorded (2026-09-06)
 
@@ -265,25 +266,83 @@ offline tests plus the one real experiment above):
 
 **GICS/sector scope, stated precisely so it cannot be over-read.** The same
 revision table carries GICS Sector / GICS Sub-Industry columns, so every
-snapshot captures them — but no independent, dated, free GICS source has been
-identified to cross-check them against. `cross_check_sectors` (deterministic,
-coverage- and anomaly-aware, unit-tested) exists for when one is found, but
-until then sector/GICS values from this source are recorded
-`CAPTURED_UNEVALUATED_NOT_ADMITTED`: captured on the snapshot for future use,
-never claimed as corroborated SECONDARY evidence today.
+snapshot captures them. In GENERAL, no independent, dated, free GICS source
+has been identified that covers the full ~500-ticker universe on an ongoing
+basis, so sector/GICS values from this source stay
+`CAPTURED_UNEVALUATED_NOT_ADMITTED` for the general case: captured on the
+snapshot for future use, never claimed as corroborated SECONDARY evidence in
+general. `cross_check_sectors` (deterministic, coverage- and anomaly-aware,
+unit-tested) exists for when a general source is found. **One narrowly
+bounded exception now exists** — see "GICS/sector: one bounded, real
+cross-check now exists" below.
 
 **Conclusion, stated precisely so it cannot be over-read:** this closes the
 "is there a free path at all" question with **yes, for MEMBERSHIP, for
 APPROXIMATE-quality research** (ADR-0017 `BacktestQuality.APPROXIMATE`),
-backed by one real recorded experiment — and it changes nothing about the
-**official** requirement, or about GICS. `ASOF_GICS_BLOCKER` still reads
-`BLOCKED_EXTERNAL` / `LICENSE_REQUIRED`, and official historical S&P
-membership still requires owner-supplied S&P DJI documents. Both official
-gaps are DEFERRED, not resolved, and are **not blocking** the newly-available
-research path. See
+backed by one real recorded experiment, and — as of
+A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL (2026-09-07) — **yes, for GICS
+Sector, but ONLY for 6 named tickers and one 2018 reclassification event**
+(see below). Neither changes anything about the **official** requirement.
+`ASOF_GICS_BLOCKER` still reads `BLOCKED_EXTERNAL` / `LICENSE_REQUIRED`, and
+official historical S&P membership still requires owner-supplied S&P DJI
+documents. Both official gaps are DEFERRED, not resolved, and are **not
+blocking** the newly-available research paths. See
 `dataset_v1_wikipedia_pit.WIKIPEDIA_REVISION_HISTORY_EVALUATION` and
 `ASOF_GICS_BLOCKER["free_secondary_research_alternative"]` for the
 machine-readable record.
+
+#### GICS/sector: one bounded, real cross-check now exists (2026-09-07)
+
+A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL evaluated four concrete free
+candidates for independently cross-checking Wikipedia-recorded GICS Sector
+values (`config/data-sources/gics-sector-crosscheck-source-registry.json`):
+
+| Candidate | Outcome |
+|---|---|
+| SEC EDGAR SIC codes | rejected — different taxonomy, not GICS |
+| current-only GICS / current Wikipedia / company descriptions | rejected — no temporal/as-of semantics, would back-project |
+| Select Sector SPDR ETF daily holdings | rejected — no free dated historical archive identified |
+| S&P DJI/MSCI's own free, public, unauthenticated GICS structure-change press releases (PRNewswire) | **accepted, narrowly** — see below |
+
+The accepted candidate is S&P DJI/MSCI's own announcement of the 2018 GICS
+structure revision broadening "Telecommunication Services" into
+"Communication Services" — a free, dated, official-publisher document naming
+6 specific S&P 500 tickers moving sector (GOOGL, GOOG, FB, NFLX, TRIP,
+CMCSA), effective close of business ET 2018-09-28. `cross_check_sectors`
+gained an optional `scope_tickers` parameter for exactly this shape of
+evidence — coverage/agreement computed over the NAMED subset only, never the
+full universe.
+
+One real, bounded experiment
+(`scripts/run_wikipedia_gics_sector_crosscheck_experiment.py`, recorded under
+`docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/gics-sector-crosscheck-2018-communication-services.json`)
+fetched two real MediaWiki revisions (before: `2018-06-30` request → revision
+`848091676`; after: `2019-01-15` request → revision `878489286`, both
+page-identity/timestamp-verified against MediaWiki's own metadata) and
+cross-checked each, scoped to the 6 named tickers, against the press
+release's stated OLD and NEW sector respectively:
+
+- **AFTER transition:** 6/6 agree with "Communication Services"
+  (`agreement_ratio=1.0`, `corroborated=True`).
+- **BEFORE transition:** 5/6 agree with the stated old sector
+  (`agreement_ratio=0.8333`, `corroborated=False` — below the 0.90
+  threshold). The one disagreement: this Wikipedia revision recorded NFLX as
+  `Information Technology`, where the press release states Netflix's
+  pre-move classification was `Consumer Discretionary` (Internet & Direct
+  Marketing Retail Sub-Industry). **This disagreement is recorded, not
+  hidden** — it is itself evidence of why Wikipedia-sourced GICS/sector
+  values require independent corroboration rather than blanket trust.
+
+**Admitted as:** `SECONDARY_RESEARCH_PIT` / `BacktestQuality.APPROXIMATE`
+research evidence, bounded EXACTLY to the 6 named tickers and this one 2018
+event
+(`dataset_v1_wikipedia_pit.WIKIPEDIA_REVISION_HISTORY_EVALUATION["sector_gics"]["bounded_event_scoped_evidence"]`).
+**Does NOT admit:** a general, continuous, full-universe GICS/sector
+cross-check for any other ticker, date, or event — that stays
+`CAPTURED_UNEVALUATED_NOT_ADMITTED`. Does not flip `asof_gics` or
+`pit_sp500_membership` in `dataset_v1.py`, does not change
+`ASOF_GICS_BLOCKER`'s `BLOCKED_EXTERNAL` / `LICENSE_REQUIRED` state, and does
+not qualify `PIT_STRICT`, final OOS/shadow, `PAPER_AUTO` or `LIVE`.
 
 Required A-WP2 principles:
 
@@ -408,13 +467,24 @@ further autonomous implementation:
    frozen strategy's full backtest window (or approve an ADR that does), so
    the existing relative split/walk-forward specification can be anchored to
    real calendar dates and the machinery run for real, unmodified.
-6. **GICS/sector cross-check has no independent source to run against.**
-   `cross_check_sectors` is built, deterministic and tested with fixtures,
-   but has never been run against a real independent dated GICS source
-   because none has been identified as free and legitimate. This is a
-   research task (find/propose a candidate), not an implementation task; it
-   is recorded here so it is not silently dropped, but no bounded next task
-   is encoded for it today.
+6. **GICS/sector cross-check has no independent source to run against, in
+   GENERAL.** `cross_check_sectors` is built, deterministic and tested with
+   fixtures. **Update (A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL,
+   2026-09-07):** four concrete free candidates were evaluated
+   (`config/data-sources/gics-sector-crosscheck-source-registry.json`); one
+   (S&P DJI/MSCI's own free, public GICS structure-change press releases) was
+   accepted and used in a real, bounded experiment — the 2018 Communication
+   Services revision, cross-checked for its 6 named tickers before
+   (`corroborated=False`, a real recorded NFLX disagreement) and after
+   (`corroborated=True`) the reclassification (see "GICS/sector: one bounded,
+   real cross-check now exists" above and
+   `docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/`). This
+   closes the "is there any free path at all" research question with **yes,
+   narrowly** — it does NOT establish a general, continuous, full-universe
+   GICS cross-check capability, which remains an open research task (find a
+   source with ongoing full-universe coverage, or accept none exists); it
+   does not close `ASOF_GICS_BLOCKER`, and no bounded next task is encoded
+   for the GENERAL case today.
 
 Items 1–4 are unchanged: every official/PIT_STRICT path forward requires an
 owner-supplied artifact, a licensing decision, or an owner-run with
@@ -446,9 +516,11 @@ and re-inspect `main` afterward.
 > as the single-date experiment already does) and record the resulting
 > SECONDARY_RESEARCH_PIT / `BacktestQuality.APPROXIMATE` MEMBERSHIP dataset
 > under `docs/poi/evidence/`. This does not close gaps 1, 2 or 4 above, and
-> does not admit GICS/sector evidence (gap 6) — the official/PIT_STRICT
-> requirements stay separately tracked and owner-gated — and must not be
-> represented as such.
+> does not admit GENERAL GICS/sector evidence (gap 6's general, continuous,
+> full-universe case — see "GICS/sector: one bounded, real cross-check now
+> exists" above for the one narrowly bounded exception that DOES now exist)
+> — the official/PIT_STRICT requirements stay separately tracked and
+> owner-gated — and must not be represented as such.
 
 This mirrors `dataset_v1_wikipedia_pit.WIKIPEDIA_REVISION_HISTORY_EVALUATION["next_bounded_task"]`
 exactly; keep the two in sync if either changes.
@@ -763,7 +835,8 @@ Do not use chat history as the only durable record of a product/safety decision.
 ## 11. Immediate next-work rule
 
 **Reconciled 2026-09-06 (updated same day after a second independent
-review, and again same day after A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD).**
+review, and again same day after A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD;
+updated again 2026-09-07 after A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL).**
 AutoDev has already merged the A-WP2 owner-decision (PR #100),
 forward-S&P-snapshot (PR #101), DatasetManifest/no-look-ahead (PR #102), the
 S&P historical-secondary source registry (PR #104), the current/forward S&P
@@ -813,10 +886,29 @@ this is recorded precisely as `WINDOW_DEFINITION_REQUIRED` rather than
 fabricated. Once that date range exists, running the machinery is
 dependency-safe again. It must be scoped and reported honestly either way: it
 produces `SECONDARY_RESEARCH_PIT` / `BacktestQuality.APPROXIMATE`
-**MEMBERSHIP** evidence only, GICS/sector stays
-`CAPTURED_UNEVALUATED_NOT_ADMITTED` (gap 6, no independent GICS source
-identified), and none of it closes or is represented as closing the official
-gaps above.
+**MEMBERSHIP** evidence only; GICS/sector stays
+`CAPTURED_UNEVALUATED_NOT_ADMITTED` for the GENERAL, continuous,
+full-universe case (gap 6) — see the next paragraph for the one narrowly
+bounded exception — and none of it closes or is represented as closing the
+official gaps above.
+
+**`A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL` (§5, gap 6) is now DONE for a
+narrowly bounded case; the general case remains an open research question,
+not encoded as a bounded next task.** Four concrete free candidates were
+evaluated (`config/data-sources/gics-sector-crosscheck-source-registry.json`);
+one (S&P DJI/MSCI's own free, public GICS structure-change press releases)
+was accepted and used in a real experiment cross-checking the 2018
+Communication Services revision for its 6 named tickers, both before
+(`corroborated=False`, a real recorded NFLX disagreement — not hidden) and
+after (`corroborated=True`) the reclassification (see "GICS/sector: one
+bounded, real cross-check now exists" in §5 above and
+`docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/`). Do not
+recreate this experiment or re-evaluate the same four candidates. This
+closes the "is there any free GICS cross-check path at all" question with
+**yes, narrowly** — it must be scoped and reported honestly: it admits
+`SECONDARY_RESEARCH_PIT` / `BacktestQuality.APPROXIMATE` evidence bounded
+EXACTLY to those 6 tickers and that one event, never a general capability,
+and it does not close `ASOF_GICS_BLOCKER` or either official gap above.
 
 M4 → M5 → M6 remain gated on **official, PIT_STRICT** M3 dataset evidence and
 stay `PENDING`; an APPROXIMATE-quality dataset from item 5 does not itself

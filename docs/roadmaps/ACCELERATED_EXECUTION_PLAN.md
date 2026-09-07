@@ -90,14 +90,29 @@ Every other track is plumbing by comparison.
   (`WikipediaDatasetStore` / `run_wikipedia_revision_history_batch` /
   `build_dataset_manifest`,
   `scripts/run_wikipedia_revision_history_batch.py`, 24 further offline
-  tests). The official/PIT_STRICT gaps — historical S&P 500 PIT membership,
-  historical GICS, survivorship-free delisted-name OHLCV, and real (not
-  fixture) corporate-action evidence — still need an owner-supplied
-  artifact, a licensing decision, or an owner-run against SEC EDGAR/IBKR; the
+  tests), and (2026-09-07, `A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL`) the
+  GICS-sector cross-check candidate evaluation
+  (`config/data-sources/gics-sector-crosscheck-source-registry.json`) plus
+  ONE real bounded experiment
+  (`scripts/run_wikipedia_gics_sector_crosscheck_experiment.py`; the 2018
+  GICS Communication Services structure revision cross-checked for 6 named
+  tickers, recorded under
+  `docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/`). The
+  official/PIT_STRICT gaps — historical S&P 500 PIT membership, historical
+  GICS, survivorship-free delisted-name OHLCV, and real (not fixture)
+  corporate-action evidence — still need an owner-supplied artifact, a
+  licensing decision, or an owner-run against SEC EDGAR/IBKR; the
   Wikipedia-revision path never substitutes for any of them (permanently
   `SECONDARY_RESEARCH_PIT`), and its GICS/sector values are captured but
-  `CAPTURED_UNEVALUATED_NOT_ADMITTED` — no independent dated GICS source has
-  been found to cross-check them against. See
+  `CAPTURED_UNEVALUATED_NOT_ADMITTED` for the GENERAL, continuous,
+  full-universe case — no independent dated GICS source has been found that
+  covers the full universe on an ongoing basis. One narrowly bounded
+  exception now exists: the 2018 event above is corroborated for its 6 named
+  tickers AFTER the reclassification (`corroborated=True`, 6/6) but NOT
+  before it (`corroborated=False`, 5/6 — a real, recorded NFLX disagreement,
+  not hidden); this is `SECONDARY_RESEARCH_PIT` / `BacktestQuality.APPROXIMATE`
+  evidence bounded exactly to those 6 tickers and that one event, never a
+  general capability, and it does not close `ASOF_GICS_BLOCKER`. See
   [`MVP_DELIVERY_PLAN.md`](MVP_DELIVERY_PLAN.md) §5 M3 for the authoritative,
   itemized owner-action list; the one remaining next step for the
   Wikipedia-revision path
@@ -105,7 +120,9 @@ Every other track is plumbing by comparison.
   machinery over the full backtest window) requires the owner (or an
   approved ADR) to first supply the absolute window
   (`WINDOW_DEFINITION_REQUIRED`) — no absolute start/end date exists on main
-  today, only the relative 60/20/20 + walk-forward proportions.
+  today, only the relative 60/20/20 + walk-forward proportions. Identifying a
+  source sufficient for a GENERAL, continuous, full-universe GICS cross-check
+  remains an open research question, not a bounded next task.
 
 ### A-WP3 — Replay and in-sample backtest
 - **Work:** deterministic replay of the frozen manifest; in-sample backtest with

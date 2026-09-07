@@ -59,6 +59,31 @@
 > (`dataset_v1_wikipedia_pit.WINDOW_DEFINITION_REQUIRED`); it blocks only the
 > FULL-WINDOW empirical MEMBERSHIP research dataset, not this machinery, and
 > it does not touch either GAP row below.
+>
+> **2026-09-07 follow-up (A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL).** The
+> GICS/sector GAP row below had one open research question: whether ANY free,
+> independent, dated source exists to cross-check Wikipedia-recorded GICS
+> Sector values, at all. Four concrete candidates were evaluated
+> (`config/data-sources/gics-sector-crosscheck-source-registry.json`): SEC SIC
+> (different taxonomy, rejected), current-only GICS/Wikipedia/company
+> descriptions (no temporal semantics, rejected), Select Sector SPDR ETF
+> holdings (no free dated historical archive identified, rejected), and S&P
+> DJI/MSCI's own free, public, unauthenticated press releases announcing GICS
+> structure revisions (accepted, narrowly). One real, bounded experiment
+> (`scripts/run_wikipedia_gics_sector_crosscheck_experiment.py`, recorded
+> under `docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/`) used
+> the last candidate to cross-check the 2018 GICS Communication Services
+> structure revision for its 6 named tickers (GOOGL, GOOG, FB, NFLX, TRIP,
+> CMCSA), before and after the reclassification: the AFTER observation
+> corroborated (6/6); the BEFORE observation did NOT (5/6 — a real, recorded
+> disagreement on NFLX, not hidden). This admits `SECONDARY_RESEARCH_PIT` /
+> `BacktestQuality.APPROXIMATE` evidence bounded EXACTLY to those 6 tickers
+> and that one event
+> (`dataset_v1_wikipedia_pit.WIKIPEDIA_REVISION_HISTORY_EVALUATION["sector_gics"]["bounded_event_scoped_evidence"]`).
+> It does **not** establish a general, continuous, full-universe GICS
+> cross-check (that remains `CAPTURED_UNEVALUATED_NOT_ADMITTED`), and it does
+> **not** close the GICS GAP row below, which stays WAITING_EXTERNAL for
+> **official**, licensed evidence.
 
 ## 1. Sourcing principle (owner correction #1)
 The remaining reference-data gaps do **not** have to be bought from one bundled

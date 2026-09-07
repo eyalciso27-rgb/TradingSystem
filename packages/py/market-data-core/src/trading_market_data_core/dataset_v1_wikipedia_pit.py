@@ -57,14 +57,43 @@ carries the GICS Sector / GICS Sub-Industry columns already parsed by
 :mod:`sp500_wikitable`, so every :class:`WikipediaRevisionSnapshot` CAPTURES
 both. But only **membership** currently has a working independent
 cross-check (:func:`cross_check_membership`) and is therefore admissible
-SECONDARY research evidence. **GICS/sector-as-recorded is NOT currently
+SECONDARY research evidence. **GICS/sector-as-recorded is NOT, in general,
 cross-checked** — no independent, dated, free GICS source has been
-identified — and stays ``CAPTURED_UNEVALUATED_NOT_ADMITTED``
-(``WIKIPEDIA_REVISION_HISTORY_EVALUATION``): it is retained on the snapshot
-for future use, never claimed as corroborated evidence today.
+identified that covers the full ~500-ticker universe on an ongoing basis —
+and stays ``CAPTURED_UNEVALUATED_NOT_ADMITTED``
+(``WIKIPEDIA_REVISION_HISTORY_EVALUATION["sector_gics"]["status"]``): it is
+retained on the snapshot for future use, never claimed as corroborated
+evidence in general.
 :func:`cross_check_sectors` exists, is deterministic, and is tested, so that
-claim can change the moment such a source exists — adding the function does
-not, by itself, change it.
+general claim can change the moment such a source exists — adding the
+function does not, by itself, change it.
+
+A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL (2026-09-07) found and used one
+free, dated, independent source for exactly ONE bounded, narrowly justified
+case: S&P Dow Jones Indices/MSCI's own free, public, unauthenticated press
+releases naming specific companies reclassified between specific GICS
+sectors on a specific effective date (config/data-sources/gics-sector-
+crosscheck-source-registry.json records every candidate evaluated, including
+the ones rejected — SEC SIC is a different taxonomy, current-only
+GICS/Wikipedia/company descriptions carry no temporal semantics, Select
+Sector SPDR ETF holdings have no free dated historical archive identified).
+:func:`cross_check_sectors` gained an optional ``scope_tickers`` parameter for
+exactly this shape of evidence — a source that only ever makes a claim about
+specific NAMED companies, never the full universe — and a real experiment
+(``scripts/run_wikipedia_gics_sector_crosscheck_experiment.py``, recorded
+under ``docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/``) used
+it to cross-check the 2018 GICS Communication Services structure revision for
+its 6 named tickers (GOOGL, GOOG, FB, NFLX, TRIP, CMCSA) both before and after
+the reclassification. The AFTER observation corroborated (6/6); the BEFORE
+observation did NOT (5/6 — Wikipedia recorded NFLX as Information Technology
+where the press release states its pre-move classification was Consumer
+Discretionary), and that disagreement is recorded, not hidden — see
+``WIKIPEDIA_REVISION_HISTORY_EVALUATION["sector_gics"]["bounded_event_scoped_evidence"]``
+for the full result. This admits SECONDARY_RESEARCH_PIT /
+``BacktestQuality.APPROXIMATE`` evidence bounded EXACTLY to those 6 tickers
+and that one event; it does not establish a general cross-check capability,
+does not flip any capability in ``dataset_v1.py``, and does not touch
+``ASOF_GICS_BLOCKER`` (still ``DEFERRED_NOT_BLOCKING``).
 
 What this module explicitly does NOT do, per the owner decisions and
 ADR-0017 (repeated here because it is the entire point of keeping this
@@ -521,6 +550,13 @@ class SectorCrossCheckResult:
     disagreements: tuple[tuple[str, str, str], ...]  # (ticker, wiki_sector, secondary_sector)
     uncovered_tickers: tuple[str, ...]
     detail: str
+    #: ``None`` for a full-universe check (the default). When a caller passes
+    #: ``scope_tickers`` to :func:`cross_check_sectors` -- a narrowly justified
+    #: classification-change case, never an unbounded weakening of the check
+    #: -- this is the exact, sorted set of tickers the coverage/agreement
+    #: ratios were computed over, so a reader of the persisted result can
+    #: never mistake a scoped check for a full-universe one.
+    scope_tickers: tuple[str, ...] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -534,6 +570,8 @@ class SectorCrossCheckResult:
             "disagreement_count": len(self.disagreements),
             "disagreements": [list(item) for item in self.disagreements],
             "uncovered_ticker_count": len(self.uncovered_tickers),
+            "scope_tickers": list(self.scope_tickers) if self.scope_tickers is not None else None,
+            "scope": "NARROW_CLASSIFICATION_CHANGE_CASE" if self.scope_tickers is not None else "FULL_WIKIPEDIA_UNIVERSE",
             "detail": self.detail,
         }
 
@@ -558,6 +596,7 @@ def cross_check_sectors(
     as_of: date,
     minimum_coverage_ratio: float = MINIMUM_SECTOR_COVERAGE_RATIO,
     minimum_agreement_ratio: float = MINIMUM_SECTOR_AGREEMENT_RATIO,
+    scope_tickers: frozenset[str] | None = None,
 ) -> SectorCrossCheckResult:
     """Corroborate GICS Sector values against one independent SECONDARY source.
 
@@ -568,18 +607,32 @@ def cross_check_sectors(
 
     This exists so GICS/sector-as-recorded from a Wikipedia revision CAN be
     admitted as SECONDARY historical evidence once a real independent,
-    dated sector source is available to run it against. Until then, no
-    caller in this repository invokes this with anything but a fabricated or
-    fixture mapping in a test: ``WIKIPEDIA_REVISION_HISTORY_EVALUATION``
-    explicitly records that sector/GICS stays `CAPTURED_UNEVALUATED_NOT_ADMITTED`
-    because no such independent dated source has been identified yet -- adding
-    this function does not, by itself, change that claim.
+    dated sector source is available to run it against. A real one now
+    exists for exactly ONE narrowly justified case: S&P DJI/MSCI's own free,
+    dated GICS structure-change press releases (e.g. the 2018 Communication
+    Services revision) name specific companies moving between named sectors
+    as of a specific effective date -- but only those named companies, never
+    the full ~500-ticker universe. ``scope_tickers`` exists for exactly this
+    shape of evidence: when a caller supplies it, coverage and agreement are
+    computed ONLY over that explicit, named subset (never the full Wikipedia
+    universe), because that is the entire population the source evidence
+    itself makes a claim about. It never weakens the general check: the
+    default (``None``) is byte-for-byte the prior full-universe behavior, and
+    a caller cannot use a narrow scope to hide a low-coverage full-universe
+    claim -- ``WIKIPEDIA_REVISION_HISTORY_EVALUATION["sector_gics"]`` records
+    exactly which claim (bounded event-scoped vs. general continuous) each
+    admitted result supports; adding this parameter does not, by itself,
+    change the general continuous claim from `CAPTURED_UNEVALUATED_NOT_ADMITTED`.
 
     Fails closed, before any comparison is attempted, on the same misuse
     classes :func:`cross_check_membership` guards against: both ratio
     overrides are refused outside their canonical-to-1.0 range (never
     weakenable), and a revision timestamped after ``as_of`` is refused
-    (no look-ahead).
+    (no look-ahead). ``scope_tickers``, if given, must be non-empty and every
+    member must actually be present in the Wikipedia snapshot -- a scope
+    naming a ticker the snapshot does not carry is an identity/coverage
+    mistake in the caller's own claimed evidence, not something this function
+    silently drops.
     """
     if not (MINIMUM_SECTOR_COVERAGE_RATIO <= minimum_coverage_ratio <= 1.0):
         raise SourceAdapterError(
@@ -608,7 +661,24 @@ def cross_check_sectors(
             " sector mapping; an empty mapping is not corroboration, it is the"
             " absence of a check"
         )
-    wiki_tickers = wikipedia.tickers()
+    if scope_tickers is not None:
+        if not scope_tickers:
+            raise SourceAdapterError(
+                "scope_tickers, if supplied, must be non-empty; an empty scope"
+                " is not a narrowly justified case, it is the absence of one"
+            )
+        missing_from_snapshot = sorted(scope_tickers - wikipedia.tickers())
+        if missing_from_snapshot:
+            raise SourceAdapterError(
+                f"scope_tickers names {missing_from_snapshot} which"
+                f" revision {wikipedia.revision.revision_id} does not carry at"
+                " all; refusing to run a scoped cross-check against a ticker"
+                " the snapshot cannot corroborate or refute (ambiguous"
+                " identity)"
+            )
+        wiki_tickers = frozenset(scope_tickers)
+    else:
+        wiki_tickers = wikipedia.tickers()
     covered = sorted(t for t in wiki_tickers if t in secondary_sectors)
     uncovered = sorted(t for t in wiki_tickers if t not in secondary_sectors)
     coverage_ratio = len(covered) / len(wiki_tickers) if wiki_tickers else 0.0
@@ -639,6 +709,12 @@ def cross_check_sectors(
         f" thresholds coverage>={minimum_coverage_ratio:.4f}"
         f" agreement>={minimum_agreement_ratio:.4f}); {len(uncovered)} ticker(s)"
         f" not covered by {secondary_source_id}"
+        + (
+            f"; scoped to {len(scope_tickers)} named ticker(s), not the full"
+            " Wikipedia universe"
+            if scope_tickers is not None
+            else ""
+        )
     )
     return SectorCrossCheckResult(
         as_of=as_of,
@@ -650,6 +726,7 @@ def cross_check_sectors(
         agreements=tuple(agreements),
         disagreements=tuple(disagreements),
         uncovered_tickers=tuple(uncovered),
+        scope_tickers=tuple(sorted(scope_tickers)) if scope_tickers is not None else None,
         detail=detail,
     )
 
@@ -2121,19 +2198,116 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
     ),
     "sector_gics": {
         "status": "CAPTURED_UNEVALUATED_NOT_ADMITTED",
+        "status_scope": (
+            "This CAPTURED_UNEVALUATED_NOT_ADMITTED status covers the GENERAL,"
+            " continuous, full-universe GICS/sector cross-check claim -- i.e."
+            " 'this source's GICS Sector value can be trusted for any ticker on"
+            " any date'. It does NOT describe a narrower, already-closed gap:"
+            " see 'bounded_event_scoped_evidence' below for ONE specific"
+            " classification-change case that HAS been cross-checked against a"
+            " real independent free dated source and IS admitted, bounded"
+            " exactly to that case."
+        ),
         "explanation": (
             "The same revision table carries GICS Sector / GICS Sub-Industry"
             " columns, so every parsed observation captures them (see"
             " primary_source.observations in the real_experiment evidence file)."
-            " But NO independent, dated, free GICS source has been identified to"
-            " cross-check them against, so sector/GICS values from this source"
-            " are NOT admitted as corroborated SECONDARY historical evidence --"
-            " they are retained on the snapshot for future use only."
-            " cross_check_sectors (deterministic, coverage- and anomaly-aware,"
-            " unit-tested) exists for the moment an independent dated GICS"
-            " source is identified; adding that function does not, by itself,"
-            " change this status."
+            " No independent, dated, free GICS source has been identified that"
+            " covers the full ~500-ticker universe on an ongoing basis, so"
+            " sector/GICS values from this source are NOT admitted as"
+            " corroborated SECONDARY historical evidence IN GENERAL -- they"
+            " remain retained on the snapshot for future use beyond the one"
+            " bounded case below. cross_check_sectors (deterministic, coverage-"
+            " and anomaly-aware, unit-tested, and now also usable with a"
+            " narrow, named ``scope_tickers`` for exactly the bounded-event"
+            " shape of evidence below) exists for the moment a general"
+            " independent dated GICS source is identified; adding it does not,"
+            " by itself, change this general status."
         ),
+        "bounded_event_scoped_evidence": {
+            "task": "A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL",
+            "evaluated_at": "2026-09-07",
+            "candidate_source": (
+                "S&P Dow Jones Indices / MSCI's own free, public, unauthenticated"
+                " press releases announcing specific GICS structure revisions"
+                " (distributed via PRNewswire; no login, no paywall, no"
+                " bot-protection bypass) -- recorded as candidate"
+                " 'spdji-msci-gics-structure-change-press-releases' in"
+                " config/data-sources/gics-sector-crosscheck-source-registry.json"
+                " alongside every OTHER free candidate evaluated and found"
+                " insufficient (SEC SIC -- different taxonomy; current-only"
+                " GICS/Wikipedia/company descriptions -- no temporal semantics;"
+                " Select Sector SPDR ETF holdings -- no free dated historical"
+                " archive identified)."
+            ),
+            "real_experiment": {
+                "performed_at": "2026-09-07",
+                "performed_by": "scripts/run_wikipedia_gics_sector_crosscheck_experiment.py",
+                "evidence_path": (
+                    "docs/poi/evidence/dataset-v1/wikipedia-gics-sector-crosscheck/"
+                    "gics-sector-crosscheck-2018-communication-services.json"
+                ),
+                "event": (
+                    "The 2018 GICS structure revision broadening"
+                    " 'Telecommunication Services' into 'Communication"
+                    " Services' (announced 2017-11-15; effective close of"
+                    " business ET 2018-09-28 in GICS Direct). The press release"
+                    " names 6 S&P 500 tickers moving sector: GOOGL, GOOG, FB"
+                    " (from Information Technology) and NFLX, TRIP, CMCSA (from"
+                    " Consumer Discretionary), all TO Communication Services."
+                ),
+                "method": (
+                    "Two real MediaWiki revisions of 'List of S&P 500 companies'"
+                    " were fetched, page-identity/timestamp-verified against"
+                    " MediaWiki's own metadata: one at or before 2018-06-30"
+                    " (revision 848091676, well before the effective date) and"
+                    " one at or before 2019-01-15 (revision 878489286, well"
+                    " after it). cross_check_sectors(..., scope_tickers={the 6"
+                    " named tickers}) was run against the press release's"
+                    " stated OLD sector (for the before revision) and NEW"
+                    " sector (for the after revision) respectively -- scoped"
+                    " exactly to those 6 tickers, never the full universe."
+                ),
+                "result": (
+                    "AFTER-transition (2019-01-15 revision): 6/6 named tickers"
+                    " agree with the press release's stated 'Communication"
+                    " Services' (agreement_ratio=1.0, corroborated=True)."
+                    " BEFORE-transition (2018-06-30 revision): 5/6 agree with"
+                    " the press release's stated OLD sector"
+                    " (agreement_ratio=0.8333, corroborated=False -- below the"
+                    " 0.90 threshold) because this Wikipedia revision recorded"
+                    " NFLX as 'Information Technology' where the press release"
+                    " states Netflix's pre-move classification was 'Consumer"
+                    " Discretionary' (Internet & Direct Marketing Retail"
+                    " Sub-Industry). BOTH results are recorded in evidence_path"
+                    " -- the disagreement was not hidden or forced to agree;"
+                    " it is itself evidence of exactly why Wikipedia-sourced"
+                    " GICS/sector values require independent corroboration"
+                    " rather than blanket trust (see the module docstring's"
+                    " 'why_secondary_not_official')."
+                ),
+            },
+            "admitted_as": (
+                "SECONDARY_RESEARCH_PIT / BacktestQuality.APPROXIMATE research"
+                " evidence, bounded EXACTLY to the 6 named tickers"
+                " (GOOGL, GOOG, FB, NFLX, TRIP, CMCSA) and the 2018"
+                " Communication Services reclassification event. The"
+                " AFTER-transition observation is corroborated for those 6"
+                " tickers; the BEFORE-transition observation is NOT"
+                " corroborated (recorded disagreement on NFLX) and must not be"
+                " used as if it were."
+            ),
+            "does_not_admit": (
+                "A general, continuous, full-universe GICS/sector cross-check"
+                " capability for any OTHER ticker, date, or classification-"
+                "change event -- the 'status'/'status_scope' above still"
+                " governs every case other than this one. Does not flip"
+                " asof_gics or pit_sp500_membership in dataset_v1.py, does not"
+                " change ASOF_GICS_BLOCKER's BLOCKED_EXTERNAL /"
+                " LICENSE_REQUIRED state, and does not qualify PIT_STRICT,"
+                " final OOS/shadow, PAPER_AUTO or LIVE."
+            ),
+        },
     },
     "usable_for": "BacktestQuality.APPROXIMATE research/backtest of MEMBERSHIP only (ADR-0017)",
     "not_usable_for": (
@@ -2190,10 +2364,19 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
         " scripts/run_wikipedia_revision_history_batch.py over the resulting"
         " calendar decision-date grid to build and record the"
         " APPROXIMATE-quality MEMBERSHIP research dataset under"
-        " docs/poi/evidence/; separately, identify and validate an independent"
-        " dated GICS source before sector/GICS evidence from this path can be"
-        " admitted. The official/licensed gap stays separately tracked in"
-        " ASOF_GICS_BLOCKER and is not closed by either."
+        " docs/poi/evidence/. Separately"
+        " (A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL, 2026-09-07), one free,"
+        " dated, independent GICS cross-check candidate WAS identified and"
+        " used in a real bounded experiment -- see"
+        " 'sector_gics'.'bounded_event_scoped_evidence' above -- but it is"
+        " scoped to exactly 6 named tickers and one 2018 reclassification"
+        " event, not a general capability; identifying a source sufficient for"
+        " a GENERAL, continuous, full-universe GICS cross-check remains open"
+        " (config/data-sources/gics-sector-crosscheck-source-registry.json"
+        " records every free candidate evaluated for that so far and why each"
+        " one insufficient for the general case was rejected). The"
+        " official/licensed gap stays separately tracked in ASOF_GICS_BLOCKER"
+        " (DEFERRED_NOT_BLOCKING) and is not closed by any of this."
     ),
 }
 
