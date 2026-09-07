@@ -6,6 +6,7 @@ N-PORT-P filings on SEC EDGAR, retains every raw XML with SHA-256, resolves
 issuer identity conservatively, then applies the canonical sector coverage and
 agreement gates. The result is SECONDARY_RESEARCH_PIT / APPROXIMATE only.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -14,15 +15,23 @@ import os
 import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-for rel in ("packages/py/market-data-core/src", "packages/py/contracts/src", "packages/py/domain/src"):
+for rel in (
+    "packages/py/market-data-core/src",
+    "packages/py/contracts/src",
+    "packages/py/domain/src",
+):
     sys.path.insert(0, str(REPO_ROOT / rel))
 
-from trading_market_data_core.dataset_v1_sources import SecEdgarClient, UrllibHttpFetcher  # noqa: E402
 from trading_market_data_core.dataset_v1_sec_sector_spdr_gics import (  # noqa: E402
     build_secondary_sector_mapping,
     select_sector_spdr_snapshot_as_of,
+)
+from trading_market_data_core.dataset_v1_sources import (  # noqa: E402
+    SecEdgarClient,
+    UrllibHttpFetcher,
 )
 from trading_market_data_core.dataset_v1_wikipedia_pit import (  # noqa: E402
     WikipediaConstituentObservation,
@@ -32,7 +41,9 @@ from trading_market_data_core.dataset_v1_wikipedia_pit import (  # noqa: E402
 )
 
 AS_OF = date(2023, 12, 31)
-WIKI_EVIDENCE = REPO_ROOT / "docs/poi/evidence/dataset-v1/wikipedia-revision-history/experiment-2023-12-31.json"
+WIKI_EVIDENCE = (
+    REPO_ROOT / "docs/poi/evidence/dataset-v1/wikipedia-revision-history/experiment-2023-12-31.json"
+)
 OUT_ROOT = REPO_ROOT / "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics"
 RAW_ROOT = OUT_ROOT / AS_OF.isoformat()
 RESULT_PATH = OUT_ROOT / f"experiment-{AS_OF.isoformat()}.json"
@@ -45,7 +56,9 @@ def _sha256(raw: bytes) -> str:
 
 
 def _canonical_bytes(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
 
 
 def _write_immutable(path: Path, raw: bytes) -> None:
@@ -69,11 +82,14 @@ def _load_wikipedia_snapshot() -> tuple[WikipediaRevisionSnapshot, dict[str, obj
     revision = WikipediaRevisionRef(
         page_title=str(primary["page_title"]),
         revision_id=int(primary["revision_id"]),
-        revision_timestamp=datetime.fromisoformat(str(primary["revision_timestamp"])).astimezone(UTC),
+        revision_timestamp=datetime.fromisoformat(str(primary["revision_timestamp"])).astimezone(
+            UTC
+        ),
     )
     observations = tuple(
         WikipediaConstituentObservation(
-            ticker=str(row["ticker"]), name=str(row["name"]),
+            ticker=str(row["ticker"]),
+            name=str(row["name"]),
             gics_sector=str(row["gics_sector"]),
             gics_sub_industry=str(row["gics_sub_industry"]),
         )
@@ -87,12 +103,14 @@ def _load_wikipedia_snapshot() -> tuple[WikipediaRevisionSnapshot, dict[str, obj
 def main() -> int:
     performed_at = datetime.now(tz=UTC)
     wikipedia, wiki_evidence = _load_wikipedia_snapshot()
-    user_agent = os.environ.get("SEC_EDGAR_USER_AGENT") or "TradingSystem DatasetV1 GICS experiment eyalciso27@gmail.com"
+    primary = cast(dict[str, Any], wiki_evidence["primary_source"])
+    user_agent = (
+        os.environ.get("SEC_EDGAR_USER_AGENT")
+        or "TradingSystem DatasetV1 GICS experiment eyalciso27@gmail.com"
+    )
     fetcher = UrllibHttpFetcher()
     client = SecEdgarClient(fetcher, user_agent=user_agent)
-    snapshot = select_sector_spdr_snapshot_as_of(
-        AS_OF, client=client, bytes_fetcher=fetcher
-    )
+    snapshot = select_sector_spdr_snapshot_as_of(AS_OF, client=client, bytes_fetcher=fetcher)
     filing_records: list[dict[str, object]] = []
     for fetched in sorted(snapshot.filings, key=lambda item: item.filing.gics_sector):
         filing = fetched.filing
@@ -101,12 +119,14 @@ def main() -> int:
         _write_immutable(raw_path, fetched.raw_bytes)
         if _sha256(raw_path.read_bytes()) != fetched.raw_checksum:
             raise RuntimeError(f"retained SEC checksum mismatch for {raw_path}")
-        filing_records.append({
-            **filing.to_dict(),
-            "holding_count": len(fetched.holdings),
-            "raw_artifact_path": str(raw_path.relative_to(REPO_ROOT)).replace("\\", "/"),
-            "raw_checksum": fetched.raw_checksum,
-        })
+        filing_records.append(
+            {
+                **filing.to_dict(),
+                "holding_count": len(fetched.holdings),
+                "raw_artifact_path": str(raw_path.relative_to(REPO_ROOT)).replace("\\", "/"),
+                "raw_checksum": fetched.raw_checksum,
+            }
+        )
 
     resolution = build_secondary_sector_mapping(
         snapshot,
@@ -118,13 +138,15 @@ def main() -> int:
         secondary_source_id=SECONDARY_SOURCE_ID,
         as_of=AS_OF,
     )
-    primary = wiki_evidence["primary_source"]
     body: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "artifact_type": "historical_sector_crosscheck_experiment",
         "classification": "SECONDARY_RESEARCH_PIT",
         "backtest_quality": "APPROXIMATE",
-        "scope": "GICS Sector only for one bounded historical as-of date; GICS Sub-Industry is not cross-checked",
+        "scope": (
+            "GICS Sector only for one bounded historical as-of date; "
+            "GICS Sub-Industry is not cross-checked"
+        ),
         "requested_as_of": AS_OF.isoformat(),
         "performed_at": performed_at.isoformat(),
         "wikipedia_source": {
@@ -147,7 +169,9 @@ def main() -> int:
         "identity_resolution": resolution.to_dict(),
         "sector_cross_check": cross_check.to_dict(),
         "admission": {
-            "status": "ADMITTED_SECONDARY_RESEARCH_PIT_APPROXIMATE" if cross_check.corroborated else "REFUSED_NOT_CORROBORATED",
+            "status": "ADMITTED_SECONDARY_RESEARCH_PIT_APPROXIMATE"
+            if cross_check.corroborated
+            else "REFUSED_NOT_CORROBORATED",
             "usable_for": "BacktestQuality.APPROXIMATE historical GICS Sector research only",
             "not_usable_for": [
                 "BacktestQuality.PIT_STRICT",
@@ -160,13 +184,17 @@ def main() -> int:
         },
     }
     body["evidence_checksum"] = _sha256(_canonical_bytes(body))
-    rendered = (json.dumps(body, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    rendered = (json.dumps(body, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode(
+        "utf-8"
+    )
     _write_immutable(RESULT_PATH, rendered)
     print(f"evidence={RESULT_PATH.relative_to(REPO_ROOT)}")
     print(f"filings={len(filing_records)}")
-    print(f"coverage={cross_check.coverage_ratio:.6f} ({cross_check.covered_tickers}/{len(wikipedia.observations)})")
-    print(f"agreement={cross_check.agreement_ratio:.6f} ({cross_check.agreement_count}/{cross_check.covered_tickers})")
-    print(f"uncovered={cross_check.uncovered_ticker_count}")
+    coverage_detail = f"{cross_check.covered_tickers}/{len(wikipedia.observations)}"
+    print(f"coverage={cross_check.coverage_ratio:.6f} ({coverage_detail})")
+    agreement_detail = f"{len(cross_check.agreements)}/{cross_check.covered_tickers}"
+    print(f"agreement={cross_check.agreement_ratio:.6f} ({agreement_detail})")
+    print(f"uncovered={len(cross_check.uncovered_tickers)}")
     print(f"corroborated={cross_check.corroborated}")
     print(f"checksum={body['evidence_checksum']}")
     return 0 if cross_check.corroborated else 2

@@ -853,8 +853,7 @@ def fetch_revision_wikitext(
     parse = payload.get("parse")
     if not isinstance(parse, dict):
         raise SourceAdapterError(
-            f"revision {verified_revision.revision_id} payload carries no MediaWiki"
-            " parse result"
+            f"revision {verified_revision.revision_id} payload carries no MediaWiki parse result"
         )
     wikitext = parse.get("wikitext")
     if not isinstance(wikitext, str):
@@ -1055,9 +1054,7 @@ class SecondaryProvenance:
         if not self.source_id.strip():
             raise SourceAdapterError("secondary provenance requires a non-empty source_id")
         if not self.source_url.lower().startswith("https://"):
-            raise SourceAdapterError(
-                "secondary provenance source_url must be fetched over HTTPS"
-            )
+            raise SourceAdapterError("secondary provenance source_url must be fetched over HTTPS")
         if self.fetched_at.tzinfo is None:
             raise SourceAdapterError(
                 "secondary provenance fetched_at must be timezone-aware (a real,"
@@ -1073,9 +1070,7 @@ class SecondaryProvenance:
                     f"secondary provenance {label} must be a real sha256: digest"
                 )
         if not self.raw_artifact_path.strip():
-            raise SourceAdapterError(
-                "secondary provenance requires a non-empty raw_artifact_path"
-            )
+            raise SourceAdapterError("secondary provenance requires a non-empty raw_artifact_path")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -1150,9 +1145,7 @@ class WikipediaDatasetEntry:
                 " instant, never a naive guess)"
             )
         if not self.raw_provenance_path.strip():
-            raise SourceAdapterError(
-                "a dataset entry requires a non-empty raw_provenance_path"
-            )
+            raise SourceAdapterError("a dataset entry requires a non-empty raw_provenance_path")
         if self.secondary_provenance.source_id != self.cross_check.secondary_source_id:
             raise SourceAdapterError(
                 f"secondary provenance source_id"
@@ -1258,9 +1251,7 @@ def _snapshot_from_dict(payload: Mapping[str, object]) -> WikipediaRevisionSnaps
             ticker=str(o["ticker"]),
             name=str(o.get("name", "")),
             gics_sector=str(o["gics_sector"]) if o.get("gics_sector") else None,
-            gics_sub_industry=(
-                str(o["gics_sub_industry"]) if o.get("gics_sub_industry") else None
-            ),
+            gics_sub_industry=(str(o["gics_sub_industry"]) if o.get("gics_sub_industry") else None),
         )
         for o in raw_observations
     )
@@ -1320,8 +1311,10 @@ def _cross_check_from_dict(
     secondary_tickers = agreements | only_in_secondary
     secondary_source_id = str(payload["secondary_source_id"])
     return cross_check_membership(
-        wikipedia=wikipedia, secondary_tickers=secondary_tickers,
-        secondary_source_id=secondary_source_id, as_of=as_of,
+        wikipedia=wikipedia,
+        secondary_tickers=secondary_tickers,
+        secondary_source_id=secondary_source_id,
+        as_of=as_of,
     )
 
 
@@ -1588,8 +1581,8 @@ class WikipediaDatasetStore:
                 " matched_row_checksum (tampered); refusing to trust this"
                 " dataset entry"
             )
-        reconstructed_secondary_tickers = (
-            frozenset(entry.cross_check.agreements) | frozenset(entry.cross_check.only_in_secondary)
+        reconstructed_secondary_tickers = frozenset(entry.cross_check.agreements) | frozenset(
+            entry.cross_check.only_in_secondary
         )
         if match.tickers != reconstructed_secondary_tickers:
             raise SourceAdapterError(
@@ -1691,8 +1684,11 @@ class WikipediaDatasetStore:
                     json.dumps(entry.to_dict(), indent=2, sort_keys=True).encode("utf-8"),
                 )
         return WikipediaDatasetAcceptResult(
-            as_of=entry.as_of, entry_path=entry_path, raw_path=raw_path,
-            secondary_raw_path=secondary_raw_path, already_written=already_written,
+            as_of=entry.as_of,
+            entry_path=entry_path,
+            raw_path=raw_path,
+            secondary_raw_path=secondary_raw_path,
+            already_written=already_written,
         )
 
 
@@ -1758,9 +1754,7 @@ def run_wikipedia_revision_history_batch(
     fetch_revision_at_or_before_fn: Callable[
         ..., WikipediaRevisionRef
     ] = fetch_revision_at_or_before,
-    fetch_revision_wikitext_fn: Callable[
-        ..., RawWikipediaRevisionFetch
-    ] = fetch_revision_wikitext,
+    fetch_revision_wikitext_fn: Callable[..., RawWikipediaRevisionFetch] = fetch_revision_wikitext,
     now: Callable[[], datetime] = lambda: datetime.now(tz=UTC),
     timeout_seconds: float = 30.0,
     user_agent: str = DEFAULT_USER_AGENT,
@@ -1801,8 +1795,7 @@ def run_wikipedia_revision_history_batch(
     """
     if len(set(as_of_dates)) != len(as_of_dates):
         raise SourceAdapterError(
-            "duplicate as_of dates requested in one batch run; each date must"
-            " appear at most once"
+            "duplicate as_of dates requested in one batch run; each date must appear at most once"
         )
     secondary_full_file_checksum = raw_artifact_checksum(secondary_raw_bytes)
     rows: list[WikipediaDatasetBatchRow] = []
@@ -1825,7 +1818,9 @@ def run_wikipedia_revision_history_batch(
             continue
         try:
             revision_ref = fetch_revision_at_or_before_fn(
-                as_of, page_title=page_title, timeout_seconds=timeout_seconds,
+                as_of,
+                page_title=page_title,
+                timeout_seconds=timeout_seconds,
                 user_agent=user_agent,
             )
             fetched = fetch_revision_wikitext_fn(
@@ -1834,8 +1829,10 @@ def run_wikipedia_revision_history_batch(
             snapshot = fetched.snapshot
             match = secondary_match_at_or_before(as_of)
             cross_check = cross_check_membership(
-                wikipedia=snapshot, secondary_tickers=match.tickers,
-                secondary_source_id=secondary_source_id, as_of=as_of,
+                wikipedia=snapshot,
+                secondary_tickers=match.tickers,
+                secondary_source_id=secondary_source_id,
+                as_of=as_of,
             )
         except SourceAdapterError as error:
             rows.append(
@@ -1866,14 +1863,19 @@ def run_wikipedia_revision_history_batch(
             matched_row_checksum=raw_artifact_checksum(match.matched_line.encode("utf-8")),
         )
         entry = WikipediaDatasetEntry(
-            as_of=as_of, snapshot=snapshot, cross_check=cross_check,
-            fetch_observed_at=now(), raw_provenance_path=str(raw_path),
+            as_of=as_of,
+            snapshot=snapshot,
+            cross_check=cross_check,
+            fetch_observed_at=now(),
+            raw_provenance_path=str(raw_path),
             secondary_provenance=secondary_provenance,
         )
         store.accept(entry, fetched.raw_bytes, secondary_raw_bytes=secondary_raw_bytes)
         rows.append(
             WikipediaDatasetBatchRow(
-                as_of=as_of, outcome=BATCH_OUTCOME_ADMITTED, detail=cross_check.detail,
+                as_of=as_of,
+                outcome=BATCH_OUTCOME_ADMITTED,
+                detail=cross_check.detail,
                 revision_id=snapshot.revision.revision_id,
                 agreement_ratio=cross_check.agreement_ratio,
             )
@@ -1907,9 +1909,7 @@ def build_dataset_manifest(
     ordered_entries = tuple(sorted(entries, key=lambda entry: entry.as_of))
     covered = tuple(entry.as_of for entry in ordered_entries)
     if len(set(covered)) != len(covered):
-        raise SourceAdapterError(
-            "dataset manifest cannot be built over duplicate as_of entries"
-        )
+        raise SourceAdapterError("dataset manifest cannot be built over duplicate as_of entries")
     requested = tuple(sorted(set(requested_as_of_dates)))
     covered_set = set(covered)
     gaps = tuple(
@@ -1978,9 +1978,9 @@ def build_dataset_manifest(
         }
         for entry in ordered_entries
     ]
-    serialized = json.dumps(
-        fingerprint_material, sort_keys=True, separators=(",", ":")
-    ).encode("ascii", "backslashreplace")
+    serialized = json.dumps(fingerprint_material, sort_keys=True, separators=(",", ":")).encode(
+        "ascii", "backslashreplace"
+    )
     content_fingerprint = "sha256:" + hashlib.sha256(serialized).hexdigest()
     return WikipediaDatasetManifest(
         schema_version=DATASET_MANIFEST_SCHEMA_VERSION,
@@ -2066,8 +2066,7 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
         "performed_at": "2026-09-06",
         "performed_by": "scripts/run_wikipedia_revision_history_experiment.py",
         "evidence_path": (
-            "docs/poi/evidence/dataset-v1/wikipedia-revision-history/"
-            "experiment-2023-12-31.json"
+            "docs/poi/evidence/dataset-v1/wikipedia-revision-history/experiment-2023-12-31.json"
         ),
         "summary": (
             "One real, bounded experiment was fetched and recorded (not just"
@@ -2119,8 +2118,7 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
         "scope": "GICS Sector only; GICS Sub-Industry remains unadmitted",
         "independent_source_id": "sec-edgar-nport-select-sector-spdr",
         "evidence_path": (
-            "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/"
-            "experiment-2023-12-31.json"
+            "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31.json"
         ),
         "coverage_ratio": 0.9582504970178927,
         "agreement_ratio": 1.0,
@@ -2140,12 +2138,14 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
             " historical GICS requirement."
         ),
     },
-    "usable_for": "BacktestQuality.APPROXIMATE research/backtest of MEMBERSHIP and empirically corroborated GICS Sector at recorded dates (ADR-0017)",
+    "usable_for": (
+        "BacktestQuality.APPROXIMATE research/backtest of MEMBERSHIP and "
+        "empirically corroborated GICS Sector at recorded dates (ADR-0017)"
+    ),
     "not_usable_for": (
         "BacktestQuality.PIT_STRICT",
         "the asof_gics capability (stays BLOCKED_EXTERNAL / LICENSE_REQUIRED)",
-        "the pit_sp500_membership capability (stays owner-gated on official"
-        " S&P DJI announcements)",
+        "the pit_sp500_membership capability (stays owner-gated on official S&P DJI announcements)",
         "GICS Sub-Industry historical assignment evidence",
         "final OOS/shadow qualification evidence",
         "any claim of S&P DJI official truth",

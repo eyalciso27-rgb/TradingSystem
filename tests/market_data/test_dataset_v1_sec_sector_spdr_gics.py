@@ -14,11 +14,11 @@ produced by ``scripts/run_sec_sector_spdr_gics_crosscheck_experiment.py``.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import hashlib
 import json
-from pathlib import Path
+from collections.abc import Mapping
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pytest
 from trading_market_data_core.dataset_v1_sec_sector_spdr_gics import (
@@ -85,9 +85,9 @@ def test_normalize_company_name_does_not_bridge_legal_to_brand_names() -> None:
     """A real, honest limitation: this is NOT solved by generic normalization,
     and this module never fabricates a per-company alias to bridge it."""
     assert normalize_company_name("Deere & Co") != normalize_company_name("John Deere")
-    assert normalize_company_name(
-        "International Business Machines Corp"
-    ) != normalize_company_name("IBM")
+    assert normalize_company_name("International Business Machines Corp") != normalize_company_name(
+        "IBM"
+    )
 
 
 def test_normalize_company_name_drops_parenthetical_share_class_annotations() -> None:
@@ -136,7 +136,9 @@ _NPORT_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 
 
 def _nport_xml(
-    *, series_id: str = "S000006415", series_name: str = "The Technology Select Sector SPDR Fund",
+    *,
+    series_id: str = "S000006415",
+    series_name: str = "The Technology Select Sector SPDR Fund",
     rep_pd_date: str = "2023-12-31",
 ) -> bytes:
     return _NPORT_XML_TEMPLATE.format(
@@ -188,13 +190,20 @@ def test_parse_nport_primary_doc_fails_closed_on_malformed_xml() -> None:
 
 
 def _fetch(
-    *, gics_sector: str, series_id: str, holdings: tuple[SectorSpdrHolding, ...] = (),
-    report_period_date: date = date(2023, 12, 31), accession_number: str | None = None,
+    *,
+    gics_sector: str,
+    series_id: str,
+    holdings: tuple[SectorSpdrHolding, ...] = (),
+    report_period_date: date = date(2023, 12, 31),
+    accession_number: str | None = None,
 ) -> SectorSpdrFilingFetch:
     raw = f"fixture-{series_id}".encode()
     filing = SectorSpdrFilingRef(
-        cik=CIK, accession_number=accession_number or f"acc-{series_id}", series_id=series_id,
-        series_name=f"The {gics_sector} Select Sector SPDR Fund", gics_sector=gics_sector,
+        cik=CIK,
+        accession_number=accession_number or f"acc-{series_id}",
+        series_id=series_id,
+        series_name=f"The {gics_sector} Select Sector SPDR Fund",
+        gics_sector=gics_sector,
         report_period_date=report_period_date,
     )
     return SectorSpdrFilingFetch(
@@ -204,12 +213,18 @@ def _fetch(
 
 def test_filing_fetch_rejects_a_raw_checksum_mismatch() -> None:
     filing = SectorSpdrFilingRef(
-        cik=CIK, accession_number="acc-1", series_id="S1", series_name="X", gics_sector="Energy",
+        cik=CIK,
+        accession_number="acc-1",
+        series_id="S1",
+        series_name="X",
+        gics_sector="Energy",
         report_period_date=date(2023, 12, 31),
     )
     with pytest.raises(SourceAdapterError, match="raw_checksum"):
         SectorSpdrFilingFetch(
-            filing=filing, holdings=(), raw_bytes=b"real bytes",
+            filing=filing,
+            holdings=(),
+            raw_bytes=b"real bytes",
             raw_checksum="sha256:" + "a" * 64,
         )
 
@@ -235,7 +250,8 @@ def test_snapshot_fails_closed_on_a_partial_fund_set() -> None:
 def test_snapshot_fails_closed_on_a_later_filing_no_look_ahead() -> None:
     fetches = list(_all_11_fetches())
     fetches[0] = _fetch(
-        gics_sector=sorted(GICS_SECTOR_NAMES)[0], series_id="S0",
+        gics_sector=sorted(GICS_SECTOR_NAMES)[0],
+        series_id="S0",
         report_period_date=date(2024, 1, 31),  # after as_of
     )
     with pytest.raises(SourceAdapterError, match="no look-ahead"):
@@ -268,13 +284,18 @@ def test_select_sector_spdr_snapshot_as_of_picks_the_latest_filing_at_or_before(
         index = int(index_str)
         report_period_date = date(2023, 12, 31) if kind == "late" else date(2023, 9, 30)
         return _fetch(
-            gics_sector=sectors[index], series_id=f"S{index}",
-            report_period_date=report_period_date, accession_number=accession_number,
+            gics_sector=sectors[index],
+            series_id=f"S{index}",
+            report_period_date=report_period_date,
+            accession_number=accession_number,
         )
 
     snapshot = select_sector_spdr_snapshot_as_of(
-        date(2023, 12, 31), client=object(), bytes_fetcher=object(),  # type: ignore[arg-type]
-        discover_fn=fake_discover, fetch_fn=fake_fetch,
+        date(2023, 12, 31),
+        client=object(),  # type: ignore[arg-type]
+        bytes_fetcher=object(),  # type: ignore[arg-type]
+        discover_fn=fake_discover,
+        fetch_fn=fake_fetch,
     )
     assert len(snapshot.filings) == 11
     reported_periods = {fetch.filing.report_period_date for fetch in snapshot.filings}
@@ -302,13 +323,18 @@ def test_select_sector_spdr_snapshot_as_of_skips_a_filing_after_as_of() -> None:
         # the "toolate" filing itself reports a period AFTER as_of
         report_period_date = date(2024, 1, 31) if kind == "toolate" else date(2023, 9, 30)
         return _fetch(
-            gics_sector=sectors[index], series_id=f"S{index}",
-            report_period_date=report_period_date, accession_number=accession_number,
+            gics_sector=sectors[index],
+            series_id=f"S{index}",
+            report_period_date=report_period_date,
+            accession_number=accession_number,
         )
 
     snapshot = select_sector_spdr_snapshot_as_of(
-        date(2023, 12, 31), client=object(), bytes_fetcher=object(),  # type: ignore[arg-type]
-        discover_fn=fake_discover, fetch_fn=fake_fetch,
+        date(2023, 12, 31),
+        client=object(),  # type: ignore[arg-type]
+        bytes_fetcher=object(),  # type: ignore[arg-type]
+        discover_fn=fake_discover,
+        fetch_fn=fake_fetch,
     )
     reported_periods = {fetch.filing.report_period_date for fetch in snapshot.filings}
     assert reported_periods == {date(2023, 9, 30)}
@@ -328,14 +354,19 @@ def test_select_sector_spdr_snapshot_as_of_fails_closed_when_a_fund_never_resolv
         del cik, client, bytes_fetcher
         index = int(accession_number.split("-")[1])
         return _fetch(
-            gics_sector=sectors[index], series_id=f"S{index}",
-            report_period_date=date(2023, 12, 31), accession_number=accession_number,
+            gics_sector=sectors[index],
+            series_id=f"S{index}",
+            report_period_date=date(2023, 12, 31),
+            accession_number=accession_number,
         )
 
     with pytest.raises(SourceAdapterError, match="missing"):
         select_sector_spdr_snapshot_as_of(
-            date(2023, 12, 31), client=object(), bytes_fetcher=object(),  # type: ignore[arg-type]
-            discover_fn=fake_discover, fetch_fn=fake_fetch,
+            date(2023, 12, 31),
+            client=object(),  # type: ignore[arg-type]
+            bytes_fetcher=object(),  # type: ignore[arg-type]
+            discover_fn=fake_discover,
+            fetch_fn=fake_fetch,
         )
 
 
@@ -371,7 +402,9 @@ def _submissions_payload() -> dict[str, object]:
             "recent": {
                 "form": ["NPORT-P", "N-CEN", "NPORT-P"],
                 "accessionNumber": [
-                    "0001752724-24-043154", "0001752724-24-000001", "0001752724-23-000099",
+                    "0001752724-24-043154",
+                    "0001752724-24-000001",
+                    "0001752724-23-000099",
                 ],
                 "filingDate": ["2024-02-27", "2024-01-15", "2023-11-27"],
             }
@@ -413,7 +446,8 @@ def test_build_secondary_sector_mapping_matches_unambiguous_names() -> None:
         as_of=date(2023, 12, 31),
         filings=tuple(
             _fetch(
-                gics_sector=sector, series_id=f"S{i}",
+                gics_sector=sector,
+                series_id=f"S{i}",
                 holdings=(_holding(f"Company {i} Common Inc"),) if sector == "Energy" else (),
             )
             for i, sector in enumerate(sorted(GICS_SECTOR_NAMES))
@@ -433,7 +467,8 @@ def test_build_secondary_sector_mapping_excludes_ambiguous_matches() -> None:
         as_of=date(2023, 12, 31),
         filings=tuple(
             _fetch(
-                gics_sector=sector, series_id=f"S{i}",
+                gics_sector=sector,
+                series_id=f"S{i}",
                 holdings=(_holding("Alphabet Inc"),) if sector == "Communication Services" else (),
             )
             for i, sector in enumerate(sorted(GICS_SECTOR_NAMES))
@@ -455,7 +490,8 @@ def test_build_secondary_sector_mapping_records_a_holding_with_no_wikipedia_matc
         as_of=date(2023, 12, 31),
         filings=tuple(
             _fetch(
-                gics_sector=sector, series_id=f"S{i}",
+                gics_sector=sector,
+                series_id=f"S{i}",
                 holdings=(_holding("Deere & Co"),) if sector == "Industrials" else (),
             )
             for i, sector in enumerate(sorted(GICS_SECTOR_NAMES))
@@ -490,17 +526,22 @@ def _sector_for_index(i: int) -> str:
 def _wiki_snapshot(*, count: int = _ROW_COUNT) -> WikipediaRevisionSnapshot:
     observations = tuple(
         WikipediaConstituentObservation(
-            ticker=_ticker_for_index(i), name=f"Company {i} Common Inc",
-            gics_sector=_sector_for_index(i), gics_sub_industry="Sub-Industry",
+            ticker=_ticker_for_index(i),
+            name=f"Company {i} Common Inc",
+            gics_sector=_sector_for_index(i),
+            gics_sub_industry="Sub-Industry",
         )
         for i in range(count)
     )
     revision = WikipediaRevisionRef(
-        page_title="List of S&P 500 companies", revision_id=1,
+        page_title="List of S&P 500 companies",
+        revision_id=1,
         revision_timestamp=datetime(2023, 12, 31, tzinfo=UTC),
     )
     return WikipediaRevisionSnapshot(
-        revision=revision, raw_checksum="sha256:" + "a" * 64, observations=observations,
+        revision=revision,
+        raw_checksum="sha256:" + "a" * 64,
+        observations=observations,
     )
 
 
@@ -512,9 +553,7 @@ def _sector_snapshot_covering(*, fraction: float, agree: bool) -> SectorSpdrSnap
         company_indices = [i for i in range(_ROW_COUNT) if _sector_for_index(i) == sector]
         take = int(len(company_indices) * fraction)
         claimed_sector = sector if agree else _fund_disagreement_sector(sector)
-        holdings = tuple(
-            _holding(f"Company {i} Common Inc") for i in company_indices[:take]
-        )
+        holdings = tuple(_holding(f"Company {i} Common Inc") for i in company_indices[:take])
         filings.append(
             _fetch(gics_sector=claimed_sector, series_id=f"S{sector_index}", holdings=holdings)
         )
@@ -536,8 +575,10 @@ def test_end_to_end_sufficient_coverage_and_agreement_is_admitted() -> None:
         wikipedia_observations=[(o.ticker, o.name) for o in wiki.observations],
     )
     result = cross_check_sectors(
-        wikipedia=wiki, secondary_sectors=resolution.secondary_sectors,
-        secondary_source_id="sec-edgar-nport-select-sector-spdr", as_of=date(2023, 12, 31),
+        wikipedia=wiki,
+        secondary_sectors=resolution.secondary_sectors,
+        secondary_source_id="sec-edgar-nport-select-sector-spdr",
+        as_of=date(2023, 12, 31),
     )
     assert result.corroborated is True
     assert result.coverage_ratio >= MINIMUM_SECTOR_COVERAGE_RATIO
@@ -557,8 +598,10 @@ def test_end_to_end_insufficient_coverage_fails_closed() -> None:
     )
     with pytest.raises(SourceAdapterError, match="coverage"):
         cross_check_sectors(
-            wikipedia=wiki, secondary_sectors=resolution.secondary_sectors,
-            secondary_source_id="sec-edgar-nport-select-sector-spdr", as_of=date(2023, 12, 31),
+            wikipedia=wiki,
+            secondary_sectors=resolution.secondary_sectors,
+            secondary_source_id="sec-edgar-nport-select-sector-spdr",
+            as_of=date(2023, 12, 31),
         )
 
 
@@ -570,8 +613,10 @@ def test_end_to_end_sufficient_coverage_but_disagreement_is_not_corroborated() -
         wikipedia_observations=[(o.ticker, o.name) for o in wiki.observations],
     )
     result = cross_check_sectors(
-        wikipedia=wiki, secondary_sectors=resolution.secondary_sectors,
-        secondary_source_id="sec-edgar-nport-select-sector-spdr", as_of=date(2023, 12, 31),
+        wikipedia=wiki,
+        secondary_sectors=resolution.secondary_sectors,
+        secondary_source_id="sec-edgar-nport-select-sector-spdr",
+        as_of=date(2023, 12, 31),
     )
     assert result.coverage_ratio >= MINIMUM_SECTOR_COVERAGE_RATIO
     assert result.corroborated is False
@@ -580,7 +625,9 @@ def test_end_to_end_sufficient_coverage_but_disagreement_is_not_corroborated() -
 
 def test_recorded_real_sector_experiment_is_self_authenticating() -> None:
     repo = Path(__file__).resolve().parents[2]
-    evidence_path = repo / "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31.json"
+    evidence_path = (
+        repo / "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31.json"
+    )
     payload = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert payload["admission"]["status"] == "ADMITTED_SECONDARY_RESEARCH_PIT_APPROXIMATE"
     assert payload["independent_source"]["filing_count"] == 11
@@ -598,5 +645,7 @@ def test_recorded_real_sector_experiment_is_self_authenticating() -> None:
     assert "sha256:" + hashlib.sha256(wiki_raw).hexdigest() == wiki["raw_checksum"]
 
     expected = payload.pop("evidence_checksum")
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
     assert expected == "sha256:" + hashlib.sha256(canonical).hexdigest()

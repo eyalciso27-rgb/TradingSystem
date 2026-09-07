@@ -51,7 +51,17 @@ normalization still leaves an AMBIGUOUS match (e.g. "Alphabet Inc" naming
 both GOOG and GOOGL) or NO match at all (a real, common case: SEC's legal
 name and Wikipedia's brand name genuinely differ, e.g. "Deere & Co" vs.
 "John Deere"), the holding is recorded as unmatched/ambiguous and contributes
-NOTHING to the resulting secondary-sector mapping -- never guessed. The real, bounded experiment run against 2023-12-31 resolved 482/503 Wikipedia tickers (95.83% coverage, above the canonical 90% floor) and found 482/482 sector agreements (100%), with 21 unresolved/ambiguous tickers explicitly retained as uncovered rather than guessed. See ``docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/`` for the full checksum-bound record and ``dataset_v1_wikipedia_pit.WIKIPEDIA_REVISION_HISTORY_EVALUATION["sector_gics"]`` for the deliberately bounded admission: GICS Sector only, SECONDARY_RESEARCH_PIT / APPROXIMATE, never official/PIT_STRICT and never GICS Sub-Industry.
+NOTHING to the resulting secondary-sector mapping -- never guessed. The real,
+bounded experiment run against 2023-12-31 resolved 482/503 Wikipedia tickers
+(95.83% coverage, above the canonical 90% floor) and found 482/482 sector
+agreements (100%), with 21 unresolved/ambiguous tickers explicitly retained
+as uncovered rather than guessed. See
+``docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/`` for the full
+checksum-bound record and
+``dataset_v1_wikipedia_pit.WIKIPEDIA_REVISION_HISTORY_EVALUATION["sector_gics"]``
+for the deliberately bounded admission: GICS Sector only,
+SECONDARY_RESEARCH_PIT / APPROXIMATE, never official/PIT_STRICT and never
+GICS Sub-Industry.
 
 Every real network call in this module goes through the existing
 ``SecEdgarClient`` (rate-limited, fails closed without a declared contact
@@ -163,9 +173,23 @@ _EQUITY_COMMON_ASSET_CATEGORY = "EC"
 #: it.
 _GENERIC_LEGAL_SUFFIX_TOKENS = frozenset(
     {
-        "INC", "CORP", "CORPORATION", "COMPANY", "THE", "LTD", "LIMITED",
-        "PLC", "GROUP", "HOLDINGS", "LLC", "SA", "NV", "TRUST",
-        "INTERNATIONAL", "INTL", "AND",
+        "INC",
+        "CORP",
+        "CORPORATION",
+        "COMPANY",
+        "THE",
+        "LTD",
+        "LIMITED",
+        "PLC",
+        "GROUP",
+        "HOLDINGS",
+        "LLC",
+        "SA",
+        "NV",
+        "TRUST",
+        "INTERNATIONAL",
+        "INTL",
+        "AND",
     }
 )
 
@@ -340,16 +364,21 @@ def parse_nport_primary_doc(
         asset_cat_element = element.find(f"{{{_NPORT_NAMESPACE}}}assetCat")
         if name_element is None or not (name_element.text or "").strip():
             continue  # a holding with no reported name cannot be identity-resolved
-        asset_category = (asset_cat_element.text or "").strip() if asset_cat_element is not None else ""
+        issuer_name = (name_element.text or "").strip()
+        asset_category = (
+            (asset_cat_element.text or "").strip() if asset_cat_element is not None else ""
+        )
         if asset_category != _EQUITY_COMMON_ASSET_CATEGORY:
             continue  # cash sweeps / repos / derivatives carry no GICS sector membership
-        holdings.append(
-            SectorSpdrHolding(issuer_name=name_element.text.strip(), asset_category=asset_category)
-        )
+        holdings.append(SectorSpdrHolding(issuer_name=issuer_name, asset_category=asset_category))
 
     filing = SectorSpdrFilingRef(
-        cik=cik, accession_number=accession_number, series_id=series_id,
-        series_name=series_name, gics_sector=gics_sector, report_period_date=report_period_date,
+        cik=cik,
+        accession_number=accession_number,
+        series_id=series_id,
+        series_name=series_name,
+        gics_sector=gics_sector,
+        report_period_date=report_period_date,
     )
     return filing, tuple(holdings)
 
@@ -464,7 +493,10 @@ def select_sector_spdr_snapshot_as_of(
         if fetched.filing.report_period_date > as_of:
             continue  # a later filing for a fund not yet resolved: keep looking further back
         existing = resolved.get(fetched.filing.series_id)
-        if existing is not None and existing.filing.report_period_date >= fetched.filing.report_period_date:
+        if (
+            existing is not None
+            and existing.filing.report_period_date >= fetched.filing.report_period_date
+        ):
             continue  # already have an equal-or-later-but-still-valid observation for this fund
         resolved[fetched.filing.series_id] = fetched
     return SectorSpdrSnapshot(as_of=as_of, filings=tuple(resolved.values()))
@@ -551,7 +583,9 @@ def build_secondary_sector_mapping(
                 prefix_candidates = []
                 for wiki_key, tickers in wiki_by_normalized_name.items():
                     shorter = min(len(normalized), len(wiki_key))
-                    if shorter >= 6 and (normalized.startswith(wiki_key) or wiki_key.startswith(normalized)):
+                    if shorter >= 6 and (
+                        normalized.startswith(wiki_key) or wiki_key.startswith(normalized)
+                    ):
                         prefix_candidates.extend(tickers)
                 matches = sorted(set(prefix_candidates))
             if len(matches) == 1:
@@ -559,16 +593,20 @@ def build_secondary_sector_mapping(
             elif len(matches) > 1:
                 unmatched.append(
                     UnmatchedHolding(
-                        gics_sector=fetch.filing.gics_sector, issuer_name=holding.issuer_name,
-                        normalized_name=normalized, reason="AMBIGUOUS_MATCH",
+                        gics_sector=fetch.filing.gics_sector,
+                        issuer_name=holding.issuer_name,
+                        normalized_name=normalized,
+                        reason="AMBIGUOUS_MATCH",
                         candidate_tickers=tuple(sorted(matches)),
                     )
                 )
             else:
                 unmatched.append(
                     UnmatchedHolding(
-                        gics_sector=fetch.filing.gics_sector, issuer_name=holding.issuer_name,
-                        normalized_name=normalized, reason="NO_MATCH",
+                        gics_sector=fetch.filing.gics_sector,
+                        issuer_name=holding.issuer_name,
+                        normalized_name=normalized,
+                        reason="NO_MATCH",
                     )
                 )
     return SectorIdentityResolution(
