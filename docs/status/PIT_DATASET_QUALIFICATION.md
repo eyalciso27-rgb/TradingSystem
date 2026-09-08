@@ -77,8 +77,11 @@
 > evidence but is superseded and must not be used as the canonical conclusion.
 >
 > **2026-09-09 free stable-identifier bridge follow-up.** The retained N-PORT
-> holdings were inventoried without inference: all 503 equity-common holdings
-> report CUSIP, ISIN and LEI. Free public bridge candidates were then evaluated
+> holdings were inventoried without inference and SEC null sentinels were treated
+> as absent: CUSIP is present on 478/503 rows (95.03%), ISIN on 503/503
+> (100%), and LEI on 485/503 (96.42%). The N-PORT `<identifiers>` block was
+> also checked explicitly: no equity-common holding contains `<ticker>` or
+> `<other>` in the retained filings. Free public bridge candidates were then evaluated
 > fail-closed. SEC's dated 13F security lists provide CUSIP plus issuer name but
 > no ticker; SEC Company Tickers provides ticker/CIK but no CUSIP/ISIN/LEI and
 > does not establish 2023-12-31 symbol validity; GLEIF/ANNA provides free

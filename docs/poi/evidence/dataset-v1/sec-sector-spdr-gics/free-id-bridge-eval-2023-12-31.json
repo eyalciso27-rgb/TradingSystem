@@ -45,12 +45,13 @@
       "url": "https://www.gleif.org/en/lei-data/lei-mapping"
     }
   ],
+  "evidence_checksum": "sha256:3ff6079d56fb263691e58da5f7c4011cb58b70a793534190a81153ccf62f6bbd",
   "identifier_inventory": {
     "cusip": {
-      "coverage_ratio": 1.0,
-      "present": 503,
+      "coverage_ratio": 0.9502982107355865,
+      "present": 478,
       "total": 503,
-      "unique_values": 479
+      "unique_values": 478
     },
     "equity_common_holdings": 503,
     "isin": {
@@ -60,10 +61,35 @@
       "unique_values": 503
     },
     "lei": {
-      "coverage_ratio": 1.0,
-      "present": 503,
+      "coverage_ratio": 0.9642147117296223,
+      "present": 485,
       "total": 503,
-      "unique_values": 483
+      "unique_values": 482
+    },
+    "nport_identifiers_block_checked": [
+      "isin",
+      "ticker",
+      "other"
+    ],
+    "null_sentinels_treated_as_absent": [
+      "",
+      "000000000",
+      "N/A",
+      "NA",
+      "NONE",
+      "NULL"
+    ],
+    "other": {
+      "coverage_ratio": 0.0,
+      "present": 0,
+      "total": 503,
+      "unique_values": 0
+    },
+    "ticker": {
+      "coverage_ratio": 0.0,
+      "present": 0,
+      "total": 503,
+      "unique_values": 0
     }
   },
   "input_canonical_sector_result": {
@@ -75,7 +101,7 @@
     "status": "NOT_ADMITTED",
     "total": 503
   },
-  "performed_at": "2026-09-08T21:58:28.082230+00:00",
+  "performed_at": "2026-09-08T00:00:00+00:00",
   "requested_as_of": "2023-12-31",
   "retained_sec_artifacts": [
     {
