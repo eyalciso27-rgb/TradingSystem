@@ -52,16 +52,16 @@ both GOOG and GOOGL) or NO match at all (a real, common case: SEC's legal
 name and Wikipedia's brand name genuinely differ, e.g. "Deere & Co" vs.
 "John Deere"), the holding is recorded as unmatched/ambiguous and contributes
 NOTHING to the resulting secondary-sector mapping -- never guessed. The real,
-bounded experiment run against 2023-12-31 resolved 482/503 Wikipedia tickers
-(95.83% coverage, above the canonical 90% floor) and found 482/482 sector
-agreements (100%), with 21 unresolved/ambiguous tickers explicitly retained
-as uncovered rather than guessed. See
+superseding bounded recheck against 2023-12-31 resolved 417/503 Wikipedia
+tickers (82.90% coverage, below the canonical 90% floor) and found 417/417
+sector agreements (100%), with 86 unresolved/ambiguous tickers explicitly
+retained as uncovered rather than guessed. The candidate is therefore
+NOT_ADMITTED. See
 ``docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/`` for the full
 checksum-bound record and
 ``dataset_v1_wikipedia_pit.WIKIPEDIA_REVISION_HISTORY_EVALUATION["sector_gics"]``
-for the deliberately bounded admission: GICS Sector only,
-SECONDARY_RESEARCH_PIT / APPROXIMATE, never official/PIT_STRICT and never
-GICS Sub-Industry.
+for the deliberately fail-closed result: the free GICS Sector candidate is
+NOT_ADMITTED; it is never official/PIT_STRICT and never GICS Sub-Industry.
 
 Every real network call in this module goes through the existing
 ``SecEdgarClient`` (rate-limited, fails closed without a declared contact

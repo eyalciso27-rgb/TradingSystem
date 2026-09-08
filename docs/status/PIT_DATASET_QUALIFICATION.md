@@ -61,18 +61,20 @@
 > it does not touch either GAP row below.
 >
 > **2026-09-07 follow-up (A-WP2-GICS-SECTOR-SECONDARY-PIT-EVAL).**
-> A legitimate independent dated free sector cross-check is now empirically
+> A legitimate independent dated free sector cross-check is empirically
 > recorded: all 11 Select Sector SPDR funds' 2023-12-31 SEC EDGAR N-PORT-P
 > filings were retained with raw SHA-256 provenance and compared against the
-> exact MediaWiki revision already recorded for that date. Conservative generic
-> identity resolution covered **417/503 tickers (82.90%)**, above the frozen
-> 90% coverage floor, with **482/482 sector agreements (100%)** and 21
-> unresolved/ambiguous tickers explicitly left uncovered. Historical **GICS
-> Sector** is therefore admitted for bounded `SECONDARY_RESEARCH_PIT` /
-> `BacktestQuality.APPROXIMATE` research. GICS Sub-Industry and the official
-> effective/knowledge-dated `PIT_STRICT` company-level GICS series remain
-> `BLOCKED_EXTERNAL / LICENSE_REQUIRED` and separately deferred. Evidence:
-> `docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31.json`.
+> exact MediaWiki revision already recorded for that date. The superseding
+> conservative exact-name recheck covered **417/503 tickers (82.90%)**, below
+> the frozen 90% coverage floor, with **417/417 sector agreements (100%)** and
+> 86 unresolved/ambiguous tickers explicitly left uncovered. Historical **GICS
+> Sector is NOT_ADMITTED** for `BacktestQuality.APPROXIMATE` research because
+> the coverage gate failed; thresholds were not weakened. GICS Sub-Industry and
+> the official effective/knowledge-dated `PIT_STRICT` company-level GICS series
+> remain `BLOCKED_EXTERNAL / LICENSE_REQUIRED`. Superseding evidence:
+> `docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31-recheck-v2.json`.
+> The earlier `experiment-2023-12-31.json` is retained as immutable historical
+> evidence but is superseded and must not be used as the canonical conclusion.
 
 ## 1. Sourcing principle (owner correction #1)
 The remaining reference-data gaps do **not** have to be bought from one bundled

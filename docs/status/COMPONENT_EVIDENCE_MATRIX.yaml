@@ -52,10 +52,11 @@
 # MediaWiki's own metadata rather than trusted from a caller, and the claim is
 # narrowed to MEMBERSHIP only — GICS/sector is captured from the same revision
 # sector/GICS was initially unadmitted pending a dated independent source.
-# On 2026-09-07 a real SEC EDGAR N-PORT-P Select Sector SPDR experiment
-# cleared the canonical gates (482/503 coverage, 482/482 covered agreement),
-# admitting GICS Sector only as SECONDARY_RESEARCH_PIT / APPROXIMATE. GICS
-# Sub-Industry and official/PIT_STRICT historical GICS remain external/licensed. Do not recreate any of this; the one
+# On 2026-09-08 the conservative recheck of the real SEC EDGAR N-PORT-P Select
+# Sector SPDR experiment covered 417/503 (82.90%), below the frozen 90% coverage
+# floor, despite 417/417 agreement among covered tickers. The GICS Sector
+# candidate is therefore NOT_ADMITTED; GICS Sector/Sub-Industry and
+# official/PIT_STRICT historical GICS remain external/licensed. Do not recreate any of this; the one
 # remaining dependency-safe task is to extend the one recorded date to the
 # full backtest window (A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD, see
 # MVP_DELIVERY_PLAN.md §5 M3 gap 5); finding an independent dated GICS source

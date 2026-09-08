@@ -56,11 +56,12 @@ Scope: membership vs. GICS/sector. The same table that carries tickers also
 carries the GICS Sector / GICS Sub-Industry columns already parsed by
 :mod:`sp500_wikitable`, so every :class:`WikipediaRevisionSnapshot` CAPTURES
 both. Membership is independently cross-checked by :func:`cross_check_membership`.
-As of 2026-09-07, GICS **Sector** is also independently cross-checked for the
+As of 2026-09-08, GICS **Sector** has been independently cross-checked for the
 bounded 2023-12-31 experiment against all 11 Select Sector SPDR SEC EDGAR
-N-PORT-P filings: 482/503 tickers are confidently covered and all 482 agree.
-That admits Sector only as ``SECONDARY_RESEARCH_PIT`` / ``APPROXIMATE``; GICS
-Sub-Industry and official/PIT_STRICT company-level history remain unadmitted.
+N-PORT-P filings. Conservative exact-name identity resolution covers 417/503
+tickers (82.90%), below the frozen 90% coverage floor, although all 417 covered
+tickers agree. The sector candidate is therefore ``NOT_ADMITTED``; GICS Sector,
+GICS Sub-Industry and official/PIT_STRICT company-level history remain unadmitted.
 :func:`cross_check_sectors` enforces the non-weakenable coverage/agreement gates.
 
 What this module explicitly does NOT do, per the owner decisions and
@@ -2114,36 +2115,32 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
         " 'real_experiment' above."
     ),
     "sector_gics": {
-        "status": "ADMITTED_SECONDARY_RESEARCH_PIT_APPROXIMATE",
-        "scope": "GICS Sector only; GICS Sub-Industry remains unadmitted",
+        "status": "NOT_ADMITTED",
+        "scope": "GICS Sector candidate only; GICS Sector/Sub-Industry remain unadmitted",
         "independent_source_id": "sec-edgar-nport-select-sector-spdr",
         "evidence_path": (
-            "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31.json"
+            "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/"
+            "experiment-2023-12-31-recheck-v2.json"
         ),
-        "coverage_ratio": 0.9582504970178927,
+        "coverage_ratio": 0.8290258449304175,
         "agreement_ratio": 1.0,
-        "covered_tickers": 482,
-        "uncovered_tickers": 21,
+        "covered_tickers": 417,
+        "uncovered_tickers": 86,
+        "failure_gate": "MINIMUM_SECTOR_COVERAGE_RATIO",
         "explanation": (
-            "A real bounded 2023-12-31 experiment cross-checked the revision's"
-            " GICS Sector values against all 11 Select Sector SPDR funds'"
-            " contemporaneous SEC EDGAR N-PORT-P filings. Each raw filing is"
-            " retained and SHA-256-bound. Conservative generic identity"
-            " resolution covered 482/503 tickers (95.83%), above the canonical"
-            " 90% floor, and all 482 covered tickers agreed on sector (100%)."
-            " The 21 unresolved/ambiguous tickers remain explicitly uncovered;"
-            " none are guessed. This admits sector only as"
-            " SECONDARY_RESEARCH_PIT / BacktestQuality.APPROXIMATE; it does not"
-            " admit GICS Sub-Industry or close the official/licensed PIT_STRICT"
-            " historical GICS requirement."
+            "The superseding bounded 2023-12-31 recheck used conservative exact-name"
+            " identity resolution against all 11 Select Sector SPDR N-PORT-P filings."
+            " It covered 417/503 tickers (82.90%), below the frozen 90% coverage"
+            " floor; all 417 covered tickers agreed on sector (100%). The 86"
+            " unresolved/ambiguous tickers remain explicitly uncovered and none are"
+            " guessed. Therefore the free GICS Sector candidate is NOT_ADMITTED and"
+            " cannot be used as BacktestQuality.APPROXIMATE sector evidence."
         ),
     },
-    "usable_for": (
-        "BacktestQuality.APPROXIMATE research/backtest of MEMBERSHIP and "
-        "empirically corroborated GICS Sector at recorded dates (ADR-0017)"
-    ),
+    "usable_for": "BacktestQuality.APPROXIMATE research/backtest of MEMBERSHIP only (ADR-0017)",
     "not_usable_for": (
         "BacktestQuality.PIT_STRICT",
+        "GICS Sector research/backtest evidence until a cross-check clears the frozen gates",
         "the asof_gics capability (stays BLOCKED_EXTERNAL / LICENSE_REQUIRED)",
         "the pit_sp500_membership capability (stays owner-gated on official S&P DJI announcements)",
         "GICS Sub-Industry historical assignment evidence",
