@@ -107,15 +107,39 @@ def test_the_mandated_components_are_all_covered(
 ) -> None:
     """The audit scope is fixed; a component may not quietly disappear."""
     mandated = {
-        "platform", "persistence", "security",
-        "whatsapp-user", "discord-user", "telegram-user", "telegram-bot",
-        "telegram-coexistence", "investingpro", "news", "tradingview",
-        "market-data", "external-market-data-provider",
-        "ai-provider", "ai-analysis-engines", "ai-review-committee",
-        "strategy-manifests", "fusion", "decision", "risk", "allocation",
-        "pre-submit", "ibkr-adapter", "execution", "protection",
-        "reconciliation", "dashboard", "replay", "backtest", "shadow",
-        "ibc", "watchdog", "event-bus-nats",
+        "platform",
+        "persistence",
+        "security",
+        "whatsapp-user",
+        "discord-user",
+        "telegram-user",
+        "telegram-bot",
+        "telegram-coexistence",
+        "investingpro",
+        "news",
+        "tradingview",
+        "market-data",
+        "external-market-data-provider",
+        "ai-provider",
+        "ai-analysis-engines",
+        "ai-review-committee",
+        "strategy-manifests",
+        "fusion",
+        "decision",
+        "risk",
+        "allocation",
+        "pre-submit",
+        "ibkr-adapter",
+        "execution",
+        "protection",
+        "reconciliation",
+        "dashboard",
+        "replay",
+        "backtest",
+        "shadow",
+        "ibc",
+        "watchdog",
+        "event-bus-nats",
     }
     present = {c["component_id"] for c in components}
     assert mandated <= present, f"uncovered components: {sorted(mandated - present)}"
@@ -166,8 +190,7 @@ def test_a_component_with_a_blocked_poi_is_not_presented_as_active(
         assert poi_id in poi_items, f"{component['component_id']} names unknown {poi_id}"
         if poi_items[poi_id]["status"] == "BLOCKED":
             assert component["real_integration_status"] != "INTEGRATION_VERIFIED", (
-                f"{component['component_id']} claims INTEGRATION_VERIFIED while"
-                f" {poi_id} is BLOCKED"
+                f"{component['component_id']} claims INTEGRATION_VERIFIED while {poi_id} is BLOCKED"
             )
             assert component["current_blocker"] not in (None, "", "none"), (
                 f"{component['component_id']} has a BLOCKED PoI but no blocker"
@@ -179,8 +202,14 @@ def test_an_external_source_is_never_active_without_poi_evidence(
 ) -> None:
     """External sources are the easiest thing to over-claim."""
     external = {
-        "whatsapp-user", "discord-user", "telegram-user", "telegram-bot",
-        "telegram-coexistence", "investingpro", "news", "tradingview",
+        "whatsapp-user",
+        "discord-user",
+        "telegram-user",
+        "telegram-bot",
+        "telegram-coexistence",
+        "investingpro",
+        "news",
+        "tradingview",
         "ai-provider",
     }
     for component in components:
@@ -198,12 +227,10 @@ def test_an_external_source_is_never_active_without_poi_evidence(
             # Erasing the reason is how a blocked source starts looking active.
             blocker = str(component["current_blocker"]).strip().lower()
             assert blocker not in {"", "none", "n/a", "-"}, (
-                f"{component['component_id']} is blocked by {poi_id} but states"
-                " no blocker reason"
+                f"{component['component_id']} is blocked by {poi_id} but states no blocker reason"
             )
             assert component["owner_dependency"] != "NONE", (
-                f"{component['component_id']} is blocked but declares no owner"
-                " dependency"
+                f"{component['component_id']} is blocked but declares no owner dependency"
             )
 
 
@@ -211,7 +238,10 @@ def test_social_sources_stay_read_only_for_trading(
     components: list[dict[str, Any]],
 ) -> None:
     social = {
-        "whatsapp-user", "discord-user", "telegram-user", "telegram-bot",
+        "whatsapp-user",
+        "discord-user",
+        "telegram-user",
+        "telegram-bot",
         "telegram-coexistence",
     }
     for component in components:
@@ -240,7 +270,11 @@ TOS_BLOCKED_ADAPTERS = {"whatsapp-user", "discord-user", "investingpro"}
 #: PHASE-6 package and tested with deterministic fakes. Their CODE is IMPLEMENTED
 #: but their real-account PoIs stay BLOCKED (owner credentials/hosts required).
 BUILT_ADAPTERS = {
-    "telegram-user", "telegram-bot", "telegram-coexistence", "news", "tradingview",
+    "telegram-user",
+    "telegram-bot",
+    "telegram-coexistence",
+    "news",
+    "tradingview",
 }
 
 
@@ -457,8 +491,7 @@ def test_paper_auto_gates_are_all_still_open(
         or deferred["DEF-18-post-fix-cancellation-verification"] != "PASS"
         or deferred["DEF-20-restart-recovery-cancellation"] != "PASS"
         or not any(
-            s.get("out_of_sample_pass") and s.get("shadow_pass")
-            for s in matrix["strategies"]
+            s.get("out_of_sample_pass") and s.get("shadow_pass") for s in matrix["strategies"]
         )
     )
     if gates_open:
@@ -543,11 +576,24 @@ def test_the_matrix_and_registry_agree_that_the_headline_pois_are_blocked(
 def test_the_accelerated_plan_covers_every_mandated_item() -> None:
     text = ACCEL_PLAN.read_text(encoding="utf-8")
     for item in (
-        "DEF-18", "DEF-20", "B-02", "B-03", "B-04",
-        "IMP-1401", "IMP-1402", "IMP-1403", "IMP-1404",
-        "IMP-1501", "IMP-1502", "IMP-1503",
-        "baseline-trend-breakout-v1", "walk-forward", "shadow",
-        "Go / No-Go", "ablation", "point-in-time",
+        "DEF-18",
+        "DEF-20",
+        "B-02",
+        "B-03",
+        "B-04",
+        "IMP-1401",
+        "IMP-1402",
+        "IMP-1403",
+        "IMP-1404",
+        "IMP-1501",
+        "IMP-1502",
+        "IMP-1503",
+        "baseline-trend-breakout-v1",
+        "walk-forward",
+        "shadow",
+        "Go / No-Go",
+        "ablation",
+        "point-in-time",
     ):
         assert item in text, f"the accelerated plan omits {item!r}"
     for track in ("Track A", "Track B", "Track C", "Track D"):
@@ -591,9 +637,7 @@ _NEGATIONS = ("never", "not ", "no other", "no two", "must not", "cannot", "⛔"
 def _section(text: str, heading_prefix: str) -> str:
     """The body of one '### <heading_prefix>...' block."""
     lines = text.splitlines()
-    start = next(
-        i for i, line in enumerate(lines) if line.startswith(f"### {heading_prefix}")
-    )
+    start = next(i for i, line in enumerate(lines) if line.startswith(f"### {heading_prefix}"))
     end = next(
         (i for i in range(start + 1, len(lines)) if lines[i].startswith(("### ", "## "))),
         len(lines),
@@ -621,9 +665,7 @@ def test_a_broker_mutating_work_package_never_claims_concurrency(
 ) -> None:
     text = ACCEL_PLAN.read_text(encoding="utf-8")
     offenders = _claims_concurrency(_section(text, work_package))
-    assert not offenders, (
-        f"{work_package} is broker-mutating but claims concurrency: {offenders}"
-    )
+    assert not offenders, f"{work_package} is broker-mutating but claims concurrency: {offenders}"
 
 
 def test_def20_runs_after_def18_in_its_own_clean_account_window() -> None:
@@ -657,15 +699,19 @@ def test_non_mutating_operational_hardening_stays_parallel() -> None:
     # ...and it must not be *labelled* exclusive anywhere, heading included:
     # a contradictory heading over a parallel-safe body is exactly how this
     # would silently regress.
-    for exclusive in ("serialized", "exclusive", "own scheduled window",
-                      "own window", "one at a time"):
+    for exclusive in (
+        "serialized",
+        "exclusive",
+        "own scheduled window",
+        "own window",
+        "one at a time",
+    ):
         assert exclusive not in block, (
             f"B-WP4a is non-mutating but is labelled {exclusive!r}; that would"
             " needlessly serialize safe work"
         )
     # The safe-work list mandated by the owner review.
-    for item in ("systemd", "watchdog", "port", "permission", "log rotation",
-                 "ntp", "reproducib"):
+    for item in ("systemd", "watchdog", "port", "permission", "log rotation", "ntp", "reproducib"):
         assert item in block, f"B-WP4a omits non-mutating item {item!r}"
 
 
@@ -684,9 +730,7 @@ def test_the_master_plan_repeats_the_serialization_rule() -> None:
 # -- 10. DEF-18 session wording ---------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "doc", (ACCEL_PLAN, MASTER_PLAN, CURRENT_STATUS), ids=lambda p: p.name
-)
+@pytest.mark.parametrize("doc", (ACCEL_PLAN, MASTER_PLAN, CURRENT_STATUS), ids=lambda p: p.name)
 def test_def18_is_not_described_as_requiring_regular_hours(doc: Path) -> None:
     """The lifecycle gate accepts regular, pre-market and after-hours alike."""
     text = doc.read_text(encoding="utf-8").lower()
@@ -720,8 +764,7 @@ def test_the_strategy_verdict_is_precise_not_categorical() -> None:
         "the categorical claim erases the infrastructure and hypotheses that exist"
     )
     assert (
-        "no frozen, owner-approved, evidence-qualified or\nproduction-eligible\nstrategy"
-        in text
+        "no frozen, owner-approved, evidence-qualified or\nproduction-eligible\nstrategy" in text
         or "no frozen, owner-approved, evidence-qualified or" in text
     )
     lowered = text.lower()
@@ -760,3 +803,58 @@ def test_no_committee_output_before_ablation_anywhere() -> None:
     for doc in (ACCEL_PLAN, MASTER_PLAN):
         text = doc.read_text(encoding="utf-8").lower()
         assert "execution authority" in text or "decision input" in text
+
+
+# -- 13. free GICS sector candidate stays fail-closed ------------------------
+
+
+def test_free_gics_sector_candidate_is_not_described_as_admitted() -> None:
+    governed = (
+        REPO_ROOT
+        / "packages/py/market-data-core/src/trading_market_data_core/dataset_v1_wikipedia_pit.py",
+        MATRIX,
+        REPO_ROOT / "docs/status/PIT_DATASET_QUALIFICATION.md",
+        REPO_ROOT / "docs/roadmaps/MVP_DELIVERY_PLAN.md",
+    )
+    stale_phrases = (
+        "now empirically admitted as SECONDARY_RESEARCH_PIT / APPROXIMATE",
+        "sector-only path is now empirically admitted",
+        "empirically verified for 2023-12-31",
+    )
+    for doc in governed:
+        text = doc.read_text(encoding="utf-8")
+        for phrase in stale_phrases:
+            assert phrase not in text, f"{doc.name} still contains stale GICS admission claim"
+
+
+def test_free_gics_sector_candidate_records_the_failed_coverage_gate() -> None:
+    source = (
+        REPO_ROOT
+        / "packages/py/market-data-core/src/trading_market_data_core/dataset_v1_wikipedia_pit.py"
+    ).read_text(encoding="utf-8")
+    assert "NOT_ADMITTED" in source
+    assert "417/503" in source
+    assert "82.90%" in source
+    assert "frozen 90% coverage floor" in source
+
+
+def test_superseded_gics_experiment_has_an_explicit_sidecar_marker() -> None:
+    import hashlib
+    import json
+
+    root = EVIDENCE_DIR / "dataset-v1/sec-sector-spdr-gics"
+    marker = json.loads((root / "experiment-2023-12-31.supersession.json").read_text())
+    old = root / "experiment-2023-12-31.json"
+    new = root / "experiment-2023-12-31-recheck-v2.json"
+
+    def checksum(path: Path) -> str:
+        return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+    assert marker["superseded_status"].startswith("NOT_CANONICAL")
+    assert marker["canonical_outcome"]["status"] == "NOT_ADMITTED"
+    assert (
+        marker["canonical_outcome"]["coverage_ratio"]
+        < marker["canonical_outcome"]["coverage_floor"]
+    )
+    assert marker["superseded_artifact_checksum"] == checksum(old)
+    assert marker["superseding_artifact_checksum"] == checksum(new)

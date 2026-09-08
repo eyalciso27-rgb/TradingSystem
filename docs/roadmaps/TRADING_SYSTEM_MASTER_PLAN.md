@@ -180,9 +180,7 @@ real-account PoIs remain **BLOCKED**.
 > `docs/poi/evidence/dataset-v1/wikipedia-revision-history/`). It is
 > permanently `SECONDARY_RESEARCH_PIT`, usable only for
 > `BacktestQuality.APPROXIMATE` membership research, and does not close the
-> official gap above. GICS/sector values are captured from the same source
-> but stay `CAPTURED_UNEVALUATED_NOT_ADMITTED` — no independent, dated, free
-> GICS source has been identified to cross-check them against.
+> official gap above. GICS/sector values were initially unadmitted; the 2026-09-07 bounded SEC Select Sector SPDR N-PORT-P experiment now records a conservative GICS Sector recheck as NOT_ADMITTED (coverage below the frozen floor) (417/503 coverage; 417/417 covered agreement; NOT_ADMITTED below the 90% coverage floor). GICS Sub-Industry and official/PIT_STRICT history remain deferred.
 >
 > **2026-09-06, A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD.** The
 > dependency-safe multi-date BATCH machinery to extend the one recorded date

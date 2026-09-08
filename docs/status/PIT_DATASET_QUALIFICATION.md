@@ -35,7 +35,7 @@
 > is narrowed to **MEMBERSHIP only** — it is a free, cross-checked
 > `SECONDARY_RESEARCH_PIT` path usable for `BacktestQuality.APPROXIMATE`
 > membership research (ADR-0017). GICS/sector from this source is captured
-> but `CAPTURED_UNEVALUATED_NOT_ADMITTED` (no independent dated GICS source
+> but `previously unadmitted pending an independent dated cross-check` (no independent dated GICS source
 > to cross-check against). Neither the membership evidence nor the captured
 > GICS values close either GAP row below, which remain WAITING_EXTERNAL for
 > **official** evidence.
@@ -59,6 +59,22 @@
 > (`dataset_v1_wikipedia_pit.WINDOW_DEFINITION_REQUIRED`); it blocks only the
 > FULL-WINDOW empirical MEMBERSHIP research dataset, not this machinery, and
 > it does not touch either GAP row below.
+>
+> **2026-09-07 follow-up (A-WP2-GICS-SECTOR-SECONDARY-PIT-EVAL).**
+> A legitimate independent dated free sector cross-check is empirically
+> recorded: all 11 Select Sector SPDR funds' 2023-12-31 SEC EDGAR N-PORT-P
+> filings were retained with raw SHA-256 provenance and compared against the
+> exact MediaWiki revision already recorded for that date. The superseding
+> conservative exact-name recheck covered **417/503 tickers (82.90%)**, below
+> the frozen 90% coverage floor, with **417/417 sector agreements (100%)** and
+> 86 unresolved/ambiguous tickers explicitly left uncovered. Historical **GICS
+> Sector is NOT_ADMITTED** for `BacktestQuality.APPROXIMATE` research because
+> the coverage gate failed; thresholds were not weakened. GICS Sub-Industry and
+> the official effective/knowledge-dated `PIT_STRICT` company-level GICS series
+> remain `BLOCKED_EXTERNAL / LICENSE_REQUIRED`. Superseding evidence:
+> `docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31-recheck-v2.json`.
+> The earlier `experiment-2023-12-31.json` is retained as immutable historical
+> evidence but is superseded and must not be used as the canonical conclusion.
 
 ## 1. Sourcing principle (owner correction #1)
 The remaining reference-data gaps do **not** have to be bought from one bundled
@@ -80,7 +96,7 @@ qualification (`docs/poi/IBKR-HISTORICAL-QUALIFICATION-RUNBOOK.md`) and records
 | Head-timestamp / history depth | pending empirical | n/a | n/a | verify per run |
 | BID/ASK/MIDPOINT bars | pending empirical (entitlement-dependent) | no | no | soft (fallback allowed) |
 | Corporate actions (effective-dated) | partial (adjusted bars) | adjusted only | no clean export | **GAP** |
-| GICS sector, as-of history | no | no | almost certainly no | **GAP** |
+| GICS sector, as-of history | no | no | almost certainly no | **GAP remains** — the free `SECONDARY_RESEARCH_PIT` sector candidate was evaluated for 2023-12-31 and is **NOT_ADMITTED**: 417/503 coverage (82.90%) is below the frozen 90% admission floor, despite 100% agreement among covered tickers; it confers no usable `BacktestQuality.APPROXIMATE` GICS Sector evidence, and official historical GICS remains licensed |
 | PIT S&P 500 membership | no | no | no | **GAP** |
 | Stable identifiers | conId (pending empirical) | no | no | partial |
 | Commission schedule | owner Account Management (not API) | n/a | n/a | owner reads report |

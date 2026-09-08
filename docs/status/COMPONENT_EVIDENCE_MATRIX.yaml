@@ -51,9 +51,12 @@
 # (page identity + revision timestamp) is now independently verified against
 # MediaWiki's own metadata rather than trusted from a caller, and the claim is
 # narrowed to MEMBERSHIP only — GICS/sector is captured from the same revision
-# but stays CAPTURED_UNEVALUATED_NOT_ADMITTED (cross_check_sectors exists,
-# deterministic and tested, but no independent dated GICS source has been
-# identified to run it against). Do not recreate any of this; the one
+# sector/GICS was initially unadmitted pending a dated independent source.
+# On 2026-09-08 the conservative recheck of the real SEC EDGAR N-PORT-P Select
+# Sector SPDR experiment covered 417/503 (82.90%), below the frozen 90% coverage
+# floor, despite 417/417 agreement among covered tickers. The GICS Sector
+# candidate is therefore NOT_ADMITTED; GICS Sector/Sub-Industry and
+# official/PIT_STRICT historical GICS remain external/licensed. Do not recreate any of this; the one
 # remaining dependency-safe task is to extend the one recorded date to the
 # full backtest window (A-WP2-WIKIPEDIA-REVISION-HISTORY-DATASET-BUILD, see
 # MVP_DELIVERY_PLAN.md §5 M3 gap 5); finding an independent dated GICS source
@@ -799,10 +802,13 @@ strategies:
       the manifest's `universe.definition` requires true historical S&P 500
       PIT membership (official S&P DJI documents, owner-supplied — automated
       retrieval is bot-protected) and its GICS sector-concentration rule
-      requires historical (as-of) GICS, which is LICENSE_REQUIRED with no free
-      legitimate source (see docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3,
+      requires historical (as-of) GICS, which remains LICENSE_REQUIRED. The free
+      SECONDARY_RESEARCH_PIT sector candidate is NOT_ADMITTED: conservative
+      identity resolution covers 417/503 tickers (82.90%), below the frozen 90%
+      coverage floor, so it confers no usable APPROXIMATE GICS Sector evidence
+      (see docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3,
       docs/status/PIT_DATASET_QUALIFICATION.md,
-      docs/poi/evidence/dataset-v1/asof-gics-blocker.json)
+      docs/poi/evidence/dataset-v1/asof-gics-blocker.json).
     next_action: >-
       WAITING_EXTERNAL / BLOCKED_FOR_OWNER — see
       docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3 for the exact owner actions;

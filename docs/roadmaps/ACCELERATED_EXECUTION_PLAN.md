@@ -95,9 +95,7 @@ Every other track is plumbing by comparison.
   fixture) corporate-action evidence — still need an owner-supplied
   artifact, a licensing decision, or an owner-run against SEC EDGAR/IBKR; the
   Wikipedia-revision path never substitutes for any of them (permanently
-  `SECONDARY_RESEARCH_PIT`), and its GICS/sector values are captured but
-  `CAPTURED_UNEVALUATED_NOT_ADMITTED` — no independent dated GICS source has
-  been found to cross-check them against. See
+  `SECONDARY_RESEARCH_PIT`), and its GICS/sector values were initially unadmitted; a real 2023-12-31 SEC Select Sector SPDR N-PORT-P cross-check now records a conservative GICS Sector recheck as NOT_ADMITTED (coverage below the frozen floor) (417/503 coverage; 417/417 covered agreement; NOT_ADMITTED below the 90% coverage floor). GICS Sub-Industry and official/PIT_STRICT history remain external. See
   [`MVP_DELIVERY_PLAN.md`](MVP_DELIVERY_PLAN.md) §5 M3 for the authoritative,
   itemized owner-action list; the one remaining next step for the
   Wikipedia-revision path
