@@ -462,6 +462,44 @@ def test_build_secondary_sector_mapping_matches_unambiguous_names() -> None:
     assert resolution.unmatched_holdings == ()
 
 
+def test_build_secondary_sector_mapping_matches_unique_long_prefix_at_boundary() -> None:
+    snapshot = SectorSpdrSnapshot(
+        as_of=date(2023, 12, 31),
+        filings=tuple(
+            _fetch(
+                gics_sector=sector,
+                series_id=f"S{i}",
+                holdings=(_holding("Costco"),) if sector == "Consumer Staples" else (),
+            )
+            for i, sector in enumerate(sorted(GICS_SECTOR_NAMES))
+        ),
+    )
+    resolution = build_secondary_sector_mapping(
+        snapshot, wikipedia_observations=[("COST", "Costco Wholesale Corp")]
+    )
+    assert resolution.secondary_sectors == {"COST": "Consumer Staples"}
+    assert resolution.unmatched_holdings == ()
+
+
+def test_build_secondary_sector_mapping_rejects_short_prefix_false_positive() -> None:
+    snapshot = SectorSpdrSnapshot(
+        as_of=date(2023, 12, 31),
+        filings=tuple(
+            _fetch(
+                gics_sector=sector,
+                series_id=f"S{i}",
+                holdings=(_holding("Ford"),) if sector == "Consumer Discretionary" else (),
+            )
+            for i, sector in enumerate(sorted(GICS_SECTOR_NAMES))
+        ),
+    )
+    resolution = build_secondary_sector_mapping(
+        snapshot, wikipedia_observations=[("F", "Ford Motor")]
+    )
+    assert resolution.secondary_sectors == {}
+    assert resolution.unmatched_holdings[0].reason == "NO_MATCH"
+
+
 def test_build_secondary_sector_mapping_excludes_ambiguous_matches() -> None:
     snapshot = SectorSpdrSnapshot(
         as_of=date(2023, 12, 31),

@@ -31,6 +31,7 @@ from trading_market_data_core.dataset_v1_sec_sector_spdr_gics import (  # noqa: 
 )
 from trading_market_data_core.dataset_v1_sources import (  # noqa: E402
     SecEdgarClient,
+    SourceAdapterError,
     UrllibHttpFetcher,
 )
 from trading_market_data_core.dataset_v1_wikipedia_pit import (  # noqa: E402
@@ -132,12 +133,61 @@ def main() -> int:
         snapshot,
         wikipedia_observations=[(item.ticker, item.name) for item in wikipedia.observations],
     )
-    cross_check = cross_check_sectors(
-        wikipedia=wikipedia,
-        secondary_sectors=resolution.secondary_sectors,
-        secondary_source_id=SECONDARY_SOURCE_ID,
-        as_of=AS_OF,
-    )
+    try:
+        cross_check = cross_check_sectors(
+            wikipedia=wikipedia,
+            secondary_sectors=resolution.secondary_sectors,
+            secondary_source_id=SECONDARY_SOURCE_ID,
+            as_of=AS_OF,
+        )
+        cross_check_payload: dict[str, object] = cross_check.to_dict()
+        corroborated = cross_check.corroborated
+        coverage_ratio = cross_check.coverage_ratio
+        covered_tickers = cross_check.covered_tickers
+        agreement_ratio = cross_check.agreement_ratio
+        agreement_count = len(cross_check.agreements)
+        uncovered_count = len(cross_check.uncovered_tickers)
+    except SourceAdapterError as exc:
+        message = str(exc)
+        if "sector cross-check coverage" not in message:
+            raise
+        wiki_tickers = wikipedia.tickers()
+        covered = sorted(t for t in wiki_tickers if t in resolution.secondary_sectors)
+        uncovered = sorted(t for t in wiki_tickers if t not in resolution.secondary_sectors)
+        agreements: list[str] = []
+        disagreements: list[dict[str, str]] = []
+        for ticker in covered:
+            wiki_sector = wikipedia.gics_sector_of(ticker) or ""
+            secondary_sector = resolution.secondary_sectors[ticker]
+            if wiki_sector.strip().casefold() == secondary_sector.strip().casefold():
+                agreements.append(ticker)
+            else:
+                disagreements.append(
+                    {
+                        "ticker": ticker,
+                        "wikipedia_sector": wiki_sector,
+                        "secondary_sector": secondary_sector,
+                    }
+                )
+        covered_tickers = len(covered)
+        coverage_ratio = covered_tickers / len(wiki_tickers) if wiki_tickers else 0.0
+        agreement_count = len(agreements)
+        agreement_ratio = agreement_count / covered_tickers if covered_tickers else 0.0
+        uncovered_count = len(uncovered)
+        corroborated = False
+        cross_check_payload = {
+            "secondary_source_id": SECONDARY_SOURCE_ID,
+            "as_of": AS_OF.isoformat(),
+            "covered_tickers": covered_tickers,
+            "coverage_ratio": coverage_ratio,
+            "agreements": agreements,
+            "agreement_ratio": agreement_ratio,
+            "disagreements": disagreements,
+            "uncovered_tickers": uncovered,
+            "corroborated": False,
+            "failure_gate": "MINIMUM_SECTOR_COVERAGE_RATIO",
+            "failure_reason": message,
+        }
     body: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "artifact_type": "historical_sector_crosscheck_experiment",
@@ -167,11 +217,11 @@ def main() -> int:
             "filings": filing_records,
         },
         "identity_resolution": resolution.to_dict(),
-        "sector_cross_check": cross_check.to_dict(),
+        "sector_cross_check": cross_check_payload,
         "admission": {
             "status": "ADMITTED_SECONDARY_RESEARCH_PIT_APPROXIMATE"
-            if cross_check.corroborated
-            else "REFUSED_NOT_CORROBORATED",
+            if corroborated
+            else "NOT_ADMITTED",
             "usable_for": "BacktestQuality.APPROXIMATE historical GICS Sector research only",
             "not_usable_for": [
                 "BacktestQuality.PIT_STRICT",
@@ -190,14 +240,14 @@ def main() -> int:
     _write_immutable(RESULT_PATH, rendered)
     print(f"evidence={RESULT_PATH.relative_to(REPO_ROOT)}")
     print(f"filings={len(filing_records)}")
-    coverage_detail = f"{cross_check.covered_tickers}/{len(wikipedia.observations)}"
-    print(f"coverage={cross_check.coverage_ratio:.6f} ({coverage_detail})")
-    agreement_detail = f"{len(cross_check.agreements)}/{cross_check.covered_tickers}"
-    print(f"agreement={cross_check.agreement_ratio:.6f} ({agreement_detail})")
-    print(f"uncovered={len(cross_check.uncovered_tickers)}")
-    print(f"corroborated={cross_check.corroborated}")
+    coverage_detail = f"{covered_tickers}/{len(wikipedia.observations)}"
+    print(f"coverage={coverage_ratio:.6f} ({coverage_detail})")
+    agreement_detail = f"{agreement_count}/{covered_tickers}"
+    print(f"agreement={agreement_ratio:.6f} ({agreement_detail})")
+    print(f"uncovered={uncovered_count}")
+    print(f"corroborated={corroborated}")
     print(f"checksum={body['evidence_checksum']}")
-    return 0 if cross_check.corroborated else 2
+    return 0 if corroborated else 2
 
 
 if __name__ == "__main__":
