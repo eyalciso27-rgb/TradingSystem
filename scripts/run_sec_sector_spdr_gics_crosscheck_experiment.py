@@ -193,7 +193,10 @@ def main() -> int:
     body: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "artifact_type": "historical_sector_crosscheck_experiment",
-        "supersedes": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31.json",
+        "supersedes": (
+            "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/"
+            "experiment-2023-12-31.json"
+        ),
         "classification": "SECONDARY_RESEARCH_PIT",
         "backtest_quality": "APPROXIMATE",
         "scope": (
@@ -203,8 +206,9 @@ def main() -> int:
         "requested_as_of": AS_OF.isoformat(),
         "performed_at": performed_at.isoformat(),
         "knowledge_date_caveat": (
-            "APPROXIMATE research only: report_period_date describes portfolio state as of the requested date; "
-            "SEC filing_date may be later, so this evidence is not public-knowledge-as-of/PIT_STRICT evidence."
+            "APPROXIMATE research only: report_period_date describes portfolio state "
+            "as of the requested date; SEC filing_date may be later, so this evidence "
+            "is not public-knowledge-as-of/PIT_STRICT evidence."
         ),
         "wikipedia_source": {
             "evidence_path": str(WIKI_EVIDENCE.relative_to(REPO_ROOT)).replace("\\", "/"),

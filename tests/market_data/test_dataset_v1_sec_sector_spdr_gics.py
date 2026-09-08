@@ -99,7 +99,10 @@ def test_normalize_company_name_drops_parenthetical_share_class_annotations() ->
 
 
 def test_normalize_company_name_keeps_interior_identity_words() -> None:
-    assert normalize_company_name("American International Group Inc") == "AMERICANINTERNATIONALGROUP"
+    assert (
+        normalize_company_name("American International Group Inc")
+        == "AMERICANINTERNATIONALGROUP"
+    )
     assert normalize_company_name("American Express Co") == "AMERICANEXPRESS"
 
 def test_normalize_company_name_fails_closed_on_empty_input() -> None:
@@ -670,7 +673,9 @@ def test_end_to_end_sufficient_coverage_but_disagreement_is_not_corroborated() -
 def test_recorded_real_sector_experiment_is_self_authenticating() -> None:
     repo = Path(__file__).resolve().parents[2]
     evidence_path = (
-        repo / "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31-recheck-v2.json"
+        repo
+        / "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/"
+        "experiment-2023-12-31-recheck-v2.json"
     )
     payload = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert payload["admission"]["status"] == "NOT_ADMITTED"
