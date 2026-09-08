@@ -1,7 +1,7 @@
 """A free, dated, independent GICS-sector cross-check candidate: SEC EDGAR
 N-PORT-P filings of the 11 "Select Sector SPDR" exchange-traded funds.
 
-Task A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL. ``dataset_v1_wikipedia_pit``
+Task A-WP2-GICS-SECTOR-SECONDARY-PIT-EVAL. ``dataset_v1_wikipedia_pit``
 already captures GICS Sector/Sub-Industry from the Wikipedia revision table
 but explicitly could not admit it as SECONDARY research evidence:
 ``cross_check_sectors`` existed and was tested against fixtures, but "no
@@ -181,15 +181,10 @@ _GENERIC_LEGAL_SUFFIX_TOKENS = frozenset(
         "LTD",
         "LIMITED",
         "PLC",
-        "GROUP",
-        "HOLDINGS",
         "LLC",
         "SA",
         "NV",
         "TRUST",
-        "INTERNATIONAL",
-        "INTL",
-        "AND",
     }
 )
 
@@ -247,8 +242,12 @@ def normalize_company_name(name: str) -> str:
     text = re.sub(r"\(.*?\)", "", text)  # drop parenthetical share-class annotations
     text = re.sub(r"[^A-Z0-9 ]", "", text)
     tokens = text.split()
-    expanded = (_GENERIC_ABBREVIATION_EXPANSIONS.get(token, token) for token in tokens)
-    kept = [token for token in expanded if token not in _GENERIC_LEGAL_SUFFIX_TOKENS]
+    kept = [_GENERIC_ABBREVIATION_EXPANSIONS.get(token, token) for token in tokens]
+    # Remove legal-form boilerplate only from the TRAILING suffix. Dropping words such as
+    # INTERNATIONAL/GROUP/HOLDINGS from the interior can collapse materially different
+    # issuers (for example "American International Group" -> "AMERICAN").
+    while kept and kept[-1] in _GENERIC_LEGAL_SUFFIX_TOKENS:
+        kept.pop()
     if not kept:
         raise SourceAdapterError(f"company name {name!r} normalized to nothing; refusing")
     return "".join(kept)
@@ -301,6 +300,8 @@ class SectorSpdrFilingFetch:
     holdings: tuple[SectorSpdrHolding, ...]
     raw_bytes: bytes
     raw_checksum: str
+    filing_date: date | None = None
+    source_url: str | None = None
 
     def __post_init__(self) -> None:
         if raw_artifact_checksum(self.raw_bytes) != self.raw_checksum:
@@ -308,6 +309,10 @@ class SectorSpdrFilingFetch:
                 f"{self.filing.accession_number}: raw_checksum does not match the"
                 " supplied raw bytes; refusing to bind an unauthenticated filing"
             )
+        if self.filing_date is not None and not isinstance(self.filing_date, date):
+            raise SourceAdapterError(f"{self.filing.accession_number}: invalid filing_date")
+        if self.source_url is not None and not self.source_url.startswith("https://www.sec.gov/Archives/"):
+            raise SourceAdapterError(f"{self.filing.accession_number}: invalid SEC source_url")
 
 
 def parse_nport_primary_doc(
@@ -428,7 +433,11 @@ def fetch_nport_filing(
     raw = client.archives_document(relative_path, fetcher=bytes_fetcher)
     filing, holdings = parse_nport_primary_doc(raw, cik=cik, accession_number=accession_number)
     return SectorSpdrFilingFetch(
-        filing=filing, holdings=holdings, raw_bytes=raw, raw_checksum=raw_artifact_checksum(raw)
+        filing=filing,
+        holdings=holdings,
+        raw_bytes=raw,
+        raw_checksum=raw_artifact_checksum(raw),
+        source_url=f"https://www.sec.gov/Archives/{relative_path}",
     )
 
 
@@ -481,12 +490,24 @@ def select_sector_spdr_snapshot_as_of(
     are resolved -- a partial set is never silently treated as complete.
     """
     resolved: dict[str, SectorSpdrFilingFetch] = {}
-    for accession_number, _filing_date in discover_fn(cik=cik, client=client):
+    for accession_number, filing_date in discover_fn(cik=cik, client=client):
         if len(resolved) == len(GICS_SECTOR_NAMES):
             break
         try:
             fetched = fetch_fn(
                 accession_number, cik=cik, client=client, bytes_fetcher=bytes_fetcher
+            )
+            # Discovery metadata is not trusted for report-period semantics, but the SEC
+            # filing date and exact Archives URL are required provenance for the retained
+            # artifact. Bind them after the primary document itself has been parsed.
+            accession_nodash = accession_number.replace("-", "")
+            cik_int = str(int(cik))
+            source_url = fetched.source_url or (
+                f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession_nodash}/primary_doc.xml"
+            )
+            fetched = SectorSpdrFilingFetch(
+                filing=fetched.filing, holdings=fetched.holdings, raw_bytes=fetched.raw_bytes,
+                raw_checksum=fetched.raw_checksum, filing_date=filing_date, source_url=source_url,
             )
         except SourceAdapterError:
             continue  # an unrelated/unparseable filing under this CIK; skip, don't abort
@@ -573,21 +594,8 @@ def build_secondary_sector_mapping(
         for holding in fetch.holdings:
             normalized = normalize_company_name(holding.issuer_name)
             matches = wiki_by_normalized_name.get(normalized, [])
-            # If exact normalized legal-name equality is unavailable, allow only
-            # a UNIQUE long-prefix relation. This generically reconciles a brand
-            # name with the same issuer plus a descriptive legal tail (e.g.
-            # "Costco" vs "Costco Wholesale Corp") without any company aliases.
-            # Short keys are excluded to avoid accidental joins such as single-
-            # letter/two-word abbreviations. Multiple candidates remain ambiguous.
-            if not matches:
-                prefix_candidates = []
-                for wiki_key, tickers in wiki_by_normalized_name.items():
-                    shorter = min(len(normalized), len(wiki_key))
-                    if shorter >= 6 and (
-                        normalized.startswith(wiki_key) or wiki_key.startswith(normalized)
-                    ):
-                        prefix_candidates.extend(tickers)
-                matches = sorted(set(prefix_candidates))
+            # Conservative identity boundary: exact normalized legal-name equality only.
+            # Near/prefix matches remain uncovered rather than being guessed.
             if len(matches) == 1:
                 secondary_sectors[matches[0]] = fetch.filing.gics_sector
             elif len(matches) > 1:

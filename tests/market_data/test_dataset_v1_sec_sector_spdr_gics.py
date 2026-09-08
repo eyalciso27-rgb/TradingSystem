@@ -1,6 +1,6 @@
 """Deterministic, offline proofs for the SEC EDGAR Sector-SPDR GICS candidate.
 
-Task A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL. These tests prove the
+Task A-WP2-GICS-SECTOR-SECONDARY-PIT-EVAL. These tests prove the
 machinery in ``dataset_v1_sec_sector_spdr_gics`` does what its module
 docstring claims -- deterministic identity resolution, no-look-ahead filing
 selection, fail-closed on a partial fund set or a later filing, and correct
@@ -95,6 +95,12 @@ def test_normalize_company_name_drops_parenthetical_share_class_annotations() ->
         "Alphabet Inc"
     )
 
+
+
+
+def test_normalize_company_name_keeps_interior_identity_words() -> None:
+    assert normalize_company_name("American International Group Inc") == "AMERICANINTERNATIONALGROUP"
+    assert normalize_company_name("American Express Co") == "AMERICANEXPRESS"
 
 def test_normalize_company_name_fails_closed_on_empty_input() -> None:
     with pytest.raises(SourceAdapterError, match="empty"):
@@ -462,7 +468,7 @@ def test_build_secondary_sector_mapping_matches_unambiguous_names() -> None:
     assert resolution.unmatched_holdings == ()
 
 
-def test_build_secondary_sector_mapping_matches_unique_long_prefix_at_boundary() -> None:
+def test_build_secondary_sector_mapping_does_not_guess_long_prefix_match() -> None:
     snapshot = SectorSpdrSnapshot(
         as_of=date(2023, 12, 31),
         filings=tuple(
@@ -477,8 +483,8 @@ def test_build_secondary_sector_mapping_matches_unique_long_prefix_at_boundary()
     resolution = build_secondary_sector_mapping(
         snapshot, wikipedia_observations=[("COST", "Costco Wholesale Corp")]
     )
-    assert resolution.secondary_sectors == {"COST": "Consumer Staples"}
-    assert resolution.unmatched_holdings == ()
+    assert resolution.secondary_sectors == {}
+    assert resolution.unmatched_holdings[0].reason == "NO_MATCH"
 
 
 def test_build_secondary_sector_mapping_rejects_short_prefix_false_positive() -> None:
@@ -664,16 +670,16 @@ def test_end_to_end_sufficient_coverage_but_disagreement_is_not_corroborated() -
 def test_recorded_real_sector_experiment_is_self_authenticating() -> None:
     repo = Path(__file__).resolve().parents[2]
     evidence_path = (
-        repo / "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31.json"
+        repo / "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31-recheck-v2.json"
     )
     payload = json.loads(evidence_path.read_text(encoding="utf-8"))
-    assert payload["admission"]["status"] == "ADMITTED_SECONDARY_RESEARCH_PIT_APPROXIMATE"
+    assert payload["admission"]["status"] == "NOT_ADMITTED"
     assert payload["independent_source"]["filing_count"] == 11
     result = payload["sector_cross_check"]
-    assert result["covered_tickers"] == 482
-    assert result["uncovered_ticker_count"] == 21
-    assert result["agreement_count"] == 482
-    assert result["corroborated"] is True
+    assert result["covered_tickers"] == 417
+    assert len(result["uncovered_tickers"]) == 86
+    assert len(result["agreements"]) == 417
+    assert result["corroborated"] is False
 
     for filing in payload["independent_source"]["filings"]:
         raw = (repo / filing["raw_artifact_path"]).read_bytes()

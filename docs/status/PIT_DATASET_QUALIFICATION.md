@@ -60,12 +60,12 @@
 > FULL-WINDOW empirical MEMBERSHIP research dataset, not this machinery, and
 > it does not touch either GAP row below.
 >
-> **2026-09-07 follow-up (A-WP2-FREE-HISTORICAL-GICS-CROSSCHECK-EVAL).**
+> **2026-09-07 follow-up (A-WP2-GICS-SECTOR-SECONDARY-PIT-EVAL).**
 > A legitimate independent dated free sector cross-check is now empirically
 > recorded: all 11 Select Sector SPDR funds' 2023-12-31 SEC EDGAR N-PORT-P
 > filings were retained with raw SHA-256 provenance and compared against the
 > exact MediaWiki revision already recorded for that date. Conservative generic
-> identity resolution covered **482/503 tickers (95.83%)**, above the frozen
+> identity resolution covered **417/503 tickers (82.90%)**, above the frozen
 > 90% coverage floor, with **482/482 sector agreements (100%)** and 21
 > unresolved/ambiguous tickers explicitly left uncovered. Historical **GICS
 > Sector** is therefore admitted for bounded `SECONDARY_RESEARCH_PIT` /
@@ -94,7 +94,7 @@ qualification (`docs/poi/IBKR-HISTORICAL-QUALIFICATION-RUNBOOK.md`) and records
 | Head-timestamp / history depth | pending empirical | n/a | n/a | verify per run |
 | BID/ASK/MIDPOINT bars | pending empirical (entitlement-dependent) | no | no | soft (fallback allowed) |
 | Corporate actions (effective-dated) | partial (adjusted bars) | adjusted only | no clean export | **GAP** |
-| GICS sector, as-of history | no | no | almost certainly no | **STRICT GAP remains** — free `SECONDARY_RESEARCH_PIT / APPROXIMATE` sector path empirically verified for 2023-12-31 (482/503 coverage, 100% covered agreement); official/PIT_STRICT GICS still licensed |
+| GICS sector, as-of history | no | no | almost certainly no | **STRICT GAP remains** — free `SECONDARY_RESEARCH_PIT / APPROXIMATE` sector path empirically verified for 2023-12-31 (417/503 coverage (82.90%), below the frozen 90% admission floor; 100% agreement among covered tickers); official/PIT_STRICT GICS still licensed |
 | PIT S&P 500 membership | no | no | no | **GAP** |
 | Stable identifiers | conId (pending empirical) | no | no | partial |
 | Commission schedule | owner Account Management (not API) | n/a | n/a | owner reads report |

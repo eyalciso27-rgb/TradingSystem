@@ -47,8 +47,8 @@ WIKI_EVIDENCE = (
 )
 OUT_ROOT = REPO_ROOT / "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics"
 RAW_ROOT = OUT_ROOT / AS_OF.isoformat()
-RESULT_PATH = OUT_ROOT / f"experiment-{AS_OF.isoformat()}.json"
-SCHEMA_VERSION = "sec-sector-spdr-gics-crosscheck-experiment-1.0.0"
+RESULT_PATH = OUT_ROOT / f"experiment-{AS_OF.isoformat()}-recheck-v2.json"
+SCHEMA_VERSION = "sec-sector-spdr-gics-crosscheck-experiment-2.0.0"
 SECONDARY_SOURCE_ID = "sec-edgar-nport-select-sector-spdr"
 
 
@@ -126,6 +126,8 @@ def main() -> int:
                 "holding_count": len(fetched.holdings),
                 "raw_artifact_path": str(raw_path.relative_to(REPO_ROOT)).replace("\\", "/"),
                 "raw_checksum": fetched.raw_checksum,
+                "filing_date": fetched.filing_date.isoformat() if fetched.filing_date else None,
+                "source_url": fetched.source_url,
             }
         )
 
@@ -191,6 +193,7 @@ def main() -> int:
     body: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "artifact_type": "historical_sector_crosscheck_experiment",
+        "supersedes": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31.json",
         "classification": "SECONDARY_RESEARCH_PIT",
         "backtest_quality": "APPROXIMATE",
         "scope": (
@@ -199,6 +202,10 @@ def main() -> int:
         ),
         "requested_as_of": AS_OF.isoformat(),
         "performed_at": performed_at.isoformat(),
+        "knowledge_date_caveat": (
+            "APPROXIMATE research only: report_period_date describes portfolio state as of the requested date; "
+            "SEC filing_date may be later, so this evidence is not public-knowledge-as-of/PIT_STRICT evidence."
+        ),
         "wikipedia_source": {
             "evidence_path": str(WIKI_EVIDENCE.relative_to(REPO_ROOT)).replace("\\", "/"),
             "evidence_checksum": wiki_evidence["evidence_checksum"],
