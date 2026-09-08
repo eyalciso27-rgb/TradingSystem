@@ -2062,7 +2062,7 @@ WIKIPEDIA_REVISION_HISTORY_EVALUATION: dict[str, object] = {
     "state": "SECONDARY_RESEARCH_AVAILABLE",
     "scope": "MEMBERSHIP ONLY -- see 'sector_gics' for why GICS/sector is separate",
     "classification": CLASSIFICATION,
-    "evaluated_at": "2026-09-07",
+    "evaluated_at": "2026-09-08",
     "real_experiment": {
         "performed_at": "2026-09-06",
         "performed_by": "scripts/run_wikipedia_revision_history_experiment.py",

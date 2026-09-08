@@ -10,10 +10,11 @@
     "status": "NOT_ADMITTED",
     "total_tickers": 503
   },
+  "in_band_marker": "canonical_status=SUPERSEDED_NOT_CANONICAL",
   "reason": "The first run used identity normalization/matching later judged too permissive. The conservative exact-name recheck is canonical and falls below the frozen 90% coverage floor. The original evidence remains byte-immutable for audit history only.",
   "schema_version": "sec-sector-spdr-gics-supersession-1.0.0",
   "superseded_artifact": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31.json",
-  "superseded_artifact_checksum": "sha256:abe59367808d18b2bd50d6c6b79c1dfce1979e28ae917a123bffb38e3234d26c",
+  "superseded_artifact_checksum": "sha256:c408589837471df76a4f612facdb1a17cfcbead4332ab9085c2a59615860c753",
   "superseded_by": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31-recheck-v2.json",
   "superseded_status": "NOT_CANONICAL_INVALIDATED_BY_CONSERVATIVE_IDENTITY_RECHECK",
   "superseding_artifact_checksum": "sha256:b37ebbecdb0dca1d2ee44a017af50dcc0408add69eb0d7bbe8b53545edb7d427"

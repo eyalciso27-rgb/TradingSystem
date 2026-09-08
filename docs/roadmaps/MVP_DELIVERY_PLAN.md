@@ -265,12 +265,13 @@ offline tests plus the one real experiment above):
 
 **GICS/sector scope, stated precisely so it cannot be over-read.** The same
 revision table carries GICS Sector / GICS Sub-Industry columns, so every
-snapshot captures them — but no independent, dated, free GICS source has been
-identified to cross-check them against. `cross_check_sectors` (deterministic,
-coverage- and anomaly-aware, unit-tested) exists for when one is found, but
-until then sector/GICS values from this source are recorded
-`previously unadmitted pending an independent dated cross-check`: captured on the snapshot for future use,
-never claimed as corroborated SECONDARY evidence today.
+snapshot captures them — and an independent, dated, free GICS Sector candidate has now been evaluated:
+SEC N-PORT-P holdings for the 11 Select Sector SPDR funds. The conservative
+exact-name recheck is `NOT_ADMITTED` because it covers only 417/503 tickers
+(82.90%), below the frozen 90% coverage floor. `cross_check_sectors` remains
+coverage- and anomaly-aware; unresolved or conflicting identities stay uncovered.
+The captured Wikipedia GICS values therefore remain unadmitted research data,
+not corroborated SECONDARY evidence.
 
 **Conclusion, stated precisely so it cannot be over-read:** this closes the
 "is there a free path at all" question with **yes, for MEMBERSHIP, for
@@ -808,9 +809,10 @@ this is recorded precisely as `WINDOW_DEFINITION_REQUIRED` rather than
 fabricated. Once that date range exists, running the machinery is
 dependency-safe again. It must be scoped and reported honestly either way: it
 produces `SECONDARY_RESEARCH_PIT` / `BacktestQuality.APPROXIMATE`
-**MEMBERSHIP** evidence only, GICS/sector stays
-`previously unadmitted pending an independent dated cross-check` (gap 6, no independent GICS source
-identified), and none of it closes or is represented as closing the official
+**MEMBERSHIP** evidence only. For GICS Sector, an independent dated free source
+was evaluated and is `NOT_ADMITTED` (417/503 = 82.90% coverage, below the frozen
+90% floor); GICS Sub-Industry remains unevaluated/unadmitted. None of this closes
+or is represented as closing the official
 gaps above.
 
 M4 → M5 → M6 remain gated on **official, PIT_STRICT** M3 dataset evidence and

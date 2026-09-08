@@ -13,6 +13,7 @@
   },
   "artifact_type": "historical_sector_crosscheck_experiment",
   "backtest_quality": "APPROXIMATE",
+  "canonical_status": "SUPERSEDED_NOT_CANONICAL",
   "classification": "SECONDARY_RESEARCH_PIT",
   "evidence_checksum": "sha256:9aacf66358652911071f1fc9e35ebd1bcf795dbe704019149eb4cecf3bc44ed1",
   "identity_resolution": {
@@ -333,6 +334,8 @@
     "secondary_source_id": "sec-edgar-nport-select-sector-spdr",
     "uncovered_ticker_count": 21
   },
+  "superseded_by": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31-recheck-v2.json",
+  "supersession_reason": "Identity matching in this first derived experiment was later judged too permissive; the conservative exact-name recheck is canonical and is NOT_ADMITTED below the frozen coverage floor.",
   "wikipedia_source": {
     "evidence_checksum": "sha256:1585377b66e518de7c6866335a96688f7f3a92d82ced936f2f5c61980116534a",
     "evidence_path": "docs/poi/evidence/dataset-v1/wikipedia-revision-history/experiment-2023-12-31.json",

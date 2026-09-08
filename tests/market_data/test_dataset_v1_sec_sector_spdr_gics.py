@@ -532,6 +532,27 @@ def test_build_secondary_sector_mapping_excludes_ambiguous_matches() -> None:
     assert set(unmatched.candidate_tickers) == {"GOOG", "GOOGL"}
 
 
+def test_build_secondary_sector_mapping_fails_closed_on_cross_fund_sector_conflict() -> None:
+    filings = []
+    for i, sector in enumerate(sorted(GICS_SECTOR_NAMES)):
+        holdings: tuple[SectorSpdrHolding, ...] = ()
+        if sector in {"Energy", "Industrials", "Utilities"}:
+            holdings = (_holding("Collision Corp"),)
+        filings.append(_fetch(gics_sector=sector, series_id=f"S{i}", holdings=holdings))
+    snapshot = SectorSpdrSnapshot(as_of=date(2023, 12, 31), filings=tuple(filings))
+
+    resolution = build_secondary_sector_mapping(
+        snapshot, wikipedia_observations=[("COLL", "Collision Corp")]
+    )
+
+    assert "COLL" not in resolution.secondary_sectors
+    conflicts = [
+        item for item in resolution.unmatched_holdings if item.reason == "CONFLICTING_MATCH"
+    ]
+    assert conflicts
+    assert all(item.candidate_tickers == ("COLL",) for item in conflicts)
+
+
 def test_build_secondary_sector_mapping_records_a_holding_with_no_wikipedia_match() -> None:
     snapshot = SectorSpdrSnapshot(
         as_of=date(2023, 12, 31),

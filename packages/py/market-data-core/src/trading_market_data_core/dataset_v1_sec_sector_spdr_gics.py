@@ -589,6 +589,7 @@ def build_secondary_sector_mapping(
         wiki_by_normalized_name.setdefault(key, []).append(ticker)
 
     secondary_sectors: dict[str, str] = {}
+    conflicted_tickers: set[str] = set()
     unmatched: list[UnmatchedHolding] = []
     for fetch in snapshot.filings:
         for holding in fetch.holdings:
@@ -597,7 +598,24 @@ def build_secondary_sector_mapping(
             # Conservative identity boundary: exact normalized legal-name equality only.
             # Near/prefix matches remain uncovered rather than being guessed.
             if len(matches) == 1:
-                secondary_sectors[matches[0]] = fetch.filing.gics_sector
+                ticker = matches[0]
+                existing_sector = secondary_sectors.get(ticker)
+                if ticker in conflicted_tickers or (
+                    existing_sector is not None and existing_sector != fetch.filing.gics_sector
+                ):
+                    secondary_sectors.pop(ticker, None)
+                    conflicted_tickers.add(ticker)
+                    unmatched.append(
+                        UnmatchedHolding(
+                            gics_sector=fetch.filing.gics_sector,
+                            issuer_name=holding.issuer_name,
+                            normalized_name=normalized,
+                            reason="CONFLICTING_MATCH",
+                            candidate_tickers=(ticker,),
+                        )
+                    )
+                else:
+                    secondary_sectors[ticker] = fetch.filing.gics_sector
             elif len(matches) > 1:
                 unmatched.append(
                     UnmatchedHolding(
