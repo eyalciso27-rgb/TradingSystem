@@ -802,10 +802,13 @@ strategies:
       the manifest's `universe.definition` requires true historical S&P 500
       PIT membership (official S&P DJI documents, owner-supplied — automated
       retrieval is bot-protected) and its GICS sector-concentration rule
-      requires PIT_STRICT historical (as-of) GICS, which remains LICENSE_REQUIRED; a free
-      SECONDARY_RESEARCH_PIT / APPROXIMATE sector-only path is now empirically admitted (see docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3,
+      requires historical (as-of) GICS, which remains LICENSE_REQUIRED. The free
+      SECONDARY_RESEARCH_PIT sector candidate is NOT_ADMITTED: conservative
+      identity resolution covers 417/503 tickers (82.90%), below the frozen 90%
+      coverage floor, so it confers no usable APPROXIMATE GICS Sector evidence
+      (see docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3,
       docs/status/PIT_DATASET_QUALIFICATION.md,
-      docs/poi/evidence/dataset-v1/asof-gics-blocker.json)
+      docs/poi/evidence/dataset-v1/asof-gics-blocker.json).
     next_action: >-
       WAITING_EXTERNAL / BLOCKED_FOR_OWNER — see
       docs/roadmaps/MVP_DELIVERY_PLAN.md §5 M3 for the exact owner actions;

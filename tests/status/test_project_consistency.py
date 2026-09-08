@@ -760,3 +760,51 @@ def test_no_committee_output_before_ablation_anywhere() -> None:
     for doc in (ACCEL_PLAN, MASTER_PLAN):
         text = doc.read_text(encoding="utf-8").lower()
         assert "execution authority" in text or "decision input" in text
+
+
+# -- 13. free GICS sector candidate stays fail-closed ------------------------
+
+
+def test_free_gics_sector_candidate_is_not_described_as_admitted() -> None:
+    governed = (
+        REPO_ROOT / "packages/py/market-data-core/src/trading_market_data_core/dataset_v1_wikipedia_pit.py",
+        MATRIX,
+        REPO_ROOT / "docs/status/PIT_DATASET_QUALIFICATION.md",
+        REPO_ROOT / "docs/roadmaps/MVP_DELIVERY_PLAN.md",
+    )
+    stale_phrases = (
+        "now empirically admitted as SECONDARY_RESEARCH_PIT / APPROXIMATE",
+        "sector-only path is now empirically admitted",
+        "empirically verified for 2023-12-31",
+    )
+    for doc in governed:
+        text = doc.read_text(encoding="utf-8")
+        for phrase in stale_phrases:
+            assert phrase not in text, f"{doc.name} still contains stale GICS admission claim"
+
+
+def test_free_gics_sector_candidate_records_the_failed_coverage_gate() -> None:
+    source = (
+        REPO_ROOT
+        / "packages/py/market-data-core/src/trading_market_data_core/dataset_v1_wikipedia_pit.py"
+    ).read_text(encoding="utf-8")
+    assert "NOT_ADMITTED" in source
+    assert "417/503" in source
+    assert "82.90%" in source
+    assert "frozen 90% coverage floor" in source
+
+
+def test_superseded_gics_experiment_has_an_explicit_sidecar_marker() -> None:
+    import hashlib
+    import json
+
+    root = EVIDENCE_DIR / "dataset-v1/sec-sector-spdr-gics"
+    marker = json.loads((root / "experiment-2023-12-31.supersession.json").read_text())
+    old = root / "experiment-2023-12-31.json"
+    new = root / "experiment-2023-12-31-recheck-v2.json"
+    checksum = lambda path: "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    assert marker["superseded_status"].startswith("NOT_CANONICAL")
+    assert marker["canonical_outcome"]["status"] == "NOT_ADMITTED"
+    assert marker["canonical_outcome"]["coverage_ratio"] < marker["canonical_outcome"]["coverage_floor"]
+    assert marker["superseded_artifact_checksum"] == checksum(old)
+    assert marker["superseding_artifact_checksum"] == checksum(new)

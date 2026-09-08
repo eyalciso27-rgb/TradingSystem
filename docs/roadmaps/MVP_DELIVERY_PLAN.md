@@ -367,7 +367,7 @@ further autonomous implementation:
    provider (with an ADR, per CLAUDE.md's "no paid provider without owner
    approval"), or an owner decision to accept this as a permanent official-
    evidence gap and scope the strategy's GICS sector-concentration rule
-   accordingly. **A free bounded `SECONDARY_RESEARCH_PIT` alternative was evaluated for GICS Sector research but is NOT_ADMITTED after conservative identity recheck**: the 2023-12-31 MediaWiki revision was cross-checked against all 11 Select Sector SPDR SEC N-PORT-P filings, with 417/503 coverage and 417/417 covered-sector agreement; the conservative recheck is NOT_ADMITTED because coverage is below the 90% floor. It is `BacktestQuality.APPROXIMATE` only; GICS Sub-Industry and official/PIT_STRICT historical company-level GICS remain licensed/deferred.
+   accordingly. **A free bounded `SECONDARY_RESEARCH_PIT` candidate was evaluated for GICS Sector research but is NOT_ADMITTED after conservative identity recheck**: the 2023-12-31 MediaWiki revision was cross-checked against all 11 Select Sector SPDR SEC N-PORT-P filings, with 417/503 coverage and 417/417 covered-sector agreement. Coverage is below the frozen 90% floor, so this candidate confers **no usable `BacktestQuality.APPROXIMATE` GICS Sector evidence**; GICS Sub-Industry and official historical company-level GICS remain licensed/deferred.
 3. **Survivorship-free delisted-name daily OHLCV.** IBKR does not price
    delisted names historically; no free source has been established (see
    `docs/status/PIT_DATASET_QUALIFICATION.md` §2/§4, blocker N-02/N-03 in

@@ -96,7 +96,7 @@ qualification (`docs/poi/IBKR-HISTORICAL-QUALIFICATION-RUNBOOK.md`) and records
 | Head-timestamp / history depth | pending empirical | n/a | n/a | verify per run |
 | BID/ASK/MIDPOINT bars | pending empirical (entitlement-dependent) | no | no | soft (fallback allowed) |
 | Corporate actions (effective-dated) | partial (adjusted bars) | adjusted only | no clean export | **GAP** |
-| GICS sector, as-of history | no | no | almost certainly no | **STRICT GAP remains** — free `SECONDARY_RESEARCH_PIT / APPROXIMATE` sector path empirically verified for 2023-12-31 (417/503 coverage (82.90%), below the frozen 90% admission floor; 100% agreement among covered tickers); official/PIT_STRICT GICS still licensed |
+| GICS sector, as-of history | no | no | almost certainly no | **GAP remains** — the free `SECONDARY_RESEARCH_PIT` sector candidate was evaluated for 2023-12-31 and is **NOT_ADMITTED**: 417/503 coverage (82.90%) is below the frozen 90% admission floor, despite 100% agreement among covered tickers; it confers no usable `BacktestQuality.APPROXIMATE` GICS Sector evidence, and official historical GICS remains licensed |
 | PIT S&P 500 membership | no | no | no | **GAP** |
 | Stable identifiers | conId (pending empirical) | no | no | partial |
 | Commission schedule | owner Account Management (not API) | n/a | n/a | owner reads report |
