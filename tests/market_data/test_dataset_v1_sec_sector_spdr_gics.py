@@ -128,6 +128,9 @@ _NPORT_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
     <invstOrSecs>
       <invstOrSec>
         <name>Example Common Stock Inc</name>
+        <lei>549300EXAMPLELEI0001</lei>
+        <cusip>123456789</cusip>
+        <identifiers><isin value="US1234567890" /></identifiers>
         <assetCat>EC</assetCat>
       </invstOrSec>
       <invstOrSec>
@@ -166,6 +169,9 @@ def test_parse_nport_primary_doc_extracts_filing_and_ec_only_holdings() -> None:
     assert len(holdings) == 1
     assert holdings[0].issuer_name == "Example Common Stock Inc"
     assert holdings[0].asset_category == "EC"
+    assert holdings[0].cusip == "123456789"
+    assert holdings[0].isin == "US1234567890"
+    assert holdings[0].lei == "549300EXAMPLELEI0001"
 
 
 def test_parse_nport_primary_doc_fails_closed_on_missing_fields() -> None:

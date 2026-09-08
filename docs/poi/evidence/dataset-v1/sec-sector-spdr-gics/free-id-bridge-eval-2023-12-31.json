@@ -1,0 +1,166 @@
+{
+  "admission": {
+    "canonical_sector_result_unchanged": "417/503 (82.90%)",
+    "coverage_floor_unchanged": 0.9,
+    "official_licensed_gics_gap": "DEFERRED_BLOCKED_EXTERNAL",
+    "reason": "stable identifiers are present, but no evaluated legitimate free dated source closes identifier-to-ticker identity without guessing or current-value back-projection",
+    "status": "NOT_ADMITTED"
+  },
+  "artifact_type": "FREE_STABLE_IDENTIFIER_BRIDGE_EVALUATION",
+  "bridge_result": "NO_FREE_ID_BRIDGE_FOUND",
+  "evaluated_free_bridges": [
+    {
+      "authority": "U.S. Securities and Exchange Commission",
+      "date_semantics": "quarterly lists are dated and can be selected without look-ahead",
+      "fields_relevant_to_bridge": [
+        "CUSIP",
+        "issuer name",
+        "issuer description"
+      ],
+      "result": "NO_TICKER_FIELD; does not advance legal-name matching to a dated Wikipedia ticker",
+      "source": "SEC Official List of Section 13(f) Securities",
+      "url": "https://www.sec.gov/rules-regulations/staff-guidance/official-list-section-13f-securities"
+    },
+    {
+      "authority": "U.S. Securities and Exchange Commission",
+      "date_semantics": "published current company/ticker dataset; no effective-dated 2023-12-31 symbol validity is asserted",
+      "fields_relevant_to_bridge": [
+        "CIK",
+        "ticker",
+        "company title"
+      ],
+      "result": "NO_CUSIP_ISIN_LEI_KEY and no historical-validity binding; unsafe for this PIT bridge",
+      "source": "SEC Company Tickers",
+      "url": "https://www.sec.gov/file/company-tickers"
+    },
+    {
+      "authority": "Global Legal Entity Identifier Foundation / ANNA certified mapping",
+      "date_semantics": "daily open relationship files exist, but map ISIN to LEI rather than to exchange ticker",
+      "fields_relevant_to_bridge": [
+        "ISIN",
+        "LEI"
+      ],
+      "result": "IDENTIFIER_TO_IDENTIFIER_ONLY; no dated ticker link to the Wikipedia constituent key",
+      "source": "GLEIF ISIN-to-LEI relationship data",
+      "url": "https://www.gleif.org/en/lei-data/lei-mapping"
+    }
+  ],
+  "identifier_inventory": {
+    "cusip": {
+      "coverage_ratio": 1.0,
+      "present": 503,
+      "total": 503,
+      "unique_values": 479
+    },
+    "equity_common_holdings": 503,
+    "isin": {
+      "coverage_ratio": 1.0,
+      "present": 503,
+      "total": 503,
+      "unique_values": 503
+    },
+    "lei": {
+      "coverage_ratio": 1.0,
+      "present": 503,
+      "total": 503,
+      "unique_values": 483
+    }
+  },
+  "input_canonical_sector_result": {
+    "agreement_total": 417,
+    "agreements": 417,
+    "coverage_floor": 0.9,
+    "coverage_ratio": 0.8290258449304175,
+    "covered": 417,
+    "status": "NOT_ADMITTED",
+    "total": 503
+  },
+  "performed_at": "2026-09-08T21:58:28.082230+00:00",
+  "requested_as_of": "2023-12-31",
+  "retained_sec_artifacts": [
+    {
+      "accession_number": "0001752724-24-043179",
+      "equity_common_holdings": 22,
+      "path": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/2023-12-31/Communication_Services-0001752724-24-043179.xml",
+      "report_period_date": "2023-12-31",
+      "sha256": "sha256:b321dc0ed672c55ee2ee49ac3f6a76247ed0b1e3b5039c36f3fa04fd7379386b"
+    },
+    {
+      "accession_number": "0001752724-24-043158",
+      "equity_common_holdings": 53,
+      "path": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/2023-12-31/Consumer_Discretionary-0001752724-24-043158.xml",
+      "report_period_date": "2023-12-31",
+      "sha256": "sha256:c8df9dd576372f7376fdcf304d90c4a8b1d4dc583e190e061e1729975f729677"
+    },
+    {
+      "accession_number": "0001752724-24-043245",
+      "equity_common_holdings": 38,
+      "path": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/2023-12-31/Consumer_Staples-0001752724-24-043245.xml",
+      "report_period_date": "2023-12-31",
+      "sha256": "sha256:9979c0c74a1dd284c076ca319c5a084293a40c39d96e05914a6221d3ff76d396"
+    },
+    {
+      "accession_number": "0001752724-24-043191",
+      "equity_common_holdings": 23,
+      "path": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/2023-12-31/Energy-0001752724-24-043191.xml",
+      "report_period_date": "2023-12-31",
+      "sha256": "sha256:426ad1d840e1afdc1ee0b39369484323df8359baa8b3323e3bbb2c628169085f"
+    },
+    {
+      "accession_number": "0001752724-24-043193",
+      "equity_common_holdings": 72,
+      "path": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/2023-12-31/Financials-0001752724-24-043193.xml",
+      "report_period_date": "2023-12-31",
+      "sha256": "sha256:7e41dc441a36c8d8863844337e602e198f6455fdd7015cd0ca95729948090f98"
+    },
+    {
+      "accession_number": "0001752724-24-043163",
+      "equity_common_holdings": 64,
+      "path": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/2023-12-31/Health_Care-0001752724-24-043163.xml",
+      "report_period_date": "2023-12-31",
+      "sha256": "sha256:7983a4055614fca238887d9671ecaab9469cade0432fee76070d96dbc86570d6"
+    },
+    {
+      "accession_number": "0001752724-24-043184",
+      "equity_common_holdings": 78,
+      "path": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/2023-12-31/Industrials-0001752724-24-043184.xml",
+      "report_period_date": "2023-12-31",
+      "sha256": "sha256:304ce64b432e92daba1c108778031a2c8d18e913a8066a88815bfecb8ccb910a"
+    },
+    {
+      "accession_number": "0001752724-24-043154",
+      "equity_common_holdings": 64,
+      "path": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/2023-12-31/Information_Technology-0001752724-24-043154.xml",
+      "report_period_date": "2023-12-31",
+      "sha256": "sha256:906f51a52d6be9374f546462946ce7fd5b08c0b9f197856de1c65efbd94ed147"
+    },
+    {
+      "accession_number": "0001752724-24-043278",
+      "equity_common_holdings": 28,
+      "path": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/2023-12-31/Materials-0001752724-24-043278.xml",
+      "report_period_date": "2023-12-31",
+      "sha256": "sha256:10424e49f3a0b805f4ac3a4a56b2c29c52131f7f1364322635a45b15fbcca187"
+    },
+    {
+      "accession_number": "0001752724-24-043236",
+      "equity_common_holdings": 31,
+      "path": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/2023-12-31/Real_Estate-0001752724-24-043236.xml",
+      "report_period_date": "2023-12-31",
+      "sha256": "sha256:2a4feb8a2be903cc135df144dfc2c6d0c7472ce6862b5fc74126bb7ceb252c2d"
+    },
+    {
+      "accession_number": "0001752724-24-043224",
+      "equity_common_holdings": 30,
+      "path": "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/2023-12-31/Utilities-0001752724-24-043224.xml",
+      "report_period_date": "2023-12-31",
+      "sha256": "sha256:3ac38ac6b511b17889d2db41803538ab0688d33b1796b8cd8ce56381ac6a9496"
+    }
+  ],
+  "safety": {
+    "company_alias_table": false,
+    "guessed_mappings": 0,
+    "live_enabled": false,
+    "paper_auto_enabled": false
+  },
+  "schema_version": "dataset-v1-sec-sector-free-id-bridge-eval-1.0.0"
+}

@@ -258,10 +258,17 @@ def normalize_company_name(name: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class SectorSpdrHolding:
-    """One equity-common holding line from one fund's N-PORT-P filing."""
+    """One equity-common holding line from one fund's N-PORT-P filing.
+
+    Stable identifiers are captured exactly as reported by the filing. Missing
+    identifiers remain ``None``; they are never inferred from names.
+    """
 
     issuer_name: str
     asset_category: str
+    cusip: str | None = None
+    isin: str | None = None
+    lei: str | None = None
 
     def __post_init__(self) -> None:
         if not self.issuer_name.strip():
@@ -375,7 +382,27 @@ def parse_nport_primary_doc(
         )
         if asset_category != _EQUITY_COMMON_ASSET_CATEGORY:
             continue  # cash sweeps / repos / derivatives carry no GICS sector membership
-        holdings.append(SectorSpdrHolding(issuer_name=issuer_name, asset_category=asset_category))
+        cusip_element = element.find(f"{{{_NPORT_NAMESPACE}}}cusip")
+        lei_element = element.find(f"{{{_NPORT_NAMESPACE}}}lei")
+        identifiers_element = element.find(f"{{{_NPORT_NAMESPACE}}}identifiers")
+        isin_element = (
+            identifiers_element.find(f"{{{_NPORT_NAMESPACE}}}isin")
+            if identifiers_element is not None
+            else None
+        )
+        holdings.append(
+            SectorSpdrHolding(
+                issuer_name=issuer_name,
+                asset_category=asset_category,
+                cusip=(cusip_element.text or "").strip() if cusip_element is not None else None,
+                isin=(
+                    (isin_element.get("value") or "").strip()
+                    if isin_element is not None
+                    else None
+                ),
+                lei=(lei_element.text or "").strip() if lei_element is not None else None,
+            )
+        )
 
     filing = SectorSpdrFilingRef(
         cik=cik,

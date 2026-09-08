@@ -273,6 +273,14 @@ coverage- and anomaly-aware; unresolved or conflicting identities stay uncovered
 The captured Wikipedia GICS values therefore remain unadmitted research data,
 not corroborated SECONDARY evidence.
 
+A follow-up stable-identifier feasibility pass inventoried the retained SEC
+N-PORT holdings and found CUSIP, ISIN and LEI on all 503 equity-common rows.
+That completeness does not itself solve identity: the evaluated free public
+bridges do not provide a dated identifier-to-Wikipedia-ticker chain without
+guessing/current back-projection. The bounded result is therefore
+`NO_FREE_ID_BRIDGE_FOUND / NOT_ADMITTED`; the 417/503 canonical coverage and
+90% floor remain unchanged.
+
 **Conclusion, stated precisely so it cannot be over-read:** this closes the
 "is there a free path at all" question with **yes, for MEMBERSHIP, for
 APPROXIMATE-quality research** (ADR-0017 `BacktestQuality.APPROXIMATE`),
