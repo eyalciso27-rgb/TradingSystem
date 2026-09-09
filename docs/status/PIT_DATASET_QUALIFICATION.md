@@ -75,6 +75,20 @@
 > `docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/experiment-2023-12-31-recheck-v2.json`.
 > The earlier `experiment-2023-12-31.json` is retained as immutable historical
 > evidence but is superseded and must not be used as the canonical conclusion.
+>
+> **2026-09-09 free stable-identifier bridge follow-up.** The retained N-PORT
+> holdings were inventoried without inference and SEC null sentinels were treated
+> as absent: CUSIP is present on 478/503 rows (95.03%), ISIN on 503/503
+> (100%), and LEI on 485/503 (96.42%). The N-PORT `<identifiers>` block was
+> also checked explicitly: no equity-common holding contains `<ticker>` or
+> `<other>` in the retained filings. Free public bridge candidates were then evaluated
+> fail-closed. SEC's dated 13F security lists provide CUSIP plus issuer name but
+> no ticker; SEC Company Tickers provides ticker/CIK but no CUSIP/ISIN/LEI and
+> does not establish 2023-12-31 symbol validity; GLEIF/ANNA provides free
+> ISIN-to-LEI mappings but no dated exchange ticker. Therefore the bounded
+> result is `NO_FREE_ID_BRIDGE_FOUND / NOT_ADMITTED`; the canonical 417/503
+> (82.90%) outcome and frozen 90% floor are unchanged. Evidence:
+> `docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/free-id-bridge-eval-2023-12-31.json`.
 
 ## 1. Sourcing principle (owner correction #1)
 The remaining reference-data gaps do **not** have to be bought from one bundled

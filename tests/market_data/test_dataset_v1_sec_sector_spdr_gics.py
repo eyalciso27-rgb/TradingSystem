@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -96,14 +97,12 @@ def test_normalize_company_name_drops_parenthetical_share_class_annotations() ->
     )
 
 
-
-
 def test_normalize_company_name_keeps_interior_identity_words() -> None:
     assert (
-        normalize_company_name("American International Group Inc")
-        == "AMERICANINTERNATIONALGROUP"
+        normalize_company_name("American International Group Inc") == "AMERICANINTERNATIONALGROUP"
     )
     assert normalize_company_name("American Express Co") == "AMERICANEXPRESS"
+
 
 def test_normalize_company_name_fails_closed_on_empty_input() -> None:
     with pytest.raises(SourceAdapterError, match="empty"):
@@ -128,6 +127,9 @@ _NPORT_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
     <invstOrSecs>
       <invstOrSec>
         <name>Example Common Stock Inc</name>
+        <lei>549300EXAMPLELEI0001</lei>
+        <cusip>123456789</cusip>
+        <identifiers><isin value="US1234567890" /></identifiers>
         <assetCat>EC</assetCat>
       </invstOrSec>
       <invstOrSec>
@@ -166,6 +168,9 @@ def test_parse_nport_primary_doc_extracts_filing_and_ec_only_holdings() -> None:
     assert len(holdings) == 1
     assert holdings[0].issuer_name == "Example Common Stock Inc"
     assert holdings[0].asset_category == "EC"
+    assert holdings[0].cusip == "123456789"
+    assert holdings[0].isin == "US1234567890"
+    assert holdings[0].lei == "549300EXAMPLELEI0001"
 
 
 def test_parse_nport_primary_doc_fails_closed_on_missing_fields() -> None:
@@ -694,8 +699,7 @@ def test_end_to_end_sufficient_coverage_but_disagreement_is_not_corroborated() -
 def test_recorded_real_sector_experiment_is_self_authenticating() -> None:
     repo = Path(__file__).resolve().parents[2]
     evidence_path = (
-        repo
-        / "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/"
+        repo / "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/"
         "experiment-2023-12-31-recheck-v2.json"
     )
     payload = json.loads(evidence_path.read_text(encoding="utf-8"))
@@ -719,3 +723,35 @@ def test_recorded_real_sector_experiment_is_self_authenticating() -> None:
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     assert expected == "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def test_free_id_bridge_evidence_is_self_authenticating_and_current() -> None:
+    repo = Path(__file__).resolve().parents[2]
+    evidence_path = (
+        repo / "docs/poi/evidence/dataset-v1/sec-sector-spdr-gics/"
+        "free-id-bridge-eval-2023-12-31.json"
+    )
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    inventory = payload["identifier_inventory"]
+    assert inventory["cusip"]["present"] == 478
+    assert inventory["isin"]["present"] == 503
+    assert inventory["lei"]["present"] == 485
+    assert inventory["ticker"]["present"] == 0
+    assert inventory["other"]["present"] == 0
+    assert payload["bridge_result"] == "NO_FREE_ID_BRIDGE_FOUND"
+    assert payload["admission"]["status"] == "NOT_ADMITTED"
+
+    expected = payload.pop("evidence_checksum")
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    assert expected == "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+    check = subprocess.run(
+        ["uv", "run", "python", "scripts/evaluate_sec_sector_spdr_free_id_bridge.py", "--check"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check.returncode == 0, check.stderr or check.stdout
