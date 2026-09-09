@@ -43,8 +43,10 @@ seam.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
@@ -68,6 +70,11 @@ from trading_application.baseline_strategy import (
 )
 from trading_application.decision_engine import DecisionEngine, EngineDecision
 from trading_application.emergency import HaltRecord
+from trading_application.execution_identity import (
+    allocation_identity,
+    decision_identity,
+    risk_result_identity,
+)
 from trading_application.execution_plan import ExecutablePlan
 from trading_application.mvp_policy_config import MvpPolicyConfig
 from trading_application.mvp_safety_gates import (
@@ -94,6 +101,7 @@ from trading_application.pre_submit_check import (
     FinalPreSubmitCheck,
     PreSubmitAction,
     PreSubmitCheckResult,
+    PreSubmitEvaluation,
     PreSubmitRequest,
     RefreshedAccount,
     RefreshedMarket,
@@ -130,6 +138,9 @@ class MvpResult(StrEnum):
     NO_NEW_ENTRY = "NO_NEW_ENTRY"
     #: Approved (possibly reduced) into a sealed canonical execution intent.
     EXECUTION_INTENT = "EXECUTION_INTENT"
+    #: Evaluate-only terminal: lineage is sealed, but no executable plan or
+    #: SubmitAuthorization exists.
+    READ_ONLY_INTENT = "READ_ONLY_INTENT"
 
 
 class MvpStage(StrEnum):
@@ -148,6 +159,9 @@ class MvpStage(StrEnum):
     ALLOCATION = "ALLOCATION"
     PRE_SUBMIT = "PRE_SUBMIT"
     EXECUTION_INTENT = "EXECUTION_INTENT"
+    #: Evaluate-only terminal: lineage is sealed, but no executable plan or
+    #: SubmitAuthorization exists.
+    READ_ONLY_INTENT = "READ_ONLY_INTENT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +240,62 @@ class MvpExecutionInputs:
 
 
 @dataclass(frozen=True, slots=True)
+class MvpReadOnlySeal:
+    """Content-addressed lineage for an evaluate-only candidate.
+
+    This is deliberately NOT an ExecutablePlan and carries no submit
+    authorization. It proves exactly which frozen strategy/input snapshot,
+    decision, risk result and allocation reached the evaluate-only gate.
+    """
+
+    seal_ref: str
+    strategy_id: str
+    strategy_version: str
+    strategy_fingerprint: str
+    input_snapshot_ref: str
+    decision_ref: str
+    risk_ref: str
+    allocation_ref: str
+    evaluated_quantity: Decimal
+    as_of: datetime
+
+
+def _content_ref(namespace: str, payload: object) -> str:
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str
+    )
+    digest = hashlib.sha256(canonical.encode("ascii")).hexdigest()
+    return f"{namespace}:sha256:{digest}"
+
+
+def _input_snapshot_ref(
+    *,
+    instrument_id: UUID,
+    bars: BarSeries,
+    candidate: MvpCandidateFacts,
+    universe: UniverseFacts,
+    account: MvpAccountSnapshot,
+    execution: MvpExecutionInputs,
+    as_of: datetime,
+) -> str:
+    """Bind every evaluate-only fact consumed by the policy to one identity."""
+    return _content_ref(
+        "mvp-input-snapshot",
+        {
+            "instrument_id": str(instrument_id),
+            "bars": asdict(bars),
+            "candidate": asdict(candidate),
+            "universe": asdict(universe),
+            "account": asdict(account),
+            "refreshed_market": asdict(execution.refreshed_market),
+            "refreshed_account": asdict(execution.refreshed_account),
+            "approval": asdict(execution.approval),
+            "as_of": as_of,
+        },
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class MvpPolicyOutcome:
     """The full, deterministic result of one MVP evaluation."""
 
@@ -240,6 +310,8 @@ class MvpPolicyOutcome:
     risk_result: RiskResult | None = None
     allocation: CandidateAllocation | None = None
     pre_submit: PreSubmitCheckResult | None = None
+    pre_submit_evaluation: PreSubmitEvaluation | None = None
+    read_only_seal: MvpReadOnlySeal | None = None
     executable_plan: ExecutablePlan | None = None
     engine_version: str = MVP_POLICY_ENGINE_VERSION
 
@@ -311,6 +383,69 @@ class MvpTradingPolicy:
         calendar: TradingCalendar | None = None,
         active_halts: Sequence[HaltRecord] = (),
     ) -> MvpPolicyOutcome:
+        """Canonical production-oriented policy evaluation (no broker call)."""
+        return self._evaluate(
+            instrument_id,
+            bars=bars,
+            candidate=candidate,
+            universe=universe,
+            account=account,
+            held_positions=held_positions,
+            system_records=system_records,
+            execution=execution,
+            as_of=as_of,
+            calendar=calendar,
+            active_halts=active_halts,
+            read_only=False,
+        )
+
+    def evaluate_read_only(
+        self,
+        instrument_id: UUID,
+        *,
+        bars: BarSeries,
+        candidate: MvpCandidateFacts,
+        universe: UniverseFacts,
+        account: MvpAccountSnapshot,
+        held_positions: Sequence[BrokerHeldPosition],
+        system_records: Sequence[SystemPositionRecord],
+        execution: MvpExecutionInputs,
+        as_of: datetime,
+        calendar: TradingCalendar | None = None,
+        active_halts: Sequence[HaltRecord] = (),
+    ) -> MvpPolicyOutcome:
+        """Dependency-safe M7 preflight: full evaluate path, zero submit authority."""
+        return self._evaluate(
+            instrument_id,
+            bars=bars,
+            candidate=candidate,
+            universe=universe,
+            account=account,
+            held_positions=held_positions,
+            system_records=system_records,
+            execution=execution,
+            as_of=as_of,
+            calendar=calendar,
+            active_halts=active_halts,
+            read_only=True,
+        )
+
+    def _evaluate(
+        self,
+        instrument_id: UUID,
+        *,
+        bars: BarSeries,
+        candidate: MvpCandidateFacts,
+        universe: UniverseFacts,
+        account: MvpAccountSnapshot,
+        held_positions: Sequence[BrokerHeldPosition],
+        system_records: Sequence[SystemPositionRecord],
+        execution: MvpExecutionInputs,
+        as_of: datetime,
+        calendar: TradingCalendar | None = None,
+        active_halts: Sequence[HaltRecord] = (),
+        read_only: bool,
+    ) -> MvpPolicyOutcome:
         if as_of.tzinfo is None:
             raise MvpTradingPolicyError("as_of must be timezone-aware")
 
@@ -321,9 +456,7 @@ class MvpTradingPolicy:
         # unknown session: the strategy requires an authoritative REGULAR
         # session and treats None as SESSION_UNKNOWN).
         session = calendar.session_status(as_of) if calendar is not None else None
-        evaluation = self._strategy.evaluate(
-            instrument_id, bars=bars, as_of=as_of, session=session
-        )
+        evaluation = self._strategy.evaluate(instrument_id, bars=bars, as_of=as_of, session=session)
 
         # -- 2. canonical decision path (NO TRADE is routed, never dropped) ---
         assessment_ref = f"assessment:{evaluation.candidate_id}:{TECHNICAL_BREAKOUT_KEY}"
@@ -367,9 +500,7 @@ class MvpTradingPolicy:
         signal = evaluation.signal
 
         # -- 3. UNIVERSE eligibility (S&P membership, ADV20, price, spread) ----
-        eligibility = evaluate_universe_eligibility(
-            universe, config.universe_policy, as_of=as_of
-        )
+        eligibility = evaluate_universe_eligibility(universe, config.universe_policy, as_of=as_of)
         if not eligibility.eligible:
             return MvpPolicyOutcome(
                 result=MvpResult.NO_NEW_ENTRY,
@@ -610,6 +741,80 @@ class MvpTradingPolicy:
             broker_exchange=execution.broker_exchange,
             broker_currency=execution.broker_currency,
         )
+        if read_only:
+            evaluation_only = self._pre_submit.evaluate_only(
+                pre_submit_request,
+                execution.refreshed_market,
+                execution.refreshed_account,
+                execution.approval,
+                ExecutionContext(
+                    active_halts=tuple(active_halts),
+                    broker_healthy=execution.broker_healthy,
+                    reconciliation_required=execution.reconciliation_required,
+                ),
+                as_of=as_of,
+            )
+            if evaluation_only.action in (PreSubmitAction.ALLOW, PreSubmitAction.RESIZE):
+                snapshot_ref = _input_snapshot_ref(
+                    instrument_id=instrument_id,
+                    bars=bars,
+                    candidate=candidate,
+                    universe=universe,
+                    account=account,
+                    execution=execution,
+                    as_of=as_of,
+                )
+                lineage = {
+                    "strategy_id": config.strategy_policy.strategy_id,
+                    "strategy_version": config.manifest.version,
+                    "strategy_fingerprint": config.strategy_policy.frozen_fingerprint,
+                    "input_snapshot_ref": snapshot_ref,
+                    "decision_ref": decision_identity(decision),
+                    "risk_ref": risk_result_identity(risk_result),
+                    "allocation_ref": allocation_identity(allocation),
+                    "evaluated_quantity": evaluation_only.evaluated_quantity,
+                    "as_of": as_of,
+                }
+                seal = MvpReadOnlySeal(
+                    seal_ref=_content_ref("mvp-read-only-lineage", lineage),
+                    strategy_id=config.strategy_policy.strategy_id,
+                    strategy_version=config.manifest.version,
+                    strategy_fingerprint=config.strategy_policy.frozen_fingerprint,
+                    input_snapshot_ref=snapshot_ref,
+                    decision_ref=decision_identity(decision),
+                    risk_ref=risk_result_identity(risk_result),
+                    allocation_ref=allocation_identity(allocation),
+                    evaluated_quantity=evaluation_only.evaluated_quantity,
+                    as_of=as_of,
+                )
+                return MvpPolicyOutcome(
+                    result=MvpResult.READ_ONLY_INTENT,
+                    stage=MvpStage.PRE_SUBMIT,
+                    reason_codes=evaluation_only.reason_codes,
+                    strategy_evaluation=evaluation,
+                    classification=classification,
+                    decision=decision,
+                    universe=eligibility,
+                    risk_result=risk_result,
+                    allocation=allocation,
+                    pre_submit_evaluation=evaluation_only,
+                    read_only_seal=seal,
+                    as_of=as_of,
+                )
+            return MvpPolicyOutcome(
+                result=MvpResult.NO_NEW_ENTRY,
+                stage=MvpStage.PRE_SUBMIT,
+                reason_codes=evaluation_only.reason_codes,
+                strategy_evaluation=evaluation,
+                classification=classification,
+                decision=decision,
+                universe=eligibility,
+                risk_result=risk_result,
+                allocation=allocation,
+                pre_submit_evaluation=evaluation_only,
+                as_of=as_of,
+            )
+
         pre_submit = self._pre_submit.check(
             pre_submit_request,
             execution.refreshed_market,
@@ -688,6 +893,7 @@ __all__ = [
     "MvpCandidateFacts",
     "MvpExecutionInputs",
     "MvpPolicyOutcome",
+    "MvpReadOnlySeal",
     "MvpResult",
     "MvpStage",
     "MvpTradingPolicy",

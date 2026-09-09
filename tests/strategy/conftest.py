@@ -149,12 +149,18 @@ def build_series(make_bar: Callable[..., Bar]) -> Callable[..., BarSeries]:
             fresh = last_freshness if (index == len(spec) - 1 and last_freshness) else None
             bars.append(
                 make_bar(
-                    index, close, day_range, freshness=fresh, provider=provider,
+                    index,
+                    close,
+                    day_range,
+                    freshness=fresh,
+                    provider=provider,
                     instrument=instrument,
                 )
             )
         return BarSeries(
-            instrument_id=str(instrument), provider_id=provider, interval="1D",
+            instrument_id=str(instrument),
+            provider_id=provider,
+            interval="1D",
             bars=tuple(bars),
         )
 
@@ -175,6 +181,7 @@ def triggered_series(build_series: Callable[..., BarSeries]) -> BarSeries:
 @pytest.fixture
 def as_of_after() -> Callable[[BarSeries], datetime]:
     """A minute after the last completed bar (for standalone strategy tests)."""
+
     def _as_of(series: BarSeries) -> datetime:
         return series.bars[-1].observed_at + timedelta(minutes=1)
 
@@ -184,6 +191,7 @@ def as_of_after() -> Callable[[BarSeries], datetime]:
 @pytest.fixture
 def at_trading_day() -> Callable[[int, time], datetime]:
     """An exchange-local time on the Nth trading day (for entry-timing tests)."""
+
     def _at_day(day_index: int, at_time: time) -> datetime:
         return _at(TRADING_DAYS[day_index], at_time)
 
@@ -193,6 +201,7 @@ def at_trading_day() -> Callable[[int, time], datetime]:
 @pytest.fixture
 def next_rth_as_of() -> Callable[[BarSeries], datetime]:
     """10:00 ET on the NEXT trading day after the last bar (a valid RTH entry)."""
+
     def _as_of(series: BarSeries) -> datetime:
         next_day = TRADING_DAYS[len(series.bars)]
         return _at(next_day, time(10, 0))
@@ -261,6 +270,7 @@ def execution_inputs() -> Callable[..., MvpExecutionInputs]:
         as_of: datetime,
         environment: Environment = Environment.PAPER,
         market_price: Decimal | None = None,
+        market_observed_at: datetime | None = None,
         approved: bool = True,
         broker_healthy: bool = True,
         reconciliation_required: bool = False,
@@ -277,7 +287,7 @@ def execution_inputs() -> Callable[..., MvpExecutionInputs]:
             broker_currency="USD",
             refreshed_market=RefreshedMarket(
                 price=market_price if market_price is not None else entry_price,
-                observed_at=as_of,
+                observed_at=market_observed_at if market_observed_at is not None else as_of,
             ),
             refreshed_account=RefreshedAccount(
                 risk_budget_equity=Decimal(1_000_000), observed_at=as_of
@@ -313,9 +323,11 @@ def run_policy(
         system_records: object = (),
         environment: Environment = Environment.PAPER,
         market_price: Decimal | None = None,
+        market_observed_at: datetime | None = None,
         approved: bool = True,
         broker_healthy: bool = True,
         reconciliation_required: bool = False,
+        read_only: bool = False,
         active_halts: object = (),
         calendar: TradingCalendar | None = None,
         as_of: datetime | None = None,
@@ -339,11 +351,13 @@ def run_policy(
             as_of=run_as_of,
             environment=environment,
             market_price=market_price,
+            market_observed_at=market_observed_at,
             approved=approved,
             broker_healthy=broker_healthy,
             reconciliation_required=reconciliation_required,
         )
-        return policy.evaluate(
+        evaluate = policy.evaluate_read_only if read_only else policy.evaluate
+        return evaluate(
             instrument_id,
             bars=series,
             candidate=candidate if candidate is not None else candidate_facts,
