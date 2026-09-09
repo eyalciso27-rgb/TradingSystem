@@ -275,10 +275,30 @@ def _input_snapshot_ref(
     candidate: MvpCandidateFacts,
     universe: UniverseFacts,
     account: MvpAccountSnapshot,
+    held_positions: Sequence[BrokerHeldPosition],
+    system_records: Sequence[SystemPositionRecord],
     execution: MvpExecutionInputs,
+    pre_submit_request: PreSubmitRequest,
+    execution_context: ExecutionContext,
+    calendar: TradingCalendar | None,
     as_of: datetime,
 ) -> str:
     """Bind every evaluate-only fact consumed by the policy to one identity."""
+    calendar_snapshot = (
+        None
+        if calendar is None
+        else {
+            "calendar_id": calendar.calendar_id,
+            "timezone": calendar.timezone,
+            "sessions": asdict(calendar.sessions),
+            "holidays": sorted(day.isoformat() for day in calendar.holidays),
+            "half_days": sorted(day.isoformat() for day in calendar.half_days),
+            "weekend": sorted(calendar.weekend),
+            "halts": tuple(
+                (start.isoformat(), end.isoformat()) for start, end in calendar.halts
+            ),
+        }
+    )
     return _content_ref(
         "mvp-input-snapshot",
         {
@@ -287,9 +307,14 @@ def _input_snapshot_ref(
             "candidate": asdict(candidate),
             "universe": asdict(universe),
             "account": asdict(account),
+            "held_positions": tuple(asdict(position) for position in held_positions),
+            "system_records": tuple(asdict(record) for record in system_records),
+            "calendar": calendar_snapshot,
+            "pre_submit_request": asdict(pre_submit_request),
             "refreshed_market": asdict(execution.refreshed_market),
             "refreshed_account": asdict(execution.refreshed_account),
             "approval": asdict(execution.approval),
+            "execution_context": asdict(execution_context),
             "as_of": as_of,
         },
     )
@@ -741,17 +766,18 @@ class MvpTradingPolicy:
             broker_exchange=execution.broker_exchange,
             broker_currency=execution.broker_currency,
         )
+        execution_context = ExecutionContext(
+            active_halts=tuple(active_halts),
+            broker_healthy=execution.broker_healthy,
+            reconciliation_required=execution.reconciliation_required,
+        )
         if read_only:
             evaluation_only = self._pre_submit.evaluate_only(
                 pre_submit_request,
                 execution.refreshed_market,
                 execution.refreshed_account,
                 execution.approval,
-                ExecutionContext(
-                    active_halts=tuple(active_halts),
-                    broker_healthy=execution.broker_healthy,
-                    reconciliation_required=execution.reconciliation_required,
-                ),
+                execution_context,
                 as_of=as_of,
             )
             if evaluation_only.action in (PreSubmitAction.ALLOW, PreSubmitAction.RESIZE):
@@ -761,7 +787,12 @@ class MvpTradingPolicy:
                     candidate=candidate,
                     universe=universe,
                     account=account,
+                    held_positions=held_positions,
+                    system_records=system_records,
                     execution=execution,
+                    pre_submit_request=pre_submit_request,
+                    execution_context=execution_context,
+                    calendar=calendar,
                     as_of=as_of,
                 )
                 lineage = {
@@ -789,7 +820,7 @@ class MvpTradingPolicy:
                 )
                 return MvpPolicyOutcome(
                     result=MvpResult.READ_ONLY_INTENT,
-                    stage=MvpStage.PRE_SUBMIT,
+                    stage=MvpStage.READ_ONLY_INTENT,
                     reason_codes=evaluation_only.reason_codes,
                     strategy_evaluation=evaluation,
                     classification=classification,
@@ -820,11 +851,7 @@ class MvpTradingPolicy:
             execution.refreshed_market,
             execution.refreshed_account,
             execution.approval,
-            ExecutionContext(
-                active_halts=tuple(active_halts),
-                broker_healthy=execution.broker_healthy,
-                reconciliation_required=execution.reconciliation_required,
-            ),
+            execution_context,
             as_of=as_of,
         )
         if (

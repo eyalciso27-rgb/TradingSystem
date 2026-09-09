@@ -274,6 +274,7 @@ def execution_inputs() -> Callable[..., MvpExecutionInputs]:
         approved: bool = True,
         broker_healthy: bool = True,
         reconciliation_required: bool = False,
+        client_order_id: str = "mvp-entry-1",
     ) -> MvpExecutionInputs:
         return MvpExecutionInputs(
             environment=environment,
@@ -281,7 +282,7 @@ def execution_inputs() -> Callable[..., MvpExecutionInputs]:
             side="BUY",
             order_type=OrderType.LIMIT,
             time_in_force="DAY",
-            client_order_id="mvp-entry-1",
+            client_order_id=client_order_id,
             broker_instrument_ref="brkr:conid:987654",
             broker_exchange="SMART",
             broker_currency="USD",
@@ -327,6 +328,7 @@ def run_policy(
         approved: bool = True,
         broker_healthy: bool = True,
         reconciliation_required: bool = False,
+        client_order_id: str = "mvp-entry-1",
         read_only: bool = False,
         active_halts: object = (),
         calendar: TradingCalendar | None = None,
@@ -355,6 +357,7 @@ def run_policy(
             approved=approved,
             broker_healthy=broker_healthy,
             reconciliation_required=reconciliation_required,
+            client_order_id=client_order_id,
         )
         evaluate = policy.evaluate_read_only if read_only else policy.evaluate
         return evaluate(

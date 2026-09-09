@@ -611,6 +611,7 @@ def test_read_only_preflight_seals_lineage_without_authorization(
     monkeypatch.setattr(pre_submit_module, "SubmitAuthorization", _ExplodingAuthorization)
     out = run_policy(triggered_series, read_only=True)
     assert out.result is MvpResult.READ_ONLY_INTENT
+    assert out.stage is MvpStage.READ_ONLY_INTENT
     assert out.executable_plan is None
     assert out.pre_submit is None
     assert out.pre_submit_evaluation is not None
@@ -630,6 +631,20 @@ def test_read_only_preflight_is_deterministic(
     first = run_policy(triggered_series, read_only=True)
     second = run_policy(triggered_series, read_only=True)
     assert first.read_only_seal == second.read_only_seal
+
+
+def test_read_only_seal_binds_complete_pre_submit_request(
+    run_policy: RunPolicy, triggered_series: BarSeries
+) -> None:
+    first = run_policy(triggered_series, read_only=True, client_order_id="mvp-entry-1")
+    changed = run_policy(triggered_series, read_only=True, client_order_id="mvp-entry-2")
+
+    assert first.read_only_seal is not None and changed.read_only_seal is not None
+    assert first.read_only_seal.decision_ref == changed.read_only_seal.decision_ref
+    assert first.read_only_seal.risk_ref == changed.read_only_seal.risk_ref
+    assert first.read_only_seal.allocation_ref == changed.read_only_seal.allocation_ref
+    assert first.read_only_seal.input_snapshot_ref != changed.read_only_seal.input_snapshot_ref
+    assert first.read_only_seal.seal_ref != changed.read_only_seal.seal_ref
 
 
 def test_read_only_no_trade_is_terminal_and_has_no_seal(
