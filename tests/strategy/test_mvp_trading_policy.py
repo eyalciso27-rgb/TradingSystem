@@ -13,6 +13,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, time
 from decimal import Decimal
 
+import pytest
 from trading_application.emergency import HaltRecord
 from trading_application.execution_identity import decision_identity, risk_result_identity
 from trading_application.mvp_trading_policy import (
@@ -54,13 +55,21 @@ def _pair(
     cluster: str = "BANK",
 ) -> tuple[BrokerHeldPosition, SystemPositionRecord]:
     held = BrokerHeldPosition(
-        con_id=con_id, symbol=symbol, quantity=Decimal(1),
-        notional=Decimal(notional), observed_at=datetime(2024, 1, 1, tzinfo=UTC),
+        con_id=con_id,
+        symbol=symbol,
+        quantity=Decimal(1),
+        notional=Decimal(notional),
+        observed_at=datetime(2024, 1, 1, tzinfo=UTC),
     )
     record = SystemPositionRecord(
-        con_id=con_id, symbol=symbol, strategy_id="baseline-trend-breakout-v1",
-        source_id="scanner", sector=sector, cluster=cluster,
-        open_risk_amount=Decimal(open_risk), notional=Decimal(notional),
+        con_id=con_id,
+        symbol=symbol,
+        strategy_id="baseline-trend-breakout-v1",
+        source_id="scanner",
+        sector=sector,
+        cluster=cluster,
+        open_risk_amount=Decimal(open_risk),
+        notional=Decimal(notional),
     )
     return held, record
 
@@ -252,9 +261,7 @@ def test_after_close_same_day_is_blocked(
     assert any(r.startswith("SESSION_NOT_RTH") for r in out.reason_codes)
 
 
-def test_next_rth_session_is_eligible(
-    run_policy: RunPolicy, triggered_series: BarSeries
-) -> None:
+def test_next_rth_session_is_eligible(run_policy: RunPolicy, triggered_series: BarSeries) -> None:
     out = run_policy(triggered_series)  # default as_of = next trading day 10:00 ET
     assert out.result is MvpResult.EXECUTION_INTENT
 
@@ -275,8 +282,11 @@ def test_unattributable_position_blocks_entry(
     run_policy: RunPolicy, triggered_series: BarSeries
 ) -> None:
     stray = BrokerHeldPosition(
-        con_id=777, symbol="STRAY", quantity=Decimal(5),
-        notional=Decimal(5000), observed_at=datetime(2024, 1, 1, tzinfo=UTC),
+        con_id=777,
+        symbol="STRAY",
+        quantity=Decimal(5),
+        notional=Decimal(5000),
+        observed_at=datetime(2024, 1, 1, tzinfo=UTC),
     )
     out = run_policy(triggered_series, held_positions=(stray,), system_records=())
     assert out.result is MvpResult.NO_NEW_ENTRY
@@ -354,9 +364,7 @@ def test_three_positions_in_other_sector_do_not_affect_candidate(
     assert out.result is MvpResult.EXECUTION_INTENT
 
 
-def test_sector_planned_risk_cap_blocks(
-    run_policy: RunPolicy, triggered_series: BarSeries
-) -> None:
+def test_sector_planned_risk_cap_blocks(run_policy: RunPolicy, triggered_series: BarSeries) -> None:
     # Existing same-sector risk (aggregating clusters) close to 0.75% of 1M
     # (=7500); the candidate's ~2500 approved risk pushes it over.
     h1, r1 = _pair(730, "IT_A", sector=CANDIDATE_SECTOR, cluster="CL_A", open_risk="3000")
@@ -369,7 +377,9 @@ def test_sector_planned_risk_cap_blocks(
 
 # -- B2: P&L usable only with PNL_OK -------------------------------------------
 def test_finite_pnl_without_status_blocks(
-    run_policy: RunPolicy, triggered_series: BarSeries, account_ok: AccountF,
+    run_policy: RunPolicy,
+    triggered_series: BarSeries,
+    account_ok: AccountF,
     next_rth_as_of: AsOf,
 ) -> None:
     account = account_ok(next_rth_as_of(triggered_series), session_pnl_status=None)
@@ -380,7 +390,9 @@ def test_finite_pnl_without_status_blocks(
 
 
 def test_finite_pnl_stale_status_blocks(
-    run_policy: RunPolicy, triggered_series: BarSeries, account_ok: AccountF,
+    run_policy: RunPolicy,
+    triggered_series: BarSeries,
+    account_ok: AccountF,
     next_rth_as_of: AsOf,
 ) -> None:
     account = account_ok(
@@ -392,7 +404,9 @@ def test_finite_pnl_stale_status_blocks(
 
 
 def test_zero_pnl_without_status_blocks(
-    run_policy: RunPolicy, triggered_series: BarSeries, account_ok: AccountF,
+    run_policy: RunPolicy,
+    triggered_series: BarSeries,
+    account_ok: AccountF,
     next_rth_as_of: AsOf,
 ) -> None:
     account = account_ok(
@@ -404,11 +418,14 @@ def test_zero_pnl_without_status_blocks(
 
 
 def test_zero_pnl_with_ok_status_is_valid(
-    run_policy: RunPolicy, triggered_series: BarSeries, account_ok: AccountF,
+    run_policy: RunPolicy,
+    triggered_series: BarSeries,
+    account_ok: AccountF,
     next_rth_as_of: AsOf,
 ) -> None:
     account = account_ok(
-        next_rth_as_of(triggered_series), session_pnl=Decimal("0"),
+        next_rth_as_of(triggered_series),
+        session_pnl=Decimal("0"),
         session_pnl_status=SessionPnlStatus.OK,
     )
     out = run_policy(triggered_series, account=account)
@@ -481,21 +498,23 @@ def test_changing_current_nlv_does_not_move_sod_threshold(
     as_of = next_rth_as_of(triggered_series)
     for nlv in (Decimal(1_000_000), Decimal(5_000_000)):
         account = account_ok(
-            as_of, session_pnl=Decimal("-10000"),
+            as_of,
+            session_pnl=Decimal("-10000"),
             start_of_day_equity=Decimal(1_000_000),
-            broker_net_liquidation_value=nlv, simulation_equity_cap=nlv,
+            broker_net_liquidation_value=nlv,
+            simulation_equity_cap=nlv,
         )
         out = run_policy(triggered_series, account=account)
         assert out.result is MvpResult.EXECUTION_INTENT
 
 
 # -- halts ---------------------------------------------------------------------
-def test_active_entry_halt_blocks(
-    run_policy: RunPolicy, triggered_series: BarSeries
-) -> None:
+def test_active_entry_halt_blocks(run_policy: RunPolicy, triggered_series: BarSeries) -> None:
     halt = HaltRecord(
-        scope=HaltScope.GLOBAL_ENTRY_HALT, environment=Environment.PAPER,
-        target_ref=None, reason_code="TEST_HALT",
+        scope=HaltScope.GLOBAL_ENTRY_HALT,
+        environment=Environment.PAPER,
+        target_ref=None,
+        reason_code="TEST_HALT",
     )
     out = run_policy(triggered_series, active_halts=(halt,))
     assert out.result is MvpResult.NO_NEW_ENTRY
@@ -513,9 +532,7 @@ def test_do_not_chase_price_slippage_cancels(
     assert "PRICE_SLIPPAGE_EXCEEDED" in out.reason_codes
 
 
-def test_broker_unhealthy_cancels(
-    run_policy: RunPolicy, triggered_series: BarSeries
-) -> None:
+def test_broker_unhealthy_cancels(run_policy: RunPolicy, triggered_series: BarSeries) -> None:
     out = run_policy(triggered_series, broker_healthy=False)
     assert out.result is MvpResult.NO_NEW_ENTRY
     assert out.stage is MvpStage.PRE_SUBMIT
@@ -573,11 +590,99 @@ def test_risk_reduces_but_never_increases_quantity(
 
 
 # -- environment safety --------------------------------------------------------
-def test_live_environment_is_refused(
-    run_policy: RunPolicy, triggered_series: BarSeries
-) -> None:
+def test_live_environment_is_refused(run_policy: RunPolicy, triggered_series: BarSeries) -> None:
     try:
         run_policy(triggered_series, environment=Environment.LIVE)
     except MvpTradingPolicyError:
         return
     raise AssertionError("a LIVE environment must be refused")
+
+
+# -- M7 dependency-safe read-only runtime preflight ----------------------------
+def test_read_only_preflight_seals_lineage_without_authorization(
+    run_policy: RunPolicy, triggered_series: BarSeries, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import trading_application.pre_submit_check as pre_submit_module
+
+    class _ExplodingAuthorization:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("read-only preflight must never mint SubmitAuthorization")
+
+    monkeypatch.setattr(pre_submit_module, "SubmitAuthorization", _ExplodingAuthorization)
+    out = run_policy(triggered_series, read_only=True)
+    assert out.result is MvpResult.READ_ONLY_INTENT
+    assert out.stage is MvpStage.READ_ONLY_INTENT
+    assert out.executable_plan is None
+    assert out.pre_submit is None
+    assert out.pre_submit_evaluation is not None
+    assert out.read_only_seal is not None
+    assert out.read_only_seal.strategy_id == "baseline-trend-breakout-v1"
+    assert out.read_only_seal.strategy_fingerprint.startswith("sha256:")
+    assert out.read_only_seal.input_snapshot_ref.startswith("mvp-input-snapshot:sha256:")
+    assert out.read_only_seal.decision_ref.startswith("decision:")
+    assert out.read_only_seal.risk_ref.startswith("risk-result:sha256:")
+    assert out.read_only_seal.allocation_ref.startswith("allocation:")
+    assert out.read_only_seal.seal_ref.startswith("mvp-read-only-lineage:sha256:")
+
+
+def test_read_only_preflight_is_deterministic(
+    run_policy: RunPolicy, triggered_series: BarSeries
+) -> None:
+    first = run_policy(triggered_series, read_only=True)
+    second = run_policy(triggered_series, read_only=True)
+    assert first.read_only_seal == second.read_only_seal
+
+
+def test_read_only_seal_binds_complete_pre_submit_request(
+    run_policy: RunPolicy, triggered_series: BarSeries
+) -> None:
+    first = run_policy(triggered_series, read_only=True, client_order_id="mvp-entry-1")
+    changed = run_policy(triggered_series, read_only=True, client_order_id="mvp-entry-2")
+
+    assert first.read_only_seal is not None and changed.read_only_seal is not None
+    assert first.read_only_seal.decision_ref == changed.read_only_seal.decision_ref
+    assert first.read_only_seal.risk_ref == changed.read_only_seal.risk_ref
+    assert first.read_only_seal.allocation_ref == changed.read_only_seal.allocation_ref
+    assert first.read_only_seal.input_snapshot_ref != changed.read_only_seal.input_snapshot_ref
+    assert first.read_only_seal.seal_ref != changed.read_only_seal.seal_ref
+
+
+def test_read_only_no_trade_is_terminal_and_has_no_seal(
+    run_policy: RunPolicy, build_series: Builder, base_spec: Spec
+) -> None:
+    base_spec[170] = (165.5, 2.2)
+    out = run_policy(build_series(base_spec), read_only=True)
+    assert out.result is MvpResult.NO_TRADE
+    assert out.executable_plan is None
+    assert out.read_only_seal is None
+    assert out.pre_submit_evaluation is None
+
+
+def test_read_only_unknown_inputs_fail_closed(
+    run_policy: RunPolicy, triggered_series: BarSeries, universe_facts: UniverseF
+) -> None:
+    observed = triggered_series.bars[-1].observed_at
+    out = run_policy(
+        triggered_series,
+        read_only=True,
+        universe=universe_facts(observed_at=observed, adv20_usd=None),
+    )
+    assert out.result is MvpResult.NO_NEW_ENTRY
+    assert "ADV20_UNKNOWN" in out.reason_codes
+    assert out.read_only_seal is None
+
+
+def test_read_only_stale_pre_submit_input_fails_closed(
+    run_policy: RunPolicy, triggered_series: BarSeries
+) -> None:
+    from datetime import timedelta
+
+    observed = triggered_series.bars[-1].observed_at
+    out = run_policy(
+        triggered_series,
+        read_only=True,
+        market_observed_at=observed - timedelta(days=2),
+    )
+    assert out.result is MvpResult.NO_NEW_ENTRY
+    assert any("STALE" in reason for reason in out.reason_codes)
+    assert out.read_only_seal is None

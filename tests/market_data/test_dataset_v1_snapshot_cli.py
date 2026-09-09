@@ -70,8 +70,10 @@ def test_exit_code_maps_pass_partial_and_fail() -> None:
     assert partial.result.value == "PARTIAL"
 
 
-def test_gics_reports_not_available_never_pass() -> None:
-    assert ingest_main(["prog", "gics"]) == EXIT_NOT_AVAILABLE
+def test_gics_reports_not_available_never_pass(tmp_path: Path) -> None:
+    assert ingest_main(
+        ["prog", "gics", "--evidence-dir", str(tmp_path)]
+    ) == EXIT_NOT_AVAILABLE
 
 
 def test_missing_sp_manifest_is_not_available_not_a_pass(tmp_path: Path) -> None:
