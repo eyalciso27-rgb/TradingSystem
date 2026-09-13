@@ -68,6 +68,13 @@ select = ["E", "W", "F", "I", "B", "UP"]
 python_version = "3.13"
 strict = true
 files = ["apps", "packages/py", "scripts", "tests"]
+# Keep src-layout workspace members as explicit package bases. Repository
+# scripts are a normal ``scripts.*`` package rooted at the repository itself;
+# adding ``scripts/`` as another package base gives every script a competing
+# top-level identity (for example both ``check_architecture`` and
+# ``scripts.check_architecture``).
+mypy_path = "apps/api/src:apps/core-worker/src:apps/execution-agent/src:apps/scheduler/src:packages/py/application/src:packages/py/broker-core/src:packages/py/broker-ibkr/src:packages/py/config/src:packages/py/contracts/src:packages/py/domain/src:packages/py/event-bus/src:packages/py/market-data-core/src:packages/py/observability/src:packages/py/persistence/src"
+explicit_package_bases = true
 exclude = ["node_modules", "\\.venv", "alembic/"]
 
 [tool.pytest.ini_options]

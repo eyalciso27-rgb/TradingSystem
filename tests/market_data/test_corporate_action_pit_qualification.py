@@ -11,8 +11,8 @@ requirement").
 ``scripts/validate_corporate_action_pit.py`` is purely OFFLINE and
 FIXTURE-ONLY. Every test here builds its own in-memory JSON-shaped fixture; no
 test reads a real corporate-action feed, fetches anything from the network, or
-claims empirical/integration evidence. The script lives in ``scripts/`` (not a
-package) and is imported here the same way the other script proofs do it.
+claims empirical/integration evidence. The validator is imported through the
+repository's canonical ``scripts`` package identity.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from validate_corporate_action_pit import (  # noqa: E402
+from scripts.validate_corporate_action_pit import (  # noqa: E402
     CorporateActionPitError,
     load_fixture,
     main,
@@ -608,7 +608,7 @@ def test_top_level_payload_must_be_an_object() -> None:
 
 
 def test_module_docstring_never_claims_integration_evidence() -> None:
-    import validate_corporate_action_pit as module
+    import scripts.validate_corporate_action_pit as module
 
     doc = module.__doc__ or ""
     for forbidden in ("EMPIRICALLY_VERIFIED", "REAL_DATASET_BUILT", "LIVE_READY", "PAPER_AUTO"):

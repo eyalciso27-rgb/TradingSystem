@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypeVar, runtime_checkable
 
 SOURCES_VERSION = "dataset-v1-sources-1.0.0"
 
@@ -526,6 +526,9 @@ class CrosswalkResolution:
         }
 
 
+_K = TypeVar("_K")
+
+
 class IdentityCrosswalk:
     """Deterministic identity resolution across IBKR conId / SEC CIK / tickers."""
 
@@ -551,7 +554,9 @@ class IdentityCrosswalk:
                 self._by_ticker.setdefault(ticker, []).append(entry.security_id)
 
     @staticmethod
-    def _lookup[K](index: Mapping[K, list[str]], key: K) -> tuple[str | None, str]:
+    def _lookup(  # noqa: UP047 - architecture check runs on pre-3.12 Python
+        index: Mapping[_K, list[str]], key: _K
+    ) -> tuple[str | None, str]:
         matches = index.get(key, [])
         if not matches:
             return None, "unresolved"

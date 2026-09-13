@@ -140,24 +140,21 @@ def _scope_matches(halt: HaltRecord, context: EntryContext) -> bool:
     """True when an active halt blocks the given prospective entry."""
     if halt.environment != context.environment and halt.scope not in _GLOBAL_SCOPES:
         return False
-    match halt.scope:
-        case HaltScope.GLOBAL_ENTRY_HALT:
-            return True
-        case HaltScope.ENVIRONMENT_HALT:
-            return True
-        case HaltScope.BROKER_HALT:
-            return _target_hit(halt.target_ref, context.broker_id)
-        case HaltScope.ACCOUNT_HALT:
-            return _target_hit(halt.target_ref, context.account_ref)
-        case HaltScope.STRATEGY_HALT:
-            return _target_hit(halt.target_ref, context.strategy_id)
-        case HaltScope.SYMBOL_HALT:
-            return _target_hit(halt.target_ref, context.symbol)
-        case HaltScope.SOURCE_HALT:
-            return _target_hit(halt.target_ref, context.source_id)
-        case HaltScope.MODEL_HALT:
-            return _target_hit(halt.target_ref, context.model_id)
-    return False  # pragma: no cover - exhaustive match above
+    if halt.scope in {HaltScope.GLOBAL_ENTRY_HALT, HaltScope.ENVIRONMENT_HALT}:
+        return True
+    if halt.scope is HaltScope.BROKER_HALT:
+        return _target_hit(halt.target_ref, context.broker_id)
+    if halt.scope is HaltScope.ACCOUNT_HALT:
+        return _target_hit(halt.target_ref, context.account_ref)
+    if halt.scope is HaltScope.STRATEGY_HALT:
+        return _target_hit(halt.target_ref, context.strategy_id)
+    if halt.scope is HaltScope.SYMBOL_HALT:
+        return _target_hit(halt.target_ref, context.symbol)
+    if halt.scope is HaltScope.SOURCE_HALT:
+        return _target_hit(halt.target_ref, context.source_id)
+    if halt.scope is HaltScope.MODEL_HALT:
+        return _target_hit(halt.target_ref, context.model_id)
+    return False  # pragma: no cover - HaltScope cases are exhaustive above
 
 
 def _target_hit(halt_target: str | None, context_value: str | None) -> bool:

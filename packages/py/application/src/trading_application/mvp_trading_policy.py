@@ -393,6 +393,21 @@ class MvpTradingPolicy:
         self._allocator = PortfolioAllocator(config.allocation_policy)
         self._pre_submit = FinalPreSubmitCheck(config.pre_submit_policy)
 
+    @property
+    def strategy_id(self) -> str:
+        """Identity of the frozen strategy evaluated by this policy."""
+        return self._config.strategy_policy.strategy_id
+
+    @property
+    def strategy_version(self) -> str:
+        """Version of the canonical strategy manifest."""
+        return self._config.manifest.version
+
+    @property
+    def strategy_fingerprint(self) -> str:
+        """Owner-frozen strategy fingerprint bound into read-only evidence."""
+        return self._config.strategy_policy.frozen_fingerprint
+
     def evaluate(
         self,
         instrument_id: UUID,

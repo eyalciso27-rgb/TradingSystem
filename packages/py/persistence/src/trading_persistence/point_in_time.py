@@ -15,7 +15,7 @@ supersession moment. ``as_of`` must be timezone-aware (UTC storage).
 """
 
 from datetime import datetime
-from typing import cast
+from typing import TypeVar, cast
 
 from sqlalchemy import ColumnElement, Select, and_, or_, select
 from sqlalchemy.orm import DeclarativeBase, InstrumentedAttribute
@@ -50,6 +50,11 @@ def as_of_clause(model: type[DeclarativeBase], as_of: datetime) -> ColumnElement
     )
 
 
-def select_as_of[M: DeclarativeBase](model: type[M], as_of: datetime) -> Select[tuple[M]]:
+_M = TypeVar("_M", bound=DeclarativeBase)
+
+
+def select_as_of(  # noqa: UP047 - architecture check runs on pre-3.12 Python
+    model: type[_M], as_of: datetime
+) -> Select[tuple[_M]]:
     """SELECT rows of ``model`` visible at ``as_of`` (no future records)."""
     return select(model).where(as_of_clause(model, as_of))

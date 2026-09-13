@@ -15,7 +15,7 @@ from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 #: The end of an ``as_of`` calendar day in UTC — the default knowledge cutoff for
 #: a daily backtest deciding on that date (it may use any fact KNOWN by then).
@@ -363,11 +363,14 @@ class _Bitemporal(Protocol):
     def bitemporal_key(self) -> tuple[str, ...]: ...
 
 
-def resolve_visible[B: _Bitemporal](
-    records: Sequence[B],
+_B = TypeVar("_B", bound=_Bitemporal)
+
+
+def resolve_visible(  # noqa: UP047 - architecture check runs on pre-3.12 Python
+    records: Sequence[_B],
     known_as_of: datetime,
     retractions: Sequence[RetractionRecord] = (),
-) -> tuple[B, ...]:
+) -> tuple[_B, ...]:
     """The current assertions known by ``known_as_of``.
 
     Resolution order is deterministic and defined:
@@ -858,8 +861,11 @@ class _BitemporalReference(Protocol):
     def bitemporal_key(self) -> tuple[str, ...]: ...
 
 
-def _bitemporal_errors[BR: _BitemporalReference](
-    kind: str, records: Sequence[BR], retractions: Sequence[RetractionRecord] = ()
+_BR = TypeVar("_BR", bound=_BitemporalReference)
+
+
+def _bitemporal_errors(  # noqa: UP047 - architecture check runs on pre-3.12 Python
+    kind: str, records: Sequence[_BR], retractions: Sequence[RetractionRecord] = ()
 ) -> list[str]:
     """Validate a bitemporal reference collection.
 
@@ -872,7 +878,7 @@ def _bitemporal_errors[BR: _BitemporalReference](
     are a genuine duplicate/conflict and fail closed.
     """
     errors: list[str] = []
-    by_id: dict[str, BR] = {}
+    by_id: dict[str, _BR] = {}
     for record in records:
         if record.known_at.tzinfo is None:
             errors.append(f"{kind} {record.record_id}: known_at must be timezone-aware")
