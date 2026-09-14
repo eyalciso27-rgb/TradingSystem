@@ -821,8 +821,9 @@ def test_reserved_characters_round_trip_through_the_database_url(
     import sys
 
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
-    from build_paper_database_url import build_url
     from sqlalchemy.engine import make_url
+
+    from scripts.build_paper_database_url import build_url
 
     url = build_url(
         {
@@ -846,7 +847,7 @@ def test_the_rendered_url_masks_the_password_by_default() -> None:
     import sys
 
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
-    from build_paper_database_url import build_url
+    from scripts.build_paper_database_url import build_url
 
     url = build_url(
         {
@@ -1078,7 +1079,7 @@ def test_the_database_preflight_reports_a_code_and_a_type_only() -> None:
     import sys as _sys
 
     _sys.path.insert(0, str(REPO_ROOT / "scripts"))
-    from check_paper_probe_database import UNUSABLE, check
+    from scripts.check_paper_probe_database import UNUSABLE, check
 
     # Nothing listening on port 1.
     status, line = check(
@@ -1095,7 +1096,7 @@ def test_an_unparseable_url_is_refused_without_echoing_it() -> None:
     import sys as _sys
 
     _sys.path.insert(0, str(REPO_ROOT / "scripts"))
-    from check_paper_probe_database import UNUSABLE, check
+    from scripts.check_paper_probe_database import UNUSABLE, check
 
     status, line = check("::::not a url::::")
 
@@ -1108,7 +1109,7 @@ def test_a_missing_url_is_refused() -> None:
     import sys as _sys
 
     _sys.path.insert(0, str(REPO_ROOT / "scripts"))
-    import check_paper_probe_database as checker
+    import scripts.check_paper_probe_database as checker
 
     status = checker.main([])
 

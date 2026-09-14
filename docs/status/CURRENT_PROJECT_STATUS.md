@@ -72,6 +72,13 @@ invalid prices fail; 10167 = non-blocking delayed notice).
 
 ## 4. What is proven only with fakes (`TESTED_WITH_FAKES`)
 
+- M7 read-only runtime orchestration/audit machinery is **IMPLEMENTED and
+  TESTED_WITH_FAKES**: a supplied frozen snapshot runs only through
+  `MvpTradingPolicy.evaluate_read_only`, and immutable audit/replay evidence
+  uses the existing tamper-evident chain plus content-addressed object store.
+  This is evaluate-only engineering evidence: it mints no submission
+  authorization, creates no executable plan, calls no broker, and establishes
+  no `SHADOW_PASS`, `PAPER_PASS`, real integration, or profitability evidence.
 - The **entire order lifecycle**: `tests/poi/test_paper_manual_lifecycle.py`
   (16 scenarios) drives the real ExecutionAgent + ProtectionManager +
   ReconciliationEngine over the canonical FakeBroker — idempotency (zero

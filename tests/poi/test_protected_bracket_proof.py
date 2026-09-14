@@ -21,17 +21,15 @@ from pathlib import Path
 from trading_execution_agent.execution_service import ExecutionStage
 from trading_execution_agent.protected_entry import IbkrProtectedEntryLifecycle
 
-# The proof lives in scripts/, imported as a top-level module the way the other
-# script tests do (scripts/ is not a package, so siblings import each other by
-# bare name; a package marker would break that).
+# Keep the script directory available for direct-script compatibility while
+# importing the proof through its canonical repository package identity.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from poi_protected_bracket_proof import (  # noqa: E402
+from scripts.poi_protected_bracket_proof import (  # noqa: E402
     ARM_TOKEN,
     ScopedPaperBracketAuthorization,
     main,
 )
-
 from tests.integration.test_execution_service import (  # noqa: E402
     NOW,
     PnlAwareTransport,

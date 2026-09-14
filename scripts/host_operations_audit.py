@@ -548,11 +548,11 @@ def audit_systemd_contract(audit: Audit, *, root: Path | None = None) -> None:
     Gateway ran in a user session scope that the unit did not own.
     """
     # The audit is run both as a script and loaded by path, so make the
-    # sibling module resolvable either way before importing it.
-    module_dir = str(Path(__file__).resolve().parent)
-    if module_dir not in sys.path:
-        sys.path.insert(0, module_dir)
-    from systemd_contract import (  # noqa: PLC0415 - keeps the audit standalone
+    # repository package root resolvable either way before importing it.
+    repository_root = str(Path(__file__).resolve().parent.parent)
+    if repository_root not in sys.path:
+        sys.path.insert(0, repository_root)
+    from scripts.systemd_contract import (  # noqa: PLC0415 - keeps the audit standalone
         CANONICAL_GATEWAY_UNIT,
         CANONICAL_WATCHDOG_UNIT,
         Severity,

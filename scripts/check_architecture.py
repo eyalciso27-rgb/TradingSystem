@@ -140,6 +140,23 @@ RISK_RESULT_ALLOWED_PATHS: tuple[str, ...] = (
     "packages/py/application/src/trading_application/risk_engine.py",
 )
 
+READ_ONLY_RUNTIME_PATH = (
+    "packages/py/application/src/trading_application/mvp_read_only_runtime.py"
+)
+READ_ONLY_FORBIDDEN_NAMES: frozenset[str] = frozenset(
+    {"SubmitAuthorization", "ExecutablePlan"}
+)
+READ_ONLY_FORBIDDEN_MODULES: frozenset[str] = frozenset(
+    {
+        "trading_application.execution_plan",
+        "trading_application.pre_submit_check",
+        "trading_broker_core",
+        "trading_config",
+        "trading_execution_agent",
+        "trading_broker_ibkr",
+    }
+)
+
 # Invariants that must remain literally true in the files that carry them.
 # Each is a property a future edit could quietly remove while every test still
 # passes, so the text itself is pinned.
@@ -402,6 +419,74 @@ def _check_execution_boundary(rel_path: str, tree: ast.AST) -> list[Violation]:
     return violations
 
 
+def _check_read_only_runtime(rel_path: str, tree: ast.AST) -> list[Violation]:
+    """Pin the M7 runtime to the evaluate-only authority surface."""
+    if rel_path != READ_ONLY_RUNTIME_PATH:
+        return []
+
+    def forbidden_module(name: str) -> bool:
+        return any(
+            name == forbidden or name.startswith(forbidden + ".")
+            for forbidden in READ_ONLY_FORBIDDEN_MODULES
+        )
+
+    violations: list[Violation] = []
+    evaluate_only_calls = _attribute_calls(tree, "evaluate_read_only")
+    if len(evaluate_only_calls) != 1:
+        violations.append(
+            Violation(
+                rel_path,
+                0,
+                "read-only-runtime",
+                "the runtime must call evaluate_read_only exactly once",
+            )
+        )
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in READ_ONLY_FORBIDDEN_NAMES:
+            violations.append(
+                Violation(
+                    rel_path,
+                    node.lineno,
+                    "read-only-runtime",
+                    f"{node.id} is forbidden in the read-only runtime",
+                )
+            )
+        if isinstance(node, ast.Attribute) and node.attr == "evaluate":
+            violations.append(
+                Violation(
+                    rel_path,
+                    node.lineno,
+                    "read-only-runtime",
+                    "the read-only runtime may not call the authorizing policy path",
+                )
+            )
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and forbidden_module(node.module)
+        ):
+            violations.append(
+                Violation(
+                    rel_path,
+                    node.lineno,
+                    "read-only-runtime",
+                    f"module {node.module!r} is forbidden in the read-only runtime",
+                )
+            )
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if forbidden_module(alias.name):
+                    violations.append(
+                        Violation(
+                            rel_path,
+                            node.lineno,
+                            "read-only-runtime",
+                            f"module {alias.name!r} is forbidden in the read-only runtime",
+                        )
+                    )
+    return violations
+
+
 def _check_invariants(repo_root: Path) -> list[Violation]:
     """Pin properties a future edit could remove with every test still green.
 
@@ -437,6 +522,7 @@ def scan_repository(repo_root: Path) -> list[Violation]:
         violations.extend(_check_imports(rel_path, tree))
         violations.extend(_check_text(rel_path, text))
         violations.extend(_check_execution_boundary(rel_path, tree))
+        violations.extend(_check_read_only_runtime(rel_path, tree))
         violations.extend(_check_portfolio_fabrication(rel_path, tree))
     violations.extend(_check_invariants(repo_root))
     return violations
