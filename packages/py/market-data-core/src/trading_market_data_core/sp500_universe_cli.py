@@ -85,16 +85,35 @@ def _report(
     return EXIT_STALE if status is UniverseListStatus.CURRENT_LIST_STALE else EXIT_UNAVAILABLE
 
 
+def _parse_now(value: str) -> datetime:
+    """Parse an ISO-8601 instant for --now; naive input is treated as UTC.
+
+    Invalid input raises and argparse turns it into a deterministic usage error.
+    """
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("status", "refresh"))
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--mode", choices=("PAPER", "LIVE"), default="PAPER")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--now",
+        type=_parse_now,
+        default=None,
+        help=(
+            "Evaluate freshness as of this ISO-8601 UTC instant (default: current "
+            "time). For deterministic tests and 'as-of' owner checks; does not "
+            "alter stored data."
+        ),
+    )
     _force_utf8_stdout()
     args = parser.parse_args(argv[1:])
 
-    now = datetime.now(tz=UTC)
+    now: datetime = args.now if args.now is not None else datetime.now(tz=UTC)
     mode = TradingMode(args.mode)
     store = UniverseStore(args.root)
 
