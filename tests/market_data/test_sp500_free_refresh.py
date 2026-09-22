@@ -9,7 +9,7 @@ presented as point-in-time history.
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -219,7 +219,7 @@ def test_status_reports_the_snapshot_details(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _accept_production_snapshot(UniverseStore(tmp_path), _good())
-    code = universe_main(["prog", "status", "--root", str(tmp_path)])
+    code = universe_main(["prog", "status", "--root", str(tmp_path), "--now", NOW.isoformat()])
     out = capsys.readouterr().out
     assert code == 0
     for expected in (
@@ -234,7 +234,7 @@ def test_refresh_does_not_refetch_when_not_due(
 ) -> None:
     """No network is touched here: the CLI must short-circuit on freshness."""
     _accept_production_snapshot(UniverseStore(tmp_path), _good(as_of=date(2026, 8, 15)))
-    code = universe_main(["prog", "refresh", "--root", str(tmp_path)])
+    code = universe_main(["prog", "refresh", "--root", str(tmp_path), "--now", NOW.isoformat()])
     out = capsys.readouterr().out
     assert code == 0
     assert "refresh not due" in out
@@ -352,3 +352,22 @@ def test_automatic_refresh_without_a_fetcher_keeps_the_cached_list(tmp_path: Pat
     )
     assert current is not None
     assert any("no fetcher" in finding for finding in findings)
+
+
+def test_now_override_makes_freshness_deterministic(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The injected --now clock (not wall time) decides freshness."""
+    _accept_production_snapshot(UniverseStore(tmp_path), _good(as_of=date(2026, 8, 15)))
+    fresh = universe_main(["prog", "status", "--root", str(tmp_path), "--now", NOW.isoformat()])
+    capsys.readouterr()
+    later = (NOW + timedelta(days=400)).isoformat()
+    stale = universe_main(["prog", "status", "--root", str(tmp_path), "--now", later])
+    capsys.readouterr()
+    assert fresh == 0, "the snapshot is current at the injected NOW"
+    assert stale != 0, "the same snapshot is not current 400 days later"
+
+
+def test_invalid_now_fails_deterministically(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        universe_main(["prog", "status", "--root", str(tmp_path), "--now", "not-a-timestamp"])
