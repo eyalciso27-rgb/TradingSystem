@@ -8,6 +8,18 @@
 
 ---
 
+## 2026-11-11 owner-directed experimental Paper Auto policy overlay (ADR-0020, proposed)
+
+This section is an **unmerged policy draft**, not permission to activate automatic broker orders. It proposes removing the blanket freeze for a restricted IBKR Paper experiment, while preserving the disabled runtime default, DenyAll authorizer, broker-side protective stops and all execution safety requirements.
+
+**Two independent tracks:** (1) **Experimental forward-only Paper lane**: post-fix cancel/recovery (G0), actual native bracket proof (G1), 10 controlled complete lifecycles/reconciliation (G2), idempotency under restart/disconnect (G3), risk and emergency-stop proof (G4), and 5+ trading sessions of read-only Shadow (G5); followed by a **separate owner-specific Paper activation approval**. (2) **Strategy research and profitability qualification**: complete PIT historical membership/GICS, backtest, OOS and stress continue, but do **not** block the restricted experimental Paper lane. Results in the first track cannot be called profitably qualified; Live remains prohibited.
+
+No automatic orders before G0–G5 PASS and a separate owner release. During the first pilot, the existing broker/PoI safety cap of **one share and $50 notional** governs, alongside stricter pilot caps in ADR-0020. The frozen breakout requires **completed** RTH daily bars and possible next-session entry, not a 15:45 ET unfinished bar. The agent's production DenyAll authorization and the baseline manifest flags are intentionally unchanged. See docs/runbooks/PAPER_AUTO_EXPERIMENT_RELEASE.md.
+
+This overlay amends the **sequence** for a future experimental exception to M3–M8; it does not claim M1 broker verification, M6 shadow, or M8 authorization are already complete.
+
+---
+
 ## 1. MVP outcome
 
 The current MVP is complete only when the system can autonomously execute **one real owner-frozen strategy** end-to-end in **IBKR Paper**, while obeying the mandatory risk/safety envelope and proving recovery, reconciliation, protection, auditability, and fail-closed behavior.
