@@ -17,9 +17,11 @@ For a specific task, read the additional authoritative specification documents r
 ## Non-negotiable rules
 
 - Do not redesign the architecture without an explicit ADR and user approval.
-- Do not begin Paper Auto or Live trading.
+- Do not begin Live trading.
+- Restricted Paper Auto may be implemented and tested only under the owner-gated experimental lane proposed by ADR-0020. Automatic broker submission remains forbidden until G0-G5 are integration-verified, the policy is adopted, and the owner issues a separate exact-scope operational release. Do not enable it by default.
+- During the current policy draft, no agent may enable PAPER_AUTO_ENABLED, replace DenyAllExecutionAuthorization, or place automated Paper orders.
 - Do not connect to real-money accounts.
-- Do not send an order to a broker unless the assigned task explicitly concerns the isolated IBKR Paper PoI.
+- Do not send an order to a broker unless the assigned task explicitly concerns an owner-approved isolated IBKR Paper PoI. A future Paper Auto release is separate from this drafting authorization and is not currently approved.
 - WhatsApp personal-user access is mandatory.
 - Discord personal-user access is mandatory.
 - Telegram personal-user access through TDLib is mandatory and primary.
@@ -68,6 +70,6 @@ For a specific task, read the additional authoritative specification documents r
 
 ## Current execution state
 
-The current approved activity is Phase 0 and isolated Proof-of-Integration work only.
+The current approved activity includes Phase 0, owner-approved isolated Paper Proof-of-Integration work, read-only Shadow, and documentation/implementation preparation for ADR-0020.
 
-Paper Auto and Live are prohibited.
+Under proposed ADR-0020, Paper Auto is conditionally eligible only **after** G0-G5 evidence, owner adoption, and a separate owner-scoped release. Until that release, all actual autonomous Paper submissions are forbidden; PAPER_AUTO_ENABLED stays false and production authorization remains DenyAll. Live trading is prohibited without exception.
